@@ -61,6 +61,7 @@ use std::io::Write;
 
 use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
+use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
 
 /// Number of distinct handler slots representable in an A-line opcode's
@@ -180,6 +181,9 @@ pub enum DispatchError {
         handler_name: String,
         message: String,
     },
+    /// [`LibraryTable::register_by_name`] was asked to register a function
+    /// name that isn't in the supplied [`LvoEntry`] table.
+    UnknownLibraryFunction { library: String, name: String },
 }
 
 impl fmt::Display for DispatchError {
@@ -202,7 +206,7 @@ impl fmt::Display for DispatchError {
                         if i > 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{lib}({offset:+})")?;
+                        write!(f, "{lib} ({offset:+})")?;
                     }
                     write!(f, ")")
                 }
@@ -213,6 +217,9 @@ impl fmt::Display for DispatchError {
                 handler_name,
                 message,
             } => write!(f, "{library}({lvo:+}) [{handler_name}] failed: {message}"),
+            DispatchError::UnknownLibraryFunction { library, name } => {
+                write!(f, "{library}: no LVO metadata for function {name:?}")
+            }
         }
     }
 }
@@ -230,6 +237,12 @@ pub struct LibraryTable<C: Cpu> {
     /// registered against, used to produce helpful diagnostics for
     /// unhandled calls.
     bases: HashMap<String, u32>,
+    /// LVO metadata table associated with each library base that's been
+    /// registered through [`LibraryTable::register_by_name`] (bare
+    /// [`LibraryTable::register`] calls don't populate this -- they have
+    /// no table to record). Used to resolve unknown-call diagnostics for
+    /// that base down to a function name instead of a raw offset.
+    tables: HashMap<u32, &'static [LvoEntry]>,
 }
 
 impl<C: Cpu> Default for LibraryTable<C> {
@@ -245,6 +258,7 @@ impl<C: Cpu> LibraryTable<C> {
             slots: HashMap::new(),
             next_slot: UNKNOWN_SLOT + 1,
             bases: HashMap::new(),
+            tables: HashMap::new(),
         }
     }
 
@@ -291,6 +305,40 @@ impl<C: Cpu> LibraryTable<C> {
         slot
     }
 
+    /// Convenience wrapper around [`LibraryTable::register`] that looks up
+    /// `name`'s LVO in `table` (an [`LvoEntry`] table, e.g.
+    /// [`crate::lvos::dos::DOS_LVOS`]) instead of requiring the caller to
+    /// know the raw offset. Also records `table` against `base` so
+    /// [`DispatchError::UnknownCall`] can resolve *other*, unregistered
+    /// LVOs on this same base down to a function name (see
+    /// [`LibraryTable::dispatch`]).
+    ///
+    /// Returns [`DispatchError::UnknownLibraryFunction`] if `name` isn't in
+    /// `table`, rather than panicking -- `table` may be incomplete (a
+    /// handwritten table for a library `tools/gen_lvos.py` hasn't been run
+    /// against yet) and callers should be able to handle that as an
+    /// ordinary error, e.g. surfacing "unimplemented library function" at
+    /// startup instead of aborting.
+    pub fn register_by_name(
+        &mut self,
+        mem: &mut C::Memory,
+        base: u32,
+        table: &'static [LvoEntry],
+        library: &str,
+        name: &str,
+        handler: impl LibraryHandler<C> + 'static,
+    ) -> Result<u16, DispatchError> {
+        let entry =
+            find_by_name(table, name).ok_or_else(|| DispatchError::UnknownLibraryFunction {
+                library: library.to_string(),
+                name: name.to_string(),
+            })?;
+        let lvo = entry.lvo;
+        let entry_name = entry.name;
+        self.tables.insert(base, table);
+        Ok(self.register(mem, base, lvo, library, entry_name, handler))
+    }
+
     /// Dispatches a trapped A-line `opcode` encountered at `pc`. On
     /// success, returns the [`CallInfo`] describing what was called (for
     /// `--verbose` logging).
@@ -307,7 +355,19 @@ impl<C: Cpu> LibraryTable<C> {
             let candidates = self
                 .bases
                 .iter()
-                .map(|(lib, &base)| (lib.clone(), pc as i64 as i32 - base as i32))
+                .map(|(lib, &base)| {
+                    let offset = pc as i64 as i32 - base as i32;
+                    // Resolve through this base's LVO table, if it has one,
+                    // so the diagnostic can name the function the guest
+                    // was trying to call instead of just an offset.
+                    let label = self
+                        .tables
+                        .get(&base)
+                        .and_then(|table| find_by_lvo(table, offset))
+                        .map(|found| format!("{lib}/{}", found.name))
+                        .unwrap_or_else(|| lib.clone());
+                    (label, offset)
+                })
                 .collect();
             return Err(DispatchError::UnknownCall {
                 pc,
@@ -698,5 +758,115 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn register_by_name_looks_up_lvo_and_writes_opcode() {
+        use crate::lvos::dos::DOS_LVOS;
+
+        let mut mem = FlatMemory::new(0x2000);
+        let mut table: LibraryTable<M68kCpu> = LibraryTable::new();
+        let slot = table
+            .register_by_name(
+                &mut mem,
+                DOS_LIBRARY_BASE,
+                DOS_LVOS,
+                "dos.library",
+                "PutStr",
+                putstr_handler::<M68kCpu>,
+            )
+            .expect("PutStr is in DOS_LVOS");
+
+        // PutStr's real LVO is -948; register_by_name should have looked
+        // that up and written the trapping opcode at base - 948.
+        let addr = DOS_LIBRARY_BASE.wrapping_sub(948);
+        assert_eq!(mem.read_u16(addr), 0xA000 | slot);
+    }
+
+    #[test]
+    fn register_by_name_unknown_function_is_an_error_not_a_panic() {
+        use crate::lvos::dos::DOS_LVOS;
+
+        let mut mem = FlatMemory::new(0x2000);
+        let mut table: LibraryTable<M68kCpu> = LibraryTable::new();
+        let err = table
+            .register_by_name(
+                &mut mem,
+                DOS_LIBRARY_BASE,
+                DOS_LVOS,
+                "dos.library",
+                "TotallyNotARealFunction",
+                putstr_handler::<M68kCpu>,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DispatchError::UnknownLibraryFunction {
+                library: "dos.library".to_string(),
+                name: "TotallyNotARealFunction".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_call_diagnostic_names_the_function_when_table_is_known() {
+        use crate::lvos::dos::DOS_LVOS;
+
+        // Register PutStr by name (populates the base -> table map), then
+        // jsr an unrelated, unregistered LVO on the same base: -84 is
+        // Lock's real offset, but we never registered a handler for it.
+        let entry = TRAP_TABLE_END;
+        let words = [0x4EAE, (-84i16) as u16, 0x4E75]; // jsr -84(a6) ; rts
+        let mut mem = FlatMemory::new(0x4000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(M68kCpu::new(), mem, entry);
+        rt.table
+            .register_by_name(
+                &mut rt.mem,
+                DOS_LIBRARY_BASE,
+                DOS_LVOS,
+                "dos.library",
+                "PutStr",
+                putstr_handler::<M68kCpu>,
+            )
+            .expect("PutStr is in DOS_LVOS");
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::Dispatch(DispatchError::UnknownCall { candidates, .. }) => {
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|(lib, offset)| lib == "dos.library/Lock" && *offset == -84),
+                    "expected a dos.library/Lock (-84) candidate, got {candidates:?}"
+                );
+            }
+            other => panic!("expected UnknownCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_call_diagnostic_falls_back_to_raw_offset_without_a_table() {
+        // Same shape as the PutStr-only default registration in
+        // Runtime::new (bare `register`, no table recorded): an unknown
+        // LVO on that base should still report the library name with a
+        // plain numeric offset, not panic or silently omit the candidate.
+        let words = [0x4EAE, (-100i16) as u16]; // jsr -100(a6)
+        let mut rt = runtime_with_program(&words);
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::Dispatch(DispatchError::UnknownCall { candidates, .. }) => {
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|(lib, offset)| lib == "dos.library" && *offset == -100),
+                    "expected a dos.library (-100) candidate, got {candidates:?}"
+                );
+            }
+            other => panic!("expected UnknownCall, got {other:?}"),
+        }
     }
 }

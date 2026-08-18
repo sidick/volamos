@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Generate `crates/volamos-core/src/lvos/dos.rs` from an AROS dos.library
+interface description.
+
+This is a **one-shot codegen tool**, not a build-time dependency. Run it by
+hand when the upstream interface description changes, review the diff, and
+commit the regenerated `.rs` file like any other source change.
+
+## Source format
+
+AROS's own repository does not check in generated `.sfd`/`.fd` files for
+its ROM-resident libraries; those are produced at build time by AROS's
+`genmodule` tooling from a `.conf` file per library
+(`rom/dos/dos.conf` for `dos.library`). That `.conf` file's
+`##begin functionlist` / `##end functionlist` block is the single source of
+truth `dos_lib.sfd` would otherwise be generated from, and it encodes the
+exact same facts an SFD does: function name, LVO bias (offset), and the
+argument-register calling convention, using its own directive spellings:
+
+  - `<decl> Name(args) (REGLIST)` -- one function, in bias order. Bias
+    starts at 6 and increases by 6 for every slot consumed (a real
+    function *or* a skipped one), so `LVO = -bias`. `REGLIST` is a
+    comma-separated list of `Dn`/`An` register names in call order (or
+    empty for a no-argument call).
+  - `.private` -- applies to the immediately preceding function; marks it
+    as an internal vector not meant for guest code to call directly
+    (AROS uses this for `OpenLib`/`CloseLib`, which real guest code never
+    calls via LVO -- that's `exec.library`'s `OpenLibrary`/`CloseLibrary`
+    job). We still emit these entries (flagged `private: true`) rather
+    than silently dropping bias-consuming slots.
+  - `.skip N` -- reserves N consecutive slots with no function attached
+    (advances bias by `6*N`, emits nothing). AROS uses this for
+    intentionally-unimplemented, historical, or vendor-reserved (MorphOS
+    compatibility) slots.
+  - `.version NN` -- informational only ("this and subsequent entries
+    were added in library version NN"); does not affect bias. Ignored by
+    this tool -- we don't currently track a per-call minimum version.
+  - `.novararg` -- informational only (tells AROS's stub generator not to
+    emit a variadic amiga.lib wrapper for the preceding function); has no
+    effect on the LVO/register ABI. Ignored.
+  - `#`-prefixed lines and blank lines -- comments, ignored.
+
+No line in the emitted output is copied from the source file: this script
+extracts only the (uncopyrightable) interface facts -- names, offsets,
+register assignments -- into a fresh Rust literal; see the provenance
+header this script writes into the generated file for the exact source
+commit and license note.
+
+## Usage
+
+    python3 tools/gen_lvos.py \\
+        --input /path/to/dos.conf \\
+        --source-url https://raw.githubusercontent.com/aros-development-team/AROS/<sha>/rom/dos/dos.conf \\
+        --commit <sha> \\
+        --output crates/volamos-core/src/lvos/dos.rs
+
+`--input` may be omitted to fetch `--source-url` directly (stdlib
+`urllib` only -- no third-party dependencies). Output is fully
+deterministic for a given input: re-running with the same `--input` and
+the same `--source-url`/`--commit`/`--generated` values byte-for-byte
+reproduces the file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import urllib.request
+from dataclasses import dataclass, field
+
+FUNCTIONLIST_BEGIN = "##begin functionlist"
+FUNCTIONLIST_END = "##end functionlist"
+
+# `<decl> Name(args) (REGLIST)`, e.g.:
+#   "struct DosLibrary *OpenLib(ULONG version) (D0)"
+#   "LONG Read(BPTR file, APTR buffer, LONG length) (D1, D2, D3)"
+#   "BPTR Input() ()"
+FUNC_RE = re.compile(r"^(?P<decl>.+)\((?P<args>[^()]*)\)\s*\((?P<regs>[^()]*)\)\s*$")
+SKIP_RE = re.compile(r"^\.skip\s+(\d+)\b")
+VERSION_RE = re.compile(r"^\.version\s+\S+")
+REG_RE = re.compile(r"^([DA])([0-7])$")
+
+
+@dataclass
+class LvoEntry:
+    name: str
+    lvo: int
+    regs: list[str] = field(default_factory=list)
+    private: bool = False
+
+
+def parse_functionlist(text: str, *, source_label: str) -> list[LvoEntry]:
+    try:
+        start = text.index(FUNCTIONLIST_BEGIN) + len(FUNCTIONLIST_BEGIN)
+        end = text.index(FUNCTIONLIST_END, start)
+    except ValueError as e:
+        raise SystemExit(
+            f"{source_label}: could not find {FUNCTIONLIST_BEGIN}/{FUNCTIONLIST_END} markers"
+        ) from e
+    block = text[start:end]
+
+    entries: list[LvoEntry] = []
+    bias = 0
+    for lineno, raw_line in enumerate(block.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == ".private":
+            if not entries:
+                raise SystemExit(f"{source_label}:{lineno}: .private with no preceding function")
+            entries[-1].private = True
+            continue
+        if line == ".novararg":
+            continue
+        if VERSION_RE.match(line):
+            continue
+        m = SKIP_RE.match(line)
+        if m:
+            bias += 6 * int(m.group(1))
+            continue
+
+        m = FUNC_RE.match(line)
+        if not m:
+            raise SystemExit(f"{source_label}:{lineno}: unrecognized functionlist line: {line!r}")
+
+        decl = m.group("decl").strip()
+        name = decl.split()[-1].lstrip("*")
+        regs_str = m.group("regs").strip()
+        regs = [r.strip() for r in regs_str.split(",")] if regs_str else []
+        for r in regs:
+            if not REG_RE.match(r):
+                raise SystemExit(
+                    f"{source_label}:{lineno}: unrecognized register {r!r} in {line!r}"
+                )
+
+        bias += 6
+        entries.append(LvoEntry(name=name, lvo=-bias, regs=regs))
+
+    return entries
+
+
+def reg_literal(reg: str) -> str:
+    kind, num = REG_RE.match(reg).groups()  # type: ignore[union-attr]
+    ty = "DataRegister" if kind == "D" else "AddressRegister"
+    variant = "D" if kind == "D" else "A"
+    return f"ArgReg::{variant}({ty}({num}))"
+
+
+def render(
+    entries: list[LvoEntry],
+    *,
+    source_url: str,
+    commit: str,
+    generated: str,
+    generator: str,
+) -> str:
+    lines: list[str] = []
+    lines.append("//! Generated `dos.library` LVO (library vector offset) metadata table.")
+    lines.append("//!")
+    lines.append("//! # Provenance")
+    lines.append("//!")
+    lines.append("//! Derived from AROS's `dos.library` interface description")
+    lines.append("//! (`rom/dos/dos.conf`, the `##begin functionlist` block AROS's own build")
+    lines.append("//! generates `dos_lib.sfd`/`dos_lib.fd` from -- see `tools/gen_lvos.py` for")
+    lines.append("//! why this repo reads the `.conf` directly rather than a generated `.sfd`).")
+    lines.append("//!")
+    lines.append(f"//! - Source URL: <{source_url}>")
+    lines.append(f"//! - Source commit: {commit}")
+    lines.append(f"//! - Generated: {generated}")
+    lines.append(f"//! - Generator: `{generator}`")
+    lines.append("//!")
+    lines.append("//! Only uncopyrightable interface facts were extracted from the source --")
+    lines.append("//! function names, LVO offsets, and argument-register assignments -- as")
+    lines.append("//! bare data; no descriptive text, comments, or file structure from the")
+    lines.append("//! source was copied. This file is licensed under the same terms as the")
+    lines.append("//! rest of this repository: MIT OR Apache-2.0.")
+    lines.append("//!")
+    lines.append("//! DO NOT EDIT BY HAND. Regenerate with `tools/gen_lvos.py`.")
+    lines.append("")
+    lines.append("use crate::cpu::{AddressRegister, DataRegister};")
+    lines.append("use crate::lvos::{ArgReg, LvoEntry};")
+    lines.append("")
+    lines.append("/// The full `dos.library` LVO table (all known functions, not just the")
+    lines.append("/// ones this runtime currently implements handlers for -- this way")
+    lines.append("/// unknown-call diagnostics can print a real function name for any of")
+    lines.append("/// them, not just the handful we emulate).")
+    lines.append(f"pub static DOS_LVOS: &[LvoEntry] = &[")
+    for e in entries:
+        regs = ", ".join(reg_literal(r) for r in e.regs)
+        private = "true" if e.private else "false"
+        lines.append(
+            f'    LvoEntry {{ name: "{e.name}", lvo: {e.lvo}, '
+            f"args: &[{regs}], private: {private} }},"
+        )
+    lines.append("];")
+    lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("mod tests {")
+    lines.append("    use super::*;")
+    lines.append("    use crate::lvos::find_by_name;")
+    lines.append("")
+    lines.append("    // Sanity-check a handful of well-known LVOs against published AmigaOS")
+    lines.append("    // dos.library values (see docs/plan.md's T7 entry).")
+    lines.append("    #[test]")
+    lines.append("    fn known_lvos_match_amigaos() {")
+    lines.append("        let cases: &[(&str, i32)] = &[")
+    lines.append('            ("Open", -30),')
+    lines.append('            ("Close", -36),')
+    lines.append('            ("Read", -42),')
+    lines.append('            ("Write", -48),')
+    lines.append('            ("Input", -54),')
+    lines.append('            ("Output", -60),')
+    lines.append('            ("Seek", -66),')
+    lines.append('            ("Lock", -84),')
+    lines.append('            ("Examine", -102),')
+    lines.append('            ("ExNext", -108),')
+    lines.append('            ("CurrentDir", -126),')
+    lines.append('            ("IoErr", -132),')
+    lines.append('            ("ParentDir", -210),')
+    lines.append('            ("PutStr", -948),')
+    lines.append("        ];")
+    lines.append("        for (name, lvo) in cases {")
+    lines.append('            let entry = find_by_name(DOS_LVOS, name)')
+    lines.append('                .unwrap_or_else(|| panic!("missing LVO entry for {name}"));')
+    lines.append("            assert_eq!(entry.lvo, *lvo, \"{name} LVO mismatch\");")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    #[test]")
+    lines.append("    fn open_and_lock_take_d1_d2() {")
+    lines.append('        let open = find_by_name(DOS_LVOS, "Open").unwrap();')
+    lines.append(
+        "        assert_eq!(open.args, &[ArgReg::D(DataRegister(1)), ArgReg::D(DataRegister(2))]);"
+    )
+    lines.append('        let lock = find_by_name(DOS_LVOS, "Lock").unwrap();')
+    lines.append(
+        "        assert_eq!(lock.args, &[ArgReg::D(DataRegister(1)), ArgReg::D(DataRegister(2))]);"
+    )
+    lines.append('        let putstr = find_by_name(DOS_LVOS, "PutStr").unwrap();')
+    lines.append("        assert_eq!(putstr.args, &[ArgReg::D(DataRegister(1))]);")
+    lines.append("    }")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--input", help="local path to dos.conf (fetched from --source-url if omitted)")
+    ap.add_argument("--source-url", required=True, help="canonical raw URL of the source file")
+    ap.add_argument("--commit", required=True, help="git commit hash of the source file version used")
+    ap.add_argument("--generated", required=True, help="generation date, e.g. 2026-08-18")
+    ap.add_argument("--generator", default="tools/gen_lvos.py", help="path to this script, for the provenance header")
+    ap.add_argument("--output", required=True, help="path to write the generated .rs file")
+    args = ap.parse_args()
+
+    if args.input:
+        with open(args.input, "r", encoding="utf-8") as f:
+            text = f.read()
+        source_label = args.input
+    else:
+        with urllib.request.urlopen(args.source_url) as resp:  # noqa: S310
+            text = resp.read().decode("utf-8")
+        source_label = args.source_url
+
+    entries = parse_functionlist(text, source_label=source_label)
+    if not entries:
+        raise SystemExit(f"{source_label}: no entries parsed")
+
+    # Determinism / sanity: no duplicate names, no duplicate LVOs.
+    names = [e.name for e in entries]
+    if len(names) != len(set(names)):
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        raise SystemExit(f"duplicate function names in source: {dupes}")
+    lvos = [e.lvo for e in entries]
+    if len(lvos) != len(set(lvos)):
+        raise SystemExit("duplicate LVO offsets computed -- parser bug or malformed source")
+
+    out = render(
+        entries,
+        source_url=args.source_url,
+        commit=args.commit,
+        generated=args.generated,
+        generator=args.generator,
+    )
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(out)
+
+    print(f"wrote {len(entries)} entries to {args.output}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

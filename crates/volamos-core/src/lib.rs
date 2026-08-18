@@ -13,7 +13,9 @@ pub mod backend;
 pub mod cpu;
 pub mod dispatch;
 pub mod loader;
+pub mod lvos;
 pub mod memory;
+pub mod vfs;
 
 pub use backend::M68kCpu;
 pub use cpu::Cpu;
@@ -22,4 +24,6 @@ pub use dispatch::{
     LibraryHandler, LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, TraceEvent,
 };
 pub use loader::{HunkFile, LoadError, LoadResult, load, parse};
+pub use lvos::{ArgReg, LvoEntry, find_by_lvo, find_by_name};
 pub use memory::AddressSpace;
+pub use vfs::{MAX_ASSIGN_DEPTH, ResolveMode, Vfs, VfsConfig, VfsError};
