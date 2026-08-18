@@ -953,6 +953,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         // see crate::utility's module docs.
         crate::utility::register_utility_handlers(&mut table, &mut mem);
 
+        // exec.library list/node primitives and single-threaded message
+        // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
+        // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
+        // DeleteMsgPort/PutMsg/GetMsg/ReplyMsg/AddPort/RemPort/FindPort
+        // -- see crate::execlist's module docs.
+        crate::execlist::register_execlist_handlers(&mut table, &mut mem);
+
         // The shared fake-library-vector handler: bound once, to a slot
         // number every auto-created fake library's jump table reuses
         // (see FAKE_LIB_SLOT's docs). No opcode word is written here --
