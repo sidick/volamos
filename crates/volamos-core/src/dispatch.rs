@@ -372,6 +372,13 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// used by [`crate::execlist::create_msg_port_handler`] to fill in
     /// `mp_SigTask`.
     pub current_task: u32,
+    /// Slot a handler that opens a resource (`OpenLibrary`/
+    /// `OldOpenLibrary`, `Open`) can fill in with a human-readable
+    /// description of what it opened and the outcome -- see
+    /// [`CallInfo::detail`]'s doc for the full rationale and format
+    /// examples. Reset to `None` before every dispatched call; almost
+    /// every handler leaves it alone.
+    pub call_detail: &'a mut Option<String>,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -411,6 +418,22 @@ pub struct CallInfo {
     pub library: String,
     pub lvo: i32,
     pub handler_name: String,
+    /// A human-readable description of what a *resource-opening* call
+    /// actually opened -- the requested name and outcome, e.g.
+    /// `"library \"version.library\" -> base 0x0200 (real)"` or
+    /// `"file \"SYS:s/startup-sequence\" (MODE_OLDFILE) -> FAILED
+    /// (ERROR_OBJECT_NOT_FOUND)"`. Only the handlers for calls that open
+    /// something (`OpenLibrary`/`OldOpenLibrary`, `Open`) fill this in
+    /// (via [`HandlerContext::call_detail`]); every other call leaves it
+    /// `None`. This is what `--snoop` (see `crates/volamos/src/main.rs`)
+    /// filters down to -- a `SnoopDos`-style resource-open log, distinct
+    /// from `--verbose`'s "every trapped call" firehose, added because
+    /// diagnosing exactly this kind of thing (which library/file a real
+    /// corpus binary was actually opening) by hand-adding and removing
+    /// temporary `eprintln!`s in individual handlers turned out to be a
+    /// recurring need during the empirical-corpus work (see
+    /// `docs/plan.md`'s Phase 3 notes).
+    pub detail: Option<String>,
 }
 
 impl fmt::Display for CallInfo {
@@ -419,7 +442,11 @@ impl fmt::Display for CallInfo {
             f,
             "{}({:+}) -> {}",
             self.library, self.lvo, self.handler_name
-        )
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(f, " [{detail}]")?;
+        }
+        Ok(())
     }
 }
 
@@ -684,10 +711,11 @@ impl<C: Cpu> LibraryTable<C> {
             });
         };
 
-        let info = CallInfo {
+        let mut info = CallInfo {
             library: entry.library.clone(),
             lvo: entry.lvo,
             handler_name: entry.handler_name.clone(),
+            detail: None,
         };
 
         // Handlers construct their own `DispatchError::HandlerFailed`
@@ -700,6 +728,7 @@ impl<C: Cpu> LibraryTable<C> {
         // owns this slot's opcode), which a blanket rewrite from the
         // slot's own (generic, shared) metadata would clobber.
         entry.handler.call(ctx)?;
+        info.detail = ctx.call_detail.take();
 
         Ok(info)
     }
@@ -846,6 +875,7 @@ fn open_library_common<C: Cpu>(
     name: &str,
 ) -> Result<(), DispatchError> {
     if let Some((base, _kind)) = ctx.registry.lookup(name) {
+        *ctx.call_detail = Some(format!("library {name:?} -> base {base:#010x} (real)"));
         ctx.cpu.set_data_register(DataRegister(0), base);
         return Ok(());
     }
@@ -869,6 +899,9 @@ fn open_library_common<C: Cpu>(
     }
 
     ctx.registry.register_fake(name, base, size);
+    *ctx.call_detail = Some(format!(
+        "library {name:?} -> base {base:#010x} (fake, unimplemented)"
+    ));
     ctx.cpu.set_data_register(DataRegister(0), base);
     Ok(())
 }
@@ -1448,6 +1481,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                     let a7 = self.cpu.address_register(AddressRegister(7));
                     exectask::check_stack_bounds(&self.mem, self.task, a7)?;
 
+                    let mut call_detail = None;
                     let mut ctx = HandlerContext {
                         cpu: &mut self.cpu,
                         mem: &mut self.mem,
@@ -1457,6 +1491,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         pc: info.pc,
                         dos: &mut self.dos,
                         current_task: self.task,
+                        call_detail: &mut call_detail,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {

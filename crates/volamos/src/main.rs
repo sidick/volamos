@@ -5,7 +5,7 @@
 //! guest program's own exit code.
 //!
 //! ```text
-//! volamos [-v|--verbose] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
+//! volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
 //!         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] <program> [args...]
 //! ```
 //!
@@ -14,7 +14,14 @@
 //! `A0`/`D0` -- see `volamos_core::dispatch::Runtime::new`); a program
 //! that parses its own arguments (e.g. via `ReadArgs`) can read them
 //! from there. `-v`/`--verbose` logs each trapped library call (library
-//! name, LVO, and handler name) to stderr as it happens.
+//! name, LVO, and handler name) to stderr as it happens; `-s`/`--snoop`
+//! is a `SnoopDos`-style lighter-weight alternative that logs only
+//! resource-opening calls (`OpenLibrary`/`OldOpenLibrary`, `Open`) --
+//! what was requested and whether it resolved to a real/unimplemented
+//! library or succeeded/failed for a file (see
+//! [`volamos_core::dispatch::CallInfo::detail`]). Both can be given
+//! together, in which case `--verbose` wins (its per-call output
+//! already includes the same detail inline).
 //!
 //! `-V`/`--volume`, `-a`/`--assign`, `--cwd`, and `--auto-assign` set up
 //! a [`volamos_core::vfs::Vfs`] for `dos.library`'s path-based calls
@@ -51,6 +58,7 @@ const GUEST_MEMORY_SIZE: usize = 1 << 20; // 1 MiB
 #[derive(Debug)]
 struct Options {
     verbose: bool,
+    snoop: bool,
     program: String,
     guest_args: Vec<String>,
     volumes: Vec<(String, PathBuf)>,
@@ -74,7 +82,7 @@ impl Options {
 
 fn print_usage(program_name: &str) {
     eprintln!(
-        "usage: {program_name} [-v|--verbose] [-V NAME:hostdir]... \
+        "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--stack SIZE] <program> [args...]"
     );
@@ -83,6 +91,13 @@ fn print_usage(program_name: &str) {
     eprintln!();
     eprintln!("options:");
     eprintln!("  -v, --verbose             log each emulated library call to stderr");
+    eprintln!(
+        "  -s, --snoop               SnoopDos-style: log every opened library/file to stderr"
+    );
+    eprintln!(
+        "                            (name, and whether it resolved to a real or unimplemented"
+    );
+    eprintln!("                            library, or succeeded/failed for a file)");
     eprintln!("  -V, --volume NAME:hostdir map an Amiga volume NAME: onto a host directory");
     eprintln!("                            (repeatable)");
     eprintln!("  -a, --assign NAME:target[+target...]");
@@ -146,6 +161,7 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// pulling in an argument-parsing crate isn't worth the dependency.
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut verbose = false;
+    let mut snoop = false;
     let mut program = None;
     let mut guest_args = Vec::new();
     let mut volumes = Vec::new();
@@ -161,6 +177,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         }
         match arg.as_str() {
             "-v" | "--verbose" => verbose = true,
+            "-s" | "--snoop" => snoop = true,
             "-h" | "--help" => return Err(String::new()), // caller prints usage and exits 0
             "-V" | "--volume" => {
                 let value = args
@@ -202,6 +219,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     let program = program.ok_or_else(|| "missing <program> argument".to_string())?;
     Ok(Options {
         verbose,
+        snoop,
         program,
         guest_args,
         volumes,
@@ -364,9 +382,12 @@ fn run(opts: &Options) -> Result<i32, String> {
     let mut out = stdout.lock();
 
     let verbose = opts.verbose;
+    let snoop = opts.snoop;
     let mut trace = move |event: &TraceEvent| {
         if verbose {
             eprintln!("volamos: {event}");
+        } else if snoop && let Some(detail) = &event.detail {
+            eprintln!("snoop: {detail}");
         }
     };
 
@@ -448,6 +469,17 @@ mod tests {
         assert!(opts.verbose);
         let opts = parse_args(args(&["--verbose", "prog"])).unwrap();
         assert!(opts.verbose);
+    }
+
+    #[test]
+    fn snoop_flag_before_program() {
+        let opts = parse_args(args(&["-s", "prog"])).unwrap();
+        assert!(opts.snoop);
+        assert!(!opts.verbose);
+        let opts = parse_args(args(&["--snoop", "prog"])).unwrap();
+        assert!(opts.snoop);
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.snoop);
     }
 
     #[test]

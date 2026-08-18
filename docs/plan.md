@@ -893,11 +893,18 @@ prompted, below):
    unsurprising `0` instead of the sentinel prefill's `0xA000` trap
    opcode pattern.
 
-Also prompted a recorded feature idea (`project-snoopdos-feature-idea`
-memory): a `SnoopDos`-style CLI flag to log opened libraries/devices/
-files, since diagnosing this required repeatedly hand-adding and
-removing temporary `eprintln!`s in `open_library_handler`/`RawDoFmt`/
-`CopyMem` -- not attempted in this pass, just recorded for later.
+Also prompted, and immediately implemented (2026-08-19), a
+`SnoopDos`-style CLI flag: `-s`/`--snoop` (`crates/volamos/src/
+main.rs`), built on a new `CallInfo::detail: Option<String>` field
+(`dispatch.rs`) and a `HandlerContext::call_detail` slot handlers can
+fill in. `OpenLibrary`/`OldOpenLibrary` and dos.library's `Open` now
+populate it (e.g. `library "version.library" -> base 0x00000200
+(real)`); `--snoop` prints only those lines, `--verbose` shows them
+inline alongside its existing per-call trace. Exactly the tool that
+would have made the four fixes above faster to find instead of
+hand-adding and removing temporary `eprintln!`s in `open_library_handler`/
+`RawDoFmt`/`CopyMem` -- reach for it first on the next corpus binary
+that needs this kind of diagnosis.
 
 ## Phase 4 — parity pass (three-oracle harness)
 

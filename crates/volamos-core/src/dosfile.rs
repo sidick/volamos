@@ -583,9 +583,21 @@ fn open_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     let name_ptr = ctx.cpu.data_register(DataRegister(1));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
     let mode = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let mode_label = match mode {
+        MODE_OLDFILE => "MODE_OLDFILE",
+        MODE_NEWFILE => "MODE_NEWFILE",
+        MODE_READWRITE => "MODE_READWRITE",
+        _ => "MODE_?",
+    };
     match ctx.dos.open(ctx.heap, ctx.mem, &name, mode) {
-        Ok(bptr) => ctx.cpu.set_data_register(DataRegister(0), bptr),
+        Ok(bptr) => {
+            *ctx.call_detail = Some(format!("file {name:?} ({mode_label}) -> ok"));
+            ctx.cpu.set_data_register(DataRegister(0), bptr)
+        }
         Err(code) => {
+            *ctx.call_detail = Some(format!(
+                "file {name:?} ({mode_label}) -> FAILED (IoErr {code})"
+            ));
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
         }
