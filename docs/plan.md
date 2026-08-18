@@ -905,12 +905,24 @@ console tools only.
    Kickstart image sourcing for `REAL_ROM_B64` remains open — Simon
    holds that decision personally (Cloanto/Hyperion-copyrighted binary,
    never committed to this repo) and it isn't blocking today.
-3. **Empirical corpus — decided 2026-08-18.** Primary real-world test
-   corpus: the **AmigaDOS `C:` Shell commands** from a genuine
-   Workbench 3.1 disk (`List`, `Copy`, `Assign`, `Type`, `Dir`, `Echo`,
-   etc.) — pure `dos.library`/`exec.library`/`utility.library`
-   consumers with no GUI/custom-chip surface at all, ~70 small,
-   independently-testable binaries giving broad `dos.library` coverage
+3. **Empirical corpus — decided 2026-08-18, disk source refined
+   2026-08-18.** Primary real-world test corpus: the **AmigaDOS `C:`
+   Shell commands** from a genuine Workbench disk (`List`, `Copy`,
+   `Assign`, `Type`, `Dir`, `Echo`, etc.) — pure `dos.library`/
+   `exec.library`/`utility.library` consumers with no GUI/custom-chip
+   surface at all, ~70 small, independently-testable binaries giving
+   broad `dos.library` coverage. Source disk: **Workbench 3.1.4**
+   (dos.library V46), not the original 3.1 (V40) media — Simon's
+   reasoning: 3.1.4 is Hyperion's own consolidated bug-fix-only re-issue
+   of 3.1, so its `C:` binaries are a definitively consistent,
+   single-source artifact, unlike original 3.1 media which shipped in
+   several slightly different regional/patch revisions over the years.
+   This is a source-of-binaries choice, not a change to the project's
+   compatibility *target* — [[project-kickstart-target|KS/WB 3.1 (V40)
+   stays the first-stage target]], and Phase 4's real-Kickstart oracle
+   baseline is still pinned at 3.1; 3.1.4 is "3.1 plus fixes," so its
+   `C:` commands are expected to behave identically for anything this
+   runtime implements against the V40 API surface. Coverage
    (including `ReadArgs`, implemented 2026-08-18 — see Phase 3's entry
    — since every `C:` command uses the standard `ReadArgs` template
    convention), already the kind of corpus vamos itself is validated
@@ -920,10 +932,10 @@ console tools only.
    risk of hitting an unimplemented call deep into a multi-pass build.
    **Licensing note, same treatment as Phase 4's `REAL_ROM_B64`
    pattern**: real `C:` command binaries are Commodore/Hyperion
-   copyrighted files that only exist on an actual Workbench 3.1 disk —
+   copyrighted files that only exist on an actual Workbench disk —
    they must never be committed to this repo as fixtures. Testing
    against them is a **local, opt-in, user-supplied** activity (point
-   the runtime at your own legitimate Workbench 3.1 disk image), not
+   the runtime at your own legitimate Workbench 3.1.4 disk image), not
    something CI can run unconditionally. **Follow-on, once the real
    `C:` commands work**: test AROS's own command-line equivalents next
    — same command set, functionally, but AROS's binaries are buildable
