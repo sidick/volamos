@@ -1,0 +1,304 @@
+//! The [`m68k`] crate backend: a concrete [`Cpu`] implementation.
+//!
+//! `volamos` doesn't implement its own m68k interpreter; this module wires
+//! the third-party [`m68k`](https://docs.rs/m68k) crate's `CpuCore` behind
+//! the [`Cpu`] trait defined in [`crate::cpu`].
+//!
+//! # Choice of backend
+//!
+//! The `m68k` crate (not to be confused with any similarly-named crate) is
+//! a safe, embeddable M68000-family interpreter with:
+//!
+//! - an [`AddressBus`] trait for host-provided memory/devices, matching
+//!   the shape of our own [`AddressSpace`] closely enough that
+//!   [`FlatMemory`] can implement both;
+//! - a `CpuCore::step` that surfaces A-line traps, F-line traps, `TRAP
+//!   #n`, `BKPT #n`, and illegal instructions as distinct
+//!   [`m68k::StepResult`] variants *without* taking the corresponding
+//!   hardware exception, which is exactly the hook AmigaOS library-call
+//!   dispatch (traditionally implemented via A-line opcodes in a jump
+//!   table) needs.
+//!
+//! # Trait fit
+//!
+//! [`crate::cpu::Cpu::Memory`] is a single associated type, so the guest
+//! memory implementation needs to satisfy both our [`AddressSpace`] trait
+//! and `m68k`'s [`AddressBus`] trait. Rather than introduce a wrapper
+//! type, [`AddressBus`] is implemented directly for [`FlatMemory`] in this
+//! module (in terms of the [`AddressSpace`] methods it already has), so
+//! `M68kCpu::Memory = FlatMemory`.
+//!
+//! No changes were needed to the `Cpu` trait's method signatures; only
+//! `StopReason` gained a payload (see [`crate::cpu::TrapInfo`]) so callers
+//! can tell which trap fired and where.
+
+use m68k::{AddressBus, CpuCore, CpuType, StepResult};
+
+use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapInfo, TrapKind};
+use crate::memory::{AddressSpace, FlatMemory};
+
+/// Start of the low guest-memory region reserved for a fake AmigaOS
+/// library jump table.
+///
+/// A later stage populates this region with trap-triggering entries (one
+/// A-line opcode per library vector, conventionally at negative offsets
+/// from a library base pointer) so that guest `JSR`/`JMP` instructions
+/// through a library base land here and surface as [`StopReason::Trap`].
+/// Guest code and data must be loaded above [`TRAP_TABLE_END`].
+pub const TRAP_TABLE_BASE: u32 = 0x0000;
+
+/// Size in bytes of the reserved trap table region.
+///
+/// 4 KiB is far more than any single classic AmigaOS library needs (even
+/// `exec.library`'s jump table is under 1 KiB), leaving headroom for
+/// several libraries' worth of fake vectors before guest code/data must
+/// start.
+pub const TRAP_TABLE_SIZE: u32 = 0x1000;
+
+/// First guest address *after* the reserved trap table region
+/// (exclusive). Guest code, data, and stack should live at or above this
+/// address.
+pub const TRAP_TABLE_END: u32 = TRAP_TABLE_BASE + TRAP_TABLE_SIZE;
+
+impl AddressBus for FlatMemory {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        AddressSpace::read_u8(self, address)
+    }
+
+    fn read_word(&mut self, address: u32) -> u16 {
+        AddressSpace::read_u16(self, address)
+    }
+
+    fn read_long(&mut self, address: u32) -> u32 {
+        AddressSpace::read_u32(self, address)
+    }
+
+    fn write_byte(&mut self, address: u32, value: u8) {
+        AddressSpace::write_u8(self, address, value);
+    }
+
+    fn write_word(&mut self, address: u32, value: u16) {
+        AddressSpace::write_u16(self, address, value);
+    }
+
+    fn write_long(&mut self, address: u32, value: u32) {
+        AddressSpace::write_u32(self, address, value);
+    }
+}
+
+/// A [`Cpu`] implementation backed by the `m68k` crate's `CpuCore`.
+///
+/// Emulates a plain M68000 (no MMU, no FPU); later stages can expose a
+/// way to pick a different [`CpuType`] if that's ever needed for
+/// AmigaOS-version-specific behavior, but AmigaOS CLI binaries generally
+/// don't require anything past a 68000-level instruction set.
+pub struct M68kCpu {
+    core: CpuCore,
+}
+
+impl M68kCpu {
+    /// Creates a new M68000 core.
+    ///
+    /// Registers and the program counter start at `0`; callers are
+    /// expected to set up the initial PC and stack pointer (typically via
+    /// [`Cpu::set_pc`] and [`Cpu::set_address_register`] on A7) before
+    /// running guest code; see this module's docs for the reserved
+    /// low-memory trap table region guest code must be loaded above.
+    ///
+    /// This deliberately does *not* perform the m68k hardware reset
+    /// sequence (which reads the initial SSP/PC from guest addresses 0
+    /// and 4): those addresses are reserved for the fake library jump
+    /// table, not a real reset vector.
+    pub fn new() -> Self {
+        let mut core = CpuCore::new();
+        core.set_cpu_type(CpuType::M68000);
+        core.reset_soft();
+        Self { core }
+    }
+}
+
+impl Default for M68kCpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cpu for M68kCpu {
+    type Memory = FlatMemory;
+
+    fn step(&mut self, mem: &mut Self::Memory) -> StopReason {
+        match self.core.step(mem) {
+            StepResult::Ok { .. } => StopReason::Step,
+            StepResult::Stopped => StopReason::Halted,
+            StepResult::AlineTrap { opcode } => StopReason::Trap(TrapInfo {
+                kind: TrapKind::ALine { opcode },
+                pc: self.core.ppc,
+            }),
+            StepResult::FlineTrap { opcode } => StopReason::Trap(TrapInfo {
+                kind: TrapKind::FLine { opcode },
+                pc: self.core.ppc,
+            }),
+            StepResult::TrapInstruction { trap_num } => StopReason::Trap(TrapInfo {
+                kind: TrapKind::Trap { trap_num },
+                pc: self.core.ppc,
+            }),
+            StepResult::Breakpoint { bp_num } => StopReason::Trap(TrapInfo {
+                kind: TrapKind::Breakpoint { bp_num },
+                pc: self.core.ppc,
+            }),
+            StepResult::IllegalInstruction { opcode } => StopReason::Trap(TrapInfo {
+                kind: TrapKind::Illegal { opcode },
+                pc: self.core.ppc,
+            }),
+        }
+    }
+
+    fn data_register(&self, reg: DataRegister) -> u32 {
+        self.core.d(reg.0 as usize)
+    }
+
+    fn set_data_register(&mut self, reg: DataRegister, value: u32) {
+        self.core.set_d(reg.0 as usize, value);
+    }
+
+    fn address_register(&self, reg: AddressRegister) -> u32 {
+        self.core.a(reg.0 as usize)
+    }
+
+    fn set_address_register(&mut self, reg: AddressRegister, value: u32) {
+        self.core.set_a(reg.0 as usize, value);
+    }
+
+    fn pc(&self) -> u32 {
+        self.core.pc
+    }
+
+    fn set_pc(&mut self, value: u32) {
+        self.core.pc = value;
+        // The prefetch queue may hold words fetched relative to the old
+        // PC; drop them so the next `step` refetches from the new PC.
+        self.core.invalidate_prefetch();
+    }
+
+    fn sr(&self) -> u16 {
+        self.core.get_sr()
+    }
+
+    fn set_sr(&mut self, value: u16) {
+        self.core.set_sr(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loads `words` (big-endian opcode/operand words) into `mem` starting
+    /// at `addr`.
+    fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
+        let mut offset = addr;
+        for &w in words {
+            mem.write_u16(offset, w);
+            offset += 2;
+        }
+    }
+
+    /// A fresh CPU with its PC set just past the reserved trap table, and
+    /// A7 set to the top of memory.
+    fn new_cpu_with_memory(size: usize) -> (M68kCpu, FlatMemory) {
+        let mem = FlatMemory::new(size);
+        let mut cpu = M68kCpu::new();
+        cpu.set_pc(TRAP_TABLE_END);
+        cpu.set_address_register(AddressRegister(7), size as u32);
+        (cpu, mem)
+    }
+
+    #[test]
+    fn moveq_sets_data_register_and_advances_pc() {
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let start = cpu.pc();
+        // 0x7005: MOVEQ.L #5, D0
+        load_words(&mut mem, start, &[0x7005]);
+
+        let reason = cpu.step(&mut mem);
+
+        assert_eq!(reason, StopReason::Step);
+        assert_eq!(cpu.data_register(DataRegister(0)), 5);
+        assert_eq!(cpu.pc(), start + 2);
+    }
+
+    #[test]
+    fn nop_advances_pc_without_changing_registers() {
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let start = cpu.pc();
+        // 0x4E71: NOP
+        load_words(&mut mem, start, &[0x4E71]);
+        cpu.set_data_register(DataRegister(1), 0xABCD_1234);
+
+        let reason = cpu.step(&mut mem);
+
+        assert_eq!(reason, StopReason::Step);
+        assert_eq!(cpu.data_register(DataRegister(1)), 0xABCD_1234);
+        assert_eq!(cpu.pc(), start + 2);
+    }
+
+    #[test]
+    fn trap_instruction_surfaces_as_stop_reason_trap() {
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let start = cpu.pc();
+        // 0x4E40: TRAP #0
+        load_words(&mut mem, start, &[0x4E40]);
+
+        let reason = cpu.step(&mut mem);
+
+        assert_eq!(
+            reason,
+            StopReason::Trap(TrapInfo {
+                kind: TrapKind::Trap { trap_num: 0 },
+                pc: start,
+            })
+        );
+        // The m68k core still advances PC past the trapping word even
+        // though the trap is intercepted rather than taken as a hardware
+        // exception.
+        assert_eq!(cpu.pc(), start + 2);
+    }
+
+    #[test]
+    fn aline_opcode_surfaces_as_stop_reason_trap_with_pc_of_trapping_instruction() {
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        // 0x7007: MOVEQ.L #7, D0 (step 1, just to move PC off the reset value)
+        // 0xA000: A-line trap opcode (library jump-table style vector)
+        let start = cpu.pc();
+        load_words(&mut mem, start, &[0x7007, 0xA000]);
+
+        let first = cpu.step(&mut mem);
+        assert_eq!(first, StopReason::Step);
+        let aline_pc = cpu.pc();
+
+        let reason = cpu.step(&mut mem);
+
+        assert_eq!(
+            reason,
+            StopReason::Trap(TrapInfo {
+                kind: TrapKind::ALine { opcode: 0xA000 },
+                pc: aline_pc,
+            })
+        );
+        assert_eq!(cpu.pc(), aline_pc + 2);
+    }
+
+    #[test]
+    fn address_register_roundtrip() {
+        let (mut cpu, _mem) = new_cpu_with_memory(0x2000);
+        cpu.set_address_register(AddressRegister(3), 0xDEAD_BEEF);
+        assert_eq!(cpu.address_register(AddressRegister(3)), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn status_register_roundtrip() {
+        let (mut cpu, _mem) = new_cpu_with_memory(0x2000);
+        cpu.set_sr(0x2700);
+        assert_eq!(cpu.sr(), 0x2700);
+    }
+}

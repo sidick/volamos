@@ -1,0 +1,11 @@
+[package]
+name = "volamos-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core library for volamos: CPU/memory abstractions and AmigaOS library emulation"
+
+[dependencies]
+m68k = "=0.10.14"
