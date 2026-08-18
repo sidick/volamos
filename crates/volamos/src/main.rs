@@ -232,21 +232,92 @@ fn default_cwd(opts: &Options) -> String {
     "root:".to_string()
 }
 
-/// Builds the [`Vfs`] `opts` describes, or `None` if no VFS-related flag
-/// was given at all (see [`Options::wants_vfs`]).
-fn build_vfs(opts: &Options) -> Result<Option<Vfs>, String> {
+/// Builds the [`VfsConfig`] `opts` describes, or `None` if no VFS-related
+/// flag was given at all (see [`Options::wants_vfs`]). `run` builds a
+/// [`Vfs`] from this once for the top-level [`Runtime`], and clones it
+/// into the `System()`/`Execute` nested-runner closure (see
+/// [`run_nested_program`]) so a nested program gets an independently
+/// constructed [`Vfs`] from the *same* configuration -- there's no way to
+/// reach back into the parent's already-installed `Vfs` from there
+/// anyway ([`crate::dispatch::Runtime`] owns it by value, not by any
+/// handle a closure built before the `Runtime` exists could hold).
+fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
     if !opts.wants_vfs() {
-        return Ok(None);
+        return None;
     }
-    let config = VfsConfig {
+    Some(VfsConfig {
         volumes: opts.volumes.clone(),
         assigns: opts.assigns.clone(),
         auto_assign_root: opts.auto_assign_root.clone(),
         cwd: default_cwd(opts),
+    })
+}
+
+/// The host-side `System()`/`Execute()` runner installed on the
+/// top-level [`Runtime`] this CLI builds (see [`volamos_core::dosseg`]'s
+/// module docs for the overall architecture): loads `host_path` through
+/// the ordinary [`loader::load`] path into a *fresh* guest address space
+/// (deliberately not `dosseg::build_seglist`'s seglist framing -- that's
+/// a different in-guest-memory representation meant for `LoadSeg`
+/// callers, not for actually executing a program) and runs it to
+/// completion in a brand-new [`Runtime`], sharing `vfs_config` (the same
+/// volumes/assigns the parent run was given) and `stack_size`.
+///
+/// Output goes to this process's own `std::io::stdout()`, opened fresh
+/// here -- not threaded through from whatever `out` sink the *parent*
+/// guest program's `Runtime::run` call was given -- since this closure
+/// runs from inside a library-call handler with no access to that mid-run
+/// borrow; see `volamos_core::dosseg`'s module docs for the consequence
+/// this has for tests that capture output into an in-memory buffer.
+///
+/// **Scope cut**: the nested `Runtime` built here does *not* itself get
+/// a `System()`/`Execute` runner installed, so a nested program's own
+/// `System()`/`Execute` calls fail cleanly (see
+/// [`volamos_core::dosseg::DosState::system`]/`execute`) rather than
+/// recursing to a second level -- documented, not silent; revisit if a
+/// corpus binary needs `System()`-calling-`System()`.
+///
+/// Returns the nested program's own exit code, or `-1` if it couldn't be
+/// loaded/run at all (unreadable file, not a valid hunk executable, or a
+/// [`volamos_core::RuntimeError`] during the nested run) -- `System()`'s
+/// own "couldn't run it" sentinel, reused here since a load/run failure
+/// deep inside a nested program is, from the parent guest's point of
+/// view, indistinguishable from "the command couldn't be invoked".
+fn run_nested_program(
+    host_path: &std::path::Path,
+    args: &[String],
+    vfs_config: Option<VfsConfig>,
+    stack_size: u32,
+) -> i32 {
+    let Ok(bytes) = std::fs::read(host_path) else {
+        return -1;
     };
-    Vfs::new(config)
-        .map(Some)
-        .map_err(|e| format!("couldn't set up volumes/assigns: {e}"))
+    let Ok(hunk_file) = loader::parse(&bytes) else {
+        return -1;
+    };
+    let mut mem = FlatMemory::new(GUEST_MEMORY_SIZE);
+    let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
+        return -1;
+    };
+
+    let config = StartConfig {
+        entry: load_result.entry,
+        load_end: load_result.end,
+        args: args.to_vec(),
+        stack_size,
+    };
+    let mut runtime = Runtime::new(M68kCpu::new(), mem, config);
+
+    if let Some(vfs_config) = vfs_config {
+        match Vfs::new(vfs_config) {
+            Ok(vfs) => runtime.set_vfs(vfs),
+            Err(_) => return -1,
+        }
+    }
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    runtime.run(&mut out, None).unwrap_or(-1)
 }
 
 fn run(opts: &Options) -> Result<i32, String> {
@@ -270,9 +341,24 @@ fn run(opts: &Options) -> Result<i32, String> {
     };
     let mut runtime = Runtime::new(cpu, mem, config);
 
-    if let Some(vfs) = build_vfs(opts)? {
+    let vfs_config = vfs_config_from_opts(opts);
+    if let Some(config) = vfs_config.clone() {
+        let vfs = Vfs::new(config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
         runtime.set_vfs(vfs);
     }
+
+    // System()/Execute (Phase 3 stage 7): a nested program is loaded and
+    // run through run_nested_program, sharing this run's volumes/assigns
+    // and --stack size -- see volamos_core::dosseg's module docs.
+    let nested_stack_size = opts.stack_size;
+    runtime.set_system_runner(move |req| {
+        run_nested_program(
+            &req.resolved_program_host_path,
+            &req.args,
+            vfs_config.clone(),
+            nested_stack_size,
+        )
+    });
 
     let stdout = io::stdout();
     let mut out = stdout.lock();

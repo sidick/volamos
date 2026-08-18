@@ -92,6 +92,16 @@ pub const ERROR_OBJECT_EXISTS: i32 = 203;
 pub const ERROR_DIR_NOT_FOUND: i32 = 204;
 /// The final path component doesn't exist.
 pub const ERROR_OBJECT_NOT_FOUND: i32 = 205;
+/// `LoadSeg`'s "the file exists but isn't a valid AmigaOS object module"
+/// error. Real AmigaOS's `<dos/dos.h>` documents this exact code (121,
+/// `ERROR_FILE_NOT_OBJECT`) for precisely this situation -- a genuine file
+/// was found and read, but it didn't parse as a hunk executable -- as
+/// distinct from [`ERROR_OBJECT_WRONG_TYPE`] (212, used elsewhere in this
+/// module for "a directory where a file was expected" and vice versa,
+/// which is a different real AmigaOS error condition). Defined here
+/// rather than in `dosseg.rs` per this module's own convention: every
+/// `IoErr()` code this runtime produces is defined in one place.
+pub const ERROR_FILE_NOT_OBJECT: i32 = 121;
 /// A component that should have been a directory (or vice versa) has the
 /// wrong type.
 pub const ERROR_OBJECT_WRONG_TYPE: i32 = 212;
@@ -263,6 +273,31 @@ pub struct DosState {
     /// `next_debug_id` (which is for `FileHandle`s) so the two id spaces
     /// don't visually collide when debugging.
     pub(crate) next_lock_id: u32,
+
+    // --- Phase 3 stage 7: LoadSeg/UnLoadSeg + System()/Execute state.
+    // Methods and handlers live in `crate::dosseg` (same "extensions live
+    // here, handler code lives in the sibling module" convention as the
+    // T11 fields above), but the fields themselves are declared here per
+    // that same convention.
+    /// Live seglists: first-segment `BPTR` (exactly the value [`LoadSeg`]
+    /// returned in `D0`, i.e. also the map key `UnLoadSeg` is called
+    /// with) -> every segment's guest-heap allocation *address* (not
+    /// BPTR) in load order, so [`crate::dosseg::DosState::unload_seg`]
+    /// knows exactly which [`GuestHeap`] blocks to free without having to
+    /// re-walk the guest-memory `next_seg` chain. See
+    /// `crate::dosseg`'s module docs for the seglist memory layout.
+    ///
+    /// [`LoadSeg`]: crate::dosseg
+    pub(crate) seglists: HashMap<u32, Vec<u32>>,
+    /// Host-side callback installed by a CLI (never by library code
+    /// itself) to actually run a resolved `System()`/`Execute()` command
+    /// as a nested guest invocation -- see `crate::dosseg`'s module docs
+    /// ("System()/Execute architecture") for why this indirection exists
+    /// and what it's given. `None` (the default) means no host is able to
+    /// run nested programs; `System`/`Execute` then fail cleanly (see
+    /// `crate::dosseg::DosState::system`/`execute`) rather than panicking
+    /// or silently no-oping.
+    pub system_runner: Option<crate::dosseg::SystemRunner>,
 }
 
 impl DosState {
@@ -281,6 +316,8 @@ impl DosState {
             current_dir_lock: None,
             initial_cwd: None,
             next_lock_id: 0,
+            seglists: HashMap::new(),
+            system_runner: None,
         }
     }
 

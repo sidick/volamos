@@ -209,3 +209,24 @@ python3 fixtures/gen_echoargs.py
 If you change a `.s` file, update its `gen_*.py` counterpart to match
 (they're meant to describe the same program), or re-assemble with vasm
 and let it supersede the hand-assembled version once vasm is available.
+
+## Phase 3 (stage 7) fixture: `systest`
+
+Source: `systest.s`; generator: `gen_systest.py` (same dual convention
+and `amiga_asm.py` assembler as the Phase 2 fixtures).
+
+1. Real startup (as above).
+2. `SystemTagList("TEST:echoargs sys arg", NULL)` (`-606(a6)`, `D1` =
+   command string, `D2` = `NULL` tag list): the runtime's host-side
+   system runner resolves `TEST:echoargs` through the `Vfs`, loads it,
+   and runs it to completion as a *nested* guest program -- its output
+   (`sys arg\n`, see the `echoargs` section above) appears on stdout
+   before anything the parent prints afterward.
+3. If `SystemTagList`'s `D0` (the nested program's exit code, or -1 on
+   failure to invoke) is nonzero, exit 99.
+4. Otherwise `PutStr("after system\n")` and exit with the distinctive
+   success code 42.
+
+Run e.g. `volamos -V TEST:/dir/containing/echoargs fixtures/systest`;
+`crates/volamos/tests/dosseg_e2e.rs` drives exactly that. Regenerate
+with `python3 fixtures/gen_systest.py` (or vasm, same rule as above).

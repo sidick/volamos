@@ -959,6 +959,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         // no-Vfs-required posture as register_dos_handlers above.
         crate::doslock::register_lock_handlers(&mut table, &mut mem);
 
+        // dos.library LoadSeg/UnLoadSeg + System()/Execute (Phase 3 stage
+        // 7): real BPTR seglist loading into guest memory, and a
+        // host-runner-hook-based System()/Execute -- see
+        // crate::dosseg's module docs. Same by-name registration and
+        // no-Vfs-required posture (fails cleanly without one) as the
+        // other dos.library registrations above.
+        crate::dosseg::register_dosseg_handlers(&mut table, &mut mem);
+
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
         // for the full reserved-region memory map. Looked up by name
@@ -1118,6 +1126,20 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// `IoErr`/`SetIoErr` work either way.
     pub fn set_vfs(&mut self, vfs: Vfs) {
         self.dos.vfs = Some(vfs);
+    }
+
+    /// Installs a host-side `System()`/`Execute()` runner callback (Phase
+    /// 3 stage 7) -- see [`crate::dosseg`]'s module docs for why this
+    /// indirection exists and what a CLI's callback is expected to do
+    /// (build and run a nested `Runtime`). Without one, `System`/
+    /// `Execute` fail cleanly (documented `IoErr()`/`BOOL` failure, not a
+    /// loud [`RuntimeError`]) -- see [`crate::dosseg::DosState::system`]/
+    /// [`crate::dosseg::DosState::execute`].
+    pub fn set_system_runner(
+        &mut self,
+        runner: impl FnMut(&crate::dosseg::SystemRequest) -> i32 + 'static,
+    ) {
+        self.dos.system_runner = Some(Box::new(runner));
     }
 
     /// Mutable access to the library table, so callers can register
