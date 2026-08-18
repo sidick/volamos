@@ -23,6 +23,14 @@
 //! given, no `Vfs` is installed at all (unchanged from pre-T13
 //! behavior): path-based dos.library calls fail cleanly with an IoErr,
 //! everything else (`Input`/`Output`/`PutStr`/...) still works.
+//!
+//! `--stack SIZE` (Phase 3 stage 6) overrides the guest stack region's
+//! size (default [`volamos_core::DEFAULT_STACK_SIZE`], 64 KiB); `SIZE`
+//! is a plain byte count, optionally suffixed `K`/`k` (KiB) or `M`/`m`
+//! (MiB) -- see [`parse_stack_size`]. Values below
+//! [`volamos_core::MIN_STACK_SIZE`] are silently clamped up to it by
+//! [`volamos_core::dispatch::Runtime::new`], mirroring real AmigaOS's
+//! own stack-size clamp.
 
 use std::io;
 use std::path::PathBuf;
@@ -33,7 +41,7 @@ use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
 use volamos_core::exectask::install_host_break_handler;
 use volamos_core::memory::FlatMemory;
 use volamos_core::vfs::{Vfs, VfsConfig};
-use volamos_core::{LoadError, loader};
+use volamos_core::{DEFAULT_STACK_SIZE, LoadError, loader};
 
 /// Guest address space size. Generous for the tiny CLI binaries this
 /// runtime currently targets; large enough to leave headroom above the
@@ -49,6 +57,7 @@ struct Options {
     assigns: Vec<(String, Vec<String>)>,
     cwd: Option<String>,
     auto_assign_root: Option<PathBuf>,
+    stack_size: u32,
 }
 
 impl Options {
@@ -67,7 +76,7 @@ fn print_usage(program_name: &str) {
     eprintln!(
         "usage: {program_name} [-v|--verbose] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
-         [--auto-assign HOSTDIR] <program> [args...]"
+         [--auto-assign HOSTDIR] [--stack SIZE] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -86,6 +95,10 @@ fn print_usage(program_name: &str) {
     eprintln!("                            (relying on --auto-assign to resolve it)");
     eprintln!("  --auto-assign HOSTDIR     fall back to <HOSTDIR>/NAME for any otherwise");
     eprintln!("                            unknown volume/assign NAME:");
+    eprintln!(
+        "  --stack SIZE              guest stack size in bytes (default {DEFAULT_STACK_SIZE});"
+    );
+    eprintln!("                            SIZE may be suffixed K (KiB) or M (MiB), e.g. 256K");
     eprintln!();
     eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
     eprintln!();
@@ -94,6 +107,27 @@ fn print_usage(program_name: &str) {
          installed at all: dos.library path-based calls (Open, Lock, Examine, ...) fail \
          cleanly with an IoErr; Input/Output/PutStr/IoErr/SetIoErr work either way."
     );
+}
+
+/// Parses a `--stack SIZE` value: a plain non-negative byte count, or the
+/// same followed by a single `K`/`k` (KiB, `* 1024`) or `M`/`m` (MiB,
+/// `* 1024 * 1024`) suffix -- e.g. `"65536"`, `"64K"`, `"1M"`. Rejects
+/// empty input, non-digit content before the optional suffix, more than
+/// one suffix character, and multiplications that would overflow `u32`
+/// (a guest address space is at most 4 GiB, so an overflowing stack
+/// request is never satisfiable anyway).
+fn parse_stack_size(s: &str) -> Result<u32, String> {
+    let (digits, multiplier) = match s.as_bytes().last() {
+        Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1024u32),
+        Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1024 * 1024u32),
+        _ => (s, 1u32),
+    };
+    let value: u32 = digits.parse().map_err(|_| {
+        format!("--stack expects a byte count (optionally K/M-suffixed), got {s:?}")
+    })?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("--stack value {s:?} overflows"))
 }
 
 /// Splits `NAME:rest` on the *first* `:` -- a volume/assign name can't
@@ -118,6 +152,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     let mut assigns = Vec::new();
     let mut cwd = None;
     let mut auto_assign_root = None;
+    let mut stack_size = DEFAULT_STACK_SIZE;
 
     while let Some(arg) = args.next() {
         if program.is_some() {
@@ -154,6 +189,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
                     .ok_or_else(|| "--auto-assign requires a HOSTDIR argument".to_string())?;
                 auto_assign_root = Some(PathBuf::from(value));
             }
+            "--stack" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--stack requires a SIZE argument".to_string())?;
+                stack_size = parse_stack_size(&value)?;
+            }
             _ => program = Some(arg),
         }
     }
@@ -167,6 +208,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         assigns,
         cwd,
         auto_assign_root,
+        stack_size,
     })
 }
 
@@ -224,6 +266,7 @@ fn run(opts: &Options) -> Result<i32, String> {
         entry: load_result.entry,
         load_end: load_result.end,
         args: opts.guest_args.clone(),
+        stack_size: opts.stack_size,
     };
     let mut runtime = Runtime::new(cpu, mem, config);
 
@@ -310,6 +353,7 @@ mod tests {
         assert!(opts.cwd.is_none());
         assert!(opts.auto_assign_root.is_none());
         assert!(!opts.wants_vfs());
+        assert_eq!(opts.stack_size, DEFAULT_STACK_SIZE);
     }
 
     #[test]
@@ -515,5 +559,72 @@ mod tests {
     fn default_cwd_falls_back_to_root_when_only_auto_assign() {
         let opts = parse_args(args(&["--auto-assign", "/host/auto", "prog"])).unwrap();
         assert_eq!(default_cwd(&opts), "root:");
+    }
+
+    // --- --stack / parse_stack_size ---
+
+    #[test]
+    fn parse_stack_size_plain_bytes() {
+        assert_eq!(parse_stack_size("65536").unwrap(), 65536);
+        assert_eq!(parse_stack_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_stack_size_kib_suffix() {
+        assert_eq!(parse_stack_size("64K").unwrap(), 64 * 1024);
+        assert_eq!(parse_stack_size("64k").unwrap(), 64 * 1024);
+    }
+
+    #[test]
+    fn parse_stack_size_mib_suffix() {
+        assert_eq!(parse_stack_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_stack_size("2m").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_stack_size_rejects_garbage() {
+        assert!(parse_stack_size("").is_err());
+        assert!(parse_stack_size("abc").is_err());
+        assert!(parse_stack_size("4KB").is_err());
+        assert!(parse_stack_size("-1").is_err());
+        assert!(parse_stack_size("1.5K").is_err());
+    }
+
+    #[test]
+    fn parse_stack_size_rejects_overflow() {
+        assert!(parse_stack_size("4294967295M").is_err());
+    }
+
+    #[test]
+    fn stack_flag_sets_stack_size() {
+        let opts = parse_args(args(&["--stack", "8192", "prog"])).unwrap();
+        assert_eq!(opts.stack_size, 8192);
+    }
+
+    #[test]
+    fn stack_flag_accepts_suffixes() {
+        let opts = parse_args(args(&["--stack", "256K", "prog"])).unwrap();
+        assert_eq!(opts.stack_size, 256 * 1024);
+    }
+
+    #[test]
+    fn stack_missing_value_is_an_error() {
+        let err = parse_args(args(&["--stack"])).unwrap_err();
+        assert!(
+            err.contains("--stack requires"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn stack_invalid_value_is_an_error() {
+        let err = parse_args(args(&["--stack", "notanumber", "prog"])).unwrap_err();
+        assert!(err.contains("--stack"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn default_stack_size_used_when_flag_absent() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert_eq!(opts.stack_size, DEFAULT_STACK_SIZE);
     }
 }

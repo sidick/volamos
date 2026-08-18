@@ -47,17 +47,106 @@
 //!                                       CheckSignal/host-break folding)
 //!     ULONG  tc_SigExcept;        +30  MAINTAINED (SetExcept; never
 //!                                       actually delivered -- see below)
+//!     UWORD  tc_TrapAlloc;        +34  (never written; stays 0)
+//!     UWORD  tc_TrapAble;         +36  (never written; stays 0)
+//!     APTR   tc_ExceptData;       +38  (never written; stays 0)
+//!     APTR   tc_ExceptCode;       +42  (never written; stays 0)
+//!     APTR   tc_TrapData;         +46  (never written; stays 0)
+//!     APTR   tc_TrapCode;         +50  (never written; stays 0)
+//!     APTR   tc_SPReg;            +54  (never written; stays 0 -- only
+//!                                       meaningful across a real
+//!                                       context switch, which this
+//!                                       single-tasking runtime never
+//!                                       performs)
+//!     APTR   tc_SPLower;          +58  MAINTAINED (Phase 3 stage 6: set
+//!                                       at task creation to the run's
+//!                                       stack region, updated by
+//!                                       StackSwap)
+//!     ULONG  tc_SPUpper;          +62  MAINTAINED (ditto)
 //!     ...                          92  (sizeof(struct Task); everything
-//!                                       past tc_SigExcept -- tc_TrapAlloc,
-//!                                       tc_TrapAble, tc_ExceptData/Code,
-//!                                       tc_TrapData, tc_SPReg/SPLower/
-//!                                       SPUpper, tc_Trap, tc_Switch/
-//!                                       Launch/Suspend/Resume hooks,
-//!                                       tc_UserData -- is zeroed once at
-//!                                       creation and never touched again;
-//!                                       nothing in this runtime reads it)
+//!                                       past tc_SPUpper -- tc_Trap,
+//!                                       tc_Switch/Launch/Suspend/Resume
+//!                                       hooks, tc_UserData -- is zeroed
+//!                                       once at creation and never
+//!                                       touched again; nothing in this
+//!                                       runtime reads it)
 //! };
 //! ```
+//!
+//! Offsets above were verified field-by-field against the real
+//! `<exec/tasks.h>` `struct Task` layout (`struct Node tc_Node` (14
+//! bytes) + `UBYTE`/`UBYTE`/`BYTE`/`BYTE`/`ULONG`/`ULONG`/`ULONG`/`ULONG`
+//! running 0..34, then `UWORD tc_TrapAlloc`/`UWORD tc_TrapAble` at
+//! 34/36, `APTR tc_ExceptData`/`tc_ExceptCode`/`tc_TrapData`/`tc_TrapCode`
+//! at 38/42/46/50, `APTR tc_SPReg` at 54, `APTR tc_SPLower` at 58,
+//! `ULONG tc_SPUpper` at 62) -- not just inferred from padding.
+//!
+//! # `StackSwap`
+//!
+//! [`stack_swap_handler`] implements `exec.library`'s `StackSwap` (LVO
+//! -732): `A0` points to a guest `struct StackSwapStruct { APTR
+//! stk_Lower; ULONG stk_Upper; APTR stk_Pointer; }` (offsets 0/4/8). Real
+//! `StackSwap` does a plain swap: the task's `A7`/`tc_SPLower`/
+//! `tc_SPUpper` exchange places with the struct's `stk_Pointer`/
+//! `stk_Lower`/`stk_Upper`, so the struct ends up holding the *old*
+//! stack -- calling `StackSwap` again with the same struct swaps back.
+//!
+//! There's a wrinkle specific to how this runtime dispatches library
+//! calls (see `crate::dispatch`'s module docs): the guest's `jsr
+//! -732(a6)` pushed a return address onto the *old* stack before
+//! trapping into [`stack_swap_handler`], and [`crate::dispatch::Runtime::
+//! run`] performs the matching `rts` itself, generically, *after* the
+//! handler returns -- by popping a return address off of whatever `A7`
+//! happens to be at that point. If [`stack_swap_handler`] simply set
+//! `A7` to the new stack's pointer and returned, that generic `rts`
+//! would pop garbage off the *new* stack (which has no return address on
+//! it) instead of the real one. So the handler does what the real
+//! assembly-language `StackSwap` implementation does: it reads the
+//! return address off the *old* `A7` itself before swapping anything,
+//! then -- after updating the struct and the task's `tc_SPLower`/
+//! `tc_SPUpper` -- pushes that same return address onto the *new* stack
+//! and sets `A7` to point at it. The generic post-handler `rts` in
+//! `Runtime::run` then pops it from the new stack exactly as it would
+//! any other call's return address, landing the guest back at its
+//! caller with `A7` now equal to the new stack's `stk_Pointer` (matching
+//! real `StackSwap`'s visible effect on the caller).
+//!
+//! One more detail matters for a *second* `StackSwap` call (the
+//! swap-back) to work: every `stk_Pointer` this handler reads or writes
+//! is kept in "nothing pending" form -- the same convention the guest
+//! itself uses when it first hands `StackSwap` a fresh stack (just its
+//! plain top address, with no return address sitting there yet). `A7`
+//! at handler-entry time, by contrast, still addresses the *just-popped*
+//! return-address slot from this very call's own `jsr` -- so the value
+//! saved into the struct is `A7 + 4`, not `A7` itself. Saving the
+//! unadjusted `A7` would leave that slot's now-stale word behind for a
+//! *later* `StackSwap` call to misread as if it were still a pending
+//! return address, corrupting the swap-back (caught by this module's own
+//! `stack_swap_switches_stack_*` tests during development). With the `+
+//! 4` adjustment, both halves of a round trip and the caller-supplied
+//! initial `stk_Pointer` all agree on the same invariant, and pushing a
+//! fresh return address always means "decrement by 4 from a
+//! nothing-pending pointer, whichever stack it names."
+//!
+//! # Stack-overflow detection
+//!
+//! [`check_stack_bounds`] is `Runtime::run`'s guard against the "stack-
+//! overflow bug class vamos is known to hit" (`docs/plan.md`'s Phase 3
+//! scope): it compares `A7` against the current task's `tc_SPLower`/
+//! `tc_SPUpper`, read fresh from guest memory (so it sees whatever
+//! `StackSwap` last set them to), and fails loudly via
+//! [`crate::dispatch::DispatchError::StackOverflow`] if `A7` has run
+//! outside those bounds, instead of letting the guest silently corrupt
+//! whatever memory happens to sit past its stack. Like the host-break
+//! poll above, this is only checked once per dispatched trap -- a tight,
+//! call-free guest loop that blows its stack and never calls a library
+//! function again won't be caught. It's also, by construction, never
+//! confused by the brief window *inside* [`stack_swap_handler`] itself
+//! where `A7` and `tc_SPLower`/`tc_SPUpper` are momentarily about to
+//! change: the check only ever runs at the top of `Runtime::run`'s loop,
+//! before a handler is invoked, at which point both the stack pointer
+//! and the bounds always describe the *same* stack (either the old one,
+//! pre-swap, or the new one, post-swap) -- never a torn mix of the two.
 //!
 //! `tc_Node.ln_Type` is set to [`NT_TASK`] and `tc_Node.ln_Name` points to
 //! a heap-allocated, NUL-terminated process name string -- both set once
@@ -171,9 +260,32 @@ pub const TC_SIGRECVD: u32 = 26;
 /// `tc_SigExcept`: `ULONG`, offset 30. Maintained by
 /// [`set_except_handler`]; never actually delivered -- see module docs.
 pub const TC_SIGEXCEPT: u32 = 30;
+/// `tc_SPLower`: `APTR`, offset 58 -- verified against `<exec/tasks.h>`,
+/// see the module docs' "`struct Task` fields this module maintains"
+/// section. The current task's stack region's lowest valid address.
+/// Maintained by [`create_current_task`] and [`stack_swap_handler`].
+pub const TC_SPLOWER: u32 = 58;
+/// `tc_SPUpper`: `ULONG`, offset 62 (per `<exec/tasks.h>`; despite the
+/// name, it's declared `ULONG` there, not `APTR`, though this module
+/// treats it as a plain address either way). The current task's stack
+/// region's address one past the highest valid address. Maintained by
+/// [`create_current_task`] and [`stack_swap_handler`].
+pub const TC_SPUPPER: u32 = 62;
 
 /// `sizeof(struct Task)` per `<exec/tasks.h>`.
 pub const TASK_STRUCT_SIZE: u32 = 92;
+
+// --- struct StackSwapStruct field offsets (bytes from the struct's own
+// address) -- per <exec/execbase.h>: `struct StackSwapStruct { APTR
+// stk_Lower; ULONG stk_Upper; APTR stk_Pointer; };`. All three fields
+// are plain 4-byte values, so the offsets are simply 0/4/8.
+
+/// `stk_Lower`: `APTR`, offset 0.
+const STK_LOWER: u32 = 0;
+/// `stk_Upper`: `ULONG`, offset 4.
+const STK_UPPER: u32 = 4;
+/// `stk_Pointer`: `APTR`, offset 8.
+const STK_POINTER: u32 = 8;
 
 /// `NT_TASK` (1), per `<exec/nodes.h>`.
 pub const NT_TASK: u8 = 1;
@@ -279,15 +391,27 @@ pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, task: u32) {
 /// panic here is a clear, immediate signal of a misconfigured
 /// (implausibly tiny) heap rather than a subtle downstream `NULL`
 /// dereference.
-pub fn create_current_task<M: AddressSpace>(mem: &mut M, heap: &mut GuestHeap) -> u32 {
+///
+/// `sp_lower`/`sp_upper` are this run's actual stack region bounds
+/// (`[sp_lower, sp_upper)`, per [`crate::dispatch::Runtime::new`]'s
+/// `StartConfig::stack_size`-derived layout), written into `tc_SPLower`/
+/// `tc_SPUpper` (Phase 3 stage 6) so [`stack_swap_handler`] and
+/// [`check_stack_bounds`] have real bounds to work with from the start.
+pub fn create_current_task<M: AddressSpace>(
+    mem: &mut M,
+    heap: &mut GuestHeap,
+    sp_lower: u32,
+    sp_upper: u32,
+) -> u32 {
     let task = heap
         .alloc(TASK_STRUCT_SIZE)
         .expect("guest heap has room for the fake current task struct");
 
     // Zero the whole struct first -- every field this module doesn't
     // maintain (tc_Flags, tc_State, tc_IDNestCnt, tc_TDNestCnt, and
-    // everything past tc_SigExcept) stays zeroed, matching a freshly
+    // everything past tc_SPUpper) stays zeroed, matching a freshly
     // allocated block; nothing in this runtime reads those fields.
+    // tc_SPLower/tc_SPUpper are overwritten with real values below.
     for i in 0..TASK_STRUCT_SIZE {
         mem.write_u8(task.wrapping_add(i), 0);
     }
@@ -306,6 +430,11 @@ pub fn create_current_task<M: AddressSpace>(mem: &mut M, heap: &mut GuestHeap) -
     // tc_SigAlloc: the 16 system-reserved low signal bits start
     // pre-allocated, matching real AmigaOS's initial state.
     mem.write_u32(task + TC_SIGALLOC, SIG_SYSTEM_RESERVED);
+
+    // tc_SPLower/tc_SPUpper: this run's actual stack region bounds (see
+    // this function's doc).
+    mem.write_u32(task + TC_SPLOWER, sp_lower);
+    mem.write_u32(task + TC_SPUPPER, sp_upper);
 
     task
 }
@@ -479,11 +608,95 @@ fn check_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     Ok(())
 }
 
+/// `exec.library`'s `StackSwap` (LVO -732): `A0` = pointer to a guest
+/// `struct StackSwapStruct`. See the module docs' "`StackSwap`" section
+/// for the full explanation, including why this handler pushes the
+/// return address onto the new stack instead of just swapping `A7`.
+fn stack_swap_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let struct_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let task = ctx.current_task;
+
+    // A7 still points at the return address the guest's own `jsr`
+    // pushed onto the *old* stack: Runtime::run's generic post-dispatch
+    // `rts` hasn't run yet (it always runs after the handler returns),
+    // so this is exactly the value a real CPU's SP would hold at this
+    // point too.
+    let old_sp = ctx.cpu.address_register(AddressRegister(7));
+    let return_addr = ctx.mem.read_u32(old_sp);
+
+    let new_lower = ctx.mem.read_u32(struct_ptr + STK_LOWER);
+    let new_upper = ctx.mem.read_u32(struct_ptr + STK_UPPER);
+    let new_pointer = ctx.mem.read_u32(struct_ptr + STK_POINTER);
+
+    let old_lower = ctx.mem.read_u32(task + TC_SPLOWER);
+    let old_upper = ctx.mem.read_u32(task + TC_SPUPPER);
+
+    // The struct now holds the *old* stack -- calling StackSwap again
+    // with the same struct swaps back, matching real StackSwap's
+    // documented contract. Every `stk_Pointer`/`new_pointer` this
+    // handler ever reads or writes is kept in "nothing pending" form
+    // (the same convention the guest itself uses when it first hands
+    // StackSwap a fresh stack's plain top address): `old_sp + 4`, not
+    // `old_sp` -- `old_sp` still addresses the *just-popped* return-
+    // address slot (its content is stale, not logically part of the
+    // stack anymore), so saving the unadjusted value would leave that
+    // stale word behind for a *later* swap-back to misread as if it
+    // were still a pending return address (this was, in fact, a real
+    // bug caught by this module's own `stack_swap_switches_stack_*`
+    // test before the `+ 4` was added). Adjusted so both halves of a
+    // swap round-trip and the caller-supplied initial `stk_Pointer`
+    // (an empty stack's plain top address) all agree on the same
+    // "nothing pending" invariant.
+    ctx.mem.write_u32(struct_ptr + STK_LOWER, old_lower);
+    ctx.mem.write_u32(struct_ptr + STK_UPPER, old_upper);
+    ctx.mem
+        .write_u32(struct_ptr + STK_POINTER, old_sp.wrapping_add(4));
+
+    ctx.mem.write_u32(task + TC_SPLOWER, new_lower);
+    ctx.mem.write_u32(task + TC_SPUPPER, new_upper);
+
+    // Push the saved return address onto the new stack and point A7 at
+    // it, so Runtime::run's generic post-dispatch `rts` (which pops
+    // whatever word A7 addresses once this handler returns) lands the
+    // guest back at its caller -- now running on the new stack, with A7
+    // ending up equal to new_pointer after that pop, exactly matching
+    // real StackSwap's visible effect. `new_pointer` is always in
+    // "nothing pending" form (see above), so unconditionally
+    // decrementing by 4 before writing is correct whether this is a
+    // fresh caller-supplied stack or one a previous StackSwap call left
+    // behind.
+    let new_sp = new_pointer.wrapping_sub(4);
+    ctx.mem.write_u32(new_sp, return_addr);
+    ctx.cpu.set_address_register(AddressRegister(7), new_sp);
+
+    Ok(())
+}
+
+/// Checks `a7` against the current task's `tc_SPLower`/`tc_SPUpper`
+/// bounds, read fresh from guest memory (so this sees whatever
+/// [`stack_swap_handler`] last set them to). Called once per dispatched
+/// trap by [`crate::dispatch::Runtime::run`], at the same point as
+/// [`fold_pending_host_break`] -- see the module docs' "Stack-overflow
+/// detection" section for the full rationale and its granularity/
+/// `StackSwap`-safety caveats.
+pub fn check_stack_bounds<M: AddressSpace>(
+    mem: &M,
+    task: u32,
+    a7: u32,
+) -> Result<(), DispatchError> {
+    let lower = mem.read_u32(task + TC_SPLOWER);
+    let upper = mem.read_u32(task + TC_SPUPPER);
+    if a7 < lower || a7 > upper {
+        return Err(DispatchError::StackOverflow { a7, lower, upper });
+    }
+    Ok(())
+}
+
 /// Registers every implemented task/signal handler: `exec.library`'s
 /// `FindTask`/`SetSignal`/`SetExcept`/`Wait`/`Signal`/`AllocSignal`/
-/// `FreeSignal`, plus `dos.library`'s `CheckSignal` (registered from
-/// here rather than `dosfile.rs`, so that file needs no edits at all --
-/// see the module docs). Called unconditionally from
+/// `FreeSignal`/`StackSwap`, plus `dos.library`'s `CheckSignal`
+/// (registered from here rather than `dosfile.rs`, so that file needs no
+/// edits at all -- see the module docs). Called unconditionally from
 /// [`crate::dispatch::Runtime::new`].
 pub fn register_exectask_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
@@ -510,6 +723,7 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("Signal", signal_handler::<C>);
     reg_exec!("AllocSignal", alloc_signal_handler::<C>);
     reg_exec!("FreeSignal", free_signal_handler::<C>);
+    reg_exec!("StackSwap", stack_swap_handler::<C>);
 
     table
         .register_by_name(
@@ -528,8 +742,42 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
 mod tests {
     use super::*;
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
-    use crate::dispatch::{Runtime, StartConfig};
+    use crate::dispatch::{EXIT_STUB_ADDR, Runtime, StartConfig};
     use crate::memory::FlatMemory;
+    use std::sync::Mutex;
+
+    /// Serializes every test in this module that calls `Runtime::run`
+    /// against [`PENDING_HOST_BREAK`] (a process-global `static`): the
+    /// Rust test runner executes tests in parallel threads within one
+    /// process, and `fold_pending_host_break` is an unconditional,
+    /// unscoped `swap` against that one global flag on *every* dispatched
+    /// trap -- so without serialization, one test setting the flag can
+    /// have it folded away by a completely unrelated test's `Runtime::run`
+    /// racing on another thread (observed: `pending_host_break_folds_into_wait`
+    /// losing its own flag to a concurrent `signal_current_task_then_wait_
+    /// returns_satisfied_subset`, and that same test spuriously gaining
+    /// `SIGBREAKF_CTRL_C` from a concurrent break-setting test). Held for
+    /// a locked test's *entire* body -- not just the moment it touches
+    /// the flag -- with the flag cleared immediately after acquiring the
+    /// lock, so a stray `true` set by a test that raced in just before
+    /// the lock was acquired can't leak into the locked section.
+    /// `unwrap_or_else` recovers from a poisoned lock (an earlier locked
+    /// test panicking mid-section) instead of cascading that failure into
+    /// every subsequent locked test.
+    static HOST_BREAK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquires [`HOST_BREAK_TEST_LOCK`] and clears
+    /// [`PENDING_HOST_BREAK`]; every test below that calls `Runtime::run`
+    /// holds the returned guard for its whole body (a `let _guard = ...`
+    /// at the top of the test, dropped implicitly at the end of the
+    /// function).
+    fn lock_host_break() -> std::sync::MutexGuard<'static, ()> {
+        let guard = HOST_BREAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        PENDING_HOST_BREAK.store(false, Ordering::SeqCst);
+        guard
+    }
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
         let mut offset = addr;
@@ -594,6 +842,7 @@ mod tests {
                 entry,
                 load_end,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         )
     }
@@ -616,6 +865,7 @@ mod tests {
 
     #[test]
     fn find_task_null_returns_current_task_with_readable_type_and_name() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_a(1)); // A1 = 0 (NULL)
         words.push(0);
@@ -641,6 +891,7 @@ mod tests {
 
     #[test]
     fn find_task_by_name_always_returns_null() {
+        let _guard = lock_host_break();
         let entry = TRAP_TABLE_END;
         let name = b"somename\0";
 
@@ -667,6 +918,7 @@ mod tests {
                 entry,
                 load_end: str_addr + name.len() as u32 + 4,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -678,6 +930,7 @@ mod tests {
 
     #[test]
     fn set_signal_sets_bits_returns_old_value() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = 0x30 (new signals)
         words.push(0);
@@ -703,6 +956,7 @@ mod tests {
 
     #[test]
     fn set_signal_clears_bits_and_leaves_unmasked_bits_untouched() {
+        let _guard = lock_host_break();
         // First call: set 0xFF under mask 0xFF (recvd = 0xFF).
         // Second call: set 0x00 under mask 0x0F (clears low nibble only).
         let mut words = Vec::new();
@@ -734,6 +988,7 @@ mod tests {
 
     #[test]
     fn alloc_signal_specific_bit_then_double_alloc_fails() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = 20
         words.push(0);
@@ -759,6 +1014,7 @@ mod tests {
 
     #[test]
     fn alloc_signal_any_prefers_high_bits() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = -1 (any)
         words.push(0xFFFF);
@@ -777,6 +1033,7 @@ mod tests {
 
     #[test]
     fn alloc_signal_exhaustion_returns_minus_one() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         // Allocate every one of the 16 application-range bits (16..32)
         // one at a time via AllocSignal(-1), then try one more.
@@ -808,6 +1065,7 @@ mod tests {
 
     #[test]
     fn free_signal_clears_bit_allowing_realloc() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // AllocSignal(20)
         words.push(0);
@@ -836,6 +1094,7 @@ mod tests {
 
     #[test]
     fn free_signal_minus_one_is_a_no_op() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = -1
         words.push(0xFFFF);
@@ -856,6 +1115,7 @@ mod tests {
 
     #[test]
     fn signal_current_task_then_wait_returns_satisfied_subset() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         // Signal(current_task, 0x30): A1 = current task addr, D0 = 0x30.
         // FindTask(NULL) first, to get the address into A1.
@@ -891,6 +1151,7 @@ mod tests {
 
     #[test]
     fn signal_to_unknown_task_fails_loudly() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_a(1)); // A1 = some bogus address
         words.push((TRAP_TABLE_END >> 16) as u16);
@@ -913,6 +1174,7 @@ mod tests {
 
     #[test]
     fn wait_on_nothing_pending_fails_loudly_instead_of_blocking() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = 1 (nothing pending)
         words.push(0);
@@ -934,6 +1196,7 @@ mod tests {
 
     #[test]
     fn set_except_returns_old_value_and_updates_masked_bits() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = 0xFF
         words.push(0);
@@ -965,6 +1228,7 @@ mod tests {
 
     #[test]
     fn check_signal_clears_and_returns_intersection() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         // SetSignal(0x30, 0x30) via exec.library requires A6 =
         // EXEC_LIBRARY_BASE; CheckSignal requires A6 = DOS_LIBRARY_BASE.
@@ -1001,6 +1265,7 @@ mod tests {
 
     #[test]
     fn check_signal_no_match_returns_zero_and_does_not_clear_other_bits() {
+        let _guard = lock_host_break();
         let mut words = Vec::new();
         words.extend_from_slice(&movea_exec_base_to_a6());
         words.push(move_imm_to_d(0)); // D0 = 0x01
@@ -1035,6 +1300,7 @@ mod tests {
 
     #[test]
     fn pending_host_break_folds_into_check_signal() {
+        let _guard = lock_host_break();
         let mut rt = dos_program(&{
             let mut words = Vec::new();
             words.push(move_imm_to_d(1)); // D1 = SIGBREAKF_CTRL_C
@@ -1061,6 +1327,7 @@ mod tests {
 
     #[test]
     fn pending_host_break_folds_into_wait() {
+        let _guard = lock_host_break();
         let mut rt = exec_program(&{
             let mut words = Vec::new();
             words.push(move_imm_to_d(0)); // D0 = SIGBREAKF_CTRL_C
@@ -1080,7 +1347,8 @@ mod tests {
 
     #[test]
     fn no_pending_break_leaves_check_signal_unaffected() {
-        PENDING_HOST_BREAK.store(false, Ordering::SeqCst);
+        // lock_host_break() already clears the flag on entry.
+        let _guard = lock_host_break();
         let mut rt = dos_program(&{
             let mut words = Vec::new();
             words.push(move_imm_to_d(1));
@@ -1101,5 +1369,177 @@ mod tests {
         // can't, without actually raising a signal, which would upset
         // the test runner) assert anything about delivery.
         install_host_break_handler();
+    }
+
+    // --- StackSwap ---
+
+    /// Swaps to a heap-adjacent (but manually placed, not
+    /// `GuestHeap`-tracked) new stack region, makes a real library call
+    /// (`PutStr`) while running on it, swaps back to the original stack,
+    /// and exits normally -- proving both the stack switch and continued
+    /// correct execution (including the generic post-dispatch `rts`
+    /// mechanism) survive a `StackSwap` round trip. See the module docs'
+    /// "`StackSwap`" section for why the handler has to push the return
+    /// address onto the new stack itself.
+    #[test]
+    fn stack_swap_switches_stack_survives_a_library_call_then_swaps_back() {
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.extend_from_slice(&movea_exec_base_to_a6());
+
+        words.push(move_imm_to_a(0)); // A0 = struct_addr (patched below)
+        let a0_patch_1 = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-732)); // StackSwap -- switch
+
+        words.extend_from_slice(&movea_dos_base_to_a6());
+        words.push(move_imm_to_d(1)); // D1 = str_addr (patched below)
+        let d1_patch = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-948)); // PutStr, on the new stack
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        words.push(move_imm_to_a(0)); // A0 = struct_addr again (patched below)
+        let a0_patch_2 = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-732)); // StackSwap -- swap back
+
+        words.push(0x7000); // moveq #0,d0
+        words.push(RTS);
+
+        // Place the string, the StackSwapStruct, and the new stack
+        // region at fixed offsets past the code -- deliberately *not*
+        // GuestHeap-tracked (nothing in this test calls AllocMem/
+        // AllocVec), with `load_end` set past all of them so the real
+        // heap (task struct + command-line buffer) never overlaps.
+        let code_len = words.len() as u32 * 2;
+        let str_addr = entry + code_len;
+        let struct_addr = str_addr + 8;
+        let new_stack_block = struct_addr + 32;
+        let new_stack_size = 0x1000u32;
+        let new_stack_top = new_stack_block + new_stack_size;
+        let load_end = new_stack_top;
+
+        words[a0_patch_1] = (struct_addr >> 16) as u16;
+        words[a0_patch_1 + 1] = struct_addr as u16;
+        words[d1_patch] = (str_addr >> 16) as u16;
+        words[d1_patch + 1] = str_addr as u16;
+        words[a0_patch_2] = (struct_addr >> 16) as u16;
+        words[a0_patch_2 + 1] = struct_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        write_c_string(&mut mem, str_addr, b"hi");
+        // struct StackSwapStruct { stk_Lower, stk_Upper, stk_Pointer }
+        mem.write_u32(struct_addr, new_stack_block);
+        mem.write_u32(struct_addr + 4, new_stack_top);
+        mem.write_u32(struct_addr + 8, new_stack_top);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let task = rt.current_task();
+        let original_lower = rt.memory().read_u32(task + TC_SPLOWER);
+        let original_upper = rt.memory().read_u32(task + TC_SPUPPER);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            out, b"hi",
+            "PutStr should have run correctly while on the swapped-to stack"
+        );
+        assert_eq!(
+            rt.memory().read_u32(task + TC_SPLOWER),
+            original_lower,
+            "tc_SPLower should be restored by the second StackSwap"
+        );
+        assert_eq!(
+            rt.memory().read_u32(task + TC_SPUPPER),
+            original_upper,
+            "tc_SPUpper should be restored by the second StackSwap"
+        );
+    }
+
+    /// A single `StackSwap` (no swap-back) immediately updates
+    /// `tc_SPLower`/`tc_SPUpper` to the new stack's bounds -- checked
+    /// directly, without going back through a second `StackSwap`, by
+    /// pre-arranging the exit sentinel at the top of the new stack so
+    /// the guest's own final `rts` (on the new stack) still lands
+    /// cleanly on [`EXIT_STUB_ADDR`].
+    #[test]
+    fn stack_swap_updates_tc_sp_lower_upper_immediately() {
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        words.push(move_imm_to_a(0)); // A0 = struct_addr (patched below)
+        let a0_patch = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-732)); // StackSwap
+        words.push(0x7000); // moveq #0,d0
+        words.push(RTS);
+
+        let code_len = words.len() as u32 * 2;
+        let struct_addr = entry + code_len;
+        let new_stack_block = struct_addr + 32;
+        let new_stack_size = 0x1000u32;
+        let new_stack_top = new_stack_block + new_stack_size;
+        // Leave margin past new_stack_top before the heap starts: its
+        // first allocation (the fake current task struct) would
+        // otherwise land exactly at new_stack_top and zero it, wiping
+        // out the exit sentinel this test pre-writes there below.
+        let load_end = new_stack_top + 0x200;
+
+        words[a0_patch] = (struct_addr >> 16) as u16;
+        words[a0_patch + 1] = struct_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(struct_addr, new_stack_block); // stk_Lower
+        mem.write_u32(struct_addr + 4, new_stack_top); // stk_Upper
+        mem.write_u32(struct_addr + 8, new_stack_top); // stk_Pointer
+        // The guest's own final `rts` (executed for real by the CPU,
+        // not by Runtime::run's synthetic post-handler one) will pop
+        // whatever is at the top of the *new* stack once StackSwap's
+        // own synthetic rts has run -- pre-arrange the exit sentinel
+        // there since this test deliberately never swaps back to the
+        // original stack (which is where the sentinel normally lives).
+        mem.write_u32(new_stack_top, EXIT_STUB_ADDR);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0);
+
+        let task = rt.current_task();
+        assert_eq!(rt.memory().read_u32(task + TC_SPLOWER), new_stack_block);
+        assert_eq!(rt.memory().read_u32(task + TC_SPUPPER), new_stack_top);
     }
 }

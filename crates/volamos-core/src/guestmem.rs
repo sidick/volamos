@@ -13,12 +13,13 @@
 //!
 //! This module fixes the rest of the layout:
 //!
-//! - [`STACK_SIZE`]: a fixed 64 KiB region at the top of guest memory is
-//!   reserved for the stack (growing downward from the top, as
-//!   `Runtime::new` already sets `A7`). 64 KiB is generous for the kind
-//!   of small CLI programs this runtime targets and leaves plenty of
-//!   headroom before Phase 3 needs anything smarter (guard pages, stack
-//!   growth, etc.).
+//! - [`DEFAULT_STACK_SIZE`]: a 64 KiB region at the top of guest memory is
+//!   reserved for the stack by default (growing downward from the top,
+//!   as `Runtime::new` already sets `A7`). 64 KiB is generous for the
+//!   kind of small CLI programs this runtime targets. Phase 3 stage 6
+//!   makes this configurable: [`crate::dispatch::StartConfig::stack_size`]
+//!   overrides it (clamped to at least [`MIN_STACK_SIZE`]), threaded from
+//!   the CLI's `--stack` flag.
 //! - The heap occupies the space between the end of the loaded program
 //!   and the base of the stack region (`stack base = memory length -
 //!   STACK_SIZE`, 4-byte aligned).
@@ -33,11 +34,22 @@
 
 use crate::memory::AddressSpace;
 
-/// Size in bytes of the guest stack region, reserved at the top of guest
-/// memory. Chosen as a generous fixed size for the small CLI-style
-/// programs this runtime targets; Phase 3+ can revisit (guard pages,
-/// growth) if that ever proves insufficient.
-pub const STACK_SIZE: u32 = 64 * 1024;
+/// Default size in bytes of the guest stack region, reserved at the top
+/// of guest memory, used when [`crate::dispatch::StartConfig::stack_size`]
+/// isn't overridden. Generous for the small CLI-style programs this
+/// runtime targets; the `--stack` CLI flag (Phase 3 stage 6) lets a
+/// caller raise it for programs that recurse or allocate large stack
+/// frames.
+pub const DEFAULT_STACK_SIZE: u32 = 64 * 1024;
+
+/// The smallest stack size [`crate::dispatch::Runtime::new`] will honor,
+/// mirroring real AmigaOS's own minimum task stack size (`AmigaDOS`'s
+/// `Run`/`RunCommand` and `CreateNewProc` both refuse less than this).
+/// A [`crate::dispatch::StartConfig::stack_size`] below this is clamped
+/// up to it rather than rejected outright -- see
+/// [`crate::dispatch::Runtime::new`]'s doc for why a clamp (not an
+/// error) was chosen.
+pub const MIN_STACK_SIZE: u32 = 4096;
 
 /// Errors [`GuestHeap`] operations can report.
 #[derive(Debug, Clone, PartialEq, Eq)]

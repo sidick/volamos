@@ -610,6 +610,7 @@ mod tests {
                 entry,
                 load_end,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         )
     }
@@ -749,6 +750,7 @@ mod tests {
                 entry,
                 load_end: list_addr + 24,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -788,6 +790,7 @@ mod tests {
                 entry,
                 load_end: list_addr + 8,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -857,6 +860,7 @@ mod tests {
                 entry,
                 load_end: str2 + 8,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -998,6 +1002,7 @@ mod tests {
                 entry,
                 load_end: result_addr + CLOCK_DATA_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -1049,6 +1054,7 @@ mod tests {
                 entry,
                 load_end: cd_addr + CLOCK_DATA_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -1100,6 +1106,7 @@ mod tests {
                 entry,
                 load_end: cd_addr + CLOCK_DATA_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -1129,6 +1136,7 @@ mod tests {
                 entry,
                 load_end: cd_addr + CLOCK_DATA_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out2 = Vec::new();

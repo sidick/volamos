@@ -43,8 +43,8 @@ pub use doslock::{
 };
 pub use exectask::{NT_TASK, SIGBREAKF_CTRL_C, TASK_STRUCT_SIZE, install_host_break_handler};
 pub use guestmem::{
-    GuestHeap, GuestHeapError, STACK_SIZE, addr_from_bptr, bptr_from_addr, read_bstr,
-    read_c_string, write_bstr, write_c_string,
+    DEFAULT_STACK_SIZE, GuestHeap, GuestHeapError, MIN_STACK_SIZE, addr_from_bptr, bptr_from_addr,
+    read_bstr, read_c_string, write_bstr, write_c_string,
 };
 pub use loader::{HunkFile, LoadError, LoadResult, load, parse};
 pub use lvos::{ArgReg, LvoEntry, find_by_lvo, find_by_name};

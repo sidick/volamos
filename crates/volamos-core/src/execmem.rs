@@ -451,6 +451,7 @@ mod tests {
                 entry,
                 load_end,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         )
     }

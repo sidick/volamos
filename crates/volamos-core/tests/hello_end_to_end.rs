@@ -28,6 +28,7 @@ fn hello_fixture_runs_to_completion_with_expected_output() {
             entry: load_result.entry,
             load_end: load_result.end,
             args: Vec::new(),
+            ..StartConfig::default()
         },
     );
 

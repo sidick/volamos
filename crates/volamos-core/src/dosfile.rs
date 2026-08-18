@@ -978,6 +978,7 @@ mod tests {
                 entry,
                 load_end,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         if let Some(root) = vfs_root {

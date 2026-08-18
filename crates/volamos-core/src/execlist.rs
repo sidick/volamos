@@ -616,6 +616,7 @@ mod tests {
                 entry,
                 load_end,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         )
     }
@@ -881,6 +882,7 @@ mod tests {
                 entry,
                 load_end: b_addr + NODE_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -929,6 +931,7 @@ mod tests {
                 entry,
                 load_end: message_addr + MESSAGE_HEADER_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();
@@ -1083,6 +1086,7 @@ mod tests {
                 entry,
                 load_end: port_addr + NODE_SIZE,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         let mut out = Vec::new();

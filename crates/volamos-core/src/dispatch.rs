@@ -63,7 +63,7 @@ use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
 use crate::dosfile::DosState;
 use crate::exectask;
-use crate::guestmem::{GuestHeap, STACK_SIZE, read_c_string};
+use crate::guestmem::{DEFAULT_STACK_SIZE, GuestHeap, MIN_STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
 use crate::vfs::Vfs;
@@ -305,6 +305,19 @@ pub enum DispatchError {
     /// [`LibraryTable::register_by_name`] was asked to register a function
     /// name that isn't in the supplied [`LvoEntry`] table.
     UnknownLibraryFunction { library: String, name: String },
+    /// The current task's stack pointer (`A7`) is outside its
+    /// `tc_SPLower`/`tc_SPUpper` bounds (read fresh from guest memory --
+    /// see [`crate::exectask::check_stack_bounds`], which is
+    /// `StackSwap`-aware). This is the "stack-overflow bug class vamos
+    /// is known to hit" (`docs/plan.md`'s Phase 3 scope): a guest
+    /// program that recurses or allocates a large stack frame runs off
+    /// the end of its (fake, host-allocated) stack region and starts
+    /// corrupting whatever guest memory happens to sit past it, which
+    /// otherwise fails confusingly far from the real cause. Checked once
+    /// per dispatched trap (the same granularity as host-break polling,
+    /// [`crate::exectask::fold_pending_host_break`]) -- see
+    /// [`Runtime::run`]'s doc for the granularity caveat.
+    StackOverflow { a7: u32, lower: u32, upper: u32 },
 }
 
 impl fmt::Display for DispatchError {
@@ -341,6 +354,11 @@ impl fmt::Display for DispatchError {
             DispatchError::UnknownLibraryFunction { library, name } => {
                 write!(f, "{library}: no LVO metadata for function {name:?}")
             }
+            DispatchError::StackOverflow { a7, lower, upper } => write!(
+                f,
+                "stack overflow: A7 {a7:#010x} is outside the current task's stack bounds \
+                 [{lower:#010x}, {upper:#010x}] -- try running with a larger --stack"
+            ),
         }
     }
 }
@@ -829,6 +847,30 @@ pub struct StartConfig {
     /// buffer allocated on the guest heap, `A0` = pointer to it, `D0` =
     /// its length (see [`Runtime::new`]'s doc for the exact framing).
     pub args: Vec<String>,
+    /// Size in bytes of the guest stack region reserved at the top of
+    /// guest memory (Phase 3 stage 6; threaded from the CLI's `--stack`
+    /// flag). [`Runtime::new`] clamps this up to
+    /// [`crate::guestmem::MIN_STACK_SIZE`] rather than erroring on a
+    /// too-small value -- mirrors real AmigaOS, which silently clamps a
+    /// requested stack size to its own minimum (`AmigaDOS`'s
+    /// `Run`/`RunCommand`/`CreateNewProc` all do this) rather than
+    /// failing the whole program launch over it. Defaults to
+    /// [`crate::guestmem::DEFAULT_STACK_SIZE`] via [`StartConfig::default`],
+    /// so existing call sites that only care about `entry`/`load_end`/
+    /// `args` can add `..StartConfig::default()` (or `..Default::default()`)
+    /// to their struct literal instead of naming this field explicitly.
+    pub stack_size: u32,
+}
+
+impl Default for StartConfig {
+    fn default() -> Self {
+        Self {
+            entry: 0,
+            load_end: 0,
+            args: Vec::new(),
+            stack_size: DEFAULT_STACK_SIZE,
+        }
+    }
 }
 
 /// Ties a [`Cpu`] backend, its guest memory, and a [`LibraryTable`]
@@ -1001,24 +1043,29 @@ impl<C: Cpu + 'static> Runtime<C> {
         // read/disassemble.
         mem.write_u16(EXIT_STUB_ADDR, 0xA000 | EXIT_SLOT);
 
-        // Stack: a fixed-size region (see `guestmem::STACK_SIZE`) at the
-        // top of guest memory, 4-byte aligned, with the exit sentinel
-        // pre-pushed as the return address for the program's outermost
-        // `rts`.
+        // Stack: a region (see `StartConfig::stack_size`, clamped to at
+        // least `guestmem::MIN_STACK_SIZE`) at the top of guest memory,
+        // 4-byte aligned, with the exit sentinel pre-pushed as the
+        // return address for the program's outermost `rts`.
+        let stack_size = config.stack_size.max(MIN_STACK_SIZE);
         let top = (mem.len() as u32) & !3;
         let sp = top.wrapping_sub(4);
         mem.write_u32(sp, EXIT_STUB_ADDR);
 
         // Heap: from the loaded program's end (rounded up) to the base
         // of the reserved stack region, so it never overlaps either.
-        let stack_base = top.saturating_sub(STACK_SIZE) & !3;
+        let stack_base = top.saturating_sub(stack_size) & !3;
         let mut heap = GuestHeap::new(config.load_end, stack_base);
 
-        // Fake current task (Phase 3 stage 5): a real, guest-visible
-        // struct Task allocated on the heap just created above, before
-        // anything else claims heap space. See crate::exectask's module
-        // docs for exactly which fields are maintained.
-        let task = exectask::create_current_task(&mut mem, &mut heap);
+        // Fake current task (Phase 3 stage 5; stack bounds since stage
+        // 6): a real, guest-visible struct Task allocated on the heap
+        // just created above, before anything else claims heap space.
+        // tc_SPLower/tc_SPUpper are set to this run's actual stack
+        // region ([stack_base, top]) so StackSwap and the stack-overflow
+        // check below have real bounds to work with. See
+        // crate::exectask's module docs for exactly which fields are
+        // maintained.
+        let task = exectask::create_current_task(&mut mem, &mut heap, stack_base, top);
 
         // Command-line buffer: args joined with spaces, '\n'-terminated
         // (the length reported in D0 includes this '\n'), plus one extra
@@ -1145,6 +1192,19 @@ impl<C: Cpu + 'static> Runtime<C> {
                     // module docs for the polling-granularity caveat.
                     exectask::fold_pending_host_break(&mut self.mem, self.task);
 
+                    // Stack-overflow check (Phase 3 stage 6): compare A7
+                    // against the current task's tc_SPLower/tc_SPUpper,
+                    // read fresh from guest memory so this is aware of
+                    // any StackSwap the guest has performed. Same
+                    // trap-dispatch-boundary granularity as the
+                    // host-break poll above -- a guest program that
+                    // overflows its stack and only touches memory
+                    // (never calling a library function) won't be
+                    // caught until its next library call, if any; see
+                    // crate::exectask::check_stack_bounds's doc.
+                    let a7 = self.cpu.address_register(AddressRegister(7));
+                    exectask::check_stack_bounds(&self.mem, self.task, a7)?;
+
                     let mut ctx = HandlerContext {
                         cpu: &mut self.cpu,
                         mem: &mut self.mem,
@@ -1212,6 +1272,7 @@ mod tests {
                 entry,
                 load_end,
                 args,
+                ..StartConfig::default()
             },
         )
     }
@@ -1314,6 +1375,115 @@ mod tests {
         assert_eq!(rt.mem.read_u16(EXIT_STUB_ADDR) & 0xF000, 0xA000);
     }
 
+    // --- stack-size handling / stack-overflow detection (Phase 3 stage 6) ---
+
+    #[test]
+    fn start_config_default_stack_size_is_used_when_unspecified() {
+        // `..StartConfig::default()` (as every other test call site in
+        // this crate uses) picks up DEFAULT_STACK_SIZE.
+        let rt = runtime_with_program(&[0x4E75]); // rts
+        let task = rt.current_task();
+        let lower = rt.mem.read_u32(task + crate::exectask::TC_SPLOWER);
+        let upper = rt.mem.read_u32(task + crate::exectask::TC_SPUPPER);
+        assert_eq!(upper - lower, DEFAULT_STACK_SIZE);
+    }
+
+    #[test]
+    fn stack_size_below_minimum_is_clamped_not_rejected() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[0x4E75]); // rts
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x100,
+                args: Vec::new(),
+                stack_size: 1, // far below MIN_STACK_SIZE
+            },
+        );
+        let task = rt.current_task();
+        let lower = rt.mem.read_u32(task + crate::exectask::TC_SPLOWER);
+        let upper = rt.mem.read_u32(task + crate::exectask::TC_SPUPPER);
+        assert_eq!(
+            upper - lower,
+            MIN_STACK_SIZE,
+            "a too-small stack_size should be clamped up to MIN_STACK_SIZE, not honored as-is"
+        );
+    }
+
+    #[test]
+    fn stack_overflow_a7_out_of_bounds_is_detected_before_dispatch() {
+        // movea.l #0,a7 (clearly outside any plausible stack region),
+        // then a library call (PutStr; a6 is still DOS_LIBRARY_BASE per
+        // Runtime::new's default seed) to reach the next trap-dispatch
+        // boundary, where Runtime::run checks A7 against the current
+        // task's tc_SPLower/tc_SPUpper before ever invoking the handler.
+        // The jsr itself pushes a return address first (predecrementing
+        // A7 by 4, wrapping from 0 to 0xFFFFFFFC), so that's the A7
+        // value the check actually observes.
+        let words = [
+            0x2E7C, 0x0000, 0x0000, // movea.l #0,a7
+            0x4EAE, 0xFC4C, // jsr -948(a6)  (PutStr)
+            0x4E75, // rts (never reached)
+        ];
+        let mut rt = runtime_with_program(&words);
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::Dispatch(DispatchError::StackOverflow { a7, lower, upper }) => {
+                assert_eq!(a7, 0u32.wrapping_sub(4));
+                assert!(lower > 0 && upper > lower);
+            }
+            other => panic!("expected StackOverflow, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("stack overflow"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("--stack"),
+            "diagnostic should suggest --stack: {msg}"
+        );
+    }
+
+    #[test]
+    fn small_stack_overflow_from_deep_pushes_is_detected() {
+        // A deliberately tiny stack (the clamped minimum) and 2000
+        // unconditional pushes -- standing in for the "recurses/pushes
+        // deeply" bug class vamos is known to hit -- followed by a
+        // library call to reach the next trap-dispatch boundary where
+        // the overflow is actually detected.
+        let entry = TRAP_TABLE_END;
+        let push_d0 = 0x2F00u16; // move.l d0,-(a7)
+        let mut words: Vec<u16> = (0..2000).map(|_| push_d0).collect();
+        words.push(0x4EAE); // jsr <disp16>(a6)
+        words.push(0xFC4C); // -948 (PutStr)
+        words.push(0x4E75); // rts (never reached)
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let load_end = entry + (words.len() as u32) * 2 + 16;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                stack_size: MIN_STACK_SIZE,
+            },
+        );
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::Dispatch(DispatchError::StackOverflow { .. }) => {}
+            other => panic!("expected StackOverflow from deep pushes, got {other:?}"),
+        }
+        assert!(err.to_string().contains("stack overflow"));
+    }
+
     #[test]
     fn additional_handler_can_be_registered_before_run() {
         // Registers a second fake library call (an arbitrary made-up LVO
@@ -1330,6 +1500,7 @@ mod tests {
                 entry,
                 load_end: entry + 0x100,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
 
@@ -1421,6 +1592,7 @@ mod tests {
                 entry,
                 load_end: entry + 0x100,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         rt.table
@@ -1541,6 +1713,7 @@ mod tests {
                 entry,
                 load_end: str_addr + name.len() as u32 + 4,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
 
@@ -1582,6 +1755,7 @@ mod tests {
                 entry,
                 load_end: str_addr + name.len() as u32 + 4,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
 
@@ -1661,6 +1835,7 @@ mod tests {
                 entry,
                 load_end,
                 args: Vec::new(),
+                ..StartConfig::default()
             },
         );
         // Since Phase 3 stage 5, the fake current task struct (see
