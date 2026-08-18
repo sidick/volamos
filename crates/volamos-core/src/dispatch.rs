@@ -975,6 +975,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         // line buffer, set on `dos` just below), not a Vfs.
         crate::dosargs::register_dosargs_handlers(&mut table, &mut mem);
 
+        // dos.library ParsePattern(NoCase)/MatchPattern(NoCase) (the
+        // wildcard engine `List`/`Copy`/`Delete`/`Dir` rely on) -- see
+        // crate::dospattern's module docs. `MatchFirst`/`MatchNext`/
+        // `MatchEnd` (the AnchorPath-based directory scanner built on
+        // top of this) are not yet implemented, per that module's docs.
+        crate::dospattern::register_dospattern_handlers(&mut table, &mut mem);
+
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
         // for the full reserved-region memory map. Looked up by name

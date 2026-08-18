@@ -765,6 +765,41 @@ behavior over an older RKRM passage describing an explicit `On`/`Off`
 value, since no known real template uses `/T` either way. 14 tests
 (13 direct-call unit tests over the parsing/materialization logic, one
 real A-line trap-dispatch end-to-end test for the register convention).
+**Flagged by Simon (2026-08-18) as needing real-oracle comparison
+testing before being trusted** — implemented from RKRM/NDK docs alone,
+not yet validated against real AmigaOS or an independent
+implementation; revisit once Phase 4's real-Kickstart oracle
+(Copperline/amiberry) is available.
+
+**`ParsePattern`/`ParsePatternNoCase`/`MatchPattern`/
+`MatchPatternNoCase` — implemented 2026-08-18**
+(`crates/volamos-core/src/dospattern.rs`), the wildcard-matching engine
+`List`/`Copy`/`Delete`/`Dir` and effectively every other `C:` command
+with a filename argument rely on. Full grammar (`?`, `#atom` repeat,
+`~atom` negation, `[...]`/`[~...]` classes with ranges, `(a|b|c)`
+alternation, `%` empty alternative, `'` escaping -- correctly scoped to
+only activate before an actual wildcard character, per the real
+semantics rather than the naive reading). Tokenized pattern buffers use
+this runtime's own self-delimiting byte encoding rather than the real
+(explicitly "internal") one, since `ParsePattern`/`MatchPattern` are
+only ever exchanged with each other; decoding reads directly from guest
+memory rather than via a NUL-terminated string read, since the encoding
+embeds raw `0x00` bytes a naive `read_c_string` truncates on (caught by
+the end-to-end trap-dispatch test, not the pure-Rust unit tests -- a
+good reminder that in-process unit tests over the parsing logic don't
+exercise the guest-memory marshalling code path at all). Scoped
+deviation: `~atom` matches against the *whole remainder* of the string
+rather than some arbitrary prefix, matching every real-world `~` usage
+this project's corpus is expected to hit (`~(#?.info)`, always the
+pattern's tail) but not a `~` with trailing atoms after it. **Not yet
+implemented**: `MatchFirst`/`MatchNext`/`MatchEnd` (the `AnchorPath`/
+`AChain`-based recursive directory scanner built on top of this engine)
+-- deliberately split out as its own follow-up, since real struct-layout
+fidelity for `AnchorPath`/`AChain` (guest programs read `ap_Info`/
+`ap_Current->an_Lock` directly, unlike `ReadArgs`'s opaque `RDArgs`) is
+a distinct chunk of work from the matcher itself. 12 tests (11 direct
+unit tests over the parser/matcher, one real A-line trap-dispatch
+end-to-end test).
 
 Known deviations/deferrals, all documented in-module: no
 `MemHeader`/`MemChunk` guest structures (flat allocator, per plan); no

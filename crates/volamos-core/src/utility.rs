@@ -142,8 +142,10 @@ fn amiga_tolower(c: u8) -> u8 {
 }
 
 /// Amiga "international mode" uppercase mapping -- the inverse of
-/// [`amiga_tolower`]; see the module docs.
-fn amiga_toupper(c: u8) -> u8 {
+/// [`amiga_tolower`]; see the module docs. `pub(crate)` so
+/// [`crate::dospattern`] can fold case the same way `MatchPatternNoCase`
+/// documents (via `utility.library`'s `ToUpper`).
+pub(crate) fn amiga_toupper(c: u8) -> u8 {
     if c.is_ascii_lowercase() || ((0xE0..=0xFE).contains(&c) && c != 0xF7) {
         c - 0x20
     } else {

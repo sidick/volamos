@@ -15,6 +15,7 @@ pub mod dispatch;
 pub mod dosargs;
 pub mod dosfile;
 pub mod doslock;
+pub mod dospattern;
 pub mod dosseg;
 pub mod execlist;
 pub mod execmem;
@@ -48,6 +49,7 @@ pub use dosfile::{
 pub use doslock::{
     ACCESS_READ, ACCESS_WRITE, ERROR_NO_MORE_ENTRIES, EXCLUSIVE_LOCK, LockEntry, SHARED_LOCK,
 };
+pub use dospattern::ERROR_LINE_TOO_LONG;
 pub use dosseg::{SegList, SystemRequest};
 pub use exectask::{NT_TASK, SIGBREAKF_CTRL_C, TASK_STRUCT_SIZE, install_host_break_handler};
 pub use guestmem::{
