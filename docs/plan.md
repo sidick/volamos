@@ -547,6 +547,23 @@ the T7-T14 text above, the code is authoritative:
   `--cwd`, `--auto-assign`; a Vfs is only installed when at least one
   such flag is given. `--cwd` defaults to the first volume's root,
   else the first assign's root, else `root:`.
+- **`RAM:` has no special treatment** (confirmed with Simon
+  2026-08-18): it is just another volume name, resolved the same way
+  as any other unmapped volume — via `-V`/`-a`/`--auto-assign`, or a
+  clean `IoErr` if none covers it. This matches vamos's own behavior
+  exactly (checked against vamos's docs: vamos aborts on an unmapped
+  volume unless Auto Assign is enabled, with no ramdisk special-case
+  either) and the project's general "port vamos's escape hatches, don't
+  invent new ones" stance. Known practical wrinkle: real hardware
+  auto-mounts `RAM:` at boot, so some real-world scripts/tools assume
+  it exists without ever assigning it — under volamos those need an
+  explicit `-V RAM:<hostdir>` or `--auto-assign` today. Considered and
+  rejected: having volamos auto-provide a default host-backed `RAM:`
+  (e.g. a managed temp directory) unless overridden — decided against,
+  since it would mean volamos silently creating/managing filesystem
+  state the user didn't ask for, which cuts against the explicit
+  everything-is-mapped-by-the-invoker design used everywhere else in
+  the volume/assign model.
 - **T14**: fixtures `filetest`/`dirtest`/`echoargs` in the dual
   `.s` + `gen_*.py` style, sharing `fixtures/amiga_asm.py` (a small
   two-pass assembler helper the generators use; vasm still not
