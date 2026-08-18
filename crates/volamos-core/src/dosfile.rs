@@ -324,6 +324,13 @@ pub struct DosState {
     /// (only when [`crate::dosargs::RdArgsEntry::owns_anchor`]) the anchor
     /// block itself.
     pub(crate) rdargs: HashMap<u32, crate::dosargs::RdArgsEntry>,
+
+    /// Local shell variables (`SetVar`/`GetVar`/`DeleteVar`, `LV_VAR`
+    /// only -- see `crate::dosvar`'s module docs for scope), keyed by
+    /// upper-cased name (variable names are case-insensitive) to raw
+    /// byte content. No `ENV:`-backed global-variable storage is
+    /// implemented; see that module's docs.
+    pub(crate) local_vars: HashMap<String, Vec<u8>>,
 }
 
 impl DosState {
@@ -347,6 +354,7 @@ impl DosState {
             cmdline: None,
             cmdline_pos: 0,
             rdargs: HashMap::new(),
+            local_vars: HashMap::new(),
         }
     }
 

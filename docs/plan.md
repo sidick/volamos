@@ -811,6 +811,37 @@ The `since`-version field proposed above remains future work — Phase 3
 picked its calls from the plan's own scope list rather than needing a
 version-gated filter yet.
 
+**First empirical corpus run — 2026-08-18** (`crates/volamos-core/src/
+{dosstr,execmem,execfmt,dosvar,dosprintf}.rs`): ran the real Workbench
+3.1.4 `C:/Version` binary (extracted from `~/src/amibake/assets/
+hyperion/AmigaOS-3.1.4-A500_A600_A2000.zip`'s `Workbench3_1_4.adf`,
+kept outside this repo per the never-vendor policy) end to end for the
+first time, adding whatever `dos.library`/`exec.library` calls it hit
+that weren't implemented yet: `StrToLong` (decimal string parsing);
+`CopyMem`/`CopyMemQuick` (raw memory copy, added to `execmem.rs`);
+`RawDoFmt` (the `printf`-like formatter every AmigaOS C startup library
+builds `sprintf`/`Printf` on top of -- the first handler in this
+runtime that steps the CPU itself mid-handler to call back into a real
+guest `PutChProc` subroutine, rather than only reading/writing
+registers and memory); `SetVar`/`GetVar`/`DeleteVar` (local shell
+variables only, no `ENV:`-backed global storage -- see `dosvar.rs`'s
+module docs); `VPrintf`/`VFPrintf` (built on `RawDoFmt`'s shared
+`render_format` core, but writing straight to `Output()`/a file handle
+instead of a guest callback). `Version` now runs to completion (exit
+code 0) and prints real formatted output via `VPrintf`, but the
+version *numbers* themselves are wrong (`Kickstart 40960.40960,
+Workbench 0.0` -- `40960` is `0xA000`, this runtime's "unknown call"
+trap-table sentinel value): `Version` reads `lib_Version`/`lib_Revision`
+directly off the fake `exec.library`/`dos.library` library `Node`
+structs, which this runtime has never populated with real values.
+That's a distinct, not-yet-scoped gap (real library-Node field
+fidelity) surfaced by this run, not a defect in the calls just added.
+20 new tests across the five modules (each with at least one real
+A-line trap-dispatch end-to-end test, not just direct-call unit tests
+-- `dospattern.rs`'s `ParsePattern`/`MatchPattern` work already showed
+that in-process unit tests over parsing/formatting logic alone miss
+guest-memory-marshalling bugs a real dispatch path catches).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

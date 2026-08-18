@@ -982,6 +982,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         // top of this) are not yet implemented, per that module's docs.
         crate::dospattern::register_dospattern_handlers(&mut table, &mut mem);
 
+        // dos.library StrToLong (decimal string -> LONG) -- see
+        // crate::dosstr's module docs.
+        crate::dosstr::register_dosstr_handlers(&mut table, &mut mem);
+
+        // dos.library SetVar/GetVar/DeleteVar (local shell variables
+        // only -- see crate::dosvar's module docs for scope).
+        crate::dosvar::register_dosvar_handlers(&mut table, &mut mem);
+
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
         // for the full reserved-region memory map. Looked up by name
@@ -1023,6 +1031,16 @@ impl<C: Cpu + 'static> Runtime<C> {
         // AvailMem/AllocVec/FreeVec over this same GuestHeap -- see
         // crate::execmem's module docs for the flat-allocator design.
         crate::execmem::register_execmem_handlers(&mut table, &mut mem);
+
+        // exec.library RawDoFmt (the printf-like formatter every AmigaOS
+        // C startup library's own sprintf/Printf builds on) -- see
+        // crate::execfmt's module docs, including how it steps the CPU
+        // itself mid-handler to call back into the guest's PutChProc.
+        crate::execfmt::register_execfmt_handlers(&mut table, &mut mem);
+
+        // dos.library VPrintf/VFPrintf -- see crate::dosprintf's module
+        // docs; built on execfmt's render_format core.
+        crate::dosprintf::register_dosprintf_handlers(&mut table, &mut mem);
 
         // utility.library (T17): tag-list helpers, case-insensitive
         // string compare, character case conversion, and date helpers --

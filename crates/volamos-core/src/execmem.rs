@@ -1,5 +1,8 @@
 //! `exec.library` memory allocation: `AllocMem`/`FreeMem`/`AllocVec`/
-//! `FreeVec`/`AvailMem` (T16, Phase 3 stage 2).
+//! `FreeVec`/`AvailMem` (T16, Phase 3 stage 2), plus `CopyMem`/
+//! `CopyMemQuick` (a raw memory-copy pair, not an allocator, but too
+//! small to earn its own module -- added here since it's still squarely
+//! an "exec.library memory-related call").
 //!
 //! # Design: flat, no `MemHeader`/`MemChunk` emulation
 //!
@@ -342,6 +345,31 @@ fn free_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
         })
 }
 
+/// `CopyMem`/`CopyMemQuick` (LVOs -624/-630): `A0` = source, `A1` =
+/// dest, `D0` = size in bytes. No return value. Real `CopyMemQuick`
+/// additionally requires long-word alignment and a size that's a
+/// multiple of 4, but since this handler just copies bytes either way
+/// (no SIMD/longword-move optimization to actually differ on), both
+/// share one implementation. Copies via an intermediate host `Vec`
+/// rather than reading and writing guest memory byte-by-byte in the
+/// same pass, so an overlapping copy (real `CopyMem`'s documented
+/// "not supported" case) still behaves predictably here instead of
+/// corrupting data depending on copy direction.
+fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let source = ctx.cpu.address_register(AddressRegister(0));
+    let dest = ctx.cpu.address_register(AddressRegister(1));
+    let size = ctx.cpu.data_register(DataRegister(0));
+
+    let mut buf = Vec::with_capacity(size as usize);
+    for i in 0..size {
+        buf.push(ctx.mem.read_u8(source.wrapping_add(i)));
+    }
+    for (i, b) in buf.into_iter().enumerate() {
+        ctx.mem.write_u8(dest.wrapping_add(i as u32), b);
+    }
+    Ok(())
+}
+
 /// Registers every T16 `exec.library` memory-allocation handler onto
 /// [`EXEC_LIBRARY_BASE`], looked up by name through [`EXEC_LVOS`] (the T7
 /// table), following [`crate::dosfile::register_dos_handlers`]'s
@@ -370,6 +398,8 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
     reg!("AvailMem", avail_mem_handler::<C>);
     reg!("AllocVec", alloc_vec_handler::<C>);
     reg!("FreeVec", free_vec_handler::<C>);
+    reg!("CopyMem", copy_mem_handler::<C>);
+    reg!("CopyMemQuick", copy_mem_handler::<C>);
 }
 
 #[cfg(test)]
@@ -725,5 +755,53 @@ mod tests {
             "AllocMem(256) should shrink the largest free block by at \
              least 256 bytes, got delta {code}"
         );
+    }
+
+    #[test]
+    fn copy_mem_copies_bytes_from_source_to_dest() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let source_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = source, patched below
+        words.push(0);
+        words.push(0);
+        let dest_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = dest, patched below
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = size
+        words.push(0);
+        words.push(8);
+        words.extend_from_slice(&jsr_disp16_a6(-624)); // CopyMem(a6)
+        words.push(RTS);
+
+        let source = b"COPYTEST";
+        let source_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let dest_addr = source_addr + source.len() as u32 + 16;
+        words[source_idx + 1] = (source_addr >> 16) as u16;
+        words[source_idx + 2] = source_addr as u16;
+        words[dest_idx + 1] = (dest_addr >> 16) as u16;
+        words[dest_idx + 2] = dest_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        for (i, &b) in source.iter().enumerate() {
+            mem.write_u8(source_addr + i as u32, b);
+        }
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: dest_addr + source.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        for (i, &b) in source.iter().enumerate() {
+            assert_eq!(rt.memory().read_u8(dest_addr + i as u32), b);
+        }
     }
 }
