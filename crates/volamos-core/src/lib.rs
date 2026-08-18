@@ -13,6 +13,7 @@ pub mod backend;
 pub mod cpu;
 pub mod dispatch;
 pub mod dosfile;
+pub mod doslock;
 pub mod guestmem;
 pub mod loader;
 pub mod lvos;
@@ -32,6 +33,9 @@ pub use dosfile::{
     ERROR_OBJECT_IN_USE, ERROR_OBJECT_NOT_FOUND, ERROR_OBJECT_WRONG_TYPE, ERROR_SEEK_ERROR,
     MODE_NEWFILE, MODE_OLDFILE, MODE_READWRITE, OFFSET_BEGINNING, OFFSET_CURRENT, OFFSET_END,
 };
+pub use doslock::{
+    ACCESS_READ, ACCESS_WRITE, ERROR_NO_MORE_ENTRIES, EXCLUSIVE_LOCK, LockEntry, SHARED_LOCK,
+};
 pub use guestmem::{
     GuestHeap, GuestHeapError, STACK_SIZE, addr_from_bptr, bptr_from_addr, read_bstr,
     read_c_string, write_bstr, write_c_string,
@@ -39,4 +43,4 @@ pub use guestmem::{
 pub use loader::{HunkFile, LoadError, LoadResult, load, parse};
 pub use lvos::{ArgReg, LvoEntry, find_by_lvo, find_by_name};
 pub use memory::AddressSpace;
-pub use vfs::{MAX_ASSIGN_DEPTH, ResolveMode, Vfs, VfsConfig, VfsError};
+pub use vfs::{MAX_ASSIGN_DEPTH, ResolveMode, Resolved, Vfs, VfsConfig, VfsError};

@@ -875,6 +875,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         // Runtime::set_vfs) for everything except path-based calls.
         crate::dosfile::register_dos_handlers(&mut table, &mut mem);
 
+        // dos.library locks + Examine/ExNext (T11): Lock/UnLock/DupLock/
+        // ParentDir/CurrentDir and directory traversal -- see
+        // crate::doslock's module docs. Same by-name registration and
+        // no-Vfs-required posture as register_dos_handlers above.
+        crate::doslock::register_lock_handlers(&mut table, &mut mem);
+
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
         // for the full reserved-region memory map. Looked up by name
@@ -1317,10 +1323,12 @@ mod tests {
         use crate::lvos::dos::DOS_LVOS;
 
         // Register PutStr by name (populates the base -> table map), then
-        // jsr an unrelated, unregistered LVO on the same base: -84 is
-        // Lock's real offset, but we never registered a handler for it.
+        // jsr an unrelated, unregistered LVO on the same base: -120 is
+        // CreateDir's real offset, but no handler is registered for it
+        // (T10/T11 register Open/Close/.../Lock/.../ParentDir, but not
+        // CreateDir).
         let entry = TRAP_TABLE_END;
-        let words = [0x4EAE, (-84i16) as u16, 0x4E75]; // jsr -84(a6) ; rts
+        let words = [0x4EAE, (-120i16) as u16, 0x4E75]; // jsr -120(a6) ; rts
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
         let mut rt = Runtime::new(
@@ -1350,8 +1358,8 @@ mod tests {
                 assert!(
                     candidates
                         .iter()
-                        .any(|(lib, offset)| lib == "dos.library/Lock" && *offset == -84),
-                    "expected a dos.library/Lock (-84) candidate, got {candidates:?}"
+                        .any(|(lib, offset)| lib == "dos.library/CreateDir" && *offset == -120),
+                    "expected a dos.library/CreateDir (-120) candidate, got {candidates:?}"
                 );
             }
             other => panic!("expected UnknownCall, got {other:?}"),

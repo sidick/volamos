@@ -262,6 +262,18 @@ pub struct VfsConfig {
     pub cwd: String,
 }
 
+/// Result of [`Vfs::resolve_with_amiga_path`]: a resolved host path plus
+/// the normalized Amiga path that reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The resolved host filesystem path (same as [`Vfs::resolve`]).
+    pub host_path: PathBuf,
+    /// The normalized Amiga path, e.g. `"SYS:work/Foo.txt"` -- see
+    /// [`Vfs::resolve_with_amiga_path`]'s docs for exactly how each
+    /// component's case is chosen.
+    pub amiga_path: String,
+}
+
 /// The volume/assign manager. See the module docs for path semantics.
 #[derive(Debug, Clone)]
 pub struct Vfs {
@@ -300,11 +312,64 @@ impl Vfs {
 
     /// Resolve an Amiga path to a host path.
     pub fn resolve(&self, amiga_path: &str, mode: ResolveMode) -> Result<PathBuf, VfsError> {
+        Ok(self.resolve_with_amiga_path(amiga_path, mode)?.host_path)
+    }
+
+    /// As [`Vfs::resolve`], but also reconstructs the *normalized* Amiga
+    /// path that got you there: `leading_name:` (the assign/volume name
+    /// actually used -- not necessarily what a relative/bare-`:` input
+    /// started with) followed by each component's on-disk-matched case
+    /// (or, for a not-yet-existing final `ParentMustExist` component,
+    /// the caller's own case, same as [`Vfs::resolve`] itself).
+    ///
+    /// Added for T11: a `Lock` needs to remember *which* Amiga path it
+    /// was resolved from (not just the host path) so `CurrentDir` can
+    /// later hand that string to [`Vfs::set_cwd`] -- a host [`PathBuf`]
+    /// alone can't be turned back into an Amiga path (multiple Amiga
+    /// paths, or none, may map to the same host directory once
+    /// assigns/auto-assign are involved).
+    pub fn resolve_with_amiga_path(
+        &self,
+        amiga_path: &str,
+        mode: ResolveMode,
+    ) -> Result<Resolved, VfsError> {
         let parsed = parse_path(amiga_path)?;
         let vol_name = self.leading_name(&parsed, amiga_path)?;
         let components = self.effective_components(&parsed)?;
         let targets = self.assign_targets(&vol_name, 0)?;
-        self.resolve_against_targets(&targets, &components, mode, amiga_path)
+        let named = apply_parent_pops(&components, amiga_path)?;
+
+        let (host_path, matched) = match mode {
+            ResolveMode::MustExist => {
+                let mut last_err = None;
+                let mut found = None;
+                for base in &targets {
+                    match resolve_named_components(base, &named, true, amiga_path) {
+                        Ok(result) => {
+                            found = Some(result);
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                found.ok_or_else(|| {
+                    last_err.unwrap_or(VfsError::NotFound {
+                        amiga_path: amiga_path.to_string(),
+                    })
+                })?
+            }
+            ResolveMode::ParentMustExist => {
+                let base = targets.first().ok_or_else(|| VfsError::InvalidPath {
+                    reason: format!("no resolution targets for '{amiga_path}'"),
+                })?;
+                resolve_named_components(base, &named, false, amiga_path)?
+            }
+        };
+
+        Ok(Resolved {
+            host_path,
+            amiga_path: format!("{vol_name}:{}", matched.join("/")),
+        })
     }
 
     /// Determine the leading volume/assign name for a parsed path,
@@ -460,43 +525,6 @@ impl Vfs {
             name: name.to_string(),
         })
     }
-
-    /// Try each candidate base directory in order, resolving
-    /// `components` (which may include `Parent` pops applying at the
-    /// *volume-root* level too, though popping above a target's root
-    /// is treated as clamping at that root rather than an error —
-    /// vamos-style leniency, since AmigaOS itself just no-ops a
-    /// too-many-parents case at the volume boundary) against the real
-    /// host filesystem.
-    fn resolve_against_targets(
-        &self,
-        targets: &[PathBuf],
-        components: &[Component],
-        mode: ResolveMode,
-        original_path: &str,
-    ) -> Result<PathBuf, VfsError> {
-        let named = apply_parent_pops(components, original_path)?;
-        match mode {
-            ResolveMode::MustExist => {
-                let mut last_err = None;
-                for base in targets {
-                    match resolve_named_components(base, &named, true, original_path) {
-                        Ok(path) => return Ok(path),
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                Err(last_err.unwrap_or(VfsError::NotFound {
-                    amiga_path: original_path.to_string(),
-                }))
-            }
-            ResolveMode::ParentMustExist => {
-                let base = targets.first().ok_or_else(|| VfsError::InvalidPath {
-                    reason: format!("no resolution targets for '{original_path}'"),
-                })?;
-                resolve_named_components(base, &named, false, original_path)
-            }
-        }
-    }
 }
 
 /// Apply `Parent` (pop-one-level) components against a flat list of
@@ -536,23 +564,30 @@ fn join_components(base: &Path, named: &[String]) -> PathBuf {
 /// last component is matched case-insensitively if present, else
 /// appended verbatim (preserving the caller's case) so newly created
 /// files/dirs get the name the guest asked for.
+///
+/// Returns the resolved host path *and* the list of matched (or, for a
+/// not-yet-existing final `ParentMustExist` component, verbatim) names,
+/// in order -- the latter is what [`Vfs::resolve_with_amiga_path`] uses
+/// to reconstruct a normalized Amiga path.
 fn resolve_named_components(
     base: &Path,
     named: &[String],
     last_must_exist: bool,
     original_path: &str,
-) -> Result<PathBuf, VfsError> {
+) -> Result<(PathBuf, Vec<String>), VfsError> {
     let mut current = base.to_path_buf();
     if named.is_empty() {
-        return Ok(current);
+        return Ok((current, Vec::new()));
     }
+    let mut matched = Vec::with_capacity(named.len());
     let last_index = named.len() - 1;
     for (i, name) in named.iter().enumerate() {
         let is_last = i == last_index;
         let must_exist = !is_last || last_must_exist;
         match find_case_insensitive(&current, name)? {
             Some(matched_name) => {
-                current.push(matched_name);
+                current.push(&matched_name);
+                matched.push(matched_name);
             }
             None => {
                 if must_exist {
@@ -564,7 +599,8 @@ fn resolve_named_components(
                     // doesn't exist yet: append verbatim, preserving
                     // the caller's given case.
                     current.push(name);
-                    return Ok(current);
+                    matched.push(name.clone());
+                    return Ok((current, matched));
                 }
             }
         }
@@ -577,7 +613,7 @@ fn resolve_named_components(
             }
         }
     }
-    Ok(current)
+    Ok((current, matched))
 }
 
 /// Look up `name` within `dir` on the host, case-insensitively.

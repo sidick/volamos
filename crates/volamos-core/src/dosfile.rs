@@ -16,13 +16,12 @@
 //!   ([`HostHandle`]: an open [`std::fs::File`], or a marker for the
 //!   `Input()`/`Output()` default handles);
 //! - the current `IoErr()` value, set by every handler that can fail;
-//! - **left obvious for T11**: this is where `Lock`/`UnLock`/`DupLock`
-//!   state (a lock id -> resolved host path registry, plus a `CurrentDir`
-//!   already covered by `Vfs::cwd`) and `ExNext`'s per-lock `read_dir`
-//!   iterator cache belong -- both are natural sibling `HashMap` fields
-//!   next to `handles` below, using the same "allocate a small guest
-//!   struct, key a host-side registry off its address" pattern `Open`
-//!   already establishes here. Nothing about locks is implemented yet.
+//! - (T11) `locks`/`exnext`/`current_dir_lock`/`initial_cwd`: the
+//!   `Lock`/`UnLock`/`DupLock`/`Examine`/`ExNext`/`CurrentDir`/`ParentDir`
+//!   state. These fields live here (per this module's own convention: a
+//!   guest struct's address keys a host-side registry entry, exactly like
+//!   `handles` above), but their methods and the handlers themselves live
+//!   in [`crate::doslock`] -- see that module's docs for the full design.
 //!
 //! # Guest `FileHandle` layout
 //!
@@ -239,6 +238,31 @@ pub struct DosState {
     /// debug id written into `fh_Arg1` (see the module docs) -- not used
     /// for lookups.
     next_debug_id: u32,
+
+    // --- T11: locks / Examine-ExNext state. Methods and handlers for
+    // these fields live in `crate::doslock`, not here (see that module's
+    // docs) -- kept as plain `pub(crate)` fields, per this module's own
+    // "extensions live here, handler code lives in the sibling module"
+    // note above, rather than duplicating DosState's own accessor style
+    // for a chunk of state this module otherwise never touches.
+    /// Guest `struct FileLock` address -> host-side lock registry entry.
+    pub(crate) locks: HashMap<u32, crate::doslock::LockEntry>,
+    /// Per-lock `ExNext` iterator state (directory entries + cursor),
+    /// keyed by the same guest `FileLock` address as `locks`. Populated
+    /// by `Examine` on a directory lock, consumed by `ExNext`.
+    pub(crate) exnext: HashMap<u32, crate::doslock::ExNextState>,
+    /// Guest address of the `FileLock` `CurrentDir` last switched to, or
+    /// `None` if the process is still on its initial (no-lock) current
+    /// directory.
+    pub(crate) current_dir_lock: Option<u32>,
+    /// The `Vfs` current directory (Amiga path string) captured the first
+    /// time `CurrentDir` runs, before it's ever changed -- `CurrentDir(0)`
+    /// restores this. `None` until the first `CurrentDir` call.
+    pub(crate) initial_cwd: Option<String>,
+    /// Monotonic counter for `fl_Key` debug values, independent of
+    /// `next_debug_id` (which is for `FileHandle`s) so the two id spaces
+    /// don't visually collide when debugging.
+    pub(crate) next_lock_id: u32,
 }
 
 impl DosState {
@@ -252,6 +276,11 @@ impl DosState {
             input_handle: None,
             output_handle: None,
             next_debug_id: 0,
+            locks: HashMap::new(),
+            exnext: HashMap::new(),
+            current_dir_lock: None,
+            initial_cwd: None,
+            next_lock_id: 0,
         }
     }
 
