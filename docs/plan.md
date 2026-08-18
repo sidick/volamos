@@ -185,12 +185,21 @@ level; T12 extends it to whole libraries. (b) vamos can also load a
 CPU (it uses this for the math libraries). That passthrough needs
 `LoadSeg` + exec library-node plumbing and is explicitly deferred to
 Phase 3 — but T12's fake-lib registry must be shaped so a
-real-library-backed base can slot in later. Math libraries
-(mathffp/mathieee) are deferred with that note; before Phase 3, check
-whether the `m68k` crate emulates 68881/68882 FPU instructions at all
-(`M68kCpu::new` currently selects `CpuType::M68000`, no FPU —
-mathffp/mathieeesingbas are software-implemented and don't need one,
-so real-library passthrough may suffice even without FPU coverage).
+real-library-backed base can slot in later. Math libraries (mathffp/mathieee) are deferred with that note.
+**Resolved (2026-08-18, verified against the crate source, not just its
+docs)**: the `m68k` crate has full FPU support — a complete `fpu` module
+(80-bit extended-precision softfloat engine, FPCR rounding modes,
+exception accumulation, transcendentals), always compiled in, not
+feature-gated. `CpuCore.fpu_present: bool` is independent of `CpuType`,
+covering both the discrete 68881/68882 coprocessor and the on-chip
+68040/68060 FPUs (`decode.rs` explicitly handles the "68020/030 without
+an attached 68881/68882" no-FPU case). `M68kCpu::new` currently selects
+`CpuType::M68000` with no FPU wired up — that's a Phase 3 configuration
+task (pick a `CpuType`/`fpu_present` combination once a call needs it),
+not a crate-capability gap. Whether Phase 3 needs FPU emulation at all
+is still a scope question (mathffp/mathieeesingbas are themselves
+software-implemented and may not need one; real-library passthrough of
+mathieee doubles might), not a tooling one.
 
 Dependency order: **T7, T8, T9 in parallel** (disjoint files, no shared
 interfaces beyond what Phase 1 already exports) → **T10, T11, T12 in
@@ -378,11 +387,14 @@ hatch), and `System()`/`Execute` for tools that shell out. Key
 decisions/risks: allocator fidelity vs simplicity (start flat,
 add MemHeader emulation only when a corpus binary trips on it); math
 libraries — resolve here via real-library passthrough (`LoadSeg` the
-original mathffp/mathieee binaries) rather than reimplementing, after
-confirming whether the `m68k` crate has any 68881 FPU coverage (the
-backend currently runs `CpuType::M68000`; softfloat library variants
-shouldn't need FPU opcodes at all); metadata tables for exec/utility
-come from the same T7 SFD codegen (`exec_lib.sfd`, `utility_lib.sfd`).
+original mathffp/mathieee binaries) rather than reimplementing; the
+`m68k` crate's FPU support is confirmed present (see the T12 note
+above), so if a corpus binary needs `mathieeedoubbas`/`mathieeeextbas`
+(which use real 68881 opcodes rather than software emulation), FPU
+coverage is available — pick a `CpuType`/`fpu_present` config once such
+a binary is in scope, not a blocker before then; metadata tables for
+exec/utility come from the same T7 SFD codegen (`exec_lib.sfd`,
+`utility_lib.sfd`).
 
 ## Phase 4 — parity pass (three-oracle harness)
 
