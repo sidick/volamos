@@ -164,6 +164,18 @@ disagrees with the "ABI facts" position, the fallback is hand-typing
 tables from documentation as calls are needed — slower but equally
 clean; see CLARIFYING QUESTIONS.
 
+**3.1-compatibility note (added 2026-08-18, after the sourcing decision
+above but relevant to it):** AROS's SFDs track AROS's own evolving API,
+which is a superset of — and in places diverges past — genuine
+Kickstart/Workbench 3.1 (V40). Now that Simon has set KS/WB 3.1 as the
+first-stage compatibility target, LVO/register facts pulled from AROS
+should be treated as *candidates* to cross-check against 3.1-era
+documentation (NDK 3.1 Autodocs, RKRM) where a call's signature might
+have changed since V40 — not assumed correct as-is. This doesn't change
+the sourcing decision (still AROS SFDs, still facts-only), just adds a
+verification step worth doing before trusting a generated table entry
+for a call known to have shifted post-3.1.
+
 ## C. Phase 2 — dos.library file I/O + volumes/assigns: task breakdown
 
 Scope: dos.library file I/O (`Open`/`Read`/`Write`/`Seek`/`Close`,
@@ -403,7 +415,13 @@ runtime, (2) vamos, (3) Copperline `--run` with a real Kickstart, and
 diffing normalised output. Fixture parity via AmiBake's
 one-build-many-formats output (same tree as host directory for the HLE
 pair, as HDF for the real-ROM column). Normalisations already agreed:
-pin one Kickstart version as baseline, capture the Amiga return code,
+pin one Kickstart version as baseline — **Simon has set the target
+compatibility level for the first stage: Kickstart/Workbench 3.1**
+(2026-08-18), so the Phase 4 oracle baseline is KS 3.1, not a later
+ROM revision. This also bounds which OS features are in-scope earlier
+than Phase 4 would otherwise force a decision on (e.g. it argues
+against depending on post-3.1 dos.library/exec.library additions
+without a compatibility note). capture the Amiga return code,
 freeze/fix virtual time so DateStamps compare equal (T11's fixed
 DateStamp anticipates this), align stack sizes across runners. CI:
 HLE pair (volamos vs vamos) runs on both ubuntu and macos hosted
