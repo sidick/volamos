@@ -49,11 +49,16 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 
 /// Size in bytes of the reserved trap table region.
 ///
-/// 4 KiB is far more than any single classic AmigaOS library needs (even
-/// `exec.library`'s jump table is under 1 KiB), leaving headroom for
-/// several libraries' worth of fake vectors before guest code/data must
-/// start.
-pub const TRAP_TABLE_SIZE: u32 = 0x1000;
+/// 4.5 KiB is far more than any single classic AmigaOS library's jump
+/// table needs (even `exec.library`'s is under 1 KiB), leaving headroom
+/// for several libraries' worth of fake vectors before guest code/data
+/// must start -- plus, above [`crate::dispatch::EXEC_LIBRARY_BASE`],
+/// enough positive-offset room for a real (if partial) `struct ExecBase`
+/// including its `LibList` at the real NDK-documented offset (378), see
+/// [`crate::dispatch::EXEC_BASE_LIBLIST_OFFSET`]'s docs. Grown from the
+/// original `0x1000` specifically to fit that -- see
+/// `crate::dispatch::write_library_node`'s module-level context for why.
+pub const TRAP_TABLE_SIZE: u32 = 0x1200;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

@@ -842,31 +842,62 @@ A-line trap-dispatch end-to-end test, not just direct-call unit tests
 that in-process unit tests over parsing/formatting logic alone miss
 guest-memory-marshalling bugs a real dispatch path catches).
 
-**Partial follow-up, same day**: `Runtime::new` now writes a real
-`struct Library` header (`lib_Node.ln_Type` = `NT_LIBRARY`,
-`lib_Version`/`lib_Revision` = 40/10, matching the documented KS/WB 3.1
-target) at `DOS_LIBRARY_BASE`/`EXEC_LIBRARY_BASE`/`UTILITY_LIBRARY_BASE`
-(`write_library_node` in `dispatch.rs`), fixing `Version`'s reported
-Kickstart *version* number (`40`, was `40960`/`0xA000`). The *revision*
-number is still wrong (`Kickstart 40.40960`) -- traced (by hand-
-disassembling the guest code around the `RawDoFmt` call site, since no
-disassembler is wired into this runtime yet) to `Version` walking
-`SysBase`'s real `LibList` (a `FindName`-style linked-list search using
-`Stricmp`) to look up the `exec.library` node by name and read
-`lib_Version`/`lib_Revision` off *that* node, rather than reading the
-header fields directly off the pointer at `AbsExecBase`. This runtime's
-fake `ExecBase` has no real `LibList` at all, so the search runs off
-into unpopulated/sentinel-filled memory. Fixing this properly means
-giving `ExecBase` a real, guest-visible `LibList` (a `struct List`,
-built from the same List/Node primitives `execlist.rs` already
-implements) with real nodes for `dos.library`/`exec.library`/
-`utility.library` -- a distinct, moderately-sized follow-up (benefits
-any future corpus binary that walks library lists, not just `Version`),
-deliberately not attempted in this same pass. `Version`'s "Workbench"
-line separately reports `0.0` for a similar reason (a list search that
-finds nothing) -- plausibly still correct/expected behavior for a bare
-CLI run with no real Workbench environment loaded, not necessarily a
-bug, but worth re-checking once `LibList` exists for real.
+**Follow-up, same day — fully resolved**: `Version` now prints
+`Kickstart 40.10, Workbench 40.10`, matching the documented KS/WB 3.1
+target, via four incremental fixes to `Runtime::new` (all in
+`dispatch.rs`), each found by hand-disassembling the guest code around
+the relevant call site (no disassembler is wired into this runtime
+yet -- see the new `project-snoopdos-feature-idea` follow-up this
+prompted, below):
+
+1. `write_library_node` writes a real `struct Library` header
+   (`lib_Node.ln_Type` = `NT_LIBRARY`, `lib_Version`/`lib_Revision` =
+   40/10) at `DOS_LIBRARY_BASE`/`EXEC_LIBRARY_BASE`/
+   `UTILITY_LIBRARY_BASE`, instead of leaving that memory sentinel-
+   filled. Fixed the Kickstart *version* number alone (`40`, was
+   `40960`/`0xA000`).
+2. `TRAP_TABLE_SIZE` grew from `0x1000` to `0x1200` and
+   `write_library_list_nodes` builds a real, walkable
+   `ExecBase.LibList` (a real `struct List`, at the true NDK-documented
+   offset 378 from `EXEC_LIBRARY_BASE` -- `EXEC_BASE_LIBLIST_OFFSET`,
+   whose doc comment has the full field-by-field offset derivation)
+   linking real nodes for `dos.library`/`exec.library`/
+   `utility.library`, reusing `execlist.rs`'s own `List`/`Node`
+   primitives (`init_list_header`/`add_tail_impl`, the latter now
+   `pub(crate)`) rather than reimplementing list-splicing. Turned out
+   not to be what `Version`'s own Kickstart-line report needed (see
+   #4), but is real, generally useful `ExecBase` fidelity for any
+   *other* corpus binary that walks library lists (confirmed via the
+   disassembly that guest code doing exactly this exists and runs,
+   just for a different purpose than first assumed).
+3. `version.library` -- a real, if lesser-known, AmigaOS library
+   `Version` opens (confirmed by temporarily logging every
+   `OpenLibrary` call's requested name) purely to read its own
+   `lib_Version`/`lib_Revision` as a stand-in for "the OS release
+   version" -- is now a fourth real registered library base
+   (`VERSION_LIBRARY_BASE`), with the same header treatment as #1. No
+   LVOs registered for it since nothing was seen calling into it, only
+   reading its header. Fixed the `Workbench 40.10` line completely.
+4. The Kickstart *revision* number turned out to come from neither
+   `lib_Revision` nor a `LibList` search: `SoftVer`
+   (`EXEC_BASE_SOFTVER_OFFSET` = 34, right after `struct Library`),
+   documented in the NDK as "kickstart release number (obs.)" -- a
+   single legacy `UWORD`, not a version/revision pair -- is what
+   `Version` actually reads for its second Kickstart number. Confirmed
+   empirically by writing a distinguishing test value there. A useful
+   general lesson recorded alongside this: `EXEC_LIBRARY_BASE`'s entire
+   `struct ExecBase` span (`LIB_STRUCT_SIZE` through
+   `EXEC_BASE_LIBLIST_OFFSET`) is now explicitly zeroed before any of
+   the above overlays their own fields, so any *other* unpopulated
+   `ExecBase` field a future corpus binary reads gets a clean,
+   unsurprising `0` instead of the sentinel prefill's `0xA000` trap
+   opcode pattern.
+
+Also prompted a recorded feature idea (`project-snoopdos-feature-idea`
+memory): a `SnoopDos`-style CLI flag to log opened libraries/devices/
+files, since diagnosing this required repeatedly hand-adding and
+removing temporary `eprintln!`s in `open_library_handler`/`RawDoFmt`/
+`CopyMem` -- not attempted in this pass, just recorded for later.
 
 ## Phase 4 — parity pass (three-oracle harness)
 

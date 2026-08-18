@@ -165,8 +165,18 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     CloseLibrary sit at -552/-408/-414, all above
 ///                     that)
 /// 0x0F00             EXEC_LIBRARY_BASE
-/// 0x0F00 .. 0x0FFC   headroom
-/// 0x0FFC .. 0x1000   EXIT_STUB_ADDR (the last word of the region)
+/// 0x0F00 .. 0x107A   headroom (below the real struct ExecBase's LibList)
+/// 0x107A .. 0x1088   ExecBase.LibList (a real struct List -- see
+///                     EXEC_BASE_LIBLIST_OFFSET's docs -- at the real
+///                     NDK-documented offset 378 from EXEC_LIBRARY_BASE,
+///                     since real guest code, not just this runtime's
+///                     own handlers, walks it directly by that offset)
+/// 0x1088 .. 0x1190   headroom, and the three real libraries' ln_Name
+///                     strings ("dos.library"/"exec.library"/
+///                     "utility.library", pointed to by their LibList
+///                     nodes -- see write_library_list_nodes)
+/// 0x1190 .. 0x11FC   headroom
+/// 0x11FC .. 0x1200   EXIT_STUB_ADDR (the last word of the region)
 /// ```
 ///
 /// Every real (non-fake) library base and its currently-implemented
@@ -187,6 +197,20 @@ pub const EXEC_LIBRARY_BASE: u32 = 0x0F00;
 /// above it before `exec.library`'s lowest LVO -- collision-free against
 /// both neighbors as currently registered.
 pub const UTILITY_LIBRARY_BASE: u32 = 0x0C00;
+
+/// Fake `version.library` base address. `version.library` is a small
+/// real AmigaOS library some `C:` commands (the real `Version` command
+/// itself, confirmed empirically -- see `docs/plan.md`'s empirical-
+/// corpus notes) open purely to read its own `lib_Version`/
+/// `lib_Revision` as a stand-in for "the OS release version", decoupled
+/// from any individual component's own version. No LVOs are registered
+/// for it (nothing seen so far calls into it, only reads its header), so
+/// it only needs [`write_library_node`]'s header, not jump-table
+/// headroom -- placed in the otherwise-unused gap between
+/// [`ABS_EXEC_BASE_ADDR`] and `dos.library`'s lowest registered LVO
+/// (`0x02CC`, see [`EXEC_LIBRARY_BASE`]'s doc), nowhere near any jump
+/// table.
+pub const VERSION_LIBRARY_BASE: u32 = 0x0200;
 
 /// Guest address holding the running "system's" `ExecBase` pointer --
 /// `AbsExecBase`, read by real AmigaOS startup code via `move.l 4,a6`
@@ -228,10 +252,12 @@ const LIBRARY_REVISION: u16 = 10;
 /// `struct Library` header that a guest reading those fields directly
 /// (rather than through a documented call this runtime intercepts, e.g.
 /// the real `Version` command reading `SysBase->LibNode.lib_Version`)
-/// gets a real-looking answer. Every other field (the `Node` link
-/// pointers, `lib_Flags`, `lib_IdString`, `lib_Sum`, `lib_OpenCnt`) stays
-/// zeroed -- this runtime doesn't maintain a real library list, checksum,
-/// or open count, so there's nothing meaningful to put there.
+/// gets a real-looking answer. Every other field (`lib_Flags`,
+/// `lib_IdString`, `lib_Sum`, `lib_OpenCnt`) stays zeroed -- this runtime
+/// doesn't maintain a real checksum or open count, so there's nothing
+/// meaningful to put there. The `Node` link pointers (`ln_Succ`/
+/// `ln_Pred`) are filled in separately, by [`write_library_list_nodes`],
+/// once this base has actually been linked onto `ExecBase.LibList`.
 fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
     for i in 0..LIB_STRUCT_SIZE {
         mem.write_u8(base.wrapping_add(i), 0);
@@ -239,6 +265,78 @@ fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
     mem.write_u8(base.wrapping_add(LIB_NODE_TYPE_OFFSET), NT_LIBRARY);
     mem.write_u16(base.wrapping_add(LIB_VERSION_OFFSET), LIBRARY_VERSION);
     mem.write_u16(base.wrapping_add(LIB_REVISION_OFFSET), LIBRARY_REVISION);
+}
+
+/// Byte offset of `ExecBase.LibList` from [`EXEC_LIBRARY_BASE`] (real
+/// NDK `exec/execbase.h` struct layout -- computed field-by-field since
+/// there's no way to derive it from the autodocs alone):
+/// `LibNode` ([`LIB_STRUCT_SIZE`], 34) + `SoftVer`/`LowMemChkSum` (2
+/// each, 4) + `ChkBase` (4) + `ColdCapture`/`CoolCapture`/`WarmCapture`
+/// (4 each, 12) + `SysStkUpper`/`SysStkLower` (4 each, 8) + `MaxLocMem`
+/// (4) + `DebugEntry`/`DebugData`/`AlertData`/`MaxExtMem` (4 each, 16) +
+/// `ChkSum` (2) + `IntVects[16]` (`struct IntVector` is 3 pointers = 12
+/// bytes each, 192) + `ThisTask` (4) + `IdleCount`/`DispCount` (4 each,
+/// 8) + `Quantum`/`Elapsed`/`SysFlags` (2 each, 6) + `IDNestCnt`/
+/// `TDNestCnt` (1 each, 2) + `AttnFlags`/`AttnResched` (2 each, 4) +
+/// `ResModules`/`TaskTrapCode`/`TaskExceptCode`/`TaskExitCode` (4 each,
+/// 16) + `TaskSigAlloc` (4) + `TaskTrapAlloc` (2) + `MemList`/
+/// `ResourceList`/`DeviceList`/`IntrList` ([`crate::execlist::LIST_SIZE`],
+/// 14 each, 56) = 378. Real guest code (not just this runtime's own
+/// handlers) can walk `SysBase->LibList` directly at this offset, so a
+/// real, walkable list belongs here rather than just a populated
+/// header -- confirmed needed by hand-disassembling guest code around a
+/// library-list search during the `Version` investigation (see
+/// `docs/plan.md`'s empirical-corpus notes), though `Version`'s own
+/// Kickstart-version report turned out to come from a simpler, more
+/// direct source ([`EXEC_BASE_SOFTVER_OFFSET`]) rather than this list.
+const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
+
+/// Byte offset of `ExecBase.SoftVer` from [`EXEC_LIBRARY_BASE`]: right
+/// after `LibNode` ([`LIB_STRUCT_SIZE`], 34). Documented in NDK
+/// `exec/execbase.h` as "kickstart release number (obs.)" -- a single
+/// legacy `UWORD`, not a version/revision pair. Confirmed empirically
+/// (2026-08-18, see `docs/plan.md`'s empirical-corpus notes) that the
+/// real `Version` command reads `lib_Version` for the first number of
+/// its "Kickstart X.Y" report but *this* field, not `lib_Revision`, for
+/// the second -- an real-world quirk worth remembering if any other
+/// corpus binary reports an unexpected "revision"-looking number.
+const EXEC_BASE_SOFTVER_OFFSET: u32 = 34;
+
+/// Byte length of each library's `ln_Name` string, including its `NUL`
+/// terminator, as laid out by [`write_library_list_nodes`] in the
+/// headroom above `ExecBase.LibList` -- see the "Reserved-region memory
+/// map" doc on [`EXEC_LIBRARY_BASE`].
+const LIBRARY_NAME_AREA_SIZE: u32 = 64;
+
+/// Builds a real, walkable `ExecBase.LibList` (see
+/// [`EXEC_BASE_LIBLIST_OFFSET`]'s docs for why a real list, not just
+/// populated headers, is needed) linking the three real library bases
+/// ([`DOS_LIBRARY_BASE`]/[`EXEC_LIBRARY_BASE`]/[`UTILITY_LIBRARY_BASE`])
+/// on by name, using [`crate::execlist`]'s own `List`/`Node` primitives
+/// and offset constants (the exact same linked-list shape `AddTail`/
+/// `FindName` handlers work with, so nothing about this list is special-
+/// cased). Each base's embedded `struct Node` (the first 14 bytes of the
+/// `struct Library` [`write_library_node`] already wrote) becomes a real
+/// list node: `ln_Name` is pointed at a `NUL`-terminated name string
+/// written into the headroom just above the list itself, at
+/// `EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET + LIST_SIZE + n *
+/// LIBRARY_NAME_AREA_SIZE`.
+fn write_library_list_nodes(mem: &mut dyn AddressSpace) {
+    let list_addr = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
+    crate::execlist::init_list_header(mem, list_addr);
+
+    let names_start = list_addr + crate::execlist::LIST_SIZE;
+    let libraries: [(u32, &str); 3] = [
+        (DOS_LIBRARY_BASE, "dos.library"),
+        (EXEC_LIBRARY_BASE, "exec.library"),
+        (UTILITY_LIBRARY_BASE, "utility.library"),
+    ];
+    for (i, (base, name)) in libraries.into_iter().enumerate() {
+        let name_addr = names_start + (i as u32) * LIBRARY_NAME_AREA_SIZE;
+        crate::guestmem::write_c_string(mem, name_addr, name.as_bytes());
+        mem.write_u32(base + crate::execlist::LN_NAME, name_addr);
+        crate::execlist::add_tail_impl(mem, list_addr, base);
+    }
 }
 
 /// What a host-side library call handler is given to do its work: mutable
@@ -1121,19 +1219,45 @@ impl<C: Cpu + 'static> Runtime<C> {
         mem.write_u32(ABS_EXEC_BASE_ADDR, EXEC_LIBRARY_BASE);
 
         // struct Library headers (see write_library_node's doc) for the
-        // three real library bases -- a guest that reads
+        // four real library bases -- a guest that reads
         // lib_Version/lib_Revision directly (as e.g. the real Version
-        // command does to report Kickstart/Workbench numbers) gets a
-        // real-looking answer instead of whatever the sentinel prefill
-        // above left there.
+        // command does to report Kickstart/Workbench numbers, off
+        // version.library rather than exec.library -- see
+        // VERSION_LIBRARY_BASE's doc) gets a real-looking answer instead
+        // of whatever the sentinel prefill above left there.
         write_library_node(&mut mem, DOS_LIBRARY_BASE);
         write_library_node(&mut mem, EXEC_LIBRARY_BASE);
         write_library_node(&mut mem, UTILITY_LIBRARY_BASE);
+        write_library_node(&mut mem, VERSION_LIBRARY_BASE);
+
+        // Real struct ExecBase (NDK exec/execbase.h) extends well past
+        // struct Library -- SoftVer, ChkBase, the Capture vectors,
+        // MemList/ResourceList/DeviceList/IntrList, etc. -- all the way
+        // out to LibList at EXEC_BASE_LIBLIST_OFFSET. This runtime
+        // doesn't populate most of those with real values, but real
+        // guest code (real Version included -- see the module-level
+        // empirical-corpus notes in docs/plan.md) can and does read
+        // them. Zero the whole span so an unpopulated field reads as a
+        // clean, unsurprising `0` rather than the sentinel prefill's
+        // `0xA000` trap opcode pattern -- EXEC_BASE_SOFTVER_OFFSET below
+        // and write_library_list_nodes' LibList both then overwrite
+        // their own portion of this same span with real data.
+        for addr in
+            (EXEC_LIBRARY_BASE + LIB_STRUCT_SIZE)..(EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET)
+        {
+            mem.write_u8(addr, 0);
+        }
+        mem.write_u16(
+            EXEC_LIBRARY_BASE + EXEC_BASE_SOFTVER_OFFSET,
+            LIBRARY_REVISION,
+        );
+        write_library_list_nodes(&mut mem);
 
         let mut registry = LibraryRegistry::new();
         registry.register_real("dos.library", DOS_LIBRARY_BASE);
         registry.register_real("exec.library", EXEC_LIBRARY_BASE);
         registry.register_real("utility.library", UTILITY_LIBRARY_BASE);
+        registry.register_real("version.library", VERSION_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using

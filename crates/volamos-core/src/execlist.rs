@@ -225,7 +225,7 @@ pub const MSGPORT_SIGBIT_PLACEHOLDER: u8 = 0;
 /// sentinel setup: there is no `NewList` LVO to register a handler for
 /// (it's an `amiga.lib` macro, not a real library call), so this is the
 /// only place the logic lives.
-pub fn init_list_header<M: AddressSpace>(mem: &mut M, list: u32) {
+pub fn init_list_header<M: AddressSpace + ?Sized>(mem: &mut M, list: u32) {
     mem.write_u32(list + LH_HEAD, list + LH_TAIL);
     mem.write_u32(list + LH_TAIL, 0);
     mem.write_u32(list + LH_TAILPRED, list + LH_HEAD);
@@ -243,7 +243,10 @@ fn add_head_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32) {
 }
 
 /// `AddTail` (LVO -246): links `node` in as the new last node of `list`.
-fn add_tail_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32) {
+/// `pub(crate)` so [`crate::dispatch::write_library_list_nodes`] can
+/// build `ExecBase.LibList` out of the same primitive the real `AddTail`
+/// handler uses, rather than duplicating the link-list splicing logic.
+pub(crate) fn add_tail_impl<M: AddressSpace + ?Sized>(mem: &mut M, list: u32, node: u32) {
     let pred = mem.read_u32(list + LH_TAILPRED);
     mem.write_u32(node + LN_SUCC, list + LH_TAIL);
     mem.write_u32(node + LN_PRED, pred);
