@@ -298,6 +298,32 @@ pub struct DosState {
     /// `crate::dosseg::DosState::system`/`execute`) rather than panicking
     /// or silently no-oping.
     pub system_runner: Option<crate::dosseg::SystemRunner>,
+
+    // --- ReadArgs/FreeArgs state. Methods and handlers live in
+    // `crate::dosargs` (same "extensions live here, handler code lives in
+    // the sibling module" convention as the T11/Phase-3-stage-7 fields
+    // above), but the fields themselves are declared here per that same
+    // convention.
+    /// Guest address of the process's command-line buffer (the `A0`/`D0`
+    /// buffer [`crate::dispatch::Runtime::new`] builds from
+    /// [`crate::dispatch::StartConfig::args`]) and its length in bytes
+    /// (including the trailing `'\n'`). This is `ReadArgs`'s default
+    /// input source (`rdargs == NULL`), mirroring how real AmigaOS
+    /// delivers the CLI command tail through the process's buffered
+    /// `Input()` -- see `crate::dosargs`'s module docs.
+    pub(crate) cmdline: Option<(u32, u32)>,
+    /// Byte offset into `cmdline` that the next default-source `ReadArgs`
+    /// call resumes from -- real `ReadArgs(NULL)` reads from a shared,
+    /// stateful input stream, so repeated calls in one process walk
+    /// forward through the same buffer rather than each re-parsing it
+    /// from the start.
+    pub(crate) cmdline_pos: u32,
+    /// Live `ReadArgs` results, keyed by the `struct RDArgs*` anchor
+    /// address returned in `D0` (see `crate::dosargs::RDARGS_STRUCT_SIZE`).
+    /// `FreeArgs` looks up and frees every heap block an entry lists, plus
+    /// (only when [`crate::dosargs::RdArgsEntry::owns_anchor`]) the anchor
+    /// block itself.
+    pub(crate) rdargs: HashMap<u32, crate::dosargs::RdArgsEntry>,
 }
 
 impl DosState {
@@ -318,6 +344,9 @@ impl DosState {
             next_lock_id: 0,
             seglists: HashMap::new(),
             system_runner: None,
+            cmdline: None,
+            cmdline_pos: 0,
+            rdargs: HashMap::new(),
         }
     }
 

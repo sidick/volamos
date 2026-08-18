@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cpu;
 pub mod dispatch;
+pub mod dosargs;
 pub mod dosfile;
 pub mod doslock;
 pub mod dosseg;
@@ -32,6 +33,10 @@ pub use dispatch::{
     EXIT_STUB_ADDR, HandlerContext, LVO_PUTSTR, LibraryHandler, LibraryKind, LibraryRegistry,
     LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, StartConfig, TraceEvent,
     UTILITY_LIBRARY_BASE,
+};
+pub use dosargs::{
+    ERROR_BAD_NUMBER, ERROR_BAD_TEMPLATE, ERROR_KEY_NEEDS_ARG, ERROR_REQUIRED_ARG_MISSING,
+    ERROR_TOO_MANY_ARGS, ERROR_UNMATCHED_QUOTES, RdArgsEntry,
 };
 pub use dosfile::{
     DosState, ERROR_ACTION_NOT_KNOWN, ERROR_DIR_NOT_FOUND, ERROR_DISK_WRITE_PROTECTED,

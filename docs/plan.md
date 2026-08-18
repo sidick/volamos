@@ -747,12 +747,30 @@ above. Stage commits:
   exists to make real delivery observable rather than racy — rationale
   documented in `phase3_e2e.rs`).
 
+**`ReadArgs`/`FreeArgs` — implemented 2026-08-18** (`crates/volamos-core/
+src/dosargs.rs`), ahead of Phase 4 rather than left deferred: the
+empirical-corpus decision above flagged it as one of the few named gaps
+since every real `C:` command template-parses its arguments this way.
+Full template syntax (`/A/K/S/T/N/M/F`, dual keyword names, the
+documented `/M`+trailing-`/A` tail-borrowing rule from `Copy`'s
+`FROM/A/M,TO/A`), a from-scratch `ReadItem`-equivalent tokenizer
+(quoting, the `*"`/`*n`/`*e`/`**` escapes), and all six `ReadArgs`-
+specific `IoErr()` codes (114–119). Default source only (`rdargs ==
+NULL`, reading the same `A0`/`D0` command-line buffer `Runtime::new`
+already builds); a caller-supplied `RDArgs` with its own `RDA_Source`
+is accepted only as a `FreeArgs`-bookkeeping identity, not as an
+alternate string to parse — no real `C:` command needs that. `/T`
+(toggle) follows the NDK autodoc's simpler "flips on each occurrence"
+behavior over an older RKRM passage describing an explicit `On`/`Off`
+value, since no known real template uses `/T` either way. 14 tests
+(13 direct-call unit tests over the parsing/materialization logic, one
+real A-line trap-dispatch end-to-end test for the register convention).
+
 Known deviations/deferrals, all documented in-module: no
 `MemHeader`/`MemChunk` guest structures (flat allocator, per plan); no
 public message-port registry (`FindPort` → NULL); signal exceptions
 (`SetExcept`) tracked but never delivered; stack/host-break checks
-happen at library-call granularity only; `ReadArgs` still deferred (real
-startup code parses `A0`/`D0` itself); `NewStackSwap` and
+happen at library-call granularity only; `NewStackSwap` and
 `System()` I/O-redirection tags unimplemented pending corpus need.
 The `since`-version field proposed above remains future work — Phase 3
 picked its calls from the plan's own scope list rather than needing a
@@ -858,9 +876,10 @@ console tools only.
    etc.) — pure `dos.library`/`exec.library`/`utility.library`
    consumers with no GUI/custom-chip surface at all, ~70 small,
    independently-testable binaries giving broad `dos.library` coverage
-   (including `ReadArgs`, currently one of the few named gaps — every
-   `C:` command uses the standard `ReadArgs` template convention),
-   already the kind of corpus vamos itself is validated against
+   (including `ReadArgs`, implemented 2026-08-18 — see Phase 3's entry
+   — since every `C:` command uses the standard `ReadArgs` template
+   convention), already the kind of corpus vamos itself is validated
+   against
    ("general file utilities" in the original proposal). Preferred over
    a68k/vbcc as the *first* corpus: smaller, more numerous, and lower
    risk of hitting an unimplemented call deep into a multi-pass build.

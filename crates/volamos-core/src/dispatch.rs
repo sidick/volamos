@@ -967,6 +967,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         // other dos.library registrations above.
         crate::dosseg::register_dosseg_handlers(&mut table, &mut mem);
 
+        // dos.library ReadArgs/FreeArgs (the standard template-based
+        // argument parser every real Workbench/`C:` command uses) -- see
+        // crate::dosargs's module docs. Same by-name registration
+        // posture as the other dos.library registrations above; unlike
+        // them this one does need Runtime::new's own state (the command-
+        // line buffer, set on `dos` just below), not a Vfs.
+        crate::dosargs::register_dosargs_handlers(&mut table, &mut mem);
+
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
         // for the full reserved-region memory map. Looked up by name
@@ -1100,13 +1108,20 @@ impl<C: Cpu + 'static> Runtime<C> {
         cpu.set_data_register(DataRegister(0), line_len);
         cpu.set_pc(config.entry);
 
+        // ReadArgs's default source (rdargs == NULL): the same
+        // command-line buffer just built above, per crate::dosargs's
+        // module docs. Registers hold this too, but a guest program is
+        // free to clobber A0/D0 before ever calling ReadArgs.
+        let mut dos = DosState::new(None);
+        dos.cmdline = Some((args_addr, line_len));
+
         Self {
             cpu,
             mem,
             table,
             heap,
             registry,
-            dos: DosState::new(None),
+            dos,
             task,
         }
     }
