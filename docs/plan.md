@@ -303,6 +303,64 @@ inputs land (T12 is the only one that edits `Runtime::new` and
 T12 first within the second wave); T13/T14 are small, sequential
 finishers.
 
+## Phase 2 as built — verification notes (2026-08-18)
+
+Phase 2 is complete, committed, and pushed, one commit per stage
+(T7+T9 60184dd, T8 8d60f5a, T12 9ecfc69, T10 0c56974, T11 e792870,
+T13 54a8542, T14 7d9c0c2). All of `cargo build`, `cargo test
+--workspace` (124 core unit tests + 23 CLI unit tests + 15
+integration tests), `cargo fmt --all --check`, and `cargo clippy
+--all-targets -- -D warnings` are clean; still zero dependencies
+beyond `m68k = "=0.10.14"`. Where the implementation diverged from
+the T7-T14 text above, the code is authoritative:
+
+- **T7 source substitution**: AROS does not check in a generated
+  `dos_lib.sfd`; `tools/gen_lvos.py` reads the equivalent facts from
+  `rom/dos/dos.conf` (and `rom/exec/exec.conf` for T12) at commit
+  `d649ad4cd366bdcfe226ad70d5720c192cfe4653` instead — same
+  name/bias/register facts, same facts-only extraction, provenance
+  headers in the generated `lvos/dos.rs` (162 entries) and
+  `lvos/exec.rs`. All spot-checked LVOs matched published values.
+- **Module layout added**: `lvos/` (`LvoEntry`, `ArgReg`, generated
+  tables), `guestmem.rs` (`GuestHeap`, 64 KiB stack top region,
+  c-string/BPTR/BSTR helpers), `vfs.rs` (pure host-side volumes/
+  assigns/auto-assign/cwd, `resolve_with_amiga_path`), `dosfile.rs`
+  (`DosState`, file handles, IoErr, error-code mapping), `doslock.rs`
+  (locks, Examine/ExNext, CurrentDir/ParentDir).
+- **T12**: `Runtime::new(cpu, mem, StartConfig { entry, load_end,
+  args })`; heap runs from `load_end` to the stack base; guest args
+  are passed AmigaOS-style (space-joined, `\n`-terminated heap
+  buffer, `A0`/`D0`). `EXEC_LIBRARY_BASE = 0x0F00`, AbsExecBase
+  written at guest address 4; OpenLibrary/OldOpenLibrary/CloseLibrary
+  registered from the generated exec table. The vamos escape hatch is
+  ported: OpenLibrary of an unknown name auto-creates a fake base
+  (4 KiB heap-carved jump-table block prefilled with a shared
+  fake-vector slot) that fails with a named diagnostic only when a
+  vector is actually called; `LibraryRegistry` is shaped for Phase
+  3's real-library passthrough. **Deviation**: `A6` is still seeded
+  with `DOS_LIBRARY_BASE` as a documented compatibility shim for the
+  Phase 1 `hello` fixture — the real location-4 + OpenLibrary flow is
+  fully functional (the three T14 fixtures use it) and the seed can
+  be dropped once `hello` is retired or rebuilt.
+- **T11 DateStamp**: fixed all-zero `ds_Days/ds_Minute/ds_Tick`, as
+  planned, pending Phase 4's frozen virtual time. ExNext listings are
+  byte-sorted for deterministic parity runs.
+- **T13**: `-V/--volume`, `-a/--assign` (multi-target with `+`),
+  `--cwd`, `--auto-assign`; a Vfs is only installed when at least one
+  such flag is given. `--cwd` defaults to the first volume's root,
+  else the first assign's root, else `root:`.
+- **T14**: fixtures `filetest`/`dirtest`/`echoargs` in the dual
+  `.s` + `gen_*.py` style, sharing `fixtures/amiga_asm.py` (a small
+  two-pass assembler helper the generators use; vasm still not
+  required). 8 end-to-end tests drive the CLI binary across volume
+  mapping, NEWFILE round trip, IoErr failure paths, multi-assign
+  order, case-insensitive lookup, and args round trip. No
+  volamos-core bugs surfaced while writing them.
+- **ReadArgs**: stretch goal not taken; deferred to Phase 3 as
+  recorded in the clarifying questions. `Open("CONSOLE:")`/`Open("*")`
+  are likewise not yet special-cased; `Input()`/`Output()` defaults
+  cover the current corpus.
+
 ## Phase 3 — exec.library essentials + utility.library
 
 Scope: real `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem` over a
