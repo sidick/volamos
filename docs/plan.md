@@ -22,6 +22,25 @@ the details that ended up differing.
   it. Not a CI-time build dependency.
 - **Rust edition**: current stable edition (2021, or 2024 if toolchain
   support is confirmed unproblematic) — not a hard blocker either way.
+- **CPU speed: fastest possible, no throttling** (decided 2026-08-18).
+  `Runtime::run` steps the CPU as fast as the host allows; there is no
+  cycle-timing/pacing code anywhere in the runtime (the `m68k` crate
+  does carry per-instruction cycle-count tables internally, ported from
+  Musashi for its own correctness/JIT purposes, but volamos doesn't use
+  them for wall-clock throttling). This is deliberate, not an oversight
+  — it matches the project's core value proposition ("same as vamos,
+  but faster"), and unlike a full-system emulator there's no hardware
+  (CIA timers, Copper, audio) that emulated time needs to stay in sync
+  with. Known edge case, not a blocker: software with a busy-wait delay
+  loop calibrated to real 68000 speed (7.09/7.16 MHz) will see that
+  loop finish near-instantly rather than after a real delay — harmless
+  for the CLI-tool target audience (compilers/assemblers/linkers), but
+  worth remembering if a corpus binary ever behaves oddly around
+  timing. If that happens, the fix is a **per-invocation, opt-in** knob
+  (e.g. a `--speed`/cycles-per-second CLI flag using the crate's
+  existing cycle-count data to pace execution for just that run) —
+  not a global default, since fastest-possible should stay the
+  default for everything else.
 
 ## A. Repo setup
 
