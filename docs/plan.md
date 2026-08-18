@@ -144,25 +144,183 @@ assignments. Three candidate sources were on the table; the repo is
   was wrong), and its bundled `.fd` files are the Commodore-supplied
   NDK ones anyway. Deriving our tables from them would GPL-encumber an
   MIT/Apache codebase and inherit the NDK provenance. **Rejected.**
-- **AROS SFD files** — the independently maintained clean-room
-  descriptions, under the AROS Public License (MPL-1.1-derived,
-  file-level). **Chosen as the reference source**, with one important
-  qualifier: we do **not** vendor the SFD files into this repo. A
-  one-shot codegen tool (T7 below) reads them and emits our own Rust
-  tables containing *only ABI facts* — function name, LVO offset,
-  register list — with a provenance comment. Names, offsets, and
-  register assignments are uncopyrightable interface facts (the same
-  position every reimplementation project, AROS included, rests on);
-  no descriptive text, comments, or file structure is copied. The
+- **AROS's `.conf` interface descriptions** — AROS's build generates
+  `.sfd`/`.fd` files for its ROM libraries *from* a `.conf` source file
+  per library (e.g. `rom/dos/dos.conf`); AROS does not check in core
+  `.sfd` files at all (a GitHub code search found only 15 `.sfd` files
+  in the whole tree, all in third-party/contrib components — SFD is an
+  NDK-3.9-lineage format AROS barely uses). **Chosen as the reference
+  source**: the `.conf` file's `##begin functionlist` block is the same
+  facts an SFD would encode, under the AROS Public License (an
+  MPL-1.1-derived, file-level copyleft license), with one important
+  qualifier: we do **not** vendor the `.conf` file into this repo. A
+  one-shot codegen tool (`tools/gen_lvos.py`, T7 below) reads it and
+  emits our own Rust tables containing *only ABI facts* — function
+  name, LVO offset, register list — with a provenance comment. No
+  descriptive text, comments, or file structure is copied. The
   generated `.rs` files are checked in (codegen is not a build-time
-  dependency), so contributors and CI never need the SFDs.
+  dependency), so contributors and CI never need AROS's source at all.
+  (Earlier drafts of this document called this source "AROS SFD
+  files" — corrected 2026-08-18 after a licensing due-diligence pass;
+  see below.)
 
-Recorded rationale: it is the only one of the three sources that is
-both licence-compatible in spirit and clean of NDK provenance, and the
-facts-only extraction keeps the MIT/Apache grant honest. If the human
-disagrees with the "ABI facts" position, the fallback is hand-typing
-tables from documentation as calls are needed — slower but equally
-clean; see CLARIFYING QUESTIONS.
+**Rationale (revised 2026-08-18 after a dedicated due-diligence
+pass — see the "Licensing due diligence" subsection below for the full
+report).** The original framing was "AROS's license is what makes this
+safe." That was imprecise and has been corrected: AROS's `.conf` data
+is not independently clean-room-verified against Commodore's ABI — it's
+*deliberately identical* to it, because binary compatibility with real
+Amiga software requires it. So AROS's permissive license doesn't, by
+itself, "launder" the content; if the underlying facts were protectable
+expression, AROS's own copy would have the same problem, license or
+not. **The actual safety net is that bare ABI facts — a function name,
+a signed offset, a short list of register letters — are themselves
+very likely uncopyrightable** under both US law (17 U.S.C. §102(b);
+*Feist Publications v. Rural Telephone*, 499 U.S. 340 (1991); *Lotus
+Development v. Borland*, 49 F.3d 807 (1st Cir. 1995); the merger
+doctrine, since there is only one way to express "Open is at LVO -30
+taking D1, D2") and EU/UK law (*SAS Institute v. World Programming*,
+CJEU C-406/10 (2012): "neither the functionality of a computer program
+nor the programming language and the format of data files … constitute
+a form of expression" protected by the Software Directive). Note for
+the record: *Google v. Oracle*, 593 U.S. 1 (2021) is sometimes cited as
+holding APIs uncopyrightable — it did not; the Court assumed
+copyrightability arguendo and decided the case on **fair use**, for a
+much larger taking (11,500 lines of declaring code) than anything at
+stake here. Given that theory, AROS remains the right *source* to use
+it against: if the "just facts" position were ever challenged, AROS is
+an open, non-litigious counterparty whose worst case is APL compliance
+obligations, which is a categorically safer position than the
+alternative of extracting from Hyperion/Cloanto's proprietary,
+no-stated-license NDK files (see the due-diligence subsection). If the
+human disagrees with the "ABI facts" position, the fallback is
+hand-typing tables from documentation as calls are needed — slower but
+equally clean; see CLARIFYING QUESTIONS.
+
+### Licensing due diligence (2026-08-18)
+
+A dedicated research pass (fable agent, WebSearch/WebFetch, plus direct
+inspection of a locally downloaded NDK 3.2 R4 archive from Aminet) was
+run specifically to stress-test this decision rather than rubber-stamp
+it. Summary of what it found and changed:
+
+- **Verified the actual generator output is facts-only.**
+  `tools/gen_lvos.py`'s emitted `.rs` tables were checked directly:
+  name/offset/register data only, no argument names, no C types, no
+  comments carried over from the source. Flagged risk to guard against:
+  the `.conf`/`.fd`/`.sfd` *source* formats do carry comments and typed
+  argument names, so a future careless edit to the generator could
+  start pulling in expression rather than facts — worth a standing
+  warning in the generator (added, see `tools/gen_lvos.py`'s docstring)
+  and in code review for any change to it.
+- **Examined the official NDK directly.** Downloaded and read NDK 3.2
+  R4 (Hyperion Entertainment's own Aminet upload). Finding: there is no
+  license at all — no `LICENSE` file, `ReadMe-NDK.txt` is a changelog
+  with no legal terms, and neither the `.fd` nor `.sfd` files carry a
+  copyright header. The C headers claim Hyperion copyright ("Developed
+  under license") but grant no reuse rights. This is *not* better than
+  "unknown" (as one open-source Amiga toolchain project's own README
+  candidly labels NDK 3.2's license) — it is copyright-default
+  all-rights-reserved, from a rightsholder lineage (Hyperion/Cloanto)
+  with a real history of Amiga IP litigation. **Conclusion: the NDK's
+  own files must never be used as a codegen source for committed
+  tables** — see `tools/ndk_verify.py` below for the one sanctioned use
+  of a local NDK copy.
+- **GPL tool taint check**: running a GPL-licensed conversion tool
+  (`fd2sfd`/`sfdc`) over NDK data doesn't change the NDK data's license
+  status in either direction — GPL only covers a tool's own code, not
+  transformed input data that doesn't embed pieces of the tool itself
+  (GNU GPL FAQ, "In what cases is the output of a GPL program covered
+  by the GPL?"). Moot for us anyway: `gen_lvos.py` needs no such tool.
+- **Ecosystem precedent**: amitools/vamos (GPLv2) ships Commodore/NDK
+  `.fd` files verbatim with no license grant found for them; the
+  AmigaPorts m68k-amigaos-gcc project's own README calls NDK 3.2
+  "unknown license" while distributing it anyway. The community norm is
+  "ship it and rely on rightsholder tolerance." An MIT/Apache project
+  should not adopt that norm; AROS's `.conf` files, under an open
+  license from a cooperative counterparty, remain the better source
+  even though the underlying facts are identical either way.
+
+**Verdict: proceed as-is (AROS `.conf` as the generated, committed
+source), reframed on uncopyrightability rather than AROS's license per
+se, with the official NDK held in reserve strictly as a local,
+never-vendored, never-committed verification oracle** — which is
+exactly what `tools/ndk_verify.py` (added 2026-08-18) does; see below.
+This is due-diligence research, not legal advice, and is US/EU-centric;
+Simon's specific distribution jurisdiction hasn't been analyzed.
+
+### `tools/ndk_verify.py` — NDK cross-check tool (not a codegen source)
+
+Simon asked directly: since the facts themselves are uncopyrightable,
+could a tool parse the *official* NDK `.fd`/`.sfd` files and keep only
+our own derived facts in the repo, the same way `gen_lvos.py` does for
+AROS? Mechanically yes — but the practical risk is asymmetric even
+under an identical legal theory (see the due-diligence subsection
+above): if the "just facts" position were ever challenged, AROS's
+worst case is an open-source project's license-compliance ask, while
+the NDK's worst case is a claim from a rightsholder with real
+litigation history and *no* stated license to fall back on at all. So
+the NDK is used for **verification only**, never as an input to any
+committed, generated file:
+
+- `tools/ndk_verify.py` takes `--ndk-fd <path>` (a local, personally
+  obtained copy of an official NDK `_lib.fd` file, kept **outside**
+  this repo — the tool refuses to run against a path inside the repo
+  tree as a defense-in-depth check) and `--our-table <path>` (one of
+  our committed `lvos/*.rs` files), parses both for the same bare
+  facts, and prints a diff: agreements, real disagreements (offset or
+  register mismatches — these are the ones worth investigating),
+  NDK-only entries (not yet implemented, informational), and
+  our-table-only entries (worth understanding — could be a genuine
+  AROS extension beyond the real ABI, exactly the KS/WB 3.1-drift risk
+  this document already flagged).
+- **First real run, against NDK 3.2 R4's `dos_lib.fd`/`exec_lib.fd`**:
+  `dos.library` — 154 of 162 committed entries overlap with the NDK
+  file and **all 154 agree exactly** (offset and registers) — zero
+  disagreements. The 8 entries in our table but not in NDK's file are
+  AROS's own private-slot names (`OpenLib`/`CloseLib`/etc. — NDK names
+  the *same* slots `dosPrivate1..7`, a naming difference, not a
+  functional one) plus a few real AROS-only additions
+  (`AssignAddToList`, `DisplayError`, `DosGetString`, `ScanVars`,
+  `GetSegListInfo`, `CliInit`) to note as out-of-scope-for-3.1
+  candidates if the exec/dos handler implementation ever reaches them.
+  `exec.library` — 115 of 153 entries overlap and **all 115 agree**;
+  38 of our table's entries (mostly `AVL_*` tree helpers and other
+  AROS-internal additions) are confirmed **not** present in the real
+  NDK 3.2 API at all — concrete evidence of the AROS-drift risk this
+  document already anticipated, and a concrete list to exclude/flag
+  when Phase 3 picks which exec.library calls to implement.
+- **Bonus finding, not yet acted on**: a handful of NDK `.fd` comments
+  record a minimum version in recognizable short phrasings (e.g. "added
+  for V39 dos", "unimplemented until dos 36.147") — `ndk_verify.py`
+  extracts just the version token from these (never the full sentence)
+  and reports them as candidates for a future `since`-version field
+  (see the next subsection). This is the seed of a fix for the
+  "where does AROS end and 3.1 begin, and where will 3.2+ begin later"
+  concern Simon raised — see below.
+- Not wired into CI and not a build dependency — it's a manual,
+  local, dev-time cross-check, run by hand when there's an official
+  NDK copy available to check against.
+
+### Future work: a `since`-version field (not yet implemented)
+
+Simon's concern, restated: an AROS-derived table entry currently has
+provenance (*which AROS source it came from*) but no statement of
+*which real AmigaOS version it's actually valid for* — which matters
+now for staying within the KS/WB 3.1 target, and will matter again
+when the project later moves to targeting 3.2+. Proposed fix, not yet
+built: add a `since: <version>` field to `LvoEntry`, populated from the
+NDK Autodocs' own "available since Vxx" statements (a historical fact
+with even less claim to expression than an offset+register list) —
+cross-referenced via a tool in the same spirit as `ndk_verify.py`, but
+note Autodocs are prose-heavy in a way `.fd` files are not, so that
+tool needs the same "extract only the version token, never the
+surrounding text" discipline applied even more carefully. Once
+present, targeting a given OS version becomes a mechanical filter
+(`since <= V40` for 3.1, `since <= V45` for 3.2) rather than a fresh
+audit each time the target changes. Deferred rather than built now —
+scope it when Phase 3 needs to start making since-version-gated
+implementation decisions.
 
 **3.1-compatibility note (added 2026-08-18, after the sourcing decision
 above but relevant to it):** AROS's SFDs track AROS's own evolving API,

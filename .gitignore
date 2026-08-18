@@ -3,3 +3,13 @@
 *.pdb
 .DS_Store
 __pycache__/
+
+# Defense-in-depth for tools/ndk_verify.py: the official Amiga NDK carries
+# no redistribution license (see docs/plan.md and that script's module
+# doc), so it must never be vendored into this repo. `ndk_verify.py`
+# itself also refuses to run against a path inside the repo tree, but
+# these patterns are ignored too in case a copy ever lands here by
+# accident.
+/ndk/
+/NDK/
+*.lha

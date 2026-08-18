@@ -49,6 +49,15 @@ register assignments -- into a fresh Rust literal; see the provenance
 header this script writes into the generated file for the exact source
 commit and license note.
 
+GUARDRAIL FOR FUTURE CHANGES: keep it that way. The `.conf` source (and
+the `.fd`/`.sfd` formats it stands in for) carries comments, typed
+argument names, and version annotations alongside the bare facts -- if
+you extend `render()` to emit any of that (argument names, descriptive
+text, `.version`/comment content), you've crossed from extracting facts
+to copying expression, which is the whole basis of this tool's licensing
+position (see docs/plan.md's "fd/SFD metadata decision" section). Only
+name, LVO offset, and register letters belong in the output.
+
 ## Usage
 
     python3 tools/gen_lvos.py \\
