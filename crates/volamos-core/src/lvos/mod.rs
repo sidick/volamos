@@ -20,6 +20,7 @@ use crate::cpu::{AddressRegister, DataRegister};
 
 pub mod dos;
 pub mod exec;
+pub mod utility;
 
 /// One argument register in a library call's calling convention: either a
 /// data register (D0-D7) or an address register (A0-A7), reusing
@@ -87,5 +88,20 @@ mod tests {
     #[test]
     fn find_by_lvo_missing_is_none() {
         assert!(find_by_lvo(dos::DOS_LVOS, 12345).is_none());
+    }
+
+    #[test]
+    fn utility_find_by_name_and_lvo_round_trip() {
+        let entry = find_by_name(utility::UTILITY_LVOS, "FindTagItem")
+            .expect("FindTagItem should be in the table");
+        assert_eq!(entry.lvo, -30);
+        let back = find_by_lvo(utility::UTILITY_LVOS, -30)
+            .expect("looking up -30 should find FindTagItem");
+        assert_eq!(back.name, "FindTagItem");
+    }
+
+    #[test]
+    fn utility_find_by_name_missing_is_none() {
+        assert!(find_by_name(utility::UTILITY_LVOS, "NotARealFunction").is_none());
     }
 }

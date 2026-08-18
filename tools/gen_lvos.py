@@ -71,6 +71,27 @@ name, LVO offset, and register letters belong in the output.
 deterministic for a given input: re-running with the same `--input` and
 the same `--source-url`/`--commit`/`--generated` values byte-for-byte
 reproduces the file.
+
+## The implicit reserved-vector header (`--start-bias`)
+
+Every AmigaOS library reserves four jump-table slots ahead of its public
+functions -- LVO -6/-12/-18/-24 for Open/Close/Expunge/reserved, called by
+`exec.library`'s `OpenLibrary`/`CloseLibrary`/`RemLibrary`/expunge
+machinery, not by guest code directly -- before the public API starts at
+-30. AROS's own `genmodule` tool (`tools/genmodule/config.c`,
+`cfg->firstlvo`) reserves these four slots for every `modtype=library`
+`.conf` unconditionally, whether or not the `.conf`'s own
+`##begin functionlist` block spells them out. `dos.conf`/`exec.conf`
+happen to spell them out explicitly (`OpenLib`/`CloseLib`/`.skip 2` as
+the first three functionlist directives), so this script's own
+bias-starts-at-0 parser reproduces the correct real LVOs for them without
+any extra help. Other libraries' `.conf` (e.g. `utility.conf`) omit that
+preamble and rely on genmodule's implicit default -- for those, pass
+`--start-bias 24` so the first parsed entry still lands on the correct
+real bias (30, not 6). Verify against a couple of independently known
+LVOs from public AmigaOS documentation before trusting the result either
+way; a wrong `--start-bias` silently produces a self-consistent but
+uniformly-offset table.
 """
 
 from __future__ import annotations
@@ -102,7 +123,7 @@ class LvoEntry:
     private: bool = False
 
 
-def parse_functionlist(text: str, *, source_label: str) -> list[LvoEntry]:
+def parse_functionlist(text: str, *, source_label: str, start_bias: int = 0) -> list[LvoEntry]:
     try:
         start = text.index(FUNCTIONLIST_BEGIN) + len(FUNCTIONLIST_BEGIN)
         end = text.index(FUNCTIONLIST_END, start)
@@ -113,7 +134,7 @@ def parse_functionlist(text: str, *, source_label: str) -> list[LvoEntry]:
     block = text[start:end]
 
     entries: list[LvoEntry] = []
-    bias = 0
+    bias = start_bias
     for lineno, raw_line in enumerate(block.splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -290,6 +311,18 @@ def main() -> None:
         metavar="NAME=LVO",
         help="extra sanity-check case to append to the generated test (repeatable)",
     )
+    ap.add_argument(
+        "--start-bias",
+        type=int,
+        default=0,
+        help=(
+            "initial bias before the first entry in the functionlist block "
+            "(default 0; see the module docstring's 'implicit reserved-vector "
+            "header' section -- pass 24 for a library .conf that omits the "
+            "OpenLib/CloseLib/.skip 2 preamble dos.conf/exec.conf spell out "
+            "explicitly)"
+        ),
+    )
     args = ap.parse_args()
 
     table_name = args.table_name or (f"{args.library.upper()}_LVOS" if args.library else None)
@@ -314,7 +347,7 @@ def main() -> None:
             text = resp.read().decode("utf-8")
         source_label = args.source_url
 
-    entries = parse_functionlist(text, source_label=source_label)
+    entries = parse_functionlist(text, source_label=source_label, start_bias=args.start_bias)
     if not entries:
         raise SystemExit(f"{source_label}: no entries parsed")
 
