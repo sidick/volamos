@@ -555,16 +555,59 @@ utility.library (tag lists `GetTagData`/`NextTagItem`/`FindTagItem`,
 `System()`-adjacent work and for the real-library passthrough escape
 hatch), and `System()`/`Execute` for tools that shell out. Key
 decisions/risks: allocator fidelity vs simplicity (start flat,
-add MemHeader emulation only when a corpus binary trips on it); math
-libraries — resolve here via real-library passthrough (`LoadSeg` the
-original mathffp/mathieee binaries) rather than reimplementing; the
-`m68k` crate's FPU support is confirmed present (see the T12 note
-above), so if a corpus binary needs `mathieeedoubbas`/`mathieeeextbas`
-(which use real 68881 opcodes rather than software emulation), FPU
-coverage is available — pick a `CpuType`/`fpu_present` config once such
-a binary is in scope, not a blocker before then; metadata tables for
-exec/utility come from the same T7 SFD codegen (`exec_lib.sfd`,
-`utility_lib.sfd`).
+add MemHeader emulation only when a corpus binary trips on it).
+
+**Math libraries — corrected 2026-08-18 (ROM vs. disk residency
+checked before committing to an approach).** Simon flagged that the
+"just `LoadSeg` the original binaries" plan needed verifying: if a
+library is ROM-resident, there is no standalone disk file to ever
+`LoadSeg` in the first place, real Workbench 3.1 media included, and
+the only way to obtain the actual code would be extracting it from a
+Kickstart ROM dump — a much bigger licensing question than anything in
+the fd/SFD analysis above (Kickstart ROM images are Cloanto/Hyperion
+copyrighted binary code, not extractable facts), and one this project
+has deliberately not taken on (see Phase 4's `REAL_ROM_B64` opt-in-only
+treatment of ROM images). Checked against the V37-era RKRM's *Math
+Libraries* chapter (explicit "resides in ROM" / "resides on disk"
+statements per library) and cross-referenced against the NDK 3.2
+autodoc set (covers V40–V47; no evidence of a residency change, and
+confirms the complete real library list):
+
+- **ROM-resident — no disk file exists at all; real-library
+  passthrough is not possible for these**: `mathffp.library`;
+  `mathieeesingbas.library` (ROM-resident since V36, i.e. still ROM in
+  our V40/3.1 target). If a corpus binary ever needs these, the only
+  options are a from-scratch Rust reimplementation (both are simple,
+  fully public numeric formats — 32-bit FFP and IEEE-754 single, no
+  Commodore source needed to reimplement the arithmetic itself) or
+  requiring a user-supplied Kickstart ROM dump, at which point it's
+  arguably simpler to lean on Phase 4's Copperline-with-real-Kickstart
+  path instead of a bespoke ROM-extraction mechanism here.
+- **Disk-resident under `LIBS:` — real-library passthrough via
+  `LoadSeg` remains viable, copyable from a genuine Workbench 3.1
+  install disk**: `mathtrans.library` (FFP transcendental),
+  `mathieeesingtrans.library`, `mathieeedoubbas.library`,
+  `mathieeedoubtrans.library`.
+- **`mathieeeextbas.library` does not exist.** Absent from the
+  complete NDK 3.2 autodoc library list (which does include all six
+  real math libraries above) — the original proposal's mention of it
+  was a mistake, not a deferred scope item. Drop it from consideration
+  entirely rather than treating it as "not yet implemented."
+
+This doesn't change Phase 3's task list: math library support was
+already gated on corpus need, not built by default, and remains so —
+it just means "when a corpus binary needs `mathffp`/`mathieeesingbas`
+specifically, reimplement natively" rather than "LoadSeg it," while
+the other four stay LoadSeg-viable as originally planned. The `m68k`
+crate's FPU support (confirmed present, see the T12 note above) is
+still relevant for a from-scratch `mathieeesingbas`/native-FFP
+implementation choosing to use real FPU opcodes rather than a pure
+software path, and remains available for LoadSeg'd passthrough of the
+four disk-resident libraries too, if their disassembly turns out to
+use 68881 instructions directly.
+
+Metadata tables for exec/utility come from the same T7 `.conf`-reading
+codegen tool (`exec.conf`, `utility.conf`).
 
 ## Phase 4 — parity pass (three-oracle harness)
 
