@@ -194,6 +194,53 @@ pub const UTILITY_LIBRARY_BASE: u32 = 0x0C00;
 /// here.
 pub const ABS_EXEC_BASE_ADDR: u32 = 4;
 
+/// `struct Node`'s `ln_Type` byte offset within `struct Library` (see
+/// [`write_library_node`]) -- `struct Node` is `ln_Succ`/`ln_Pred` (4
+/// bytes each) then `ln_Type`.
+const LIB_NODE_TYPE_OFFSET: u32 = 8;
+/// `lib_Version`'s byte offset within `struct Library`: `struct Node`
+/// (14 bytes) + `lib_Flags`/`lib_pad` (1 each) + `lib_NegSize`/
+/// `lib_PosSize` (2 each) = 20.
+const LIB_VERSION_OFFSET: u32 = 20;
+/// `lib_Revision` immediately follows `lib_Version`.
+const LIB_REVISION_OFFSET: u32 = 22;
+/// `sizeof(struct Library)` (NDK `exec/libraries.h`): 14 (`Node`) + 2
+/// (`lib_Flags`/`lib_pad`) + 2 + 2 (`lib_NegSize`/`lib_PosSize`) + 2 + 2
+/// (`lib_Version`/`lib_Revision`) + 4 (`lib_IdString`) + 4 (`lib_Sum`) +
+/// 2 (`lib_OpenCnt`) = 34.
+const LIB_STRUCT_SIZE: u32 = 34;
+/// `exec/nodes.h`'s `NT_LIBRARY`.
+const NT_LIBRARY: u8 = 9;
+/// `lib_Version`/`lib_Revision` this runtime reports for every real
+/// library base, matching the documented KS/WB 3.1 (V40) compatibility
+/// target -- "Kickstart 40.10" is the well-known real AmigaOS 3.1 ROM
+/// version string. Applied uniformly to every real base (dos.library's
+/// actual 3.1 revision may differ slightly from exec.library's on a real
+/// ROM); this is "reads as 3.1-ish instead of the trap-table sentinel
+/// value", not byte-exact per-library parity -- see `docs/plan.md`'s
+/// Phase 4 notes for where byte-exact parity is actually pursued.
+const LIBRARY_VERSION: u16 = 40;
+const LIBRARY_REVISION: u16 = 10;
+
+/// Zeroes `sizeof(struct Library)` bytes at `base` and fills in
+/// `lib_Node.ln_Type` (`NT_LIBRARY`) and `lib_Version`/`lib_Revision`
+/// ([`LIBRARY_VERSION`]/[`LIBRARY_REVISION`]) -- just enough of a real
+/// `struct Library` header that a guest reading those fields directly
+/// (rather than through a documented call this runtime intercepts, e.g.
+/// the real `Version` command reading `SysBase->LibNode.lib_Version`)
+/// gets a real-looking answer. Every other field (the `Node` link
+/// pointers, `lib_Flags`, `lib_IdString`, `lib_Sum`, `lib_OpenCnt`) stays
+/// zeroed -- this runtime doesn't maintain a real library list, checksum,
+/// or open count, so there's nothing meaningful to put there.
+fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
+    for i in 0..LIB_STRUCT_SIZE {
+        mem.write_u8(base.wrapping_add(i), 0);
+    }
+    mem.write_u8(base.wrapping_add(LIB_NODE_TYPE_OFFSET), NT_LIBRARY);
+    mem.write_u16(base.wrapping_add(LIB_VERSION_OFFSET), LIBRARY_VERSION);
+    mem.write_u16(base.wrapping_add(LIB_REVISION_OFFSET), LIBRARY_REVISION);
+}
+
 /// What a host-side library call handler is given to do its work: mutable
 /// access to the CPU (registers), guest memory, an output sink for
 /// anything the call writes to "stdout" (e.g. `PutStr`), and the guest
@@ -1072,6 +1119,16 @@ impl<C: Cpu + 'static> Runtime<C> {
         // after the sentinel prefill above so it isn't overwritten by
         // it (this is a plain data word, never a jump-table entry).
         mem.write_u32(ABS_EXEC_BASE_ADDR, EXEC_LIBRARY_BASE);
+
+        // struct Library headers (see write_library_node's doc) for the
+        // three real library bases -- a guest that reads
+        // lib_Version/lib_Revision directly (as e.g. the real Version
+        // command does to report Kickstart/Workbench numbers) gets a
+        // real-looking answer instead of whatever the sentinel prefill
+        // above left there.
+        write_library_node(&mut mem, DOS_LIBRARY_BASE);
+        write_library_node(&mut mem, EXEC_LIBRARY_BASE);
+        write_library_node(&mut mem, UTILITY_LIBRARY_BASE);
 
         let mut registry = LibraryRegistry::new();
         registry.register_real("dos.library", DOS_LIBRARY_BASE);

@@ -842,6 +842,32 @@ A-line trap-dispatch end-to-end test, not just direct-call unit tests
 that in-process unit tests over parsing/formatting logic alone miss
 guest-memory-marshalling bugs a real dispatch path catches).
 
+**Partial follow-up, same day**: `Runtime::new` now writes a real
+`struct Library` header (`lib_Node.ln_Type` = `NT_LIBRARY`,
+`lib_Version`/`lib_Revision` = 40/10, matching the documented KS/WB 3.1
+target) at `DOS_LIBRARY_BASE`/`EXEC_LIBRARY_BASE`/`UTILITY_LIBRARY_BASE`
+(`write_library_node` in `dispatch.rs`), fixing `Version`'s reported
+Kickstart *version* number (`40`, was `40960`/`0xA000`). The *revision*
+number is still wrong (`Kickstart 40.40960`) -- traced (by hand-
+disassembling the guest code around the `RawDoFmt` call site, since no
+disassembler is wired into this runtime yet) to `Version` walking
+`SysBase`'s real `LibList` (a `FindName`-style linked-list search using
+`Stricmp`) to look up the `exec.library` node by name and read
+`lib_Version`/`lib_Revision` off *that* node, rather than reading the
+header fields directly off the pointer at `AbsExecBase`. This runtime's
+fake `ExecBase` has no real `LibList` at all, so the search runs off
+into unpopulated/sentinel-filled memory. Fixing this properly means
+giving `ExecBase` a real, guest-visible `LibList` (a `struct List`,
+built from the same List/Node primitives `execlist.rs` already
+implements) with real nodes for `dos.library`/`exec.library`/
+`utility.library` -- a distinct, moderately-sized follow-up (benefits
+any future corpus binary that walks library lists, not just `Version`),
+deliberately not attempted in this same pass. `Version`'s "Workbench"
+line separately reports `0.0` for a similar reason (a list search that
+finds nothing) -- plausibly still correct/expected behavior for a bare
+CLI run with no real Workbench environment loaded, not necessarily a
+bug, but worth re-checking once `LibList` exists for real.
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
