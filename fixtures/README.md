@@ -95,3 +95,117 @@ If both `hello.s` and `gen_hello.py` exist, they're meant to describe
 the *same* program; if you change one, update the other to match (or
 just re-assemble with vasm and let it supersede the hand-assembled
 version once vasm is available).
+
+## Phase 2 (T14) fixtures: `filetest`, `dirtest`, `echoargs`
+
+Three more hand-authored fixtures, in the same dual `.s` + `gen_*.py`
+style as `hello`, added for Phase 2's file I/O / volumes-and-assigns
+work (`docs/plan.md`'s T14, the phase's "done" criterion). Unlike
+`hello` (which relies on a pre-seeded `A6`, a Phase 1 shortcut), all
+three use the **real AmigaOS startup flow**: they read `AbsExecBase`
+from guest address 4 (`move.l 4,a6`) and call
+`OpenLibrary("dos.library", 0)` via `-552(a6)` themselves, exactly like
+a real compiled program's startup code would, then use the returned
+base in `A6` for every dos.library call.
+
+### Shared assembler: `amiga_asm.py`
+
+Hand-assembling three programs with branches and a loop (byte-exact,
+without vasm) by literally computing every displacement by hand -- the
+way `gen_hello.py` computes its one reloc -- doesn't scale. `amiga_asm.py`
+is a tiny, purpose-built two-pass "assembler" (not general-purpose: one
+method per instruction shape these three fixtures actually use, each
+derived from the M68000 Programmer's Reference Manual's encoding tables,
+same derivation style as `gen_hello.py`'s inline comments) that the three
+`gen_*.py` scripts share: it tracks code/data labels, resolves branch
+displacements (PC-relative, no relocation needed) and absolute pointers
+into the data hunk (emitted as `HUNK_RELOC32` entries, exactly like
+`gen_hello.py`'s single hand-written one) once every label's final
+hunk-local offset is known. See its module docstring for the full
+design.
+
+Each fixture is a single CODE hunk + a single DATA hunk (same two-hunk
+shape as `hello`).
+
+### `filetest`
+
+Source: `filetest.s`; generator: `gen_filetest.py`.
+
+1. Real startup: `AbsExecBase` -> `OpenLibrary("dos.library", 0)` -> `A6`.
+2. `Open("TEST:out.txt", MODE_NEWFILE)`. On failure (`D0 == 0`), PutStr
+   a fixed `"ERR\n"` marker and exit with `D0 = 1` -- the simplest
+   documented option in `docs/plan.md`'s T14 entry, rather than decoding
+   `IoErr()` into a printed decimal number.
+3. `Write` a fixed message string to it, `Close` it.
+4. Reopen the same path `MODE_OLDFILE`, `Read` the same number of bytes
+   back into a zeroed 64-byte scratch buffer, `Close` it.
+5. `PutStr` the read-back buffer (already NUL-terminated -- the buffer
+   is zero-filled and the message is well under 64 bytes) and exit 0.
+
+Run with a volume mapping for `TEST:`, e.g.
+`volamos -V TEST:/some/hostdir fixtures/filetest`, it prints the message
+it wrote and reads back, and leaves `out.txt` on the host containing the
+same bytes. Without any `-V`/`-a`/`--cwd`/`--auto-assign` flag at all (no
+`Vfs` installed), `Open` always fails, so it prints `ERR` and exits 1 --
+this is also how the fixture demonstrates `IoErr()`-driven failure.
+
+### `dirtest`
+
+Source: `dirtest.s`; generator: `gen_dirtest.py`.
+
+1. Real startup (as above).
+2. `Lock("TEST:dir", SHARED_LOCK)`. On failure, `"ERR\n"` + exit 1 (same
+   convention as `filetest`).
+3. `Examine(lock, fib)` to initialize the `ExNext` iterator, then loop:
+   `ExNext(lock, fib)` until it returns `DOSFALSE` (no more entries).
+   Each iteration copies `fib_FileName` (a BSTR at `fib+8`: one length
+   byte then that many data bytes, *not* NUL-terminated) into a scratch
+   buffer as `"<name>\n\0"`, and `PutStr`s it.
+4. `UnLock(lock)`, exit 0.
+
+Run with a volume mapping providing a `TEST:dir` directory, e.g.
+`volamos -V TEST:/some/hostdir fixtures/dirtest` (with a `dir`
+subdirectory under `hostdir`); it prints one line per entry. Directory
+enumeration order matches `crate::doslock`'s own (sorted byte-wise, for
+deterministic output).
+
+### `echoargs`
+
+Source: `echoargs.s`; generator: `gen_echoargs.py`.
+
+1. Real startup (as above; `OpenLibrary`'s own calling convention -- `A1`
+   = name, `D0` = version -- doesn't touch `A0`, so the command-line
+   pointer AmigaOS startup convention hands the program survives).
+2. `PutStr(a0)` directly: the runtime (`Runtime::new` in
+   `crates/volamos-core/src/dispatch.rs`) already leaves the guest
+   command-line buffer `'\n'`-terminated *and* NUL-terminated, so `A0` is
+   already a valid `CString*` -- no copying needed.
+3. Exit 0.
+
+`volamos fixtures/echoargs foo bar` prints `foo bar\n`; with no guest
+args, the buffer is still just `"\n"` (the trailing newline is
+unconditional), so it prints `\n`.
+
+### Regenerating
+
+Same rule as `hello`: with `vasm` (`vasmm68k_mot`) available,
+
+```sh
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/filetest fixtures/filetest.s
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/dirtest  fixtures/dirtest.s
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/echoargs fixtures/echoargs.s
+```
+
+`vasm` was not available on the machine these fixtures were authored on
+(same as `hello`), so each committed binary was produced instead by its
+`gen_*.py` script:
+
+```sh
+python3 fixtures/gen_filetest.py
+python3 fixtures/gen_dirtest.py
+python3 fixtures/gen_echoargs.py
+```
+
+If you change a `.s` file, update its `gen_*.py` counterpart to match
+(they're meant to describe the same program), or re-assemble with vasm
+and let it supersede the hand-assembled version once vasm is available.
