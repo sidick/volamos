@@ -73,9 +73,11 @@
 //! deliberate simplification: real `CreateMsgPort` calls `AllocSignal` to
 //! grab a real signal bit and stores the *current task*'s pointer in
 //! `mp_SigTask`, so `Wait()`/`Signal()` can actually wake the owning task
-//! up. This runtime has no task/signal machinery yet (that's a separate,
-//! not-yet-built Phase 3 item -- `FindTask(NULL)`/`SetSignal`/`Wait`) and
-//! is single-threaded regardless, so:
+//! up. This runtime doesn't call `AllocSignal` on the guest's behalf here
+//! (no signal bit is actually reserved for the port), and is
+//! single-threaded regardless (there's only ever the one fake current
+//! task -- see `crate::exectask`'s module docs, added in Phase 3 stage
+//! 5), so:
 //!
 //! - `mp_Flags` = [`PA_SIGNAL`] (`0`), matching real `CreateMsgPort`'s
 //!   default.
@@ -83,9 +85,14 @@
 //!   placeholder rather than an actually-allocated signal bit -- nothing
 //!   in this runtime ever tests it, since [`GetMsg`] never blocks (see
 //!   below) and there's no `Wait`/`Signal` implementation to consult it.
-//! - `mp_SigTask` = `0` (`NULL`) -- there's no fake "current task" struct
-//!   to point at yet. Documented here as a placeholder to revisit once
-//!   `FindTask(NULL)` exists.
+//! - `mp_SigTask` = [`HandlerContext::current_task`], the fake current
+//!   task's guest address (Phase 3 stage 5 added `FindTask`/`Wait`/
+//!   `Signal` -- see `crate::exectask`'s module docs). This is now the
+//!   real value a guest program would see from real `CreateMsgPort`;
+//!   it's still not meaningfully *actionable* here, since nothing in
+//!   this runtime ever calls `Wait`/`Signal` on a guest's behalf itself
+//!   -- a guest that reads `mp_SigTask` back just sees a consistent,
+//!   correct pointer.
 //!
 //! [`GetMsg`] (LVO -372) never blocks: it's a plain `RemHead` of
 //! `mp_MsgList`, returning `NULL` on an empty port instead of suspending
@@ -455,7 +462,7 @@ fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     ctx.mem.write_u8(port + MP_FLAGS, PA_SIGNAL);
     ctx.mem
         .write_u8(port + MP_SIGBIT, MSGPORT_SIGBIT_PLACEHOLDER);
-    ctx.mem.write_u32(port + MP_SIGTASK, 0);
+    ctx.mem.write_u32(port + MP_SIGTASK, ctx.current_task);
 
     init_list_header(ctx.mem, port + MP_MSGLIST);
 

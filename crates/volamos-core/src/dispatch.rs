@@ -62,6 +62,7 @@ use std::io::Write;
 use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
 use crate::dosfile::DosState;
+use crate::exectask;
 use crate::guestmem::{GuestHeap, STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
@@ -219,6 +220,13 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// current `IoErr()` value, and (optionally) a [`Vfs`] for path
     /// resolution. See [`crate::dosfile`]'s module docs.
     pub dos: &'a mut DosState,
+    /// Guest address of the fake "current task" `struct Task` (Phase 3
+    /// stage 5). Guest memory at this address is the sole authority for
+    /// its signal state (`tc_SigAlloc`/`tc_SigWait`/`tc_SigRecvd`/
+    /// `tc_SigExcept`) -- see [`crate::exectask`]'s module docs. Also
+    /// used by [`crate::execlist::create_msg_port_handler`] to fill in
+    /// `mp_SigTask`.
+    pub current_task: u32,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -852,6 +860,9 @@ pub struct Runtime<C: Cpu> {
     heap: GuestHeap,
     registry: LibraryRegistry,
     dos: DosState,
+    /// Guest address of the fake "current task" struct -- see
+    /// [`HandlerContext::current_task`] and [`crate::exectask`].
+    task: u32,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -960,6 +971,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         // -- see crate::execlist's module docs.
         crate::execlist::register_execlist_handlers(&mut table, &mut mem);
 
+        // exec.library task/signal basics + dos.library CheckSignal
+        // (Phase 3 stage 5): FindTask/SetSignal/SetExcept/Wait/Signal/
+        // AllocSignal/FreeSignal and CheckSignal -- see
+        // crate::exectask's module docs. The fake current task struct
+        // itself is created further down, once the heap exists.
+        exectask::register_exectask_handlers(&mut table, &mut mem);
+
         // The shared fake-library-vector handler: bound once, to a slot
         // number every auto-created fake library's jump table reuses
         // (see FAKE_LIB_SLOT's docs). No opcode word is written here --
@@ -996,6 +1014,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         let stack_base = top.saturating_sub(STACK_SIZE) & !3;
         let mut heap = GuestHeap::new(config.load_end, stack_base);
 
+        // Fake current task (Phase 3 stage 5): a real, guest-visible
+        // struct Task allocated on the heap just created above, before
+        // anything else claims heap space. See crate::exectask's module
+        // docs for exactly which fields are maintained.
+        let task = exectask::create_current_task(&mut mem, &mut heap);
+
         // Command-line buffer: args joined with spaces, '\n'-terminated
         // (the length reported in D0 includes this '\n'), plus one extra
         // NUL byte as a defensive terminator for code that scans instead
@@ -1028,7 +1052,15 @@ impl<C: Cpu + 'static> Runtime<C> {
             heap,
             registry,
             dos: DosState::new(None),
+            task,
         }
+    }
+
+    /// Guest address of the fake "current task" struct -- see
+    /// [`HandlerContext::current_task`] and [`crate::exectask`]'s module
+    /// docs.
+    pub fn current_task(&self) -> u32 {
+        self.task
     }
 
     /// Installs (or replaces) the [`Vfs`] used by `dos.library` path-based
@@ -1106,6 +1138,13 @@ impl<C: Cpu + 'static> Runtime<C> {
                         });
                     };
 
+                    // Fold in any pending host break (SIGINT/SIGTERM ->
+                    // SIGBREAKF_CTRL_C) before dispatching -- cheap, and
+                    // this is the only place a compute-bound guest
+                    // program is ever interrupted; see crate::exectask's
+                    // module docs for the polling-granularity caveat.
+                    exectask::fold_pending_host_break(&mut self.mem, self.task);
+
                     let mut ctx = HandlerContext {
                         cpu: &mut self.cpu,
                         mem: &mut self.mem,
@@ -1114,6 +1153,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         registry: &mut self.registry,
                         pc: info.pc,
                         dos: &mut self.dos,
+                        current_task: self.task,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
@@ -1623,10 +1663,17 @@ mod tests {
                 args: Vec::new(),
             },
         );
-        // The command-line buffer is the very first thing Runtime::new
-        // allocates from the heap, so A0 doubles as a direct probe of
-        // the heap's start address.
+        // Since Phase 3 stage 5, the fake current task struct (see
+        // crate::exectask) and its process-name string are allocated
+        // from the heap *before* the command-line buffer, so A0 (the
+        // command-line buffer's address) no longer equals load_end
+        // directly -- but the task struct itself does, since it's the
+        // very first thing Runtime::new allocates from the heap.
+        assert_eq!(rt.task, load_end);
         let a0 = rt.cpu.address_register(AddressRegister(0));
-        assert_eq!(a0, load_end);
+        assert!(
+            a0 > load_end,
+            "A0 (command-line buffer) should sit after the task struct + name string"
+        );
     }
 }

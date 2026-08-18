@@ -30,6 +30,7 @@ use std::process::ExitCode;
 
 use volamos_core::backend::{M68kCpu, TRAP_TABLE_END};
 use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
+use volamos_core::exectask::install_host_break_handler;
 use volamos_core::memory::FlatMemory;
 use volamos_core::vfs::{Vfs, VfsConfig};
 use volamos_core::{LoadError, loader};
@@ -246,6 +247,13 @@ fn run(opts: &Options) -> Result<i32, String> {
 }
 
 fn main() -> ExitCode {
+    // Host SIGINT/SIGTERM -> guest SIGBREAKF_CTRL_C (Phase 3 stage 5).
+    // Installed here, once, at real CLI startup -- never from
+    // `Runtime::new` itself, which would hijack the test runner's own
+    // SIGINT handling for every unit test in the workspace. See
+    // `volamos_core::exectask`'s module docs.
+    install_host_break_handler();
+
     let mut args = std::env::args();
     let program_name = args.next().unwrap_or_else(|| "volamos".to_string());
 

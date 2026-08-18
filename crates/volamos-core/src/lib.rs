@@ -16,6 +16,7 @@ pub mod dosfile;
 pub mod doslock;
 pub mod execlist;
 pub mod execmem;
+pub mod exectask;
 pub mod guestmem;
 pub mod loader;
 pub mod lvos;
@@ -40,6 +41,7 @@ pub use dosfile::{
 pub use doslock::{
     ACCESS_READ, ACCESS_WRITE, ERROR_NO_MORE_ENTRIES, EXCLUSIVE_LOCK, LockEntry, SHARED_LOCK,
 };
+pub use exectask::{NT_TASK, SIGBREAKF_CTRL_C, TASK_STRUCT_SIZE, install_host_break_handler};
 pub use guestmem::{
     GuestHeap, GuestHeapError, STACK_SIZE, addr_from_bptr, bptr_from_addr, read_bstr,
     read_c_string, write_bstr, write_c_string,
