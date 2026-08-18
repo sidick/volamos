@@ -21,22 +21,36 @@ system, or any Amiga hardware.
 
 ## Status
 
-**Phase 1: CPU + trap plumbing — complete.**
+**Phase 1 (CPU + trap plumbing) and Phase 2 (dos.library file I/O +
+volumes/assigns) — complete.**
 
-The runtime can load a simple AmigaOS hunk executable, run it on an
-interpreted m68k CPU (the [`m68k`](https://crates.io/crates/m68k) crate
-behind a swappable `Cpu` trait), intercept a library call made the real
-AmigaOS way (`jsr _LVOPutStr(a6)` through a fake `dos.library` base) via
-A-line trap dispatch, service it with a native Rust handler, and propagate
-the guest's exit code. Try it:
+The runtime loads an AmigaOS hunk executable, runs it on an interpreted
+m68k CPU (the [`m68k`](https://crates.io/crates/m68k) crate behind a
+swappable `Cpu` trait), intercepts library calls made the real AmigaOS
+way (`OpenLibrary` via `AbsExecBase` at address 4, then `jsr` through the
+returned library base) via A-line trap dispatch, services them with
+native Rust handlers, and propagates the guest's exit code. Try it:
 
 ```sh
 cargo run -p volamos -- fixtures/hello
+cargo run -p volamos -- -V TEST:/tmp/some-hostdir fixtures/filetest
+cargo run -p volamos -- fixtures/echoargs foo bar
 ```
 
-Only one library call (`dos.library/PutStr`) is implemented so far; real
-file I/O, volumes/assigns, and the rest of `dos.library`/`exec.library`
-are Phase 2+.
+Implemented so far: `dos.library` file I/O (`Open`/`Read`/`Write`/`Seek`/
+`Close`, `Input`/`Output`, `IoErr`/`SetIoErr`), locks and directory
+traversal (`Lock`/`UnLock`/`DupLock`/`Examine`/`ExNext`/`CurrentDir`/
+`ParentDir`), a host-backed volume/assign filesystem (`-V`/`-a`/
+`--auto-assign` CLI flags, multi-assign search order, Amiga `:`/`/`
+semantics), a guest heap with BPTR/BSTR helpers, and a real `exec.library`
+`OpenLibrary`/`CloseLibrary` flow (unknown libraries get an auto-created
+fake base rather than failing outright, mirroring `vamos`). Run
+`cargo run -p volamos -- --help` for the full CLI surface.
+
+`exec.library` memory allocation beyond the guest heap, `utility.library`,
+signals, and `LoadSeg`/`System()` are Phase 3+. See
+[`docs/plan.md`](docs/plan.md) for the full phase breakdown and current
+status.
 
 ## Workspace layout
 

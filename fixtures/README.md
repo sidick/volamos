@@ -1,9 +1,9 @@
 # fixtures/
 
-Test fixtures for `volamos`'s Phase 1 hunk loader and (later) trap
-dispatch. These are hand-authored, deliberately tiny, and not part of
-the normal `cargo build`; they exist purely to be loaded and run by
-`volamos-core`'s tests.
+Test fixtures for `volamos`'s hunk loader, trap dispatch, and
+`dos.library`/`exec.library` handlers. These are hand-authored,
+deliberately tiny, and not part of the normal `cargo build`; they exist
+purely to be loaded and run by `volamos-core`'s tests.
 
 ## `hello`
 
