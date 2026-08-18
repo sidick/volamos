@@ -5,7 +5,7 @@
 //! poking at raw memory/opcodes the way `hello_fixture.rs` does.
 
 use volamos_core::backend::{M68kCpu, TRAP_TABLE_END};
-use volamos_core::dispatch::Runtime;
+use volamos_core::dispatch::{Runtime, StartConfig};
 use volamos_core::memory::FlatMemory;
 use volamos_core::{TraceEvent, loader};
 
@@ -16,12 +16,20 @@ const HELLO: &[u8] = include_bytes!("../../../fixtures/hello");
 fn hello_fixture_runs_to_completion_with_expected_output() {
     let file = loader::parse(HELLO).expect("fixtures/hello should be a well-formed hunk file");
 
-    let mut mem = FlatMemory::new(0x10_000);
+    let mut mem = FlatMemory::new(0x2_0000);
     let load_result =
         loader::load(&file, &mut mem, TRAP_TABLE_END).expect("fixture should load cleanly");
 
     let cpu = M68kCpu::new();
-    let mut runtime = Runtime::new(cpu, mem, load_result.entry);
+    let mut runtime = Runtime::new(
+        cpu,
+        mem,
+        StartConfig {
+            entry: load_result.entry,
+            load_end: load_result.end,
+            args: Vec::new(),
+        },
+    );
 
     let mut out = Vec::new();
     let mut events: Vec<TraceEvent> = Vec::new();

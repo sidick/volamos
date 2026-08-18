@@ -23,21 +23,13 @@
 //!   and the base of the stack region (`stack base = memory length -
 //!   STACK_SIZE`, 4-byte aligned).
 //!
-//! Because heap start depends on where the loaded program ends, and
-//! [`crate::dispatch::Runtime::new`] doesn't (yet) know that -- its
-//! signature is `new(cpu, mem, entry)`, deliberately left untouched here
-//! per the Phase 2 task split (T12 owns growing it into a start-config
-//! struct that threads the real load end through) -- `Runtime::new`
-//! instead builds a *default* [`GuestHeap`] running from
-//! [`HEAP_DEFAULT_START`] to the computed stack base. This default is a
-//! placeholder: for any program whose loaded hunks extend past
-//! [`HEAP_DEFAULT_START`], the default heap region overlaps the program
-//! image, so callers that need a heap that doesn't stomp on their
-//! program should build their own `GuestHeap` (typically starting at the
-//! end of the highest loaded hunk) and install it via
-//! [`crate::dispatch::Runtime::set_heap`] before running. T12 will wire
-//! the real load-end-based start through automatically once its
-//! start-config struct lands.
+//! Since T12, heap start is derived directly from where the loaded
+//! program actually ends: [`crate::dispatch::Runtime::new`] takes a
+//! [`crate::dispatch::StartConfig`] whose `load_end` field (typically
+//! [`crate::loader::LoadResult::end`]) becomes the heap's start address,
+//! so it never overlaps the program image. [`crate::dispatch::Runtime::
+//! set_heap`] remains available to install a different heap outright
+//! (e.g. for tests).
 
 use crate::memory::AddressSpace;
 
@@ -46,13 +38,6 @@ use crate::memory::AddressSpace;
 /// programs this runtime targets; Phase 3+ can revisit (guard pages,
 /// growth) if that ever proves insufficient.
 pub const STACK_SIZE: u32 = 64 * 1024;
-
-/// Default heap start address used by [`crate::dispatch::Runtime::new`]
-/// before the real load-end is threaded through (see module docs). This
-/// is deliberately just past the reserved trap-table region; callers
-/// whose loaded program extends beyond this address must install their
-/// own [`GuestHeap`] via `Runtime::set_heap`.
-pub const HEAP_DEFAULT_START: u32 = crate::backend::TRAP_TABLE_END;
 
 /// Errors [`GuestHeap`] operations can report.
 #[derive(Debug, Clone, PartialEq, Eq)]

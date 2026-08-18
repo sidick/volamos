@@ -19,6 +19,7 @@
 use crate::cpu::{AddressRegister, DataRegister};
 
 pub mod dos;
+pub mod exec;
 
 /// One argument register in a library call's calling convention: either a
 /// data register (D0-D7) or an address register (A0-A7), reusing

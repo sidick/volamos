@@ -192,6 +192,13 @@ pub struct LoadResult {
     /// Guest load address of each hunk, indexed the same as
     /// [`HunkFile::hunks`].
     pub hunk_addrs: Vec<u32>,
+    /// The first guest address *after* every loaded hunk (hunks are
+    /// packed back-to-back, each padded up to a 4-byte boundary, so this
+    /// is already 4-byte aligned). Callers building a
+    /// [`crate::dispatch::StartConfig`] pass this as `load_end`, so the
+    /// guest heap starts right after the loaded program instead of
+    /// risking overlap with it.
+    pub end: u32,
 }
 
 /// A tiny cursor over a byte slice that reads big-endian 32-bit words and
@@ -474,6 +481,7 @@ pub fn load(
     Ok(LoadResult {
         entry: hunk_addrs[0],
         hunk_addrs,
+        end: cursor,
     })
 }
 

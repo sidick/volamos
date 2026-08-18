@@ -61,7 +61,7 @@ use std::io::Write;
 
 use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
-use crate::guestmem::{GuestHeap, HEAP_DEFAULT_START, STACK_SIZE, read_c_string};
+use crate::guestmem::{GuestHeap, STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
 
@@ -84,6 +84,27 @@ const EXIT_SLOT: u16 = MAX_LIBRARY_SLOTS - 1;
 /// address. Not available to [`LibraryTable::register`].
 const UNKNOWN_SLOT: u16 = 0;
 
+/// The slot index reserved for the shared fake-library-vector handler
+/// (see [`fake_lib_vector_handler`] and the "vamos escape hatch" module
+/// docs). Exactly one handler instance serves *every* auto-created fake
+/// library's entire jump table: [`open_library_handler`] writes this
+/// same opcode word (`0xA000 | FAKE_LIB_SLOT`) across the whole reserved
+/// block it carves out of the guest heap for a new fake library, and the
+/// handler resolves which library/offset a given call landed on from
+/// [`HandlerContext::pc`] via [`LibraryRegistry::resolve_fake`]. Not
+/// available to [`LibraryTable::register`].
+const FAKE_LIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 2;
+
+/// Size in bytes of the jump-table block [`open_library_handler`] carves
+/// out of the guest heap for each newly auto-created fake library.
+/// Generous (matches [`crate::backend::TRAP_TABLE_SIZE`]) so any
+/// plausible LVO offset a real program might use lands inside it; a
+/// `jsr`/`jmp` at an offset beyond this falls outside the prefilled
+/// block and reads whatever the heap allocator happened to put there
+/// next -- a known limitation worth revisiting if a future fixture ever
+/// hits it.
+const FAKE_LIB_JUMP_TABLE_SIZE: u32 = 0x1000;
+
 /// Guest address of the exit sentinel: the last word inside the reserved
 /// jump-table region, deliberately kept clear of any library base's
 /// negative-offset range (all real library bases used here sit at or
@@ -100,6 +121,51 @@ pub const DOS_LIBRARY_BASE: u32 = 0x0800;
 /// `_LVOPutStr`.
 pub const LVO_PUTSTR: i32 = -948;
 
+/// Fake `exec.library` base address (T12). AmigaOS convention puts the
+/// running system's `SysBase`/`ExecBase` pointer at absolute guest
+/// address 4 ([`ABS_EXEC_BASE_ADDR`]); this is the value stored there.
+///
+/// # Reserved-region memory map
+///
+/// The whole reserved region is `[`TRAP_TABLE_BASE`] (`0x0000`),
+/// [`crate::backend::TRAP_TABLE_END`]) (`0x1000`). Within it:
+///
+/// ```text
+/// 0x0000 .. 0x0004   (unused; kept clear so AbsExecBase's own pointer,
+///                      one word below the lowest thing anyone reads at
+///                      absolute 0, is unambiguous)
+/// 0x0004 .. 0x0008   AbsExecBase: holds EXEC_LIBRARY_BASE (u32), the
+///                     value a real program reads via `move.l 4,a6`.
+///                     Not a jump-table entry -- never executed.
+/// 0x0008 .. 0x02CC   unused headroom
+/// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
+///                     handlers register LVOs as negative as -1356 off
+///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
+/// 0x0800             DOS_LIBRARY_BASE
+/// 0x0800 .. 0x0CC8   headroom above dos.library's jump table, below
+///                     exec.library's
+/// 0x0CC8 .. 0x0F00   exec.library's registered LVOs (OpenLibrary at
+///                     -552 = 0x0CC8, OldOpenLibrary at -408 = 0x0D68,
+///                     CloseLibrary at -414 = 0x0D62)
+/// 0x0F00             EXEC_LIBRARY_BASE
+/// 0x0F00 .. 0x0FFC   headroom
+/// 0x0FFC .. 0x1000   EXIT_STUB_ADDR (the last word of the region)
+/// ```
+///
+/// Every real (non-fake) library base and its currently-implemented
+/// LVOs therefore sits inside the reserved region, with room to spare
+/// before the two bases' jump tables would ever collide. Fake libraries
+/// (see the "vamos escape hatch" docs on [`open_library_handler`]) are
+/// carved from the guest *heap* instead, well above this region, since
+/// their number and jump-table extent aren't known up front.
+pub const EXEC_LIBRARY_BASE: u32 = 0x0F00;
+
+/// Guest address holding the running "system's" `ExecBase` pointer --
+/// `AbsExecBase`, read by real AmigaOS startup code via `move.l 4,a6`
+/// (or `move.l 4.w,a6`). [`Runtime::new`] writes [`EXEC_LIBRARY_BASE`]
+/// here.
+pub const ABS_EXEC_BASE_ADDR: u32 = 4;
+
 /// What a host-side library call handler is given to do its work: mutable
 /// access to the CPU (registers), guest memory, an output sink for
 /// anything the call writes to "stdout" (e.g. `PutStr`), and the guest
@@ -110,6 +176,18 @@ pub struct HandlerContext<'a, C: Cpu> {
     pub mem: &'a mut C::Memory,
     pub out: &'a mut dyn Write,
     pub heap: &'a mut GuestHeap,
+    /// The registry of known library bases (real and vamos-style
+    /// auto-created fakes; see [`LibraryRegistry`]). `exec.library`'s
+    /// `OpenLibrary`/`OldOpenLibrary` consult and grow this; the shared
+    /// fake-library-vector handler reads it (via [`HandlerContext::pc`])
+    /// to name which fake library a trapped call belongs to.
+    pub registry: &'a mut LibraryRegistry,
+    /// Guest address of the trapping A-line opcode that led to this
+    /// call (i.e. the LVO address, `base + lvo`). Most handlers don't
+    /// need this (they already know their own LVO), but the shared
+    /// fake-library-vector handler does, since one handler instance
+    /// serves every auto-created fake library's entire jump table.
+    pub pc: u32,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -286,9 +364,9 @@ impl<C: Cpu> LibraryTable<C> {
     ) -> u16 {
         let slot = self.next_slot;
         assert!(
-            slot < EXIT_SLOT,
+            slot < FAKE_LIB_SLOT,
             "LibraryTable: too many registered handlers (max {})",
-            EXIT_SLOT - 1
+            FAKE_LIB_SLOT - 1
         );
         self.next_slot += 1;
 
@@ -343,18 +421,41 @@ impl<C: Cpu> LibraryTable<C> {
         Ok(self.register(mem, base, lvo, library, entry_name, handler))
     }
 
+    /// Binds `slot` directly to `handler` without writing any jump-table
+    /// opcode word or consuming a `next_slot` counter value (unlike
+    /// [`LibraryTable::register`]). Used exactly once, at
+    /// [`Runtime::new`] time, to bind [`FAKE_LIB_SLOT`] to the shared
+    /// [`fake_lib_vector_handler`]: every word [`open_library_handler`]
+    /// later writes into a fake library's jump-table block reuses this
+    /// same slot number, so one handler instance serves every
+    /// auto-created fake library, keyed at call time by [`HandlerContext::pc`]
+    /// rather than by slot.
+    fn register_fixed_slot(&mut self, slot: u16, handler: impl LibraryHandler<C> + 'static) {
+        self.slots.insert(
+            slot,
+            Slot {
+                library: "<fake>".to_string(),
+                lvo: 0,
+                handler_name: "<fake-library-vector>".to_string(),
+                handler: Box::new(handler),
+            },
+        );
+    }
+
     /// Dispatches a trapped A-line `opcode` encountered at `pc`. On
     /// success, returns the [`CallInfo`] describing what was called (for
     /// `--verbose` logging).
+    ///
+    /// `ctx.pc` must already be set to the trapping opcode's address
+    /// (this is also where `ctx.cpu`/`ctx.mem`/etc. get handed to
+    /// whichever handler is dispatched to, per [`HandlerContext`]'s
+    /// docs).
     fn dispatch(
         &mut self,
         opcode: u16,
-        pc: u32,
-        cpu: &mut C,
-        mem: &mut C::Memory,
-        out: &mut dyn Write,
-        heap: &mut GuestHeap,
+        ctx: &mut HandlerContext<'_, C>,
     ) -> Result<CallInfo, DispatchError> {
+        let pc = ctx.pc;
         let slot = opcode & 0x0FFF;
         let Some(entry) = self.slots.get_mut(&slot) else {
             let candidates = self
@@ -387,24 +488,218 @@ impl<C: Cpu> LibraryTable<C> {
             handler_name: entry.handler_name.clone(),
         };
 
-        let mut ctx = HandlerContext {
-            cpu,
-            mem,
-            out,
-            heap,
-        };
-        entry.handler.call(&mut ctx).map_err(|e| match e {
-            DispatchError::HandlerFailed { message, .. } => DispatchError::HandlerFailed {
-                library: info.library.clone(),
-                lvo: info.lvo,
-                handler_name: info.handler_name.clone(),
-                message,
-            },
-            other => other,
-        })?;
+        // Handlers construct their own `DispatchError::HandlerFailed`
+        // with accurate `library`/`lvo`/`handler_name` fields (see e.g.
+        // `putstr_handler`), so unlike an earlier version of this code,
+        // nothing here rewrites those fields from the slot's registered
+        // metadata: the shared fake-library-vector handler (see
+        // `fake_lib_vector_handler`) reports a *different* library/LVO
+        // per call (resolved from `pc` against the fake library that
+        // owns this slot's opcode), which a blanket rewrite from the
+        // slot's own (generic, shared) metadata would clobber.
+        entry.handler.call(ctx)?;
 
         Ok(info)
     }
+}
+
+/// Whether a [`LibraryRegistry`] entry is backed by a real emulated jump
+/// table, or was auto-created by [`open_library_handler`]'s vamos-style
+/// escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryKind {
+    /// A library base this runtime actually emulates (has real,
+    /// individually-registered LVO handlers), e.g. `dos.library`.
+    Real,
+    /// A library base auto-created because `OpenLibrary`/
+    /// `OldOpenLibrary` was asked for a name this runtime doesn't
+    /// implement. `OpenLibrary` itself never fails for these -- only
+    /// calling one of the fake library's vectors does, with a
+    /// diagnostic naming the library (see [`fake_lib_vector_handler`]).
+    /// Shaped so a future real-library-backed base (Phase 3's `LoadSeg`
+    /// passthrough for e.g. the math libraries) can slot in as a third
+    /// kind without disturbing this one.
+    Faked,
+}
+
+/// One auto-created fake library's jump-table block, recorded so
+/// [`fake_lib_vector_handler`] can resolve a trapped call's `pc` back to
+/// a library name + offset (see [`LibraryRegistry::resolve_fake`]).
+#[derive(Debug, Clone)]
+struct FakeLibrary {
+    name: String,
+    /// The fake library's base address (the value returned in `D0`);
+    /// the jump-table block occupies `[base - size, base)`.
+    base: u32,
+    size: u32,
+}
+
+/// Registry of known library bases by name -- both the runtime's real,
+/// individually-emulated libraries ([`LibraryKind::Real`], registered
+/// once at [`Runtime::new`] time) and any fake libraries
+/// [`open_library_handler`] auto-creates on demand ([`LibraryKind::
+/// Faked`]). `exec.library`'s `OpenLibrary`/`OldOpenLibrary` consult
+/// this to avoid creating duplicate fake bases for repeat `OpenLibrary`
+/// calls of the same unimplemented name.
+///
+/// Deliberately a separate type from [`LibraryTable`] (rather than a
+/// field on it): [`LibraryTable::dispatch`] already holds a mutable
+/// borrow of one registered handler slot while calling it, and
+/// `OpenLibrary`'s handler needs to *insert* a new library base while
+/// running as one of those very slots -- keeping this registry as an
+/// independent value on [`Runtime`] (passed into [`HandlerContext`]
+/// alongside, not through, the table) sidesteps that aliasing
+/// conflict entirely.
+#[derive(Debug, Clone, Default)]
+pub struct LibraryRegistry {
+    known: HashMap<String, (u32, LibraryKind)>,
+    fakes: Vec<FakeLibrary>,
+}
+
+impl LibraryRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a real, emulated library base (e.g. `dos.library` ->
+    /// [`DOS_LIBRARY_BASE`]).
+    pub fn register_real(&mut self, name: &str, base: u32) {
+        self.known
+            .insert(name.to_string(), (base, LibraryKind::Real));
+    }
+
+    /// Looks up a previously-registered (real or fake) library base by
+    /// name.
+    pub fn lookup(&self, name: &str) -> Option<(u32, LibraryKind)> {
+        self.known.get(name).copied()
+    }
+
+    /// Records a newly auto-created fake library base and its
+    /// jump-table block size, so future `OpenLibrary` calls for the
+    /// same name reuse it, and [`Self::resolve_fake`] can name it.
+    fn register_fake(&mut self, name: &str, base: u32, size: u32) {
+        self.known
+            .insert(name.to_string(), (base, LibraryKind::Faked));
+        self.fakes.push(FakeLibrary {
+            name: name.to_string(),
+            base,
+            size,
+        });
+    }
+
+    /// Given the guest address a trapped call landed at, finds the fake
+    /// library (if any) whose jump-table block contains it, returning
+    /// its name and the LVO offset (`pc - base`, always `<= 0`) within
+    /// it.
+    fn resolve_fake(&self, pc: u32) -> Option<(&str, i32)> {
+        self.fakes
+            .iter()
+            .find(|f| pc >= f.base.wrapping_sub(f.size) && pc < f.base)
+            .map(|f| (f.name.as_str(), pc as i64 as i32 - f.base as i32))
+    }
+}
+
+/// `exec.library`'s `OpenLibrary` handler (LVO -552): `A1` = pointer to
+/// the library name (C string), `D0` = requested minimum version
+/// (ignored -- this runtime doesn't track library versions). Returns
+/// the library's base in `D0`.
+///
+/// # vamos escape hatch
+///
+/// Ported from vamos's own behavior (see `docs/plan.md`'s "vamos escape
+/// hatches" note): opening a library this runtime doesn't implement
+/// never fails here. Instead, a fake base is auto-created on first
+/// request (and reused on repeat requests for the same name, via
+/// [`LibraryRegistry`]) -- a block of [`FAKE_LIB_JUMP_TABLE_SIZE`] bytes
+/// carved from the guest heap, entirely prefilled with the shared
+/// [`FAKE_LIB_SLOT`] opcode, with the base set to the end of that block
+/// (so every plausible negative LVO offset lands inside it and traps).
+/// A run therefore never fails at `OpenLibrary` time for an unknown
+/// library -- only if/when the guest actually calls one of its vectors,
+/// which [`fake_lib_vector_handler`] turns into a diagnostic naming the
+/// library. This mirrors real (and vamos) behavior: many programs
+/// `OpenLibrary` a handful of libraries speculatively and only call
+/// into the ones that actually opened successfully.
+fn open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+    open_library_common(ctx, &name)
+}
+
+/// `exec.library`'s `OldOpenLibrary` handler (LVO -408): the pre-V36
+/// single-argument form of `OpenLibrary` (`A1` = library name, no
+/// version). Shares [`open_library_common`] with [`open_library_handler`].
+fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+    open_library_common(ctx, &name)
+}
+
+/// Shared `OpenLibrary`/`OldOpenLibrary` implementation: looks `name` up
+/// in [`HandlerContext::registry`], auto-creating a fake base per the
+/// vamos escape hatch (see [`open_library_handler`]) if it isn't there,
+/// and writes the resulting base into `D0`.
+fn open_library_common<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+) -> Result<(), DispatchError> {
+    if let Some((base, _kind)) = ctx.registry.lookup(name) {
+        ctx.cpu.set_data_register(DataRegister(0), base);
+        return Ok(());
+    }
+
+    let size = FAKE_LIB_JUMP_TABLE_SIZE;
+    let block = ctx
+        .heap
+        .alloc(size)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -552,
+            handler_name: "OpenLibrary".to_string(),
+            message: format!("couldn't auto-create fake library {name:?}: {e}"),
+        })?;
+    let base = block.wrapping_add(size);
+
+    let mut addr = block;
+    while addr < base {
+        ctx.mem.write_u16(addr, 0xA000 | FAKE_LIB_SLOT);
+        addr = addr.wrapping_add(2);
+    }
+
+    ctx.registry.register_fake(name, base, size);
+    ctx.cpu.set_data_register(DataRegister(0), base);
+    Ok(())
+}
+
+/// `exec.library`'s `CloseLibrary` handler (LVO -414): `A1` = library
+/// base. A no-op -- this runtime doesn't refcount library opens/closes,
+/// and real `CloseLibrary` only returns a meaningful (non-`NULL`) `D0`
+/// (a `BPTR` segList) when the close actually expunges the library from
+/// memory, which never applies to anything faked or fixed-address here.
+fn close_library_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// The shared handler bound to [`FAKE_LIB_SLOT`]: every vector of every
+/// auto-created fake library (see [`open_library_handler`]) traps here.
+/// Resolves [`HandlerContext::pc`] back to the owning fake library's
+/// name and LVO offset via [`LibraryRegistry::resolve_fake`], then fails
+/// the call with a diagnostic naming it -- this is where the vamos
+/// escape hatch's "clear diagnostic on first real use" guarantee is
+/// actually produced.
+fn fake_lib_vector_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let (library, lvo) = match ctx.registry.resolve_fake(ctx.pc) {
+        Some((name, lvo)) => (name.to_string(), lvo),
+        None => ("<unresolved fake library>".to_string(), 0),
+    };
+    Err(DispatchError::HandlerFailed {
+        library,
+        lvo,
+        handler_name: "<unimplemented>".to_string(),
+        message: "call into an auto-created fake library (OpenLibrary of a library name this \
+                  runtime doesn't implement); this vector isn't emulated"
+            .to_string(),
+    })
 }
 
 /// The `dos.library` `PutStr` handler: writes the NUL-terminated string
@@ -461,22 +756,62 @@ impl From<DispatchError> for RuntimeError {
     }
 }
 
+/// Start-up configuration for [`Runtime::new`]: everything about a guest
+/// program invocation that isn't already implied by the loaded hunks
+/// themselves (the CPU and memory are supplied separately).
+///
+/// Introduced in T12 to replace the fixed `new(cpu, mem, entry)`
+/// signature Phase 1 had -- the one deliberately cross-cutting API
+/// change T12 owns (see `docs/plan.md`'s T12 entry): threading real
+/// guest command-line arguments through, and deriving the heap's start
+/// address from where the loaded program actually ends (see the
+/// `guestmem` module docs) instead of Phase 1's fixed placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartConfig {
+    /// Guest address to start executing at (typically
+    /// [`crate::loader::LoadResult::entry`]).
+    pub entry: u32,
+    /// The first guest address *after* every loaded hunk (typically
+    /// [`crate::loader::LoadResult::end`]). The guest heap starts here
+    /// (rounded up to a 4-byte boundary), so it never overlaps the
+    /// loaded program image.
+    pub load_end: u32,
+    /// The guest program's command-line arguments (not including the
+    /// program name itself, matching `argv[1..]` convention), passed
+    /// per AmigaOS startup convention: joined with spaces into a single
+    /// buffer allocated on the guest heap, `A0` = pointer to it, `D0` =
+    /// its length (see [`Runtime::new`]'s doc for the exact framing).
+    pub args: Vec<String>,
+}
+
 /// Ties a [`Cpu`] backend, its guest memory, and a [`LibraryTable`]
 /// together to run a loaded program to completion.
 ///
 /// Construction sets up:
-/// - `A6` = [`DOS_LIBRARY_BASE`] (the fixtures this runtime targets
-///   assume a library base is already in `A6` at program start; Phase 2
-///   would replace this with a real `OpenLibrary`-driven base).
+/// - `A6` = [`DOS_LIBRARY_BASE`]. This is a compatibility seed, *not*
+///   how a real AmigaOS program finds a library base: real startup code
+///   reads [`EXEC_LIBRARY_BASE`] from [`ABS_EXEC_BASE_ADDR`] (guest
+///   address 4) and calls `OpenLibrary("dos.library", 0)` itself, both
+///   of which are also fully wired up (see [`open_library_handler`]).
+///   `A6` is seeded anyway because the Phase 1 `hello` fixture (and its
+///   tests) call straight into `-948(a6)` without ever calling
+///   `OpenLibrary` first; T14 updates the fixtures to use the real
+///   `OpenLibrary` flow, at which point this seed becomes redundant but
+///   still harmless (real programs overwrite `A6` themselves before
+///   using it).
+/// - Guest address 4 ([`ABS_EXEC_BASE_ADDR`]) = [`EXEC_LIBRARY_BASE`].
 /// - `A7` (the stack pointer) at the top of guest memory, with
 ///   [`EXIT_STUB_ADDR`] pre-pushed as the return address so the guest's
 ///   own final `rts` lands on the exit sentinel (see module docs).
+/// - `A0`/`D0` = the guest command-line buffer/length (see
+///   [`Runtime::new`]).
 /// - `PC` = the program's entry point.
 pub struct Runtime<C: Cpu> {
     cpu: C,
     mem: C::Memory,
     table: LibraryTable<C>,
     heap: GuestHeap,
+    registry: LibraryRegistry,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -485,13 +820,25 @@ pub type TraceEvent = CallInfo;
 
 impl<C: Cpu + 'static> Runtime<C> {
     /// Builds a runtime around an already-constructed CPU and loaded
-    /// guest memory. `entry` is the guest address to start executing at
-    /// (typically [`crate::loader::LoadResult::entry`]).
+    /// guest memory, per `config` (see [`StartConfig`]).
     ///
-    /// The fake `dos.library` jump table (currently just `PutStr`) is
+    /// The fake `dos.library` (`PutStr`) and `exec.library`
+    /// (`OpenLibrary`/`OldOpenLibrary`/`CloseLibrary`) jump tables are
     /// registered automatically; see [`Runtime::library_table_mut`] to
     /// register additional handlers before calling [`Runtime::run`].
-    pub fn new(mut cpu: C, mut mem: C::Memory, entry: u32) -> Self {
+    ///
+    /// # Guest command-line convention
+    ///
+    /// `config.args` is joined with single spaces and a trailing `'\n'`
+    /// (the AmigaOS CLI command-line buffer convention: a program that
+    /// parses its own arguments out of `A0`/`D0`, e.g. via `ReadArgs`,
+    /// expects exactly this framing) into a buffer allocated on the
+    /// guest heap, with one extra `NUL` byte written after the `'\n'`
+    /// as a defensive terminator for anything that scans for one
+    /// instead of trusting the length. `A0` is set to that buffer's
+    /// address; `D0` is set to the buffer's length *including* the
+    /// `'\n'` but *not* the extra `NUL`, matching the real convention.
+    pub fn new(mut cpu: C, mut mem: C::Memory, config: StartConfig) -> Self {
         // Prefill the whole reserved jump-table region with the "unknown
         // call" sentinel opcode before registering anything real, so any
         // `jsr`/`jmp` into an LVO nobody's registered a handler for still
@@ -513,6 +860,59 @@ impl<C: Cpu + 'static> Runtime<C> {
             putstr_handler::<C>,
         );
 
+        // exec.library: only the three LVOs T12 needs (OpenLibrary /
+        // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
+        // for the full reserved-region memory map. Looked up by name
+        // through the generated EXEC_LVOS table (T7-style), same as
+        // dos.library, so unknown-call diagnostics on this base resolve
+        // to real function names too.
+        table
+            .register_by_name(
+                &mut mem,
+                EXEC_LIBRARY_BASE,
+                crate::lvos::exec::EXEC_LVOS,
+                "exec.library",
+                "OpenLibrary",
+                open_library_handler::<C>,
+            )
+            .expect("OpenLibrary is in EXEC_LVOS");
+        table
+            .register_by_name(
+                &mut mem,
+                EXEC_LIBRARY_BASE,
+                crate::lvos::exec::EXEC_LVOS,
+                "exec.library",
+                "OldOpenLibrary",
+                old_open_library_handler::<C>,
+            )
+            .expect("OldOpenLibrary is in EXEC_LVOS");
+        table
+            .register_by_name(
+                &mut mem,
+                EXEC_LIBRARY_BASE,
+                crate::lvos::exec::EXEC_LVOS,
+                "exec.library",
+                "CloseLibrary",
+                close_library_handler::<C>,
+            )
+            .expect("CloseLibrary is in EXEC_LVOS");
+
+        // The shared fake-library-vector handler: bound once, to a slot
+        // number every auto-created fake library's jump table reuses
+        // (see FAKE_LIB_SLOT's docs). No opcode word is written here --
+        // open_library_handler writes them, per fake library, on demand.
+        table.register_fixed_slot(FAKE_LIB_SLOT, fake_lib_vector_handler::<C>);
+
+        // AbsExecBase: guest address 4 holds EXEC_LIBRARY_BASE, the
+        // pointer real startup code reads via `move.l 4,a6`. Written
+        // after the sentinel prefill above so it isn't overwritten by
+        // it (this is a plain data word, never a jump-table entry).
+        mem.write_u32(ABS_EXEC_BASE_ADDR, EXEC_LIBRARY_BASE);
+
+        let mut registry = LibraryRegistry::new();
+        registry.register_real("dos.library", DOS_LIBRARY_BASE);
+        registry.register_real("exec.library", EXEC_LIBRARY_BASE);
+
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using
         // a real slot number keeps the trap table self-consistent to
@@ -527,27 +927,42 @@ impl<C: Cpu + 'static> Runtime<C> {
         let sp = top.wrapping_sub(4);
         mem.write_u32(sp, EXIT_STUB_ADDR);
 
+        // Heap: from the loaded program's end (rounded up) to the base
+        // of the reserved stack region, so it never overlaps either.
+        let stack_base = top.saturating_sub(STACK_SIZE) & !3;
+        let mut heap = GuestHeap::new(config.load_end, stack_base);
+
+        // Command-line buffer: args joined with spaces, '\n'-terminated
+        // (the length reported in D0 includes this '\n'), plus one extra
+        // NUL byte as a defensive terminator for code that scans instead
+        // of trusting D0. Allocated on the heap built just above.
+        let mut line = config.args.join(" ").into_bytes();
+        line.push(b'\n');
+        let line_len = line.len() as u32;
+        let args_addr = heap
+            .alloc(line_len + 1)
+            .expect("guest heap has room for the command-line buffer");
+        {
+            let mut a = args_addr;
+            for &b in &line {
+                mem.write_u8(a, b);
+                a = a.wrapping_add(1);
+            }
+            mem.write_u8(a, 0);
+        }
+
         cpu.set_address_register(AddressRegister(7), sp);
         cpu.set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
-        cpu.set_pc(entry);
-
-        // Default heap: HEAP_DEFAULT_START..stack base. This is a
-        // placeholder -- Runtime::new doesn't know where the loaded
-        // program actually ends, so it can't derive a heap start that's
-        // guaranteed not to overlap the program image (see guestmem.rs
-        // module docs). Callers whose program extends past
-        // HEAP_DEFAULT_START should build their own GuestHeap (starting
-        // past the highest loaded hunk) and install it via
-        // Runtime::set_heap before running. T12's start-config struct
-        // will thread the real load-end through automatically.
-        let stack_base = top.saturating_sub(STACK_SIZE) & !3;
-        let heap = GuestHeap::new(HEAP_DEFAULT_START, stack_base);
+        cpu.set_address_register(AddressRegister(0), args_addr);
+        cpu.set_data_register(DataRegister(0), line_len);
+        cpu.set_pc(config.entry);
 
         Self {
             cpu,
             mem,
             table,
             heap,
+            registry,
         }
     }
 
@@ -564,11 +979,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         &mut self.heap
     }
 
-    /// Replaces the runtime's guest heap wholesale -- e.g. to install one
-    /// whose start address accounts for a program's real load end,
-    /// rather than the conservative [`HEAP_DEFAULT_START`] placeholder
-    /// [`Runtime::new`] installs by default (see the `guestmem` module
-    /// docs). T12's start-config struct will make this automatic.
+    /// Replaces the runtime's guest heap wholesale -- e.g. to shrink or
+    /// grow it relative to what [`StartConfig::load_end`] implied, or to
+    /// swap in a heap with pre-existing allocations for a test. Note
+    /// this does *not* move the already-allocated command-line buffer
+    /// [`Runtime::new`] placed on the *old* heap; callers replacing the
+    /// heap should generally do so before relying on `A0`/`D0`.
     pub fn set_heap(&mut self, heap: GuestHeap) {
         self.heap = heap;
     }
@@ -615,14 +1031,15 @@ impl<C: Cpu + 'static> Runtime<C> {
                         });
                     };
 
-                    let call_info = self.table.dispatch(
-                        opcode,
-                        info.pc,
-                        &mut self.cpu,
-                        &mut self.mem,
+                    let mut ctx = HandlerContext {
+                        cpu: &mut self.cpu,
+                        mem: &mut self.mem,
                         out,
-                        &mut self.heap,
-                    )?;
+                        heap: &mut self.heap,
+                        registry: &mut self.registry,
+                        pc: info.pc,
+                    };
+                    let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
                         trace(&call_info);
                     }
@@ -656,12 +1073,31 @@ mod tests {
     }
 
     /// Builds a runtime with a fresh CPU/memory and a program consisting
-    /// only of `words`, loaded at `TRAP_TABLE_END`.
+    /// only of `words`, loaded at `TRAP_TABLE_END`. Memory is sized
+    /// generously (128 KiB) so the fixed 64 KiB stack region and a
+    /// working heap both fit comfortably above the tiny test programs
+    /// this helper loads (see `guestmem::STACK_SIZE`).
     fn runtime_with_program(words: &[u16]) -> Runtime<M68kCpu> {
-        let mut mem = FlatMemory::new(0x4000);
+        runtime_with_program_and_args(words, Vec::new())
+    }
+
+    /// As [`runtime_with_program`], but with explicit guest command-line
+    /// arguments.
+    fn runtime_with_program_and_args(words: &[u16], args: Vec<String>) -> Runtime<M68kCpu> {
+        let mut mem = FlatMemory::new(0x2_0000);
         let entry = TRAP_TABLE_END;
         load_words(&mut mem, entry, words);
-        Runtime::new(M68kCpu::new(), mem, entry)
+        // Comfortably past any test program's code + inline data.
+        let load_end = entry + 0x100;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args,
+            },
+        )
     }
 
     #[test]
@@ -769,9 +1205,17 @@ mod tests {
         // its result (D0 = 7) survives to become the process exit code.
         let entry = TRAP_TABLE_END;
         let words = [0x4EAE, (-200i16) as u16, 0x4E75]; // jsr -200(a6) ; rts
-        let mut mem = FlatMemory::new(0x4000);
+        let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
-        let mut rt = Runtime::new(M68kCpu::new(), mem, entry);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x100,
+                args: Vec::new(),
+            },
+        );
 
         // Disjoint private-field access (same module tree) lets us borrow
         // `table` and `mem` independently, which `library_table_mut()`
@@ -850,9 +1294,17 @@ mod tests {
         // Lock's real offset, but we never registered a handler for it.
         let entry = TRAP_TABLE_END;
         let words = [0x4EAE, (-84i16) as u16, 0x4E75]; // jsr -84(a6) ; rts
-        let mut mem = FlatMemory::new(0x4000);
+        let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
-        let mut rt = Runtime::new(M68kCpu::new(), mem, entry);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x100,
+                args: Vec::new(),
+            },
+        );
         rt.table
             .register_by_name(
                 &mut rt.mem,
@@ -901,5 +1353,202 @@ mod tests {
             }
             other => panic!("expected UnknownCall, got {other:?}"),
         }
+    }
+
+    // --- T12: exec.library OpenLibrary/OldOpenLibrary/CloseLibrary,
+    // process startup (A0/D0 args, heap placement, AbsExecBase) ---
+
+    /// `movea.l #imm32,An` opcode (source: immediate long, destination:
+    /// address register direct). The immediate follows as two words.
+    fn movea_imm(n: u16) -> u16 {
+        0x207C | (n << 9)
+    }
+
+    /// `movea.l Dx,An` opcode (source: data register direct,
+    /// destination: address register direct).
+    fn movea_dn(an: u16, dn: u16) -> u16 {
+        0x2040 | (an << 9) | dn
+    }
+
+    /// `jsr <disp16>(An)` opcode. The 16-bit displacement follows as one
+    /// word.
+    fn jsr_disp16(an: u16) -> u16 {
+        0x4EA8 | an
+    }
+
+    const MOVEQ_D0_0: u16 = 0x7000; // moveq #0,d0
+    const RTS: u16 = 0x4E75;
+
+    /// Appends a `movea.l #imm32,An` (3 words: opcode + hi + lo) to
+    /// `words`.
+    fn push_movea_imm(words: &mut Vec<u16>, an: u16, imm: u32) {
+        words.push(movea_imm(an));
+        words.push((imm >> 16) as u16);
+        words.push(imm as u16);
+    }
+
+    /// Appends a `jsr <disp16>(An)` (2 words) to `words`.
+    fn push_jsr(words: &mut Vec<u16>, an: u16, disp: i32) {
+        words.push(jsr_disp16(an));
+        words.push(disp as u16);
+    }
+
+    #[test]
+    fn open_library_of_dos_returns_dos_base() {
+        // A1 = "dos.library"\0, A6 = EXEC_LIBRARY_BASE, jsr OpenLibrary
+        // (-552(a6)), rts -- D0 (and hence the exit code) is whatever
+        // OpenLibrary put there.
+        let entry = TRAP_TABLE_END;
+        let name = b"dos.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        // Patch A1's immediate (the two words right after the movea
+        // opcode at index 0) now that str_addr is known.
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32, DOS_LIBRARY_BASE,
+            "OpenLibrary(\"dos.library\") should return DOS_LIBRARY_BASE in D0"
+        );
+    }
+
+    #[test]
+    fn open_library_of_unknown_name_auto_creates_fake_and_succeeds() {
+        // OpenLibrary("xyz.library") must succeed (never fails at
+        // OpenLibrary time, per the vamos escape hatch), returning some
+        // fake base in D0; only calling a vector on that base fails.
+        let entry = TRAP_TABLE_END;
+        let name = b"xyz.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("xyz.library") -> D0
+        words.push(movea_dn(6, 0)); // A6 = D0 (the fake base)
+        push_jsr(&mut words, 6, -6); // call an arbitrary vector on it
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+            },
+        );
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::Dispatch(DispatchError::HandlerFailed { library, lvo, .. }) => {
+                assert_eq!(library, "xyz.library");
+                assert_eq!(lvo, -6);
+            }
+            other => panic!("expected a HandlerFailed naming xyz.library, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_library_is_a_no_op() {
+        // A1 = DOS_LIBRARY_BASE, A6 = EXEC_LIBRARY_BASE, jsr
+        // CloseLibrary (-414(a6)); then explicitly zero D0 and exit, so
+        // a clean 0 exit code proves CloseLibrary didn't error or crash
+        // (it isn't expected to touch D0 itself).
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, DOS_LIBRARY_BASE);
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -414); // CloseLibrary
+        words.push(MOVEQ_D0_0);
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("CloseLibrary should be a no-op, not error");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn location_4_holds_exec_library_base() {
+        let rt = runtime_with_program(&[RTS]);
+        assert_eq!(
+            rt.mem.read_u32(ABS_EXEC_BASE_ADDR),
+            EXEC_LIBRARY_BASE,
+            "guest address 4 (AbsExecBase) should hold EXEC_LIBRARY_BASE"
+        );
+    }
+
+    #[test]
+    fn a0_d0_hold_the_joined_newline_terminated_command_line() {
+        let rt = runtime_with_program_and_args(&[RTS], vec!["foo".to_string(), "bar".to_string()]);
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        let d0 = rt.cpu.data_register(DataRegister(0));
+        assert_eq!(d0, 8, "\"foo bar\\n\" is 8 bytes");
+        let bytes: Vec<u8> = (0..d0).map(|i| rt.mem.read_u8(a0 + i)).collect();
+        assert_eq!(bytes, b"foo bar\n");
+        // A defensive NUL immediately follows, not counted in D0.
+        assert_eq!(rt.mem.read_u8(a0 + d0), 0);
+    }
+
+    #[test]
+    fn empty_args_still_produce_a_bare_newline_command_line() {
+        let rt = runtime_with_program_and_args(&[RTS], Vec::new());
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        let d0 = rt.cpu.data_register(DataRegister(0));
+        assert_eq!(d0, 1);
+        assert_eq!(rt.mem.read_u8(a0), b'\n');
+    }
+
+    #[test]
+    fn heap_starts_at_load_end() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[RTS]);
+        let load_end = entry + 0x40; // already 4-byte aligned
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+            },
+        );
+        // The command-line buffer is the very first thing Runtime::new
+        // allocates from the heap, so A0 doubles as a direct probe of
+        // the heap's start address.
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        assert_eq!(a0, load_end);
     }
 }

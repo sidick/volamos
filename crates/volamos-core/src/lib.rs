@@ -21,12 +21,13 @@ pub mod vfs;
 pub use backend::M68kCpu;
 pub use cpu::Cpu;
 pub use dispatch::{
-    CallInfo, DOS_LIBRARY_BASE, DispatchError, EXIT_STUB_ADDR, HandlerContext, LVO_PUTSTR,
-    LibraryHandler, LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, TraceEvent,
+    ABS_EXEC_BASE_ADDR, CallInfo, DOS_LIBRARY_BASE, DispatchError, EXEC_LIBRARY_BASE,
+    EXIT_STUB_ADDR, HandlerContext, LVO_PUTSTR, LibraryHandler, LibraryKind, LibraryRegistry,
+    LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, StartConfig, TraceEvent,
 };
 pub use guestmem::{
-    GuestHeap, GuestHeapError, HEAP_DEFAULT_START, STACK_SIZE, addr_from_bptr, bptr_from_addr,
-    read_bstr, read_c_string, write_bstr, write_c_string,
+    GuestHeap, GuestHeapError, STACK_SIZE, addr_from_bptr, bptr_from_addr, read_bstr,
+    read_c_string, write_bstr, write_c_string,
 };
 pub use loader::{HunkFile, LoadError, LoadResult, load, parse};
 pub use lvos::{ArgReg, LvoEntry, find_by_lvo, find_by_name};

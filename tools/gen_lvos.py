@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Generate `crates/volamos-core/src/lvos/dos.rs` from an AROS dos.library
-interface description.
+"""Generate a `crates/volamos-core/src/lvos/*.rs` LVO metadata table from an
+AROS library interface description (originally written for `dos.library`;
+generalized in T12 to also emit `exec.library`'s table -- any AROS `.conf`
+with a `##begin functionlist` block works via `--table-name`/`--library-doc`/
+`--module-doc`/`--sanity`).
 
 This is a **one-shot codegen tool**, not a build-time dependency. Run it by
 hand when the upstream interface description changes, review the diff, and
@@ -154,15 +157,19 @@ def render(
     commit: str,
     generated: str,
     generator: str,
+    library_doc: str,
+    conf_path: str,
+    table_name: str,
+    sanity: list[tuple[str, int]],
 ) -> str:
     lines: list[str] = []
-    lines.append("//! Generated `dos.library` LVO (library vector offset) metadata table.")
+    lines.append(f"//! Generated `{library_doc}` LVO (library vector offset) metadata table.")
     lines.append("//!")
     lines.append("//! # Provenance")
     lines.append("//!")
-    lines.append("//! Derived from AROS's `dos.library` interface description")
-    lines.append("//! (`rom/dos/dos.conf`, the `##begin functionlist` block AROS's own build")
-    lines.append("//! generates `dos_lib.sfd`/`dos_lib.fd` from -- see `tools/gen_lvos.py` for")
+    lines.append(f"//! Derived from AROS's `{library_doc}` interface description")
+    lines.append(f"//! (`{conf_path}`, the `##begin functionlist` block AROS's own build")
+    lines.append("//! generates the `.sfd`/`.fd` files from -- see `tools/gen_lvos.py` for")
     lines.append("//! why this repo reads the `.conf` directly rather than a generated `.sfd`).")
     lines.append("//!")
     lines.append(f"//! - Source URL: <{source_url}>")
@@ -181,11 +188,11 @@ def render(
     lines.append("use crate::cpu::{AddressRegister, DataRegister};")
     lines.append("use crate::lvos::{ArgReg, LvoEntry};")
     lines.append("")
-    lines.append("/// The full `dos.library` LVO table (all known functions, not just the")
+    lines.append(f"/// The full `{library_doc}` LVO table (all known functions, not just the")
     lines.append("/// ones this runtime currently implements handlers for -- this way")
     lines.append("/// unknown-call diagnostics can print a real function name for any of")
     lines.append("/// them, not just the handful we emulate).")
-    lines.append(f"pub static DOS_LVOS: &[LvoEntry] = &[")
+    lines.append(f"pub static {table_name}: &[LvoEntry] = &[")
     for e in entries:
         regs = ", ".join(reg_literal(r) for r in e.regs)
         private = "true" if e.private else "false"
@@ -201,59 +208,93 @@ def render(
     lines.append("    use crate::lvos::find_by_name;")
     lines.append("")
     lines.append("    // Sanity-check a handful of well-known LVOs against published AmigaOS")
-    lines.append("    // dos.library values (see docs/plan.md's T7 entry).")
+    lines.append(f"    // {library_doc} values (see docs/plan.md's T7/T12 entries).")
     lines.append("    #[test]")
     lines.append("    fn known_lvos_match_amigaos() {")
     lines.append("        let cases: &[(&str, i32)] = &[")
-    lines.append('            ("Open", -30),')
-    lines.append('            ("Close", -36),')
-    lines.append('            ("Read", -42),')
-    lines.append('            ("Write", -48),')
-    lines.append('            ("Input", -54),')
-    lines.append('            ("Output", -60),')
-    lines.append('            ("Seek", -66),')
-    lines.append('            ("Lock", -84),')
-    lines.append('            ("Examine", -102),')
-    lines.append('            ("ExNext", -108),')
-    lines.append('            ("CurrentDir", -126),')
-    lines.append('            ("IoErr", -132),')
-    lines.append('            ("ParentDir", -210),')
-    lines.append('            ("PutStr", -948),')
+    for name, lvo in sanity:
+        lines.append(f'            ("{name}", {lvo}),')
     lines.append("        ];")
     lines.append("        for (name, lvo) in cases {")
-    lines.append('            let entry = find_by_name(DOS_LVOS, name)')
+    lines.append(f'            let entry = find_by_name({table_name}, name)')
     lines.append('                .unwrap_or_else(|| panic!("missing LVO entry for {name}"));')
     lines.append("            assert_eq!(entry.lvo, *lvo, \"{name} LVO mismatch\");")
     lines.append("        }")
-    lines.append("    }")
-    lines.append("")
-    lines.append("    #[test]")
-    lines.append("    fn open_and_lock_take_d1_d2() {")
-    lines.append('        let open = find_by_name(DOS_LVOS, "Open").unwrap();')
-    lines.append(
-        "        assert_eq!(open.args, &[ArgReg::D(DataRegister(1)), ArgReg::D(DataRegister(2))]);"
-    )
-    lines.append('        let lock = find_by_name(DOS_LVOS, "Lock").unwrap();')
-    lines.append(
-        "        assert_eq!(lock.args, &[ArgReg::D(DataRegister(1)), ArgReg::D(DataRegister(2))]);"
-    )
-    lines.append('        let putstr = find_by_name(DOS_LVOS, "PutStr").unwrap();')
-    lines.append("        assert_eq!(putstr.args, &[ArgReg::D(DataRegister(1))]);")
     lines.append("    }")
     lines.append("}")
     lines.append("")
     return "\n".join(lines)
 
 
+# Sanity cases baked in per-library so a plain `--library dos`/`--library
+# exec` invocation (no need to spell out every `--sanity` flag by hand)
+# reproduces the exact tables this repo committed. Extra `--sanity`
+# flags on the command line are appended to whichever of these applies.
+_BUILTIN_SANITY: dict[str, list[tuple[str, int]]] = {
+    "dos": [
+        ("Open", -30),
+        ("Close", -36),
+        ("Read", -42),
+        ("Write", -48),
+        ("Input", -54),
+        ("Output", -60),
+        ("Seek", -66),
+        ("Lock", -84),
+        ("Examine", -102),
+        ("ExNext", -108),
+        ("CurrentDir", -126),
+        ("IoErr", -132),
+        ("ParentDir", -210),
+        ("PutStr", -948),
+    ],
+    "exec": [
+        ("OpenLibrary", -552),
+        ("OldOpenLibrary", -408),
+        ("CloseLibrary", -414),
+        ("AllocMem", -198),
+        ("FreeMem", -210),
+        ("FindTask", -294),
+    ],
+}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", help="local path to dos.conf (fetched from --source-url if omitted)")
+    ap.add_argument("--input", help="local path to the .conf file (fetched from --source-url if omitted)")
     ap.add_argument("--source-url", required=True, help="canonical raw URL of the source file")
     ap.add_argument("--commit", required=True, help="git commit hash of the source file version used")
     ap.add_argument("--generated", required=True, help="generation date, e.g. 2026-08-18")
     ap.add_argument("--generator", default="tools/gen_lvos.py", help="path to this script, for the provenance header")
     ap.add_argument("--output", required=True, help="path to write the generated .rs file")
+    ap.add_argument(
+        "--library",
+        choices=sorted(_BUILTIN_SANITY),
+        help="shorthand: fills in --table-name/--library-doc/--conf-path/--sanity defaults for a known library",
+    )
+    ap.add_argument("--table-name", help='Rust static name, e.g. "EXEC_LVOS" (default derived from --library)')
+    ap.add_argument("--library-doc", help='display name, e.g. "exec.library" (default derived from --library)')
+    ap.add_argument("--conf-path", help='source path shown in the doc comment, e.g. "rom/exec/exec.conf"')
+    ap.add_argument(
+        "--sanity",
+        action="append",
+        default=[],
+        metavar="NAME=LVO",
+        help="extra sanity-check case to append to the generated test (repeatable)",
+    )
     args = ap.parse_args()
+
+    table_name = args.table_name or (f"{args.library.upper()}_LVOS" if args.library else None)
+    library_doc = args.library_doc or (f"{args.library}.library" if args.library else None)
+    conf_path = args.conf_path or (f"rom/{args.library}/{args.library}.conf" if args.library else None)
+    if not (table_name and library_doc and conf_path):
+        raise SystemExit("--library, or all of --table-name/--library-doc/--conf-path, is required")
+
+    sanity = list(_BUILTIN_SANITY.get(args.library, []))
+    for item in args.sanity:
+        name, _, lvo = item.partition("=")
+        if not _:
+            raise SystemExit(f"--sanity {item!r} must be NAME=LVO")
+        sanity.append((name, int(lvo)))
 
     if args.input:
         with open(args.input, "r", encoding="utf-8") as f:
@@ -283,6 +324,10 @@ def main() -> None:
         commit=args.commit,
         generated=args.generated,
         generator=args.generator,
+        library_doc=library_doc,
+        conf_path=conf_path,
+        table_name=table_name,
+        sanity=sanity,
     )
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(out)

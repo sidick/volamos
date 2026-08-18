@@ -8,17 +8,18 @@
 //! volamos [-v|--verbose] <program> [args...]
 //! ```
 //!
-//! `[args...]` is accepted but currently ignored (passing arguments
-//! through to the guest program's own argument-parsing convention,
-//! typically via `ReadArgs`/the CLI's command-line buffer, is Phase 2
-//! work). `-v`/`--verbose` logs each trapped library call (library name,
-//! LVO, and handler name) to stderr as it happens.
+//! `[args...]` is passed through to the guest program per AmigaOS
+//! startup convention (joined with spaces into a command-line buffer,
+//! `A0`/`D0` -- see `volamos_core::dispatch::Runtime::new`); a program
+//! that parses its own arguments (e.g. via `ReadArgs`) can read them
+//! from there. `-v`/`--verbose` logs each trapped library call (library
+//! name, LVO, and handler name) to stderr as it happens.
 
 use std::io;
 use std::process::ExitCode;
 
 use volamos_core::backend::{M68kCpu, TRAP_TABLE_END};
-use volamos_core::dispatch::{Runtime, TraceEvent};
+use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
 use volamos_core::memory::FlatMemory;
 use volamos_core::{LoadError, loader};
 
@@ -30,8 +31,6 @@ const GUEST_MEMORY_SIZE: usize = 1 << 20; // 1 MiB
 struct Options {
     verbose: bool,
     program: String,
-    /// Accepted but currently unused; see module docs.
-    #[allow(dead_code)]
     guest_args: Vec<String>,
 }
 
@@ -43,8 +42,7 @@ fn print_usage(program_name: &str) {
     eprintln!("options:");
     eprintln!("  -v, --verbose   log each emulated library call to stderr");
     eprintln!();
-    eprintln!("note: [args...] is currently accepted but ignored (guest");
-    eprintln!("      argument passing is not yet implemented).");
+    eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
 }
 
 /// Hand-rolled argument parsing: this CLI's surface is small enough that
@@ -87,7 +85,12 @@ fn run(opts: &Options) -> Result<i32, String> {
         .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
 
     let cpu = M68kCpu::new();
-    let mut runtime = Runtime::new(cpu, mem, load_result.entry);
+    let config = StartConfig {
+        entry: load_result.entry,
+        load_end: load_result.end,
+        args: opts.guest_args.clone(),
+    };
+    let mut runtime = Runtime::new(cpu, mem, config);
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
