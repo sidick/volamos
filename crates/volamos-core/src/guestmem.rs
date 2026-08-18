@@ -225,6 +225,33 @@ impl GuestHeap {
     pub fn free_bytes(&self) -> u32 {
         self.free.iter().map(|b| b.size).sum()
     }
+
+    /// Total free bytes remaining across all free blocks -- an alias for
+    /// [`GuestHeap::free_bytes`] under the name `exec.library`'s
+    /// `AvailMem` (see `crate::execmem`) uses for its default (non-
+    /// `MEMF_LARGEST`) query, so that module doesn't need to know
+    /// `free_bytes` predates it.
+    pub fn total_free(&self) -> u32 {
+        self.free_bytes()
+    }
+
+    /// The size in bytes of the single largest free block, or `0` if the
+    /// heap has no free space at all. Backs `AvailMem`'s `MEMF_LARGEST`
+    /// query (`crate::execmem`): the largest block a single subsequent
+    /// `alloc` could satisfy, as opposed to [`GuestHeap::total_free`]'s
+    /// sum across every (possibly non-contiguous) free block.
+    pub fn largest_free(&self) -> u32 {
+        self.free.iter().map(|b| b.size).max().unwrap_or(0)
+    }
+
+    /// The size of the live allocation starting at `addr`, if any --
+    /// i.e. exactly what a prior [`GuestHeap::alloc`] call returned. Used
+    /// by `crate::execmem`'s `FreeMem`/`FreeVec` handlers to validate the
+    /// size the guest claims it's freeing against what was actually
+    /// allocated, without needing a parallel host-side size-tracking map.
+    pub fn size_of_live_alloc(&self, addr: u32) -> Option<u32> {
+        self.live.get(&addr).copied()
+    }
 }
 
 /// Rounds `value` up to the nearest multiple of 4, saturating at `u32::MAX`
@@ -430,6 +457,51 @@ mod tests {
         let round = read_bstr(&mem, 0);
         assert_eq!(round.len(), 255);
         assert!(round.iter().all(|&b| b == b'x'));
+    }
+
+    #[test]
+    fn total_free_sums_disjoint_free_blocks() {
+        let mut heap = GuestHeap::new(0x1000, 0x1000 + 48);
+        assert_eq!(heap.total_free(), 48);
+        let a = heap.alloc(16).unwrap();
+        let _b = heap.alloc(16).unwrap();
+        let _c = heap.alloc(16).unwrap();
+        assert_eq!(heap.total_free(), 0);
+        heap.free(a).unwrap();
+        assert_eq!(heap.total_free(), 16);
+    }
+
+    #[test]
+    fn largest_free_finds_the_biggest_block_even_when_fragmented() {
+        let mut heap = GuestHeap::new(0x1000, 0x1000 + 48);
+        let a = heap.alloc(16).unwrap();
+        let _b = heap.alloc(16).unwrap();
+        let _c = heap.alloc(16).unwrap();
+        assert_eq!(heap.largest_free(), 0);
+        // Free the first and third blocks (non-adjacent to each other,
+        // so they don't coalesce into one bigger block): two 16-byte
+        // free blocks, not one 32-byte one.
+        heap.free(a).unwrap();
+        heap.free(_c).unwrap();
+        assert_eq!(heap.largest_free(), 16);
+        assert_eq!(heap.total_free(), 32);
+    }
+
+    #[test]
+    fn largest_free_is_zero_on_an_empty_heap() {
+        let heap = GuestHeap::new(0x2000, 0x1000); // end <= start -> empty
+        assert_eq!(heap.largest_free(), 0);
+        assert_eq!(heap.total_free(), 0);
+    }
+
+    #[test]
+    fn size_of_live_alloc_reports_the_rounded_size_and_none_when_unknown() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let a = heap.alloc(13).unwrap(); // rounds up to 16
+        assert_eq!(heap.size_of_live_alloc(a), Some(16));
+        assert_eq!(heap.size_of_live_alloc(0x1234), None);
+        heap.free(a).unwrap();
+        assert_eq!(heap.size_of_live_alloc(a), None);
     }
 
     #[test]

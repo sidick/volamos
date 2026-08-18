@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod dispatch;
 pub mod dosfile;
 pub mod doslock;
+pub mod execmem;
 pub mod guestmem;
 pub mod loader;
 pub mod lvos;

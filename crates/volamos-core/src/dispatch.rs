@@ -918,6 +918,11 @@ impl<C: Cpu + 'static> Runtime<C> {
             )
             .expect("CloseLibrary is in EXEC_LVOS");
 
+        // exec.library memory allocation (T16): AllocMem/FreeMem/
+        // AvailMem/AllocVec/FreeVec over this same GuestHeap -- see
+        // crate::execmem's module docs for the flat-allocator design.
+        crate::execmem::register_execmem_handlers(&mut table, &mut mem);
+
         // The shared fake-library-vector handler: bound once, to a slot
         // number every auto-created fake library's jump table reuses
         // (see FAKE_LIB_SLOT's docs). No opcode word is written here --
