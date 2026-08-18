@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cpu;
 pub mod dispatch;
+pub mod guestmem;
 pub mod loader;
 pub mod lvos;
 pub mod memory;
@@ -22,6 +23,10 @@ pub use cpu::Cpu;
 pub use dispatch::{
     CallInfo, DOS_LIBRARY_BASE, DispatchError, EXIT_STUB_ADDR, HandlerContext, LVO_PUTSTR,
     LibraryHandler, LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, TraceEvent,
+};
+pub use guestmem::{
+    GuestHeap, GuestHeapError, HEAP_DEFAULT_START, STACK_SIZE, addr_from_bptr, bptr_from_addr,
+    read_bstr, read_c_string, write_bstr, write_c_string,
 };
 pub use loader::{HunkFile, LoadError, LoadResult, load, parse};
 pub use lvos::{ArgReg, LvoEntry, find_by_lvo, find_by_name};

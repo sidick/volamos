@@ -61,6 +61,7 @@ use std::io::Write;
 
 use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
+use crate::guestmem::{GuestHeap, HEAP_DEFAULT_START, STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
 
@@ -100,12 +101,15 @@ pub const DOS_LIBRARY_BASE: u32 = 0x0800;
 pub const LVO_PUTSTR: i32 = -948;
 
 /// What a host-side library call handler is given to do its work: mutable
-/// access to the CPU (registers), guest memory, and an output sink for
-/// anything the call writes to "stdout" (e.g. `PutStr`).
+/// access to the CPU (registers), guest memory, an output sink for
+/// anything the call writes to "stdout" (e.g. `PutStr`), and the guest
+/// heap (for handlers that need to allocate guest-visible structures,
+/// e.g. T10/T11's `FileHandle`/`FileInfoBlock`).
 pub struct HandlerContext<'a, C: Cpu> {
     pub cpu: &'a mut C,
     pub mem: &'a mut C::Memory,
     pub out: &'a mut dyn Write,
+    pub heap: &'a mut GuestHeap,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -349,6 +353,7 @@ impl<C: Cpu> LibraryTable<C> {
         cpu: &mut C,
         mem: &mut C::Memory,
         out: &mut dyn Write,
+        heap: &mut GuestHeap,
     ) -> Result<CallInfo, DispatchError> {
         let slot = opcode & 0x0FFF;
         let Some(entry) = self.slots.get_mut(&slot) else {
@@ -382,7 +387,12 @@ impl<C: Cpu> LibraryTable<C> {
             handler_name: entry.handler_name.clone(),
         };
 
-        let mut ctx = HandlerContext { cpu, mem, out };
+        let mut ctx = HandlerContext {
+            cpu,
+            mem,
+            out,
+            heap,
+        };
         entry.handler.call(&mut ctx).map_err(|e| match e {
             DispatchError::HandlerFailed { message, .. } => DispatchError::HandlerFailed {
                 library: info.library.clone(),
@@ -395,22 +405,6 @@ impl<C: Cpu> LibraryTable<C> {
 
         Ok(info)
     }
-}
-
-/// Reads a NUL-terminated string starting at `addr` out of guest memory.
-/// The terminator is not included in the returned bytes.
-fn read_c_string(mem: &dyn AddressSpace, addr: u32) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let mut a = addr;
-    loop {
-        let b = mem.read_u8(a);
-        if b == 0 {
-            break;
-        }
-        bytes.push(b);
-        a = a.wrapping_add(1);
-    }
-    bytes
 }
 
 /// The `dos.library` `PutStr` handler: writes the NUL-terminated string
@@ -482,6 +476,7 @@ pub struct Runtime<C: Cpu> {
     cpu: C,
     mem: C::Memory,
     table: LibraryTable<C>,
+    heap: GuestHeap,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -524,9 +519,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // read/disassemble.
         mem.write_u16(EXIT_STUB_ADDR, 0xA000 | EXIT_SLOT);
 
-        // Stack: top of guest memory, 4-byte aligned, with the exit
-        // sentinel pre-pushed as the return address for the program's
-        // outermost `rts`.
+        // Stack: a fixed-size region (see `guestmem::STACK_SIZE`) at the
+        // top of guest memory, 4-byte aligned, with the exit sentinel
+        // pre-pushed as the return address for the program's outermost
+        // `rts`.
         let top = (mem.len() as u32) & !3;
         let sp = top.wrapping_sub(4);
         mem.write_u32(sp, EXIT_STUB_ADDR);
@@ -535,7 +531,24 @@ impl<C: Cpu + 'static> Runtime<C> {
         cpu.set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
         cpu.set_pc(entry);
 
-        Self { cpu, mem, table }
+        // Default heap: HEAP_DEFAULT_START..stack base. This is a
+        // placeholder -- Runtime::new doesn't know where the loaded
+        // program actually ends, so it can't derive a heap start that's
+        // guaranteed not to overlap the program image (see guestmem.rs
+        // module docs). Callers whose program extends past
+        // HEAP_DEFAULT_START should build their own GuestHeap (starting
+        // past the highest loaded hunk) and install it via
+        // Runtime::set_heap before running. T12's start-config struct
+        // will thread the real load-end through automatically.
+        let stack_base = top.saturating_sub(STACK_SIZE) & !3;
+        let heap = GuestHeap::new(HEAP_DEFAULT_START, stack_base);
+
+        Self {
+            cpu,
+            mem,
+            table,
+            heap,
+        }
     }
 
     /// Mutable access to the library table, so callers can register
@@ -543,6 +556,21 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// [`Runtime::run`].
     pub fn library_table_mut(&mut self) -> &mut LibraryTable<C> {
         &mut self.table
+    }
+
+    /// Mutable access to the guest heap, so handlers/tests can allocate
+    /// guest-visible structures directly.
+    pub fn heap_mut(&mut self) -> &mut GuestHeap {
+        &mut self.heap
+    }
+
+    /// Replaces the runtime's guest heap wholesale -- e.g. to install one
+    /// whose start address accounts for a program's real load end,
+    /// rather than the conservative [`HEAP_DEFAULT_START`] placeholder
+    /// [`Runtime::new`] installs by default (see the `guestmem` module
+    /// docs). T12's start-config struct will make this automatic.
+    pub fn set_heap(&mut self, heap: GuestHeap) {
+        self.heap = heap;
     }
 
     /// Direct access to guest memory (e.g. for tests that want to inspect
@@ -587,9 +615,14 @@ impl<C: Cpu + 'static> Runtime<C> {
                         });
                     };
 
-                    let call_info =
-                        self.table
-                            .dispatch(opcode, info.pc, &mut self.cpu, &mut self.mem, out)?;
+                    let call_info = self.table.dispatch(
+                        opcode,
+                        info.pc,
+                        &mut self.cpu,
+                        &mut self.mem,
+                        out,
+                        &mut self.heap,
+                    )?;
                     if let Some(trace) = trace.as_deref_mut() {
                         trace(&call_info);
                     }
