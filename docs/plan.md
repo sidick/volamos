@@ -828,14 +828,30 @@ console tools only.
    nothing downstream. Note the proposal's premise that vamos's
    tables are "BSD-ish" was wrong: amitools is GPLv2, so that option
    was never actually clean.
-2. **Phase 4 external tools.** The three-oracle harness depends on
-   AmiBake and Copperline, neither of which this repo controls (plus
-   vamos, which is pip-installable). Where do AmiBake and Copperline
-   come from — are they available/installable today, should the
-   harness pin specific versions, and do you have a Kickstart image
-   (and which version to pin as baseline) for the `REAL_ROM_B64`
-   secret? Doesn't block Phase 2/3, but should be answered before
-   Phase 4 planning firms up.
+2. **Phase 4 external tools — decided 2026-08-18.** The three-oracle
+   harness depends on AmiBake and Copperline, neither of which this
+   repo controls (plus vamos, which is pip-installable).
+   **Copperline** is a real, actively developed Rust Amiga emulator
+   (cycle-accurate OCS/ECS/AGA, 68000-68040) with a JSON-RPC control
+   protocol (`copperline-ctl`) aimed at scripts/agents — confirmed as
+   the real-Kickstart oracle for Phase 4, as originally proposed (not
+   swapped for the also-available `amiberry` MCP server; the two could
+   be added as a cross-check later, but that's not required to start).
+   **AmiBake** is Simon's own tool, in early private development at
+   `~/src/amibake` (not yet public/released) — a manifest-driven Amiga
+   test-image builder ("a Dockerfile for Amiga setups": pick a base
+   OS, list packages/versions, a machine variant, emit a bootable
+   image plus matching emulator config). It already targets emitting
+   both `copperline` and `amiberry` configs from one manifest. Status
+   as of 2026-08-18: `lint` and the resolver work; AROS-base
+   build/boot is done; OS 3.x bases (needed for this project's KS/WB
+   3.1 target) land around its milestone M8, still ahead. Consequence
+   for this repo: Phase 4 cannot start in earnest until AmiBake's
+   OS3.x-base milestone lands, since Phase 4's fixture parity depends
+   on AmiBake producing real Workbench 3.1 images, not just AROS ones.
+   Kickstart image sourcing for `REAL_ROM_B64` remains open — Simon
+   holds that decision personally (Cloanto/Hyperion-copyrighted binary,
+   never committed to this repo) and it isn't blocking today.
 3. **Empirical corpus — decided 2026-08-18.** Primary real-world test
    corpus: the **AmigaDOS `C:` Shell commands** from a genuine
    Workbench 3.1 disk (`List`, `Copy`, `Assign`, `Type`, `Dir`, `Echo`,
