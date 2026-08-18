@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cpu;
 pub mod dispatch;
+pub mod dosfile;
 pub mod guestmem;
 pub mod loader;
 pub mod lvos;
@@ -24,6 +25,12 @@ pub use dispatch::{
     ABS_EXEC_BASE_ADDR, CallInfo, DOS_LIBRARY_BASE, DispatchError, EXEC_LIBRARY_BASE,
     EXIT_STUB_ADDR, HandlerContext, LVO_PUTSTR, LibraryHandler, LibraryKind, LibraryRegistry,
     LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, StartConfig, TraceEvent,
+};
+pub use dosfile::{
+    DosState, ERROR_ACTION_NOT_KNOWN, ERROR_DIR_NOT_FOUND, ERROR_DISK_WRITE_PROTECTED,
+    ERROR_INVALID_COMPONENT_NAME, ERROR_INVALID_LOCK, ERROR_NO_FREE_STORE, ERROR_OBJECT_EXISTS,
+    ERROR_OBJECT_IN_USE, ERROR_OBJECT_NOT_FOUND, ERROR_OBJECT_WRONG_TYPE, ERROR_SEEK_ERROR,
+    MODE_NEWFILE, MODE_OLDFILE, MODE_READWRITE, OFFSET_BEGINNING, OFFSET_CURRENT, OFFSET_END,
 };
 pub use guestmem::{
     GuestHeap, GuestHeapError, STACK_SIZE, addr_from_bptr, bptr_from_addr, read_bstr,

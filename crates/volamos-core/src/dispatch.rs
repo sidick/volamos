@@ -61,9 +61,11 @@ use std::io::Write;
 
 use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
+use crate::dosfile::DosState;
 use crate::guestmem::{GuestHeap, STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
+use crate::vfs::Vfs;
 
 /// Number of distinct handler slots representable in an A-line opcode's
 /// low 12 bits (`0xA000`..=`0xAFFF`). One slot is reserved for the exit
@@ -188,6 +190,10 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// fake-library-vector handler does, since one handler instance
     /// serves every auto-created fake library's entire jump table.
     pub pc: u32,
+    /// Host-side `dos.library` state (T10): the file-handle registry,
+    /// current `IoErr()` value, and (optionally) a [`Vfs`] for path
+    /// resolution. See [`crate::dosfile`]'s module docs.
+    pub dos: &'a mut DosState,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -710,6 +716,14 @@ fn fake_lib_vector_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 /// only happen if the sink itself errors, which we don't expect for an
 /// in-memory buffer or stdout); it maps such a failure to `HandlerFailed`
 /// rather than panicking.
+///
+/// Superseded in [`Runtime::new`]'s actual registration by T10's
+/// [`crate::dosfile`]-based `PutStr` (written through `Output()`, per
+/// the T7 table); kept here (`#[cfg(test)]`) because this module's own
+/// tests still use it directly to exercise [`LibraryTable::register`]/
+/// [`LibraryTable::register_by_name`] mechanics independent of
+/// `DosState`.
+#[cfg(test)]
 fn putstr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ptr = ctx.cpu.data_register(DataRegister(1));
     let bytes = read_c_string(ctx.mem, ptr);
@@ -812,6 +826,7 @@ pub struct Runtime<C: Cpu> {
     table: LibraryTable<C>,
     heap: GuestHeap,
     registry: LibraryRegistry,
+    dos: DosState,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -851,14 +866,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         }
 
         let mut table = LibraryTable::new();
-        table.register(
-            &mut mem,
-            DOS_LIBRARY_BASE,
-            LVO_PUTSTR,
-            "dos.library",
-            "PutStr",
-            putstr_handler::<C>,
-        );
+
+        // dos.library file I/O (T10): Open/Close/Read/Write/Seek,
+        // Input/Output, IoErr/SetIoErr, and PutStr (reimplemented on top
+        // of Output() -- see crate::dosfile's module docs). Registered
+        // unconditionally, by name through the T7 DOS_LVOS table; these
+        // handlers work even before a Vfs is installed (see
+        // Runtime::set_vfs) for everything except path-based calls.
+        crate::dosfile::register_dos_handlers(&mut table, &mut mem);
 
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
@@ -963,7 +978,18 @@ impl<C: Cpu + 'static> Runtime<C> {
             table,
             heap,
             registry,
+            dos: DosState::new(None),
         }
+    }
+
+    /// Installs (or replaces) the [`Vfs`] used by `dos.library` path-based
+    /// calls (`Open`, and T11's `Lock`/`Examine`/...). Without this,
+    /// those calls fail cleanly with an `IoErr()` of
+    /// [`crate::dosfile::ERROR_OBJECT_NOT_FOUND`] (see
+    /// [`crate::dosfile`]'s module docs); `Input`/`Output`/`PutStr`/
+    /// `IoErr`/`SetIoErr` work either way.
+    pub fn set_vfs(&mut self, vfs: Vfs) {
+        self.dos.vfs = Some(vfs);
     }
 
     /// Mutable access to the library table, so callers can register
@@ -1038,6 +1064,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         heap: &mut self.heap,
                         registry: &mut self.registry,
                         pc: info.pc,
+                        dos: &mut self.dos,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
