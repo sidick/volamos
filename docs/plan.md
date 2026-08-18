@@ -836,13 +836,35 @@ console tools only.
    (and which version to pin as baseline) for the `REAL_ROM_B64`
    secret? Doesn't block Phase 2/3, but should be answered before
    Phase 4 planning firms up.
-3. **Empirical corpus.** The long tail of library calls is meant to be
-   discovered by running real tools, not reading RKRM cover-to-cover.
-   Which binaries should anchor Phase 2/3 acceptance — e.g. vbcc/vasm/
-   vlink Amiga-hosted builds, SAS/C, lha? Phase 2's fixtures are
-   hand-authored either way, but the choice decides which calls Phase
-   3 must implement first (and whether math libraries can stay
-   deferred).
+3. **Empirical corpus — decided 2026-08-18.** Primary real-world test
+   corpus: the **AmigaDOS `C:` Shell commands** from a genuine
+   Workbench 3.1 disk (`List`, `Copy`, `Assign`, `Type`, `Dir`, `Echo`,
+   etc.) — pure `dos.library`/`exec.library`/`utility.library`
+   consumers with no GUI/custom-chip surface at all, ~70 small,
+   independently-testable binaries giving broad `dos.library` coverage
+   (including `ReadArgs`, currently one of the few named gaps — every
+   `C:` command uses the standard `ReadArgs` template convention),
+   already the kind of corpus vamos itself is validated against
+   ("general file utilities" in the original proposal). Preferred over
+   a68k/vbcc as the *first* corpus: smaller, more numerous, and lower
+   risk of hitting an unimplemented call deep into a multi-pass build.
+   **Licensing note, same treatment as Phase 4's `REAL_ROM_B64`
+   pattern**: real `C:` command binaries are Commodore/Hyperion
+   copyrighted files that only exist on an actual Workbench 3.1 disk —
+   they must never be committed to this repo as fixtures. Testing
+   against them is a **local, opt-in, user-supplied** activity (point
+   the runtime at your own legitimate Workbench 3.1 disk image), not
+   something CI can run unconditionally. **Follow-on, once the real
+   `C:` commands work**: test AROS's own command-line equivalents next
+   — same command set, functionally, but AROS's binaries are buildable
+   from openly licensed source (APL 1.1), so unlike the real Workbench
+   disk they could plausibly be built and even committed as CI fixtures
+   later, without the opt-in/never-vendored constraint. Useful as a
+   second, more-available corpus and as an interesting three-way check
+   in its own right (real KS 3.1 binary vs. AROS binary vs. volamos),
+   though that's a nice-to-have, not required. a68k/vbcc/SAS/C remain
+   good *later* corpus candidates once `C:` commands pass, especially
+   for exercising `System()`/`Execute` and multi-pass toolchain flows.
 
 (Resolved, for the record: the `m68k` crate pin `=0.10.14` is still
 the newest release as of 2026-08-18 — no churn action needed; and
