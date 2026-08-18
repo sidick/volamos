@@ -19,6 +19,7 @@ pub mod guestmem;
 pub mod loader;
 pub mod lvos;
 pub mod memory;
+pub mod utility;
 pub mod vfs;
 
 pub use backend::M68kCpu;
@@ -27,6 +28,7 @@ pub use dispatch::{
     ABS_EXEC_BASE_ADDR, CallInfo, DOS_LIBRARY_BASE, DispatchError, EXEC_LIBRARY_BASE,
     EXIT_STUB_ADDR, HandlerContext, LVO_PUTSTR, LibraryHandler, LibraryKind, LibraryRegistry,
     LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, StartConfig, TraceEvent,
+    UTILITY_LIBRARY_BASE,
 };
 pub use dosfile::{
     DosState, ERROR_ACTION_NOT_KNOWN, ERROR_DIR_NOT_FOUND, ERROR_DISK_WRITE_PROTECTED,

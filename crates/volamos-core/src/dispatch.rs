@@ -144,11 +144,25 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
 /// 0x0800             DOS_LIBRARY_BASE
-/// 0x0800 .. 0x0CC8   headroom above dos.library's jump table, below
-///                     exec.library's
-/// 0x0CC8 .. 0x0F00   exec.library's registered LVOs (OpenLibrary at
-///                     -552 = 0x0CC8, OldOpenLibrary at -408 = 0x0D68,
-///                     CloseLibrary at -414 = 0x0D62)
+/// 0x0800 .. 0x0BAC   headroom above dos.library's jump table, below
+///                     utility.library's
+/// 0x0BAC .. 0x0C00   utility.library's registered LVOs (T17: lowest is
+///                     ToLower at -180 = 0x0C00 - 180 = 0x0BAC; ordinary
+///                     headroom below that for any future utility.
+///                     library addition down to about -1024 before it
+///                     would reach dos.library's region)
+/// 0x0C00             UTILITY_LIBRARY_BASE
+/// 0x0C00 .. 0x0C4E   headroom above utility.library's jump table, below
+///                     exec.library's (0x0C4E - 0x0C00 = 0x4E bytes --
+///                     enough that the two bases' negative-offset ranges
+///                     never overlap, though this is the tightest gap in
+///                     the map, worth rechecking if either library's
+///                     lowest LVO grows more negative)
+/// 0x0C4E .. 0x0F00   exec.library's registered LVOs (T16 pushed the
+///                     lowest down to FreeVec at -690 = 0x0F00 - 690 =
+///                     0x0C4E; T12's OpenLibrary/OldOpenLibrary/
+///                     CloseLibrary sit at -552/-408/-414, all above
+///                     that)
 /// 0x0F00             EXEC_LIBRARY_BASE
 /// 0x0F00 .. 0x0FFC   headroom
 /// 0x0FFC .. 0x1000   EXIT_STUB_ADDR (the last word of the region)
@@ -156,11 +170,22 @@ pub const LVO_PUTSTR: i32 = -948;
 ///
 /// Every real (non-fake) library base and its currently-implemented
 /// LVOs therefore sits inside the reserved region, with room to spare
-/// before the two bases' jump tables would ever collide. Fake libraries
+/// before any two bases' jump tables would ever collide. Fake libraries
 /// (see the "vamos escape hatch" docs on [`open_library_handler`]) are
 /// carved from the guest *heap* instead, well above this region, since
 /// their number and jump-table extent aren't known up front.
 pub const EXEC_LIBRARY_BASE: u32 = 0x0F00;
+
+/// Fake `utility.library` base address (T17). Chosen inside the gap
+/// between `dos.library`'s registered LVOs (ending at [`DOS_LIBRARY_BASE`]
+/// = `0x0800`) and `exec.library`'s lowest registered LVO (`FreeVec` at
+/// `EXEC_LIBRARY_BASE - 690 = 0x0C4E`) -- see [`EXEC_LIBRARY_BASE`]'s doc
+/// for the full reserved-region memory map. `0x0C00` leaves `0x400` bytes
+/// of headroom below it (room for `utility.library` LVOs down to about
+/// `-1024` before ever reaching `dos.library`'s region) and `0x4E` bytes
+/// above it before `exec.library`'s lowest LVO -- collision-free against
+/// both neighbors as currently registered.
+pub const UTILITY_LIBRARY_BASE: u32 = 0x0C00;
 
 /// Guest address holding the running "system's" `ExecBase` pointer --
 /// `AbsExecBase`, read by real AmigaOS startup code via `move.l 4,a6`
@@ -923,6 +948,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // crate::execmem's module docs for the flat-allocator design.
         crate::execmem::register_execmem_handlers(&mut table, &mut mem);
 
+        // utility.library (T17): tag-list helpers, case-insensitive
+        // string compare, character case conversion, and date helpers --
+        // see crate::utility's module docs.
+        crate::utility::register_utility_handlers(&mut table, &mut mem);
+
         // The shared fake-library-vector handler: bound once, to a slot
         // number every auto-created fake library's jump table reuses
         // (see FAKE_LIB_SLOT's docs). No opcode word is written here --
@@ -938,6 +968,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         let mut registry = LibraryRegistry::new();
         registry.register_real("dos.library", DOS_LIBRARY_BASE);
         registry.register_real("exec.library", EXEC_LIBRARY_BASE);
+        registry.register_real("utility.library", UTILITY_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using
