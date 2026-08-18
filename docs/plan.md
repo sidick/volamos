@@ -609,6 +609,119 @@ use 68881 instructions directly.
 Metadata tables for exec/utility come from the same T7 `.conf`-reading
 codegen tool (`exec.conf`, `utility.conf`).
 
+## Phase 3 as built — verification notes (2026-08-18)
+
+Phase 3 is complete, committed, and pushed, one commit per stage
+(T15 ce6c3bc, T16 587b957, T17 c36172d, T18 875cf93, T19 3fb371a,
+T20 2da8233, T21 a74fb9c, T22 dea1659). All of `cargo build`,
+`cargo test --workspace` (219 core unit tests + 33 CLI unit tests + 22
+integration tests across six files), `cargo fmt --all --check`, and
+`cargo clippy --all-targets -- -D warnings` are clean; still zero
+dependencies beyond `m68k = "=0.10.14"`. Math libraries were not
+implemented, stubbed, or scaffolded, per the residency correction
+above. Stage commits:
+
+- **T15 (`ce6c3bc`)** — generated `lvos/utility.rs` (44
+  entries) from AROS `rom/utility/utility.conf` via `tools/gen_lvos.py`,
+  same provenance discipline as T7.
+- **T16 (`587b957`)** — `execmem.rs`: `AllocMem`/`FreeMem`/`AllocVec`/
+  `FreeVec`/`AvailMem` over the *same* `GuestHeap` T8 built (flat, no
+  `MemHeader`/`MemChunk` emulation, exactly as scoped — "start flat").
+  8-byte size rounding at the call boundary; `FreeMem` fails loudly on
+  size mismatch or unknown/double-freed blocks (bug-catching posture);
+  `AllocVec` uses an 8-byte in-guest size header. (This stage was
+  recovered and committed by the coordinating session after the first
+  orchestrator run died to a session limit; independently re-verified.)
+- **T17 (`c36172d`)** — `utility.rs` handlers: `GetTagData`/
+  `FindTagItem`/`NextTagItem` (full `TAG_MORE`/`TAG_SKIP`/`TAG_IGNORE`
+  traversal, NULL list legal), `Stricmp`/`Strnicmp`/`ToUpper`/`ToLower`
+  (Amiga "international" Latin-1 case convention, documented as the
+  no-locale default), `Amiga2Date`/`Date2Amiga`/`CheckDate` (seconds
+  since 1978-01-01, which was a Sunday; `wday` 0 = Sunday).
+  `UTILITY_LIBRARY_BASE = 0x0C00`, in the reserved-region gap between
+  the dos and exec jump tables; registered with `LibraryRegistry` so
+  `OpenLibrary("utility.library")` resolves to it.
+- **T18 (`875cf93`)** — `execlist.rs`: `AddHead`/`AddTail`/`Remove`/
+  `RemHead`/`RemTail`/`Insert`/`Enqueue`/`FindName` operating directly
+  on guest `struct List`/`Node` memory with the real sentinel layout
+  (guest code that walks the structures itself sees real-AmigaOS bytes);
+  single-threaded `CreateMsgPort`/`DeleteMsgPort`/`PutMsg`/`GetMsg`/
+  `ReplyMsg` (non-blocking `GetMsg`, no signaling). `AddPort`/`RemPort`/
+  `FindPort` are minimal (no public port registry; `FindPort` returns
+  NULL) per the fixed "no cross-process IPC" non-goal. `init_list_header`
+  is the public `NewList` equivalent.
+- **T19 (`3fb371a`)** — `exectask.rs`: a real 92-byte guest `struct
+  Task` allocated at `Runtime::new` time (guest memory is the sole
+  signal-state authority; maintained fields: `ln_Type`/`ln_Name`,
+  `tc_SigAlloc` init `0x0000FFFF`, `tc_SigWait`, `tc_SigRecvd`,
+  `tc_SigExcept`, and — from T20 — `tc_SPLower`/`tc_SPUpper`).
+  `FindTask(NULL)` returns it; non-NULL names return 0 (single-tasking).
+  `SetSignal`/`SetExcept`/`AllocSignal`/`FreeSignal`/`Signal` per the
+  real contracts; `Wait` returns the satisfied subset or **fails loudly
+  if it would block forever** (vamos-style trap on unrunnable waits).
+  Host SIGINT/SIGTERM → `SIGBREAKF_CTRL_C` via a hand-rolled
+  `#[cfg(unix)]` `signal()` binding (no new dependency) setting an
+  atomic that `Runtime::run` folds into `tc_SigRecvd` once per
+  dispatched trap (documented granularity: compute-bound loops see it
+  only at their next library call); installation is explicit
+  (`install_host_break_handler()`, called by the CLI, never by
+  `Runtime::new`). `dos.library` `CheckSignal` returns-and-clears
+  masked pending signals. `CreateMsgPort` now fills `mp_SigTask`.
+- **T20 (`2da8233`)** — stack handling: `StartConfig::stack_size`
+  (default 64 KiB, clamped to a 4096-byte minimum), CLI `--stack SIZE`
+  with `K`/`M` suffixes; `tc_SPLower`/`tc_SPUpper` populated;
+  `StackSwap` (LVO -732) swaps `A7` + task bounds with the guest
+  `StackSwapStruct`, keeping `stk_Pointer` values in "nothing pending"
+  form (+4 adjustment) and re-pushing the return address onto the new
+  stack so the generic post-dispatch RTS works — round-trip proven by
+  test. `Runtime::run` checks `A7` against the (StackSwap-aware) task
+  bounds once per dispatched trap, failing with `DispatchError::
+  StackOverflow` naming `A7`, the bounds, and `--stack` — the vamos
+  stack-overflow bug class, caught loudly. `NewStackSwap` left
+  unregistered. This commit also serializes `exectask`'s host-break
+  tests behind a test-only mutex, fixing a parallel-test race on the
+  global pending-break atomic found during orchestrator re-verification.
+- **T21 (`a74fb9c`)** — `dosseg.rs`: `LoadSeg` builds a **real BPTR
+  seglist** (per-hunk `GuestHeap` blocks framed
+  `[ULONG length][BPTR next][payload]`, BPTR addressing the link field,
+  RELOC32 applied against payload addresses, BSS zero-filled), resolves
+  paths through the Vfs with `Open(MODE_OLDFILE)` semantics, sets
+  `IoErr` (`ERROR_OBJECT_NOT_FOUND`; `ERROR_FILE_NOT_OBJECT` (121) for
+  a non-hunk file) and returns 0 on failure. `UnLoadSeg(0)` is a legal
+  no-op; unknown seglists fail loudly. `SystemTagList`/`Execute` route
+  through a host-side runner hook (`Runtime::set_system_runner`) the
+  CLI installs to run the resolved program as a **fresh nested
+  `Runtime`** sharing the parent's Vfs config (vamos-style); without a
+  runner they fail cleanly per the real return-value contracts (`System`
+  → command exit code or -1; `Execute` → BOOL). Documented scope cuts:
+  no `SYS_Input`/`SYS_Output`/`Execute` redirection yet; nested output
+  goes to process stdout. Proven per the plan's requirement by loading
+  arbitrary small hunk executables (in-test synthesized binaries and the
+  new `systest` fixture), not any real AmigaOS library.
+- **T22 (`dea1659`)** — fixtures + e2e (the phase's "done" criterion):
+  `exectest` (AllocMem/AllocVec round trips, real
+  `OpenLibrary("utility.library")` + `Stricmp`/`GetTagData`/`Strnicmp`,
+  `FindTask`/`SetSignal` + `CheckSignal`), `recurse` (deep `bsr`
+  self-recursion tripping the stack-overflow guard for real), plus
+  T21's `systest` (nested `SystemTagList` execution with output
+  interleaving and exit-code propagation). 5 new `phase3_e2e.rs` tests +
+  4 `dosseg_e2e.rs` tests drive the actual CLI binary; CI's existing
+  `cargo test --all` picks them up (no workflow change needed). SIGINT
+  delivery is deliberately unit-test-only (no long-running fixture
+  exists to make real delivery observable rather than racy — rationale
+  documented in `phase3_e2e.rs`).
+
+Known deviations/deferrals, all documented in-module: no
+`MemHeader`/`MemChunk` guest structures (flat allocator, per plan); no
+public message-port registry (`FindPort` → NULL); signal exceptions
+(`SetExcept`) tracked but never delivered; stack/host-break checks
+happen at library-call granularity only; `ReadArgs` still deferred (real
+startup code parses `A0`/`D0` itself); `NewStackSwap` and
+`System()` I/O-redirection tags unimplemented pending corpus need.
+The `since`-version field proposed above remains future work — Phase 3
+picked its calls from the plan's own scope list rather than needing a
+version-gated filter yet.
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
