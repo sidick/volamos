@@ -230,3 +230,100 @@ and `amiga_asm.py` assembler as the Phase 2 fixtures).
 Run e.g. `volamos -V TEST:/dir/containing/echoargs fixtures/systest`;
 `crates/volamos/tests/dosseg_e2e.rs` drives exactly that. Regenerate
 with `python3 fixtures/gen_systest.py` (or vasm, same rule as above).
+
+## Phase 3 (stage 8) fixtures: `exectest`, `recurse`
+
+Two more fixtures, in the same dual `.s` + `gen_*.py` style, added for
+Phase 3 stage 8 (`docs/plan.md`'s "fixtures + end-to-end tests" done
+criterion): CLI-level coverage, through real hunk-loaded execution, for
+the Phase 3 handlers that otherwise only had in-crate unit tests --
+`exec.library`'s `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`
+(`execmem.rs`), `utility.library` opened for real via `OpenLibrary`
+(`utility.rs`), `exec.library`'s `FindTask`/`SetSignal` plus
+`dos.library`'s `CheckSignal` (`exectask.rs`), and the guest
+stack-overflow guard (also `exectask.rs`).
+
+### `exectest`
+
+Source: `exectest.s`; generator: `gen_exectest.py`.
+
+1. Real startup: `AbsExecBase` -> `OpenLibrary("dos.library", 0)`
+   (unchecked, matching every earlier fixture) -> `A3` (kept in `A3`
+   rather than `A6`, since this fixture keeps making further
+   *exec.library* calls afterward and needs `A6` free for those -- the
+   trap dispatcher resolves purely from where a `jsr` physically lands,
+   not from any "current A6" the runtime tracks, so any address register
+   can hold any library base at any time).
+2. `AllocMem(64, MEMF_CLEAR)` via `A6` = `EXEC_LIBRARY_BASE`: checks
+   non-NULL (exit 1 on failure) and that the first byte reads `0` (exit
+   2 on failure), writes a byte pattern past it, then `FreeMem`s the
+   original 64-byte block. `AllocVec(20, 0)`/`FreeVec` round trip (exit
+   3 if `AllocVec` returns NULL).
+3. `OpenLibrary("utility.library", 0)` via `A6` (exit 4 if NULL; this
+   runtime always resolves that name to the fixed `UTILITY_LIBRARY_BASE`
+   -- it's registered as a real library at `Runtime::new` time, never
+   the auto-created-fake-library path) -> `A4`. `Stricmp("AMIGA",
+   "amiga")` via `A4` (exit 5 if nonzero). `GetTagData` on a tag list
+   built directly in the DATA hunk (`{TAG_VAL, 7}, {TAG_DONE, 0}`, via
+   `amiga_asm.py`'s `DataBuilder.u32s`, expects `7` back, exit 6
+   otherwise). `Strnicmp("HELLO1", "HELLO2", 6)` (expects nonzero --
+   exit 7 if it wrongly reports equal).
+4. `FindTask(NULL)` via `A6` (exit 8 if NULL). `SetSignal(0, 0)`
+   (unchecked read), then `SetSignal(1<<5, 1<<5)` to set bit 5, then
+   `dos.library`'s `CheckSignal(1<<5)` via `A3` (expects exactly `1<<5`
+   back -- exit 9 otherwise).
+5. On full success: `PutStr("exec ok\n")` via `A3` and exit `0`.
+
+Every failure path `PutStr`s a single fixed `"ERR\n"` marker (the
+`filetest.s` convention) with a distinct nonzero exit code (1-9) per
+checked step, rather than decoding the failure into printed text.
+
+Run `volamos fixtures/exectest` -- no `-V`/`-a` flags needed, nothing
+here touches the filesystem; it prints `exec ok` and exits `0`.
+`crates/volamos/tests/phase3_e2e.rs` drives exactly that.
+
+### `recurse`
+
+Source: `recurse.s`; generator: `gen_recurse.py`.
+
+An infinite loop: one cheap `dos.library` call (`PutStr` of a one-byte
+message) per iteration -- the call that actually re-checks the guest
+stack bounds, since `crate::exectask::check_stack_bounds` only runs once
+per *dispatched trap*, never on a bare instruction -- followed by a
+`bsr` back to the top of the loop, which is what actually grows the
+stack: each `bsr` pushes a 4-byte return address that's never popped
+(there's no matching `rts`; the loop never returns). Needs no new
+addressing-mode support from `amiga_asm.py`: `BSR`'s word format
+(`0110 0001 dddddddd`) is identical in shape to `BRA`/`BEQ`/`BNE`'s, so
+`CodeBuilder.branch` handles it already -- `CodeBuilder.BSR` (added
+alongside `BRA`/`BEQ`, plus a new `BNE`, for these two fixtures) is
+just the right opcode-base constant, no new fixup logic.
+
+Run with a small `--stack`, e.g. `volamos --stack 4096 fixtures/recurse`
+(4096 is `volamos_core::MIN_STACK_SIZE`, the CLI's own clamp floor): it
+prints roughly a thousand `x` lines, then exits nonzero with a "stack
+overflow" diagnostic on stderr once `A7` runs below the current task's
+stack bounds -- proving the guard (`docs/plan.md`'s "stack-overflow bug
+class vamos is known to hit") fires loudly instead of letting the guest
+silently corrupt memory past its stack. `crates/volamos/tests/
+phase3_e2e.rs` drives exactly that.
+
+### Regenerating
+
+Same rule as the earlier fixtures: with `vasm` (`vasmm68k_mot`)
+available,
+
+```sh
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/exectest fixtures/exectest.s
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/recurse  fixtures/recurse.s
+```
+
+Without vasm (as on the machine these were authored on), regenerate the
+hand-assembled versions with:
+
+```sh
+python3 fixtures/gen_exectest.py
+python3 fixtures/gen_recurse.py
+```
+
+If you change a `.s` file, update its `gen_*.py` counterpart to match.

@@ -81,6 +81,17 @@ class DataBuilder:
         self.label(name)
         self.bytes += bytes(n)
 
+    def u32s(self, name: str, values: list[int]) -> None:
+        """A sequence of big-endian 32-bit words -- e.g. a `TagItem`
+        array (`{ti_Tag, ti_Data}` pairs, `<utility/tagitem.h>`) built
+        directly in the DATA hunk for a fixture to hand `utility.library`
+        calls like `GetTagData`. Added for Phase 3 stage 8's `exectest`
+        fixture (`gen_exectest.py`), the first one needing raw longword
+        data rather than a C string or a zeroed scratch buffer."""
+        self.label(name)
+        for v in values:
+            self.bytes += u32(v)
+
     def align4(self) -> None:
         while len(self.bytes) % 4:
             self.bytes.append(0)
@@ -199,10 +210,21 @@ class CodeBuilder:
         q = imm % 8
         self.word(0x5100 | (q << 9) | 0x80 | dn)
 
+    def sub_l_d_from_d(self, dst: int, src: int) -> None:
+        """`sub.l Dsrc,Ddst` -- `Ddst = Ddst - Dsrc` (SUB, long, dest=Dn
+        direct with the "Dn - <ea> -> Dn" opmode `100`, src=Dn direct
+        addressing mode `000`). Verified against
+        `crates/volamos-core/src/execmem.rs`'s own hand-assembled test
+        (`0x9480` there is commented `sub.l D0,D2`, i.e. `dst=2, src=0`:
+        `0x9080 | (2 << 9) | 0 == 0x9480`, confirming this formula)."""
+        self.word(0x9080 | (dst << 9) | src)
+
     # Word-form branch opcode bases (displacement byte = 0x00, so a
     # 16-bit displacement word always follows).
     BRA = 0x6000
+    BSR = 0x6100
     BEQ = 0x6700
+    BNE = 0x6600
 
     def branch(self, opcode_base: int, label: str) -> None:
         self.word(opcode_base)
