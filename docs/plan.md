@@ -950,6 +950,30 @@ end-to-end test), plus the two corrected `doslock.rs` unit tests and
 the regenerated `dirtest` fixture's own e2e coverage in
 `crates/volamos/tests/phase2_e2e.rs`.
 
+**`FGetC`/`FPutC`/`UnGetC`/`FRead`/`FWrite`/`FGets`/`FPuts`/
+`WriteChars`/`Flush`/`SetVBuf` — implemented 2026-08-19**
+(`crates/volamos-core/src/dosbuf.rs`), the last gap in `Type`'s own
+call chain: after `MatchFirst` + the `fib_FileName` fix above, `Type`
+opens the matched file and reads it via buffered I/O rather than raw
+`Read()`. Real AmigaOS gives every `FileHandle` a `SetVBuf`-configurable
+internal buffer purely as a host-round-trip optimization -- since this
+runtime's `DosState::read`/`write` already reach the host file
+immediately with no intermediate layer to bypass, `SetVBuf` and `Flush`
+are correctness-preserving no-ops (always report success/`DOSTRUE`).
+The one piece of real, observable state is `UnGetC`'s one-byte
+pushback (`DosState::ungetc_buf`/`last_getc`), which `FGetC` consults
+before touching the host file. `Type` now runs fully end-to-end against
+the real corpus binary:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Type WORK:hello.txt
+Hello from volamos!
+This is a test file.
+```
+8 new end-to-end trap-dispatch tests in `dosbuf.rs` (`FGetC` first-byte
+and EOF, `FPutC` to `Output()`, `UnGetC`→`FGetC` pushback round-trip,
+`FGets` line read, `FWrite`/`FRead` block-record semantics,
+`Flush`/`SetVBuf` no-op success).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

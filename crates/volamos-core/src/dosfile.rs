@@ -337,6 +337,17 @@ pub struct DosState {
     /// `MatchEnd` (and this runtime's own error paths) remove entries
     /// and unlock every directory lock a scan is still holding.
     pub(crate) anchor_states: HashMap<u32, crate::dosanchor::AnchorMatchState>,
+
+    /// `UnGetC`'s one-byte pushback, keyed by guest `FileHandle*`
+    /// address -- present only while a pushed-back byte (or `ENDSTREAMCH`
+    /// EOF marker) is waiting to be re-delivered by the next `FGetC`.
+    /// See `crate::dosbuf`'s module docs.
+    pub(crate) ungetc_buf: HashMap<u32, i32>,
+    /// The last value `FGetC` actually returned for a handle (a byte
+    /// `0..=255`, or `ENDSTREAMCH` on EOF/error) -- consulted by
+    /// `UnGetC(fh, -1)`, which pushes back "whatever was last read"
+    /// rather than a caller-specified byte.
+    pub(crate) last_getc: HashMap<u32, i32>,
 }
 
 impl DosState {
@@ -362,6 +373,8 @@ impl DosState {
             rdargs: HashMap::new(),
             local_vars: HashMap::new(),
             anchor_states: HashMap::new(),
+            ungetc_buf: HashMap::new(),
+            last_getc: HashMap::new(),
         }
     }
 

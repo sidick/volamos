@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod dispatch;
 pub mod dosanchor;
 pub mod dosargs;
+pub mod dosbuf;
 pub mod dosfile;
 pub mod doslock;
 pub mod dospattern;
