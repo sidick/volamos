@@ -69,7 +69,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr, read_c_string};
+use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr, read_c_string, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 use crate::vfs::{ResolveMode, Vfs, VfsError};
@@ -227,8 +227,11 @@ pub fn map_vfs_error(err: &VfsError) -> i32 {
 
 /// A file handle's host-side backing.
 enum HostHandle {
-    /// A real host file opened via `Open`.
-    HostFile(File),
+    /// A real host file opened via `Open`, plus the normalized Amiga
+    /// path it was resolved from (see [`crate::doslock`]'s `LockEntry`
+    /// for the same "record the path that produced it" convention) --
+    /// [`DosState::name_from_fh`] reads this back for `NameFromFH`.
+    HostFile(File, String),
     /// The `Input()` default handle: reads come from host stdin.
     Stdin,
     /// The `Output()` default handle. Writes to this handle are
@@ -484,9 +487,10 @@ impl DosState {
             MODE_READWRITE => (ResolveMode::ParentMustExist, false),
             _ => return Err(ERROR_ACTION_NOT_KNOWN),
         };
-        let path = vfs
-            .resolve(name, resolve_mode)
+        let resolved = vfs
+            .resolve_with_amiga_path(name, resolve_mode)
             .map_err(|e| map_vfs_error(&e))?;
+        let path = resolved.host_path;
 
         let file = if is_new {
             OpenOptions::new()
@@ -516,7 +520,8 @@ impl DosState {
 
         let id = self.next_id();
         let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
-        self.handles.insert(addr, HostHandle::HostFile(file));
+        self.handles
+            .insert(addr, HostHandle::HostFile(file, resolved.amiga_path));
         Ok(bptr_from_addr(addr))
     }
 
@@ -542,7 +547,7 @@ impl DosState {
     /// contract) or an `IoErr()` code.
     pub fn read(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, i32> {
         match self.handles.get_mut(&addr) {
-            Some(HostHandle::HostFile(f)) => {
+            Some(HostHandle::HostFile(f, _)) => {
                 let mut buf = vec![0u8; len];
                 let n = f.read(&mut buf).map_err(|e| map_io_error(&e))?;
                 buf.truncate(n);
@@ -568,7 +573,7 @@ impl DosState {
     /// bytes actually written, or an `IoErr()` code.
     pub fn write(&mut self, addr: u32, data: &[u8]) -> Result<usize, i32> {
         match self.handles.get_mut(&addr) {
-            Some(HostHandle::HostFile(f)) => f.write(data).map_err(|e| map_io_error(&e)),
+            Some(HostHandle::HostFile(f, _)) => f.write(data).map_err(|e| map_io_error(&e)),
             Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
             None => Err(ERROR_INVALID_LOCK),
         }
@@ -583,7 +588,7 @@ impl DosState {
     /// [`ERROR_SEEK_ERROR`].
     pub fn seek(&mut self, addr: u32, position: i32, offset_mode: i32) -> Result<i32, i32> {
         match self.handles.get_mut(&addr) {
-            Some(HostHandle::HostFile(f)) => {
+            Some(HostHandle::HostFile(f, _)) => {
                 let old = f.stream_position().map_err(|_| ERROR_SEEK_ERROR)? as i32;
                 let seek_from = match offset_mode {
                     OFFSET_BEGINNING => SeekFrom::Start(position.max(0) as u64),
@@ -595,6 +600,19 @@ impl DosState {
                 Ok(old)
             }
             Some(_) => Err(ERROR_SEEK_ERROR),
+            None => Err(ERROR_INVALID_LOCK),
+        }
+    }
+
+    /// `NameFromFH`: the normalized Amiga path `addr`'s handle was
+    /// opened from (recorded on it by [`Self::open`]). Fails with
+    /// [`ERROR_INVALID_LOCK`] for an unknown handle, or
+    /// [`ERROR_ACTION_NOT_KNOWN`] for the `Input()`/`Output()` default
+    /// handles (stdin/stdout aren't Amiga path-backed objects at all).
+    pub fn name_from_fh(&self, addr: u32) -> Result<String, i32> {
+        match self.handles.get(&addr) {
+            Some(HostHandle::HostFile(_, amiga_path)) => Ok(amiga_path.clone()),
+            Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
             None => Err(ERROR_INVALID_LOCK),
         }
     }
@@ -735,6 +753,37 @@ fn close_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     }
     ctx.cpu
         .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
+/// `NameFromFH` (`D1` = `BPTR` file handle, `D2` = buffer, `D3` =
+/// buffer capacity). `D0` = `DOSTRUE`/`DOSFALSE` (`DOSFALSE` +
+/// `IoErr()` = [`crate::dospattern::ERROR_LINE_TOO_LONG`] if the path
+/// doesn't fit) -- same contract and truncation behavior as
+/// `crate::doslock`'s `NameFromLock`.
+fn name_from_fh_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let buf_addr = ctx.cpu.data_register(DataRegister(2));
+    let cap = ctx.cpu.data_register(DataRegister(3)) as usize;
+    let addr = addr_from_bptr(bptr);
+
+    match ctx.dos.name_from_fh(addr) {
+        Ok(path) if path.len() < cap => {
+            write_c_string(ctx.mem, buf_addr, path.as_bytes());
+            ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
+        }
+        Ok(path) => {
+            let mut truncated = path.into_bytes();
+            truncated.truncate(cap.saturating_sub(1));
+            write_c_string(ctx.mem, buf_addr, &truncated);
+            ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
     Ok(())
 }
 
@@ -1046,6 +1095,7 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     }
     reg!("Open", open_handler::<C>);
     reg!("Close", close_handler::<C>);
+    reg!("NameFromFH", name_from_fh_handler::<C>);
     reg!("Read", read_handler::<C>);
     reg!("Write", write_handler::<C>);
     reg!("Seek", seek_handler::<C>);
@@ -1152,6 +1202,35 @@ mod tests {
         assert_eq!(n, 5);
         assert!(dos.close(&mut heap, addr));
         assert_eq!(fs::read(tmp.path().join("new.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn name_from_fh_returns_the_normalized_amiga_path() {
+        let tmp = TempDir::new("name-from-fh");
+        fs::write(tmp.path().join("existing.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:existing.txt", MODE_OLDFILE)
+            .expect("open should succeed");
+        let addr = addr_from_bptr(bptr);
+        assert_eq!(dos.name_from_fh(addr).unwrap(), "SYS:existing.txt");
+    }
+
+    #[test]
+    fn name_from_fh_unknown_handle_is_invalid_lock() {
+        let dos = DosState::new(None);
+        assert_eq!(dos.name_from_fh(0x1234), Err(ERROR_INVALID_LOCK));
+    }
+
+    #[test]
+    fn name_from_fh_on_stdout_default_handle_fails() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let addr = dos.output_addr(&mut heap, &mut mem).unwrap();
+        assert_eq!(dos.name_from_fh(addr), Err(ERROR_ACTION_NOT_KNOWN));
     }
 
     #[test]
@@ -1461,6 +1540,41 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn end_to_end_name_from_fh_writes_the_normalized_path() {
+        let tmp = TempDir::new("e2e-name-from-fh");
+        fs::write(tmp.path().join("existing.txt"), b"hi").unwrap();
+        let name = b"SYS:existing.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched below)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, MODE_OLDFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = BPTR
+        words.push(0x2200); // move.l d0,d1 (fh -> D1 for NameFromFH)
+        let buf_idx = push_move_imm_to_d(&mut words, 2, 0); // D2 = buffer (patched)
+        push_move_imm_to_d(&mut words, 3, 64); // D3 = capacity
+        push_jsr(&mut words, 6, -408); // NameFromFH(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let buf_addr = name_addr + name.len() as u32;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(
+            crate::guestmem::read_c_string(rt.memory(), buf_addr),
+            b"SYS:existing.txt"
+        );
     }
 
     #[test]

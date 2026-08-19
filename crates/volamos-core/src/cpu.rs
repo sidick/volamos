@@ -91,6 +91,21 @@ pub enum StopReason {
     /// The CPU halted itself (e.g. executed a STOP instruction, or hit an
     /// illegal instruction with no handler).
     Halted,
+    /// The program counter ran off the end of guest memory (e.g. a `JSR`/
+    /// `JMP` through a bogus/uninitialized address register). Without
+    /// this check, [`crate::memory::AddressSpace`]'s "out-of-range reads
+    /// return `0`" convention means the CPU would silently decode an
+    /// endless stream of zero-word instructions and keep marching
+    /// forward (`u32` address wraparound included) until it happened to
+    /// land back on something that traps -- turning a guest bug into a
+    /// wildly misleading diagnostic pointing at the wrong address,
+    /// possibly thousands of instructions later. Caught eagerly instead
+    /// (see [`Cpu::run`]'s default implementation), so the reported `pc`
+    /// is the real faulting jump target.
+    PcOutOfBounds {
+        /// The out-of-range program counter value.
+        pc: u32,
+    },
 }
 
 /// A minimal abstraction over an m68k CPU core.
@@ -115,6 +130,10 @@ pub trait Cpu {
     /// backend may run a tight native loop instead.
     fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
         loop {
+            let pc = self.pc();
+            if pc as usize >= mem.len() {
+                return StopReason::PcOutOfBounds { pc };
+            }
             match self.step(mem) {
                 StopReason::Step => continue,
                 other => return other,
@@ -145,4 +164,42 @@ pub trait Cpu {
 
     /// Writes the status register.
     fn set_sr(&mut self, value: u16);
+
+    /// Delivers the real m68k hardware exception for a trap [`Cpu::step`]/
+    /// [`Cpu::run`] just reported, other than [`TrapKind::ALine`] (this
+    /// runtime's own library-call dispatch convention, always handled by
+    /// the caller itself, never routed here): reads the guest's real
+    /// exception vector table (at `vector * 4`, matching a plain 68000
+    /// with `VBR` fixed at `0`), and if the guest has installed a
+    /// handler there (a non-`0` entry -- real AmigaOS/well-behaved guest
+    /// programs commonly do this for hardware feature detection, e.g.
+    /// probing for an FPU by executing a real F-line instruction and
+    /// catching the resulting exception), pushes a real exception stack
+    /// frame (`SR` then `PC`) and jumps to it -- exactly what real
+    /// hardware does, letting the guest's *own* handler run and
+    /// eventually `RTE` back.
+    ///
+    /// Returns `false` (does nothing to CPU state) if the vector table
+    /// entry is `0` (no handler installed) -- the caller should treat
+    /// this the same as before this method existed (report an
+    /// unhandled/unexpected trap) rather than blindly jumping to a
+    /// garbage `0` address.
+    ///
+    /// # The pushed return `PC` is the *trapping* instruction's own
+    ///   address, not the next one
+    ///
+    /// For every exception this delivers (F-line, illegal instruction,
+    /// BKPT), real 68000 hardware stacks the address of the instruction
+    /// that *couldn't* execute, not the one after it -- unlike `TRAP
+    /// #n`, which is a deliberate, always-executable instruction that
+    /// stacks its successor. This is real, standard 68000 behavior (not
+    /// a simplification this runtime introduced): the exception handler
+    /// is expected to either software-emulate the trapping instruction
+    /// and advance the stacked `PC` itself before `RTE`, or decide it
+    /// isn't going to resume normal execution at all. A guest handler
+    /// that just `RTE`s immediately without adjusting the stack will
+    /// re-trap on the same instruction forever -- this is a property of
+    /// real hardware semantics, faithfully reproduced, not a bug in
+    /// this method.
+    fn take_hardware_exception(&mut self, mem: &mut Self::Memory, kind: TrapKind) -> bool;
 }

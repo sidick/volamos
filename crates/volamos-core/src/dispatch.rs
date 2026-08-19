@@ -87,6 +87,13 @@ const EXIT_SLOT: u16 = MAX_LIBRARY_SLOTS - 1;
 /// address. Not available to [`LibraryTable::register`].
 const UNKNOWN_SLOT: u16 = 0;
 
+/// Size in bytes of the real m68k exception vector table region left
+/// genuinely zeroed rather than prefilled with the "unknown call"
+/// sentinel -- see [`EXEC_LIBRARY_BASE`]'s "Reserved-region memory map"
+/// doc for the full rationale. Covers vectors `0..=47` (`0xC0 / 4`),
+/// i.e. every vector up through `TRAP #15`.
+const EXCEPTION_VECTOR_TABLE_SIZE: u32 = 0xC0;
+
 /// The slot index reserved for the shared fake-library-vector handler
 /// (see [`fake_lib_vector_handler`] and the "vamos escape hatch" module
 /// docs). Exactly one handler instance serves *every* auto-created fake
@@ -107,6 +114,30 @@ const FAKE_LIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 2;
 /// next -- a known limitation worth revisiting if a future fixture ever
 /// hits it.
 const FAKE_LIB_JUMP_TABLE_SIZE: u32 = 0x1000;
+
+/// Library names that ship as a standard, mandatory part of every
+/// Workbench 3.1 install (`LIBS:` on the Workbench/HD disk), even though
+/// they aren't ROM-resident. Real `OpenLibrary` for one of these
+/// virtually never fails on a real V40 system -- unlike a genuinely
+/// optional/third-party disk library (this runtime's [`Vfs`] test
+/// fixtures don't vendor Commodore/Hyperion's copyrighted binaries, so
+/// there's no real file to check for anyway) -- so [`open_library_common`]
+/// treats these the same as the ROM-resident set: a fake base is always
+/// created, regardless of `Vfs` state.
+///
+/// The math libraries here are software-only (no physical FPU required
+/// to use them, hence "provides transcendental math functions" is a
+/// distinct claim from "requires a 68881/68882") -- found while running
+/// the real `PhxAss` assembler, which unconditionally `OpenLibrary`s
+/// `mathtrans.library` and, on real hardware, never needs to handle it
+/// being absent.
+const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
+    "mathtrans.library",
+    "mathieeesingbas.library",
+    "mathieeesingtrans.library",
+    "mathieeedoubbas.library",
+    "mathieeedoubtrans.library",
+];
 
 /// Guest address of the exit sentinel: the last word inside the reserved
 /// jump-table region, deliberately kept clear of any library base's
@@ -140,7 +171,23 @@ pub const LVO_PUTSTR: i32 = -948;
 /// 0x0004 .. 0x0008   AbsExecBase: holds EXEC_LIBRARY_BASE (u32), the
 ///                     value a real program reads via `move.l 4,a6`.
 ///                     Not a jump-table entry -- never executed.
-/// 0x0008 .. 0x02CC   unused headroom
+/// 0x0008 .. 0x00C0   the real m68k exception vector table for vectors
+///                     2-47 (bus error through TRAP #15) -- deliberately
+///                     left genuinely zeroed (excluded from the
+///                     "unknown call" prefill sweep below) rather than
+///                     filled with trap opcodes, so a guest program that
+///                     installs its own handler here (a real, common
+///                     idiom -- e.g. probing for an FPU by executing a
+///                     real F-line instruction and catching the
+///                     resulting exception) gets genuine 68000 exception
+///                     semantics via `Cpu::take_hardware_exception`, not
+///                     a bogus jump into this runtime's own unrelated
+///                     trap-table bytes. `0x00C0` covers every vector a
+///                     CLI program would plausibly use (up through
+///                     `TRAP #15` at vector 47 = `0xBC`) while staying
+///                     comfortably clear of `dos.library`'s own LVO
+///                     region starting at `0x02CC` below.
+/// 0x00C0 .. 0x02CC   unused headroom
 /// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
@@ -905,13 +952,16 @@ fn open_library_common<C: Cpu>(
     // Not a ROM-resident library this runtime implements: on real
     // AmigaOS this is a disk-based library, only openable if
     // `LIBS:<name>` actually exists on the searched disk -- see this
-    // function's doc comment.
+    // function's doc comment. Exception: a handful of standard
+    // Workbench 3.1 libraries (see [`STANDARD_WORKBENCH_LIBRARIES`])
+    // ship on every real install and are treated as always present.
     let libs_path = format!("LIBS:{name}");
-    let found_on_disk = ctx
-        .dos
-        .vfs
-        .as_ref()
-        .is_some_and(|vfs| vfs.resolve(&libs_path, ResolveMode::MustExist).is_ok());
+    let found_on_disk = STANDARD_WORKBENCH_LIBRARIES.contains(&name)
+        || ctx
+            .dos
+            .vfs
+            .as_ref()
+            .is_some_and(|vfs| vfs.resolve(&libs_path, ResolveMode::MustExist).is_ok());
     if !found_on_disk {
         *ctx.call_detail = Some(format!("library {name:?} -> NULL (not found on disk)"));
         ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -919,15 +969,15 @@ fn open_library_common<C: Cpu>(
     }
 
     let size = FAKE_LIB_JUMP_TABLE_SIZE;
-    let block = ctx
-        .heap
-        .alloc(size)
-        .map_err(|e| DispatchError::HandlerFailed {
-            library: "exec.library".to_string(),
-            lvo: -552,
-            handler_name: "OpenLibrary".to_string(),
-            message: format!("couldn't auto-create fake library {name:?}: {e}"),
-        })?;
+    let block =
+        ctx.heap
+            .alloc(size + LIB_STRUCT_SIZE)
+            .map_err(|e| DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -552,
+                handler_name: "OpenLibrary".to_string(),
+                message: format!("couldn't auto-create fake library {name:?}: {e}"),
+            })?;
     let base = block.wrapping_add(size);
 
     let mut addr = block;
@@ -935,6 +985,15 @@ fn open_library_common<C: Cpu>(
         ctx.mem.write_u16(addr, 0xA000 | FAKE_LIB_SLOT);
         addr = addr.wrapping_add(2);
     }
+    // A real disk-loaded library's base points at a genuine `struct
+    // Library` header (positive offsets from `base`), not just a jump
+    // table (negative offsets) -- a caller that reads `lib_Version`/
+    // `lib_Node.ln_Type` directly before deciding how to use the library
+    // (a real, common pattern; found via the real `PhxAss` assembler,
+    // which reads a version-gated field here before dispatching through
+    // one of the IEEE math libraries) needs a real-looking header, not
+    // whatever happened to be sitting in the next heap allocation.
+    write_library_node(ctx.mem, base);
 
     ctx.registry.register_fake(name, base, size);
     *ctx.call_detail = Some(format!(
@@ -1178,12 +1237,15 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// address; `D0` is set to the buffer's length *including* the
     /// `'\n'` but *not* the extra `NUL`, matching the real convention.
     pub fn new(mut cpu: C, mut mem: C::Memory, config: StartConfig) -> Self {
-        // Prefill the whole reserved jump-table region with the "unknown
-        // call" sentinel opcode before registering anything real, so any
-        // `jsr`/`jmp` into an LVO nobody's registered a handler for still
-        // traps cleanly (as an `UnknownCall`) instead of falling through
-        // to whatever raw (zeroed) bytes happen to sit there.
-        let mut addr = TRAP_TABLE_BASE;
+        // Prefill the reserved jump-table region (excluding the real
+        // exception vector table at the very bottom -- see
+        // EXEC_LIBRARY_BASE's "Reserved-region memory map" doc) with the
+        // "unknown call" sentinel opcode before registering anything
+        // real, so any `jsr`/`jmp` into an LVO nobody's registered a
+        // handler for still traps cleanly (as an `UnknownCall`) instead
+        // of falling through to whatever raw (zeroed) bytes happen to
+        // sit there.
+        let mut addr = TRAP_TABLE_BASE + EXCEPTION_VECTOR_TABLE_SIZE;
         while addr < TRAP_TABLE_END {
             mem.write_u16(addr, 0xA000 | UNKNOWN_SLOT);
             addr = addr.wrapping_add(2);
@@ -1581,6 +1643,14 @@ impl<C: Cpu + 'static> Runtime<C> {
                         pc: self.cpu.pc(),
                     });
                 }
+                StopReason::PcOutOfBounds { pc } => {
+                    return Err(RuntimeError::UnexpectedStop {
+                        reason: "program counter ran off the end of guest memory \
+                                 (likely a JSR/JMP through a bad address register)"
+                            .to_string(),
+                        pc,
+                    });
+                }
                 StopReason::Trap(info) => {
                     if info.pc == EXIT_STUB_ADDR {
                         let code = self.cpu.data_register(DataRegister(0)) as i32;
@@ -1588,6 +1658,19 @@ impl<C: Cpu + 'static> Runtime<C> {
                     }
 
                     let TrapKind::ALine { opcode } = info.kind else {
+                        // Not our own library-dispatch convention (an
+                        // F-line/illegal/BKPT/TRAP opcode the guest
+                        // actually executed, e.g. real hardware feature
+                        // detection code probing for an FPU). Try
+                        // routing it through the guest's own exception
+                        // vector table, matching what real 68000
+                        // hardware would do -- see
+                        // `Cpu::take_hardware_exception`'s doc comment.
+                        // Only report a hard failure if the guest never
+                        // installed a handler for it.
+                        if self.cpu.take_hardware_exception(&mut self.mem, info.kind) {
+                            continue;
+                        }
                         return Err(RuntimeError::UnexpectedStop {
                             reason: format!("{:?}", info.kind),
                             pc: info.pc,
@@ -1894,6 +1977,67 @@ mod tests {
             msg.contains("--stack"),
             "diagnostic should suggest --stack: {msg}"
         );
+    }
+
+    #[test]
+    fn fline_trap_routes_through_a_guest_installed_exception_handler() {
+        // Real hardware feature-detection idiom (e.g. probing for an
+        // FPU): execute a real F-line opcode with a handler installed
+        // at vector 11 (address 0x2C = 11*4). The handler sets D0=42
+        // and RTEs back; execution should then resume with the
+        // following RTS reporting that value as the exit code, proving
+        // both the trap->handler jump and the RTE-back round trip work.
+        let entry = TRAP_TABLE_END;
+        let handler_addr = entry + 0x40;
+        let words = [0xF200u16, 0x4E75]; // dc.w $F200 (F-line) ; rts
+        // A real F-line handler is responsible for advancing the
+        // stacked return PC past the trapping instruction itself before
+        // RTE (real hardware always stacks the *trapping* instruction's
+        // own address for this exception class, per Cpu::
+        // take_hardware_exception's doc comment -- unlike TRAP #n, it's
+        // not "resume after me" by default). `$F200` is one word, so
+        // +2. addq.l #2,(2,a7) ; moveq #42,d0 ; rte
+        let handler_words = [0x54AFu16, 0x0002, 0x702A, 0x4E73];
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        load_words(&mut mem, handler_addr, &handler_words);
+        mem.write_u32(11 * 4, handler_addr); // vector 11 = LINE_1111 (F-line)
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: handler_addr + 0x10,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 42,
+            "guest's own F-line handler should have run and RTE'd back"
+        );
+    }
+
+    #[test]
+    fn fline_trap_with_no_handler_installed_reports_unexpected_stop() {
+        // Same F-line opcode, but no handler installed at vector 11
+        // (left 0) -- must fail cleanly rather than jumping to address 0.
+        let words = [0xF200u16, 0x4E75];
+        let mut rt = runtime_with_program(&words);
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::UnexpectedStop { reason, .. } => {
+                assert!(reason.contains("FLine"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected UnexpectedStop, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2305,6 +2449,64 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0, "OpenLibrary with no Vfs at all should return NULL");
+    }
+
+    #[test]
+    fn open_library_of_standard_workbench_math_library_succeeds_with_real_header() {
+        // mathtrans.library (and friends) ship as a standard, mandatory
+        // part of every real Workbench 3.1 install -- unlike an
+        // arbitrary optional disk library, real OpenLibrary for one of
+        // these essentially never fails, so this runtime treats them
+        // like the ROM-resident set (see STANDARD_WORKBENCH_LIBRARIES):
+        // always succeeds, even with no Vfs configured at all. The fake
+        // base it gets must also carry a real-looking struct Library
+        // header (lib_Node.ln_Type/lib_Version/lib_Revision) at positive
+        // offsets, not just the negative-offset jump table -- found
+        // while running the real PhxAss assembler, which reads a field
+        // there before deciding how to use the library.
+        let entry = TRAP_TABLE_END;
+        let name = b"mathtrans.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("mathtrans.library") -> D0
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let base = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(base, 0, "mathtrans.library should always open");
+
+        assert_eq!(
+            rt.mem.read_u8(base.wrapping_add(LIB_NODE_TYPE_OFFSET)),
+            NT_LIBRARY
+        );
+        assert_eq!(
+            rt.mem.read_u16(base.wrapping_add(LIB_VERSION_OFFSET)),
+            LIBRARY_VERSION
+        );
+        assert_eq!(
+            rt.mem.read_u16(base.wrapping_add(LIB_REVISION_OFFSET)),
+            LIBRARY_REVISION
+        );
     }
 
     #[test]

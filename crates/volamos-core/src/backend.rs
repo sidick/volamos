@@ -192,6 +192,49 @@ impl Cpu for M68kCpu {
     fn set_sr(&mut self, value: u16) {
         self.core.set_sr(value);
     }
+
+    fn take_hardware_exception(&mut self, mem: &mut Self::Memory, kind: TrapKind) -> bool {
+        use m68k::core::exceptions::vector;
+
+        let vec_num = match kind {
+            TrapKind::ALine { .. } => {
+                debug_assert!(
+                    false,
+                    "ALine traps are never routed through take_hardware_exception"
+                );
+                return false;
+            }
+            TrapKind::FLine { .. } => vector::LINE_1111,
+            TrapKind::Illegal { .. } | TrapKind::Breakpoint { .. } => vector::ILLEGAL_INSTRUCTION,
+            TrapKind::Trap { trap_num } => vector::TRAP_BASE + u32::from(trap_num),
+        };
+
+        // A `0` entry means the guest never installed a handler for this
+        // vector; jumping there would just run off into whatever
+        // (probably zeroed) memory sits at address 0, so decline instead
+        // -- see this method's doc comment on `crate::cpu::Cpu`.
+        let handler = AddressSpace::read_u32(mem, vec_num * 4);
+        if handler == 0 {
+            return false;
+        }
+
+        match kind {
+            TrapKind::FLine { .. } => {
+                self.core.take_fline_exception(mem);
+            }
+            TrapKind::Illegal { .. } => {
+                self.core.take_illegal_exception(mem);
+            }
+            TrapKind::Breakpoint { .. } => {
+                self.core.take_bkpt_exception(mem);
+            }
+            TrapKind::Trap { trap_num } => {
+                self.core.take_trap_exception(mem, trap_num);
+            }
+            TrapKind::ALine { .. } => unreachable!("handled above"),
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +348,25 @@ mod tests {
         let (mut cpu, _mem) = new_cpu_with_memory(0x2000);
         cpu.set_sr(0x2700);
         assert_eq!(cpu.sr(), 0x2700);
+    }
+
+    #[test]
+    fn run_reports_pc_out_of_bounds_instead_of_silently_reading_zeros_forever() {
+        // A JSR/JMP through a bad address register (e.g. a guest bug --
+        // found via the real PhxAss assembler jumping through an
+        // uninitialized/garbage value) can send PC to a wildly
+        // out-of-range address. Without an eager bounds check,
+        // AddressSpace's "out-of-range reads are 0" convention means the
+        // CPU would decode an endless stream of zero-word instructions,
+        // walk forward (with u32 wraparound) potentially forever, and
+        // only stop if it happened to wrap back around onto something
+        // that traps -- reporting a misleading address far from the real
+        // bug. `Cpu::run` must catch this immediately instead.
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        cpu.set_pc(0xFFFF_FFD1);
+
+        let reason = cpu.run(&mut mem);
+
+        assert_eq!(reason, StopReason::PcOutOfBounds { pc: 0xFFFF_FFD1 });
     }
 }

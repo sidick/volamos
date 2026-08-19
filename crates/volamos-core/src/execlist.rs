@@ -127,7 +127,7 @@
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable};
-use crate::guestmem::read_c_string;
+use crate::guestmem::{GuestHeap, read_c_string};
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
 
@@ -495,6 +495,61 @@ fn delete_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         })
 }
 
+/// `CreateIORequest` (LVO -654: `A0` = reply `MsgPort*`, `D0` = size).
+/// `D0` = a zeroed `size`-byte block, with `io_Message.mn_Node.ln_Type`
+/// set to [`NT_MESSAGE`], `mn_Length` to `size` (so
+/// [`delete_io_request_handler`] knows how much to free without a
+/// separate size-tracking table), and `mn_ReplyPort` to `A0` -- or `0`
+/// if the guest heap is exhausted. Found missing while running the
+/// real `PhxAss` assembler, which builds a `timerequest` this way.
+fn create_io_request_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let port = ctx.cpu.address_register(AddressRegister(0));
+    let size = ctx.cpu.data_register(DataRegister(0));
+    let addr = create_io_request(ctx.heap, ctx.mem, port, size).unwrap_or(0);
+    ctx.cpu.set_data_register(DataRegister(0), addr);
+    Ok(())
+}
+
+/// Core of `CreateIORequest`: allocates and initializes a zeroed
+/// `size`-byte block. `None` if the guest heap is exhausted.
+fn create_io_request(
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+    port: u32,
+    size: u32,
+) -> Option<u32> {
+    let addr = heap.alloc(size).ok()?;
+    for i in 0..size {
+        mem.write_u8(addr.wrapping_add(i), 0);
+    }
+    mem.write_u8(addr + LN_TYPE, NT_MESSAGE);
+    mem.write_u16(addr + MN_LENGTH, size as u16);
+    mem.write_u32(addr + MN_REPLYPORT, port);
+    Some(addr)
+}
+
+/// `DeleteIORequest` (LVO -660: `A0` = `IORequest*` from
+/// [`create_io_request_handler`]). No return value. `NULL` is a legal
+/// no-op, matching real `DeleteIORequest`.
+fn delete_io_request_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let addr = ctx.cpu.address_register(AddressRegister(0));
+    if addr == 0 {
+        return Ok(());
+    }
+    ctx.heap
+        .free(addr)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -660,
+            handler_name: "DeleteIORequest".to_string(),
+            message: format!(
+                "DeleteIORequest called on {addr:#010x}, which isn't a currently-live \
+                 CreateIORequest allocation (never allocated, already deleted, or not an \
+                 IORequest pointer at all): {e}"
+            ),
+        })
+}
+
 /// `AddPort` (LVO -354): see the module docs' "no public port registry"
 /// section -- sets `ln_Type` to [`NT_MSGPORT`] (matching what real
 /// `AddPort` does to the node before enqueueing it) but doesn't maintain
@@ -552,6 +607,8 @@ pub fn register_execlist_handlers<C: Cpu + 'static>(
     reg!("ReplyMsg", reply_msg_handler::<C>);
     reg!("CreateMsgPort", create_msg_port_handler::<C>);
     reg!("DeleteMsgPort", delete_msg_port_handler::<C>);
+    reg!("CreateIORequest", create_io_request_handler::<C>);
+    reg!("DeleteIORequest", delete_io_request_handler::<C>);
     reg!("AddPort", add_port_handler::<C>);
     reg!("RemPort", rem_port_handler::<C>);
     reg!("FindPort", find_port_handler::<C>);
@@ -948,6 +1005,65 @@ mod tests {
             NT_MESSAGE,
             "PutMsg should have set ln_Type to NT_MESSAGE"
         );
+    }
+
+    #[test]
+    fn create_then_delete_io_request_via_dispatch() {
+        // CreateMsgPort -> A2 (kept as the reply port). CreateIORequest
+        // (A2, size=24) -> D0 = ioreq; check its header, then
+        // DeleteIORequest(ioreq) and DeleteMsgPort(port) should both
+        // succeed without error.
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+        words.extend_from_slice(&jsr_disp16_a6(-666)); // CreateMsgPort -> D0
+        words.push(move_d0_to_a(2)); // A2 = port
+        words.push(move_d0_to_a(0)); // A0 = port
+        words.push(0x7018); // moveq #24,d0 (size)
+        words.extend_from_slice(&jsr_disp16_a6(-654)); // CreateIORequest -> D0
+        words.push(0x2600); // move.l d0,d3 (d3 = ioreq, kept across the next calls)
+        words.push(0x2043); // movea.l d3,a0 (A0 = ioreq)
+        words.extend_from_slice(&jsr_disp16_a6(-660)); // DeleteIORequest(ioreq)
+        words.push(0x204A); // movea.l a2,a0 (A0 = port)
+        words.extend_from_slice(&jsr_disp16_a6(-672)); // DeleteMsgPort(port)
+        words.push(0x2003); // move.l d3,d0 (exit code = ioreq addr)
+        words.push(RTS);
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + (full.len() as u32) * 2 + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(code, 0, "CreateIORequest should have succeeded");
+    }
+
+    #[test]
+    fn create_io_request_fills_header_and_delete_frees_it() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let port_addr = 0x1000u32;
+        let before_free = heap.total_free();
+
+        let addr = create_io_request(&mut heap, &mut mem, port_addr, 24).unwrap();
+        assert_eq!(mem.read_u8(addr + LN_TYPE), NT_MESSAGE);
+        assert_eq!(mem.read_u16(addr + MN_LENGTH), 24);
+        assert_eq!(mem.read_u32(addr + MN_REPLYPORT), port_addr);
+        assert!(heap.total_free() < before_free);
+
+        heap.free(addr).unwrap();
+        assert_eq!(heap.total_free(), before_free);
     }
 
     #[test]

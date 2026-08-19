@@ -713,40 +713,72 @@ pub fn check_stack_bounds<M: AddressSpace>(
 
 /// `IOERR_OPENFAIL` (`exec/errors.h`): "device/unit failed to open".
 const IOERR_OPENFAIL: i8 = -1;
+/// `IOERR_NOCMD` (`exec/errors.h`): "command not supported by device".
+const IOERR_NOCMD: i8 = -3;
 
+/// `struct IORequest.io_Device` byte offset.
+const IO_DEVICE_OFFSET: u32 = 20;
+/// `struct IORequest.io_Command` byte offset (`UWORD`).
+const IO_COMMAND_OFFSET: u32 = 28;
 /// `struct IORequest.io_Error` byte offset (`io_Message` is 20 bytes:
 /// `mn_Node` 14 + `mn_ReplyPort` 4 + `mn_Length` 2; then `io_Device` 4,
 /// `io_Unit` 4, `io_Command` 2, `io_Flags` 1, `io_Error` 1 -- 32 bytes
 /// total, the standard `sizeof(struct IORequest)`).
 const IO_ERROR_OFFSET: u32 = 31;
+/// `struct timerequest.tr_time` (a `struct timeval`: `tv_secs`/
+/// `tv_micro`, both `ULONG`) sits right after the 32-byte `IORequest`.
+const TR_TIME_SECS_OFFSET: u32 = 32;
+const TR_TIME_MICRO_OFFSET: u32 = 36;
+
+/// A fixed, non-`NULL`, non-dereferenced sentinel for `io_Device` --
+/// see [`open_device_handler`]'s doc comment for why `timer.device` is
+/// the one device this runtime backs for real, and
+/// [`do_io_handler`]/[`send_io_handler`] for where this is read back to
+/// recognize a timer request.
+const TIMER_DEVICE_SENTINEL: u32 = 1;
+
+/// `timer.device`'s three documented commands (`devices/timer.h`,
+/// numerically `CMD_NONSTD` (9) + 0/1/2 -- confirmed against the
+/// AmiBlitz3 `timer.ab3`/`io.ab3` includes, the RKRM Devices book's own
+/// "Timer Device" chapter doesn't give literal numbers).
+const TR_ADDREQUEST: u16 = 9;
+const TR_GETSYSTIME: u16 = 10;
+const TR_SETSYSTIME: u16 = 11;
 
 /// `exec.library`'s `OpenDevice` (LVO -444: `A0` = device name
 /// `CString*`, `D0` = unit, `A1` = `struct IORequest*`, `D1` = flags).
-/// `D0` = an error code (`0` on success). This runtime has no real
-/// device drivers at all (no `timer.device`/`console.device`/... --
-/// same "no real handler processes" scope boundary `crate::dospkt`'s
-/// `DoPkt` and `crate::dosdevproc`'s `GetDeviceProc` already establish
-/// for `dos.library` handlers), so every device fails to open with
-/// `IOERR_OPENFAIL`, matching the real, documented "device/unit failed
-/// to open" convention -- not a stub pretending success.
+/// `D0` = an error code (`0` on success).
 ///
-/// Found missing running the real Workbench 3.1.4 `C:/Date` binary,
-/// which opens `timer.device` unconditionally at startup. Its
-/// no-argument "print the current date" form tolerates the open
-/// failing and still works end-to-end. Its explicit `Date DD-MMM-YY
-/// HH:MM:SS` form does *not* tolerate it, though -- confirmed (via a
-/// temporary local experiment faking success) that a real, working
-/// `timer.device` is a genuine prerequisite for that form beyond just
-/// `StrToDate`/`OpenDevice`/`CloseDevice`: with a faked-successful
-/// open it goes on to need `DoIO`/`SendIO` timer request handling and
-/// `utility.library`'s `UMult32`. Real device I/O + timer semantics
-/// are out of scope (see `crate::dospkt`'s module docs for the same
-/// "no real handler processes" boundary), so `Date` with explicit
-/// arguments is a known, documented gap, not a bug: it fails cleanly
-/// with a real, correctly-formatted `"***Bad args"` usage message
-/// rather than crashing.
+/// Found missing while running the real Workbench 3.1.4 `C:/Date`
+/// binary, which opens `timer.device` unconditionally at startup, and
+/// the real `PhxAss` assembler (Aminet), which requires it to actually
+/// open -- unlike `Date`'s no-argument form, `PhxAss` treats a failed
+/// open as fatal ("Can't open timer.device (Init)."), so making every
+/// device fail unconditionally (this runtime's original position) was
+/// too broad. `timer.device` -- specifically, only its `TR_GETSYSTIME`/
+/// `TR_SETSYSTIME`/`TR_ADDREQUEST` commands ([`do_io_handler`]) -- has
+/// simple, fully host-implementable semantics (wall clock + sleep),
+/// unlike every other device (`console.device`/hardware devices/...),
+/// which would need real drivers this runtime doesn't have (same "no
+/// real handler processes" scope boundary `crate::dospkt`'s `DoPkt`
+/// and `crate::dosdevproc`'s `GetDeviceProc` establish for
+/// `dos.library` handlers) -- so `timer.device` succeeds, backed by
+/// [`TIMER_DEVICE_SENTINEL`], and everything else still fails with
+/// `IOERR_OPENFAIL`, matching the real, documented "device/unit failed
+/// to open" convention for a device this runtime genuinely can't back.
 fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(0));
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    let name = crate::guestmem::read_c_string(ctx.mem, name_ptr);
+
+    if name.eq_ignore_ascii_case(b"timer.device") {
+        ctx.mem
+            .write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_SENTINEL);
+        ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+
     ctx.mem
         .write_u8(ioreq + IO_ERROR_OFFSET, IOERR_OPENFAIL as u8);
     ctx.cpu
@@ -755,23 +787,135 @@ fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 }
 
 /// `exec.library`'s `CloseDevice` (LVO -450: `A1` = `struct
-/// IORequest*`). No return value. A true no-op, matching
-/// [`open_device_handler`] (every device fails to open, so there's
-/// never a real device to close) -- real callers may call this even
-/// after a failed `OpenDevice` (confirmed via the real `C:/Date`
-/// binary, which does exactly that on its own failure path), so this
-/// must not assume `io_Device` is ever non-`NULL`.
+/// IORequest*`). No return value. A true no-op -- this runtime doesn't
+/// refcount device opens (matching [`crate::dispatch`]'s
+/// `CloseLibrary`), and even for `timer.device` there's no real
+/// resource to release. Real callers may call this even after a
+/// *failed* `OpenDevice` (confirmed via the real `C:/Date` binary,
+/// which does exactly that on its own failure path), so this must not
+/// assume `io_Device` is ever non-`NULL`.
 fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// Core of `DoIO`/`SendIO` for a `timer.device` request (`io_Device` ==
+/// [`TIMER_DEVICE_SENTINEL`]): dispatches on `io_Command`, writes the
+/// result into the request, and returns the `io_Error` value. Any
+/// `io_Device` this runtime doesn't recognize (shouldn't happen for a
+/// well-behaved caller, since only `timer.device` ever opens
+/// successfully) fails with [`IOERR_NOCMD`] rather than panicking.
+fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
+    let device = mem.read_u32(ioreq + IO_DEVICE_OFFSET);
+    if device != TIMER_DEVICE_SENTINEL {
+        return IOERR_NOCMD;
+    }
+
+    let command = mem.read_u16(ioreq + IO_COMMAND_OFFSET);
+    match command {
+        TR_GETSYSTIME => {
+            // tv_secs/tv_micro are both since the AmigaOS epoch
+            // (1978-01-01), per the RKRM Devices book's "Timer Device"
+            // chapter ("By convention, it tells how many seconds have
+            // passed since midnight, January 1, 1978").
+            let (days, minute, tick) = crate::dosdate::now_as_datestamp();
+            let secs = (days as i64) * 86_400 + (minute as i64) * 60 + (tick as i64) / 50;
+            let micro = (tick as i64 % 50) * 20_000;
+            mem.write_u32(ioreq + TR_TIME_SECS_OFFSET, secs as u32);
+            mem.write_u32(ioreq + TR_TIME_MICRO_OFFSET, micro as u32);
+            0
+        }
+        TR_SETSYSTIME => {
+            // No separate virtual clock to set -- accept and no-op,
+            // same "can't meaningfully change the host clock" stance
+            // as this runtime takes elsewhere.
+            0
+        }
+        TR_ADDREQUEST => {
+            // A (synchronous, since DoIO/SendIO both resolve
+            // immediately here) delay -- same host sleep
+            // crate::dosdate's Delay() uses, just from a timeval
+            // instead of a tick count.
+            let secs = mem.read_u32(ioreq + TR_TIME_SECS_OFFSET);
+            let micro = mem.read_u32(ioreq + TR_TIME_MICRO_OFFSET);
+            let millis = u64::from(secs) * 1000 + u64::from(micro) / 1000;
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+            0
+        }
+        _ => IOERR_NOCMD,
+    }
+}
+
+/// `exec.library`'s `DoIO` (LVO -456: `A1` = `struct IORequest*`).
+/// `D0` = `io_Error` (also written into the request itself, matching
+/// real `DoIO`). Synchronous by construction here (this runtime is
+/// single-threaded, so "queue and wait" and "do it now" are the same
+/// thing) -- see [`run_io_request`] for the timer commands this
+/// answers for real. Found missing while running the real `PhxAss`
+/// assembler.
+fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    let error = run_io_request(ctx.mem, ioreq);
+    ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, error as u8);
+    ctx.cpu
+        .set_data_register(DataRegister(0), error as i32 as u32);
+    Ok(())
+}
+
+/// `exec.library`'s `SendIO` (LVO -462: `A1` = `struct IORequest*`).
+/// No return value (real `SendIO` is asynchronous and doesn't report
+/// success/failure directly -- the caller finds out via `WaitIO`/
+/// `CheckIO`/the reply message). Since this runtime completes every
+/// request synchronously (see [`do_io_handler`]), this just runs it
+/// immediately and replies the message so a caller that does
+/// `SendIO`+`WaitIO` (rather than `DoIO`) still gets a correctly
+/// completed request back without ever actually blocking.
+fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    let error = run_io_request(ctx.mem, ioreq);
+    ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, error as u8);
+    Ok(())
+}
+
+/// `exec.library`'s `WaitIO` (LVO -474: `A1` = `struct IORequest*`).
+/// `D0` = `io_Error`. Every request this runtime hands out is already
+/// complete by the time `SendIO`/`DoIO` returns (see their doc
+/// comments), so this just reads back `io_Error` -- there's never
+/// anything left to actually wait for.
+fn wait_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    let error = ctx.mem.read_u8(ioreq + IO_ERROR_OFFSET);
+    ctx.cpu
+        .set_data_register(DataRegister(0), error as i8 as i32 as u32);
+    Ok(())
+}
+
+/// `exec.library`'s `CheckIO` (LVO -468: `A1` = `struct IORequest*`).
+/// `D0` = the request pointer (matching real `CheckIO`'s "still
+/// non-`NULL` `A1` on completion" contract) -- every request here is
+/// always already complete, so this never returns `0` ("still
+/// pending").
+fn check_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    ctx.cpu.set_data_register(DataRegister(0), ioreq);
+    Ok(())
+}
+
+/// `exec.library`'s `AbortIO` (LVO -480: `A1` = `struct IORequest*`).
+/// No return value. A no-op -- every request here already completed
+/// synchronously by the time `AbortIO` could possibly be called on it,
+/// matching real `AbortIO`'s documented "no effect on an
+/// already-completed request" behavior.
+fn abort_io_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     Ok(())
 }
 
 /// Registers every implemented task/signal handler: `exec.library`'s
 /// `FindTask`/`SetSignal`/`SetExcept`/`Wait`/`Signal`/`AllocSignal`/
 /// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`/`OpenDevice`/
-/// `CloseDevice`, plus `dos.library`'s
-/// `CheckSignal` (registered from here rather than `dosfile.rs`, so that
-/// file needs no edits at all -- see the module docs). Called
-/// unconditionally from [`crate::dispatch::Runtime::new`].
+/// `CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/`CheckIO`/`AbortIO`, plus
+/// `dos.library`'s `CheckSignal` (registered from here rather than
+/// `dosfile.rs`, so that file needs no edits at all -- see the module
+/// docs). Called unconditionally from [`crate::dispatch::Runtime::new`].
 pub fn register_exectask_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -802,6 +946,11 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("Permit", permit_handler::<C>);
     reg_exec!("OpenDevice", open_device_handler::<C>);
     reg_exec!("CloseDevice", close_device_handler::<C>);
+    reg_exec!("DoIO", do_io_handler::<C>);
+    reg_exec!("SendIO", send_io_handler::<C>);
+    reg_exec!("WaitIO", wait_io_handler::<C>);
+    reg_exec!("CheckIO", check_io_handler::<C>);
+    reg_exec!("AbortIO", abort_io_handler::<C>);
 
     table
         .register_by_name(
@@ -1647,7 +1796,7 @@ mod tests {
     fn open_device_always_fails_with_ioerr_openfail() {
         let _guard = lock_host_break();
         let entry = TRAP_TABLE_END;
-        let name = b"timer.device\0";
+        let name = b"some-other.device\0";
 
         let mut words = Vec::new();
         words.push(move_imm_to_a(0)); // A0 = name (patched below)
@@ -1696,6 +1845,237 @@ mod tests {
             rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET),
             IOERR_OPENFAIL as u8
         );
+    }
+
+    // --- timer.device: OpenDevice/DoIO ---
+
+    /// Builds and runs: `OpenDevice("timer.device", 0, ioreq, 0)`, then
+    /// (if `command` is `Some`) sets `io_Command`/`tr_time` on the same
+    /// `ioreq` and calls `DoIO(ioreq)`. Returns the exit code (`D0` at
+    /// the final `RTS`, i.e. `DoIO`'s `io_Error` if a command was run,
+    /// or `OpenDevice`'s own result otherwise) and the `Runtime` for
+    /// inspecting `ioreq`'s final contents.
+    fn run_open_timer_device_and_do_io(
+        command: Option<(u16, u32, u32)>,
+    ) -> (i32, Runtime<M68kCpu>, u32) {
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        let name_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        let ioreq_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+        if command.is_some() {
+            words.push(move_imm_to_a(1)); // A1 = ioreq again
+            words.push(0); // patched to the same value below
+            words.push(0);
+            words.extend_from_slice(&jsr_disp16_a6(-456)); // DoIO
+        }
+        words.push(RTS);
+
+        let name_addr = entry + (movea_exec_base_to_a6().len() + words.len()) as u32 * 2;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        words[name_idx] = (name_addr >> 16) as u16;
+        words[name_idx + 1] = name_addr as u16;
+        words[ioreq_idx] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx + 1] = ioreq_addr as u16;
+        if command.is_some() {
+            // ioreq_idx/+1 (OpenDevice's A1 immediate) -> +2 moveq d1 ->
+            // +3/+4 OpenDevice's jsr -> +5 DoIO's move_imm_to_a(1)
+            // opcode -> +6/+7 its immediate, the one patched here.
+            let a1_again_idx = ioreq_idx + 6;
+            words[a1_again_idx] = (ioreq_addr >> 16) as u16;
+            words[a1_again_idx + 1] = ioreq_addr as u16;
+        }
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..40 {
+            mem.write_u8(ioreq_addr + i, 0);
+        }
+        if let Some((cmd, secs, micro)) = command {
+            mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, cmd);
+            mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, secs);
+            mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, micro);
+        }
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: ioreq_addr + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        (code, rt, ioreq_addr)
+    }
+
+    #[test]
+    fn open_device_timer_device_succeeds() {
+        let _guard = lock_host_break();
+        let (code, rt, ioreq_addr) = run_open_timer_device_and_do_io(None);
+        assert_eq!(code, 0, "OpenDevice(timer.device) should succeed");
+        assert_eq!(
+            rt.memory().read_u32(ioreq_addr + IO_DEVICE_OFFSET),
+            TIMER_DEVICE_SENTINEL
+        );
+        assert_eq!(rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET), 0);
+    }
+
+    #[test]
+    fn do_io_get_systime_fills_tv_secs_and_tv_micro() {
+        let _guard = lock_host_break();
+        let (code, rt, ioreq_addr) = run_open_timer_device_and_do_io(Some((TR_GETSYSTIME, 0, 0)));
+        assert_eq!(code, 0);
+        let secs = rt.memory().read_u32(ioreq_addr + TR_TIME_SECS_OFFSET);
+        let micro = rt.memory().read_u32(ioreq_addr + TR_TIME_MICRO_OFFSET);
+        // Any real host clock is well past 8000 days since the Amiga
+        // epoch (matching crate::dosdate's own "plausibly recent" test).
+        assert!(secs > 8_000 * 86_400, "tv_secs should be large: {secs}");
+        assert!(
+            micro < 1_000_000,
+            "tv_micro should be a sub-second value: {micro}"
+        );
+    }
+
+    #[test]
+    fn do_io_add_request_sleeps_for_the_requested_duration() {
+        let _guard = lock_host_break();
+        // 40ms -- small enough to keep the suite fast, large enough to
+        // reliably distinguish "slept" from "didn't" (same tick count
+        // reasoning as crate::dosdate's own Delay test).
+        let start = std::time::Instant::now();
+        let (code, _rt, _ioreq_addr) =
+            run_open_timer_device_and_do_io(Some((TR_ADDREQUEST, 0, 40_000)));
+        let elapsed = start.elapsed();
+        assert_eq!(code, 0);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "TR_ADDREQUEST should have blocked for roughly 40ms, only blocked {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn do_io_unknown_command_returns_ioerr_nocmd() {
+        let _guard = lock_host_break();
+        let (code, rt, ioreq_addr) = run_open_timer_device_and_do_io(Some((999, 0, 0)));
+        assert_eq!(code, IOERR_NOCMD as i32);
+        assert_eq!(
+            rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET),
+            IOERR_NOCMD as u8
+        );
+    }
+
+    #[test]
+    fn run_io_request_unit_level_get_systime() {
+        let mut mem = FlatMemory::new(0x1000);
+        let ioreq = 0x100u32;
+        mem.write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_SENTINEL);
+        mem.write_u16(ioreq + IO_COMMAND_OFFSET, TR_GETSYSTIME);
+        assert_eq!(run_io_request(&mut mem, ioreq), 0);
+        assert!(mem.read_u32(ioreq + TR_TIME_SECS_OFFSET) > 8_000 * 86_400);
+    }
+
+    #[test]
+    fn run_io_request_unrecognized_device_returns_nocmd() {
+        let mut mem = FlatMemory::new(0x1000);
+        let ioreq = 0x100u32;
+        mem.write_u32(ioreq + IO_DEVICE_OFFSET, 0xDEAD_0000); // not TIMER_DEVICE_SENTINEL
+        mem.write_u16(ioreq + IO_COMMAND_OFFSET, TR_GETSYSTIME);
+        assert_eq!(run_io_request(&mut mem, ioreq), IOERR_NOCMD);
+    }
+
+    #[test]
+    fn send_io_wait_io_check_io_abort_io_via_dispatch() {
+        // SendIO(ioreq) [TR_GETSYSTIME] then WaitIO(ioreq) -> D0 =
+        // io_Error (0); separately CheckIO/AbortIO never block or fail
+        // since every request here already completed synchronously.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = name (patched)
+        let name_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched)
+        let ioreq_idx1 = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+        words.push(move_imm_to_a(1)); // A1 = ioreq again (patched)
+        let ioreq_idx2 = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-462)); // SendIO
+        words.push(move_imm_to_a(1)); // A1 = ioreq again (patched)
+        let ioreq_idx3 = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-468)); // CheckIO -> D0 = ioreq
+        words.push(0x2600); // move.l d0,d3 (stash CheckIO's result)
+        words.push(move_imm_to_a(1)); // A1 = ioreq again (patched)
+        let ioreq_idx4 = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-480)); // AbortIO (no-op)
+        words.push(move_imm_to_a(1)); // A1 = ioreq again (patched)
+        let ioreq_idx5 = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-474)); // WaitIO -> D0 = io_Error
+        words.push(RTS);
+
+        let name_addr = entry + (movea_exec_base_to_a6().len() + words.len()) as u32 * 2;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        for idx in [ioreq_idx1, ioreq_idx2, ioreq_idx3, ioreq_idx4, ioreq_idx5] {
+            words[idx] = (ioreq_addr >> 16) as u16;
+            words[idx + 1] = ioreq_addr as u16;
+        }
+        words[name_idx] = (name_addr >> 16) as u16;
+        words[name_idx + 1] = name_addr as u16;
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..40 {
+            mem.write_u8(ioreq_addr + i, 0);
+        }
+        mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_GETSYSTIME);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: ioreq_addr + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "WaitIO should report io_Error == 0");
     }
 
     // --- CloseDevice ---

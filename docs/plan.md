@@ -1789,6 +1789,103 @@ specific "implement this next" pointer, not a generic fake-lib wall).
 New tests: 2 (`dispatch.rs`: found-on-disk succeeds as before,
 not-found-on-disk/no-`Vfs` both return `NULL`).
 
+**Continuing the `PhxAss` run: `NameFromFH`, `CreateIORequest`/
+`DeleteIORequest`, `timer.device`, real hardware exception delivery,
+standard Workbench math libraries, and a `PcOutOfBounds` diagnostic —
+2026-08-19.** Picked the `PhxAss` gap-chain back up (Simon: "keep going
+with phxass as it's one of the more commonly used assemblers").
+
+- `dos.library`'s `NameFromFH` (LVO -154): constructs the absolute
+  Amiga path for an open file handle, same truncation/
+  `ERROR_LINE_TOO_LONG` contract as the existing `NameFromLock`.
+- `exec.library`'s `CreateIORequest`/`DeleteIORequest`: allocate/free a
+  zeroed `IORequest`-shaped block with `mn_ReplyPort`/`mn_Length`/
+  `ln_Type=NT_MESSAGE` pre-filled.
+- `timer.device`: the *one* Exec device this runtime backs for real
+  (`OpenDevice`/`DoIO`/`SendIO`/`WaitIO`/`CheckIO`/`AbortIO`), unlike
+  every other device (no real drivers modeled, so those still fail
+  `OpenDevice` with `IOERR_OPENFAIL`) -- `TR_GETSYSTIME`/`TR_SETSYSTIME`/
+  `TR_ADDREQUEST` have simple, fully host-implementable semantics (wall
+  clock read + real `std::thread::sleep`). `struct timerequest` = a
+  32-byte `IORequest` + `struct timeval` at offset 32/36; command
+  numbers confirmed against AmiBlitz3's real includes
+  (`TR_ADDREQUEST=9`, `TR_GETSYSTIME=10`, `TR_SETSYSTIME=11`).
+- **Real M68K hardware exception delivery** (Simon: "take it on, sounds
+  like it's worth doing," after `PhxAss` hit a genuine F-line/FPU-probe
+  CPU exception past `DoIO`): `Cpu::take_hardware_exception` reads the
+  guest's real exception vector table (`vector*4`, `VBR=0` for our
+  M68000 config) and, if the guest installed a handler, pushes a real
+  `[SR,PC]` frame and jumps to it -- exactly what real hardware does for
+  F-line/illegal/BKPT/`TRAP #n`, distinct from this runtime's own
+  A-line library-dispatch convention. Non-obvious hardware semantic:
+  for F-line/illegal/BKPT (unlike `TRAP #n`), the CPU stacks the
+  *trapping* instruction's own address, not the next one -- a
+  well-behaved guest handler must advance the stacked PC itself before
+  `RTE`, or it re-traps forever (confirmed the hard way: an early test
+  handler infinite-looped until this was accounted for). Required
+  fixing a bug this uncovered: `Runtime::new`'s low-memory trap-table
+  prefill covered `[0x0000, 0x1200)`, which clobbered the real vector
+  table's own address range (`vector*4`, all `<= 0xC0` through `TRAP
+  #15`) with the "unknown call" sentinel *before* any real handler could
+  ever be seen as installed -- excluded via a new
+  `EXCEPTION_VECTOR_TABLE_SIZE = 0xC0` gap.
+- **Standard Workbench 3.1 math libraries** (Simon: "it's strange, phxass
+  doesn't list an fpu as a required feature" / "it sounds like the maths
+  libraries could be worth implementing soon"): `mathtrans.library`,
+  `mathieeesingbas.library`, `mathieeesingtrans.library`,
+  `mathieeedoubbas.library`, `mathieeedoubtrans.library` are disk-based
+  on real hardware but ship as a *mandatory* part of every Workbench 3.1
+  install (unlike a genuinely optional third-party library) -- these
+  math libraries are software-only (no physical FPU required to use
+  them, resolving Simon's "doesn't list an FPU" observation: `PhxAss`
+  needs the math *library*, not the coprocessor). `open_library_common`
+  now treats this small allowlist (`STANDARD_WORKBENCH_LIBRARIES`) like
+  the ROM-resident set: always succeeds, regardless of `Vfs` state. Also
+  fixed the fake-library auto-create path to write a real `struct
+  Library` header (`lib_Node.ln_Type`/`lib_Version`/`lib_Revision`) at
+  the base's *positive* offsets, not just the negative-offset jump
+  table -- `PhxAss` reads a header field before deciding how to
+  dispatch through a library, and previously got whatever garbage
+  happened to sit in the next heap allocation.
+- **`Cpu::run`/`StopReason::PcOutOfBounds`**: found via a genuinely
+  confusing failure mode while debugging the above -- a guest bug (a
+  `JSR`/`JMP` through a bad address register still not root-caused, see
+  below) sent PC to a huge out-of-range address. `AddressSpace`'s
+  documented "out-of-range reads return `0`" convention meant the CPU
+  silently decoded an endless stream of zero-word instructions and
+  walked forward (`u32` wraparound included) for *thousands* of steps
+  before coincidentally landing back on a real trap-table sentinel,
+  producing an error that named a plausible-looking but totally wrong
+  address. `Cpu::run`'s default loop now checks `pc >= mem.len()` before
+  every step and reports the real faulting address immediately instead.
+  General robustness fix, not `PhxAss`-specific -- any guest bug that
+  computes a bad jump target now gets a useful diagnostic.
+
+**Still open**: with all of the above, `PhxAss` gets through Pass 1 and
+Pass 2 (prints both banners, calls `DoIO` for timing twice) and then
+hits `PcOutOfBounds` at `0xFFFFFFD1`. Root cause traced (via targeted,
+since-removed `eprintln!` instrumentation, not committed) to a `JSR
+(d16,A6)` at guest address `0x3068` where `A6` was loaded from
+`+0x14` of an internal `PhxAss` object (itself reached via a
+frame-relative local at `+0x15C(A5)`) and came out as the literal value
+`1` instead of a real pointer -- i.e. a `PhxAss`-internal data
+structure this runtime doesn't populate correctly ends up holding a
+small integer where a jump target (plausibly a math-library dispatch
+vtable/selector) is expected. Not yet root-caused further: doing so
+without symbols likely needs either real disassembly of `PhxAss`
+itself or a side-by-side ground-truth comparison against a real
+Kickstart/Workbench run (e.g. via the local Amiberry MCP tooling) to
+see what that field should actually contain. Left as the next gap in
+this chain.
+
+New tests: 7 (`dosfile.rs`: `NameFromFH`; `execlist.rs`:
+`CreateIORequest`/`DeleteIORequest`; `exectask.rs`: `timer.device`'s
+`OpenDevice`/`DoIO`/`SendIO`/`WaitIO`/`CheckIO`/`AbortIO`, 7 cases;
+`dispatch.rs`: F-line trap routed through a guest handler, F-line trap
+with no handler installed, standard-Workbench-library
+`OpenLibrary`-always-succeeds-with-real-header; `backend.rs`:
+`PcOutOfBounds` reporting).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

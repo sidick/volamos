@@ -120,6 +120,17 @@ fn call_put_ch_proc<C: Cpu>(
                     ),
                 });
             }
+            StopReason::PcOutOfBounds { pc } => {
+                return Err(DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo: -522,
+                    handler_name: "RawDoFmt".to_string(),
+                    message: format!(
+                        "PutChProc at {put_ch_proc:#010x} ran the program \
+                         counter off the end of guest memory (reached {pc:#010x})"
+                    ),
+                });
+            }
         }
         steps += 1;
     }
