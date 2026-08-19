@@ -1033,6 +1033,88 @@ Object not found
 unknown code, `PrintFault` end-to-end with a header and with a
 zero/no-op code, `Fault`'s buffer-fill-and-truncate behavior).
 
+**`List` gap chain — implemented 2026-08-19.** Moved to the next real
+corpus binary (`C:/List`) once `Type` ran cleanly end-to-end; found and
+fixed six gaps in sequence, each surfaced only by the next one being
+fixed:
+
+- **`DateStamp`** (`crates/volamos-core/src/dosdate.rs`): fills the
+  real `struct DateStamp` (`ds_Days`/`ds_Minute`/`ds_Tick`) from the
+  host wall clock, via a fixed 2922-day Unix-epoch-to-Amiga-epoch
+  offset. `now_as_datestamp()` is reused by `DateToStr`'s `DTF_SUBST`
+  substitution below.
+- **`AddPart`/`FilePart`/`PathPart`** (`crates/volamos-core/src/
+  dospath.rs`): pure path-string functions -- no `Vfs` involved, per
+  their own documented contract. `AddPart` reproduces the classic
+  algorithm's three cases (colon resets to the device root, each
+  leading `/` in the appended name pops one trailing component, then
+  the remainder is appended with a `/` separator only if needed).
+- **`IsFileSystem`** (`crates/volamos-core/src/dosfs.rs`): collapses to
+  "does `name`'s device/volume resolve through the `Vfs` at all"
+  (`ResolveMode::ParentMustExist`, so the exact object needn't exist),
+  since this runtime only ever backs a path with a real host-directory
+  volume (always a file system) or stdin/stdout (never reachable by a
+  device string here in the first place). `"*"` (the console) is never
+  a file system, per the RKRM's own `IsFileSystem34` workaround.
+- **`NameFromLock`** (added to `crates/volamos-core/src/doslock.rs`):
+  reuses `LockEntry::amiga_path` (already tracked for `CurrentDir`,
+  T11) directly -- the lock that produced it already recorded the
+  absolute Amiga path. `lock == 0` resolves to the literal `"SYS:"`,
+  matching the RKRM's own documented `ZERO`-lock quirk.
+  - **`DateToStr`** (`crates/volamos-core/src/dosdatestr.rs`): renders
+  `struct DateTime` (`dos/datetime.h`, 26 bytes, even-byte-packed) into
+  weekday/date/time strings, all four `dat_Format` styles, and
+  `DTF_SUBST`'s "Today"/"Tomorrow"/"Yesterday"/weekday-name/"Future"
+  substitution (comparing against `dosdate::now_as_datestamp`).
+- **`dosanchor.rs`: non-wildcard directory descent, and `APF_DirChanged`
+  hygiene** -- two real bugs found only once `List` could get this far:
+  1. A bare, non-wildcard directory argument (`List WORK:`, no
+     wildcard at all) still needs to be descendable via `APF_DODIR` in
+     real AmigaDOS -- confirmed directly against the real `List`
+     binary, which sets `APF_DODIR` right after a plain `MatchFirst`
+     match. The non-wildcard branch previously left `AnchorMatchState::
+     pattern` as `None`, which gated descent off entirely. Fixed by
+     giving it the `"#?"` (match-everything) pattern and marking the
+     level's single synthetic "entry" (itself) via a new `direct_self`
+     flag, since it has no real parent/name decomposition to reuse the
+     normal recursive-descent path's `join_amiga(parent, name)` logic
+     with -- a bare volume root like `"WORK:"` has no distinct "name"
+     component to strip back off. First attempt (reusing `dir_part` as
+     a fake parent) broke on exactly this case (`"WORK:WORK"`,
+     `ERROR_OBJECT_NOT_FOUND`); the `direct_self` flag sidesteps the
+     join entirely for both the descend step and the later
+     `APF_DIDDIR` pop-cascade (which now uses the popped level's own
+     stored path directly, not a re-derived join).
+  2. `APF_DirChanged` (RKRM `pattern-matching.md`: "cleared if the
+     directory is the same as in the previous iteration") was being set
+     once on descent but never cleared for subsequent same-directory
+     entries, nor set on the `APF_DIDDIR` pop -- `List` uses this flag
+     to decide when to print a new `"Directory ..."` header, so every
+     entry got its own header/summary until this was fixed.
+
+`List WORK:` now runs fully end-to-end against the real corpus binary,
+producing correctly-formatted output:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/List WORK:
+Directory "WORK" on Wednesday 19-Aug-26
+big.txt                    66669 ----rwed 01-Jan-78 00:00:00
+deep                          Dir ----rwed 01-Jan-78 00:00:00
+...
+5 files - 2 directories - 141 blocks used
+```
+New tests: 2 (`dosdate.rs`), 14 (`dospath.rs`), 3 (`dosfs.rs`), 3
+(`doslock.rs`, for `NameFromLock`), 10 (`dosdatestr.rs`), 3
+(`dosanchor.rs`, for the non-wildcard-descent and `DirChanged` fixes).
+
+**Known remaining `List` gap, not yet chased**: `List` of a
+non-existent explicit path (`List WORK:nope`) prints a spurious empty
+`Dir` entry instead of a clean error message, though it does still
+report a nonzero exit code (20) with no crash -- `MatchFirst` correctly
+returns `ERROR_OBJECT_NOT_FOUND`, but something in `List`'s own
+failure-handling path still falls through to printing an entry from
+unpopulated `ap_Info`. Lower priority than the working-directory case;
+revisit if a future corpus binary trips on the same class of bug.
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

@@ -1172,6 +1172,21 @@ impl<C: Cpu + 'static> Runtime<C> {
         // text, and printing it) -- see crate::dosfault's module docs.
         crate::dosfault::register_dosfault_handlers(&mut table, &mut mem);
 
+        // dos.library DateStamp (current date/time as a DateStamp) --
+        // see crate::dosdate's module docs.
+        crate::dosdate::register_dosdate_handlers(&mut table, &mut mem);
+
+        // dos.library DateToStr (DateStamp -> human-readable strings) --
+        // see crate::dosdatestr's module docs.
+        crate::dosdatestr::register_dosdatestr_handlers(&mut table, &mut mem);
+
+        // dos.library AddPart/FilePart/PathPart (pure path-string
+        // helpers) -- see crate::dospath's module docs.
+        crate::dospath::register_dospath_handlers(&mut table, &mut mem);
+
+        // dos.library IsFileSystem -- see crate::dosfs's module docs.
+        crate::dosfs::register_dosfs_handlers(&mut table, &mut mem);
+
         // dos.library StrToLong (decimal string -> LONG) -- see
         // crate::dosstr's module docs.
         crate::dosstr::register_dosstr_handlers(&mut table, &mut mem);

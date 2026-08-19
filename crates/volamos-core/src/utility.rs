@@ -385,8 +385,10 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 const EPOCH_YEAR: u32 = 1978;
 
 /// Converts a day count since [`EPOCH_YEAR`]-01-01 into `(year, month,
-/// mday)` (`month`/`mday` both 1-based).
-fn days_to_ymd(days: u32) -> (u32, u32, u32) {
+/// mday)` (`month`/`mday` both 1-based). Shared with
+/// [`crate::dosdatestr`]'s `DateToStr`, which needs the same
+/// day-count-to-calendar-date math for a `DateStamp`'s `ds_Days`.
+pub(crate) fn days_to_ymd(days: u32) -> (u32, u32, u32) {
     let mut year = EPOCH_YEAR;
     let mut remaining = days;
     loop {

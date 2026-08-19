@@ -259,6 +259,23 @@ impl DosState {
         self.new_lock(heap, mem, entry.host_path, entry.amiga_path, SHARED_LOCK)
     }
 
+    /// `NameFromLock(lock)`: the absolute Amiga path that produced
+    /// `lock` (`lock == 0` resolves to the literal string `"SYS:"`,
+    /// matching the RKRM's own documented quirk for the `ZERO` lock --
+    /// see the module docs). Fails with [`ERROR_INVALID_LOCK`] if
+    /// `addr != 0` isn't a currently-open lock.
+    pub fn name_from_lock(&self, addr: u32) -> Result<String, i32> {
+        if addr == 0 {
+            return Ok("SYS:".to_string());
+        }
+        Ok(self
+            .locks
+            .get(&addr)
+            .ok_or(ERROR_INVALID_LOCK)?
+            .amiga_path
+            .clone())
+    }
+
     /// `ParentDir(lock)`: a [`SHARED_LOCK`] on the parent directory of
     /// `lock`'s target (`lock == 0` means the current directory). Returns
     /// `Ok(0)` (not an error -- `IoErr()` stays `0`) when `lock` is
@@ -569,6 +586,35 @@ fn current_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
+/// `NameFromLock` (`D1` = `BPTR` lock, `D2` = buffer, `D3` = buffer
+/// capacity). `D0` = `DOSTRUE`/`DOSFALSE` (`DOSFALSE` + `IoErr()` =
+/// [`crate::dospattern::ERROR_LINE_TOO_LONG`] if the path doesn't fit).
+fn name_from_lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let buf_addr = ctx.cpu.data_register(DataRegister(2));
+    let cap = ctx.cpu.data_register(DataRegister(3)) as usize;
+    let addr = addr_from_bptr(bptr);
+
+    match ctx.dos.name_from_lock(addr) {
+        Ok(path) if path.len() < cap => {
+            write_c_string(ctx.mem, buf_addr, path.as_bytes());
+            ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
+        }
+        Ok(path) => {
+            let mut truncated = path.into_bytes();
+            truncated.truncate(cap.saturating_sub(1));
+            write_c_string(ctx.mem, buf_addr, &truncated);
+            ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
+    Ok(())
+}
+
 /// `Examine` (`D1` = `BPTR` lock, `D2` = `struct FileInfoBlock*`). `D0` =
 /// `DOSTRUE`/`DOSFALSE`.
 fn examine_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -629,6 +675,7 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("ExNext", ex_next_handler::<C>);
     reg!("CurrentDir", current_dir_handler::<C>);
     reg!("ParentDir", parent_dir_handler::<C>);
+    reg!("NameFromLock", name_from_lock_handler::<C>);
 }
 
 #[cfg(test)]
@@ -770,6 +817,31 @@ mod tests {
         let mut mem = FlatMemory::new(0x4000);
         let mut dos = DosState::new(None);
         assert_eq!(dos.dup_lock(&mut heap, &mut mem, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn name_from_lock_zero_is_sys_colon() {
+        let dos = DosState::new(None);
+        assert_eq!(dos.name_from_lock(0).unwrap(), "SYS:");
+    }
+
+    #[test]
+    fn name_from_lock_returns_the_locks_absolute_amiga_path() {
+        let tmp = TempDir::new("namefromlock");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos.lock(&mut heap, &mut mem, "work", SHARED_LOCK).unwrap();
+        let addr = addr_from_bptr(bptr);
+        assert_eq!(dos.name_from_lock(addr).unwrap(), "SYS:work");
+    }
+
+    #[test]
+    fn name_from_lock_invalid_lock_is_an_error() {
+        let dos = DosState::new(None);
+        let err = dos.name_from_lock(0x1234).unwrap_err();
+        assert_eq!(err, ERROR_INVALID_LOCK);
     }
 
     #[test]
@@ -1091,5 +1163,37 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_ne!(code, 0, "Open of the relative path should now succeed");
+    }
+
+    #[test]
+    fn end_to_end_name_from_lock_writes_the_absolute_path() {
+        let tmp = TempDir::new("e2e-namefromlock");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        let dir_name = b"SYS:work\0";
+
+        let mut words = Vec::new();
+        let dir_name_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32);
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = BPTR
+        words.push(0x2200); // move.l d0,d1 (lock for NameFromLock)
+        let buf_idx = push_move_imm_to_d(&mut words, 2, 0); // D2 = buffer (patched)
+        push_move_imm_to_d(&mut words, 3, 64); // D3 = capacity
+        push_jsr(&mut words, 6, -402); // NameFromLock(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let dir_name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let buf_addr = dir_name_addr + dir_name.len() as u32;
+        patch_imm32(&mut words, dir_name_idx, dir_name_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut rt =
+            runtime_with_program_and_extra(&words, dir_name_addr, dir_name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(read_c_string(rt.memory(), buf_addr), b"SYS:work");
     }
 }

@@ -159,6 +159,29 @@ pub(crate) struct AnchorMatchState {
     /// immediately after an `APF_DIDDIR` return (entering a directory
     /// right after leaving one isn't a sensible operation to check for).
     pending_entry: Option<(String, bool)>,
+    /// `true` exactly once: right after a non-wildcard `MatchFirst`
+    /// whose target is a directory, consumed by the very next `MatchNext`
+    /// call. Distinguishes "`pending_entry` is the matched object
+    /// itself" (its full path is already `levels[0].dir_amiga_path`
+    /// verbatim -- there's no separate parent to join it onto, e.g. a
+    /// bare volume root like `"WORK:"`) from the normal case
+    /// ("`pending_entry` is a real child found while scanning
+    /// `levels.last()`, so its path is `join_amiga(dir_amiga_path,
+    /// name)`"). Without this, descending from a bare non-wildcard
+    /// directory match would double up the name (`"WORK:WORK"`) --
+    /// found by running the real Workbench 3.1.4 `List` binary against a
+    /// bare volume argument.
+    direct_self: bool,
+}
+
+/// Appends a trailing `/` unless `path` already ends in `:`/`/`,
+/// matching [`ScanLevel::dir_amiga_path`]'s own invariant.
+fn ensure_trailing_sep(path: &str) -> String {
+    if path.ends_with(':') || path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
 }
 
 fn join_amiga(dir: &str, name: &str) -> String {
@@ -313,18 +336,39 @@ fn match_first(
         let level = ScanLevel {
             achain_addr,
             dir_lock_addr: addr,
+            // The matched object's *own* path (not its parent): this
+            // level has no real entries (see below), so nothing else
+            // ever joins a name onto this -- `match_next_inner`'s Step 1
+            // uses it verbatim (via `direct_self`) as the descend
+            // target when the caller sets `APF_DODIR`.
             dir_amiga_path: entry.amiga_path.clone(),
             dir_host_path: entry.host_path,
             self_name: display_name.clone(),
-            entries: vec![(display_name, is_dir)],
-            cursor: 1,
+            // Deliberately empty: this level doesn't scan a directory's
+            // children, it *is* the matched object. A further
+            // `MatchNext` either descends into it (Step 1, gated on
+            // `direct_self` + `APF_DODIR`) or -- with empty `entries`
+            // and only one level -- reports `ERROR_NO_MORE_ENTRIES`.
+            entries: vec![],
+            cursor: 0,
         };
+        // Even a bare, non-wildcard directory match can be descended
+        // into: real AmigaDOS's `List DIR:` (no wildcard at all) still
+        // lists `DIR:`'s contents once the caller sets `APF_DODIR` after
+        // seeing the match is a directory (confirmed against the real
+        // Workbench 3.1.4 `List` binary, which does exactly this). Once
+        // descended, the applicable pattern is "everything" (`#?`), not
+        // the original bare name -- there was no wildcard to re-apply.
+        let all_pattern = dospattern::parse(b"#?")
+            .expect("#? is always a valid pattern")
+            .0;
         dos.anchor_states.insert(
             ap_addr,
             AnchorMatchState {
-                pattern: None,
+                pattern: Some(all_pattern),
                 levels: vec![level],
-                pending_entry: None,
+                pending_entry: Some((display_name, is_dir)),
+                direct_self: true,
             },
         );
         return Ok(());
@@ -383,6 +427,7 @@ fn match_first(
             pattern: Some(pattern_node),
             levels: vec![level],
             pending_entry: Some((name0, is_dir0)),
+            direct_self: false,
         },
     );
     Ok(())
@@ -411,13 +456,26 @@ fn match_next_inner(
 ) -> Result<(), i32> {
     // Step 1: a directory-entering descent, if the previous match was a
     // directory and the caller has since set APF_DODIR.
+    let mut entered_directory = false;
     if let Some(pattern) = &state.pattern
         && let Some((name, true)) = state.pending_entry.take()
     {
         let flags = mem.read_u8(ap_addr + AP_FLAGS_OFFSET);
         if flags & APF_DODIR != 0 {
             let top = state.levels.last().expect("non-empty by construction");
-            let child_amiga = join_amiga(&top.dir_amiga_path, &format!("{name}/"));
+            // `direct_self`: `top` *is* the matched object (an empty,
+            // synthetic level -- see `match_first`'s non-wildcard
+            // branch), so its own path is already the descend target
+            // verbatim; there's no separate parent to join `name` onto
+            // (a bare volume root like `"WORK:"` has no such
+            // decomposition at all). Otherwise `name` is a real child
+            // found while scanning `top`, joined onto its path as usual.
+            let child_amiga = if state.direct_self {
+                ensure_trailing_sep(&top.dir_amiga_path)
+            } else {
+                join_amiga(&top.dir_amiga_path, &format!("{name}/"))
+            };
+            state.direct_self = false;
             let old_top_achain = top.achain_addr;
 
             let (bptr, addr, host_path) = lock_dir(heap, mem, dos, &child_amiga)?;
@@ -429,6 +487,7 @@ fn match_next_inner(
             mem.write_u32(ap_addr + AP_LAST_OFFSET, achain_addr);
             set_flag_bit(mem, ap_addr, APF_DODIR, false);
             set_flag_bit(mem, ap_addr, APF_DIR_CHANGED, true);
+            entered_directory = true;
 
             state.levels.push(ScanLevel {
                 achain_addr,
@@ -462,6 +521,15 @@ fn match_next_inner(
                 .unwrap_or(0)
         };
         write_match_result(mem, ap_addr, achain_addr, &name, is_dir, size, &full_path)?;
+        // Same directory as the previous iteration -- per the RKRM,
+        // `APF_DirChanged` "is also cleared if the directory is the
+        // same as in the previous iteration" (it isn't self-clearing
+        // like `APF_DIDDIR`, so this runtime has to do it explicitly).
+        // Skipped if Step 1 *just* entered this directory in this same
+        // call -- that's a real change, not a same-directory iteration.
+        if !entered_directory {
+            set_flag_bit(mem, ap_addr, APF_DIR_CHANGED, false);
+        }
         if state.pattern.is_some() {
             state.pending_entry = Some((name, is_dir));
         }
@@ -475,7 +543,13 @@ fn match_next_inner(
     dos.unlock(heap, finished.dir_lock_addr);
     let parent = state.levels.last().expect("len() > 1 just checked");
     let parent_achain = parent.achain_addr;
-    let full_path = join_amiga(&parent.dir_amiga_path, &finished.self_name);
+    // `finished.dir_amiga_path` is already this level's own full path
+    // (the invariant every `ScanLevel` maintains) -- using it directly
+    // avoids re-deriving it via `join_amiga(parent, finished.self_name)`,
+    // which breaks when `finished` was reached via `direct_self`
+    // descent (its path isn't `parent.dir_amiga_path + self_name` at
+    // all, e.g. a bare volume root like `"WORK:"`).
+    let full_path = finished.dir_amiga_path.clone();
     mem.write_u32(ap_addr + AP_LAST_OFFSET, parent_achain);
     // Restore ap_Info to the just-exited directory's own descriptor
     // (see ScanLevel::self_name's doc) before signaling APF_DIDDIR.
@@ -489,6 +563,9 @@ fn match_next_inner(
         &full_path,
     )?;
     set_flag_bit(mem, ap_addr, APF_DIDDIR, true);
+    // Leaving a directory is a directory change too (see the doc note
+    // on the entry-return path above).
+    set_flag_bit(mem, ap_addr, APF_DIR_CHANGED, true);
     state.pending_entry = None;
     Ok(())
 }
@@ -733,6 +810,88 @@ mod tests {
         assert_eq!(err, ERROR_BUFFER_OVERFLOW);
         // The FIB itself should still have been filled in correctly.
         assert_eq!(fib_name(&mem, ap), b"hello.txt");
+    }
+
+    #[test]
+    fn dir_changed_flag_is_set_on_transitions_and_cleared_within_a_directory() {
+        // Real List (and other callers) uses APF_DirChanged to decide
+        // when to print a new "Directory ..." header -- confirmed
+        // against the real Workbench 3.1.4 List binary, which printed a
+        // fresh header for *every entry* until this flag was correctly
+        // cleared between same-directory iterations.
+        let tmp = TempDir::new("dirchanged");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        fs::write(tmp.path().join("work/a.txt"), b"a").unwrap();
+        fs::write(tmp.path().join("work/b.txt"), b"b").unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        let ap = alloc_ap(&mut heap, &mut mem, 0);
+
+        match_first(&mut heap, &mut mem, &mut dos, b"SYS:work", ap).expect("match");
+        set_flag_bit(&mut mem, ap, APF_DODIR, true);
+
+        match_next(&mut heap, &mut mem, &mut dos, ap).expect("descend into work/");
+        assert_eq!(fib_name(&mem, ap), b"a.txt");
+        assert_ne!(
+            flags(&mem, ap) & APF_DIR_CHANGED,
+            0,
+            "entering a directory should set DirChanged"
+        );
+
+        match_next(&mut heap, &mut mem, &mut dos, ap).expect("second entry, same dir");
+        assert_eq!(fib_name(&mem, ap), b"b.txt");
+        assert_eq!(
+            flags(&mem, ap) & APF_DIR_CHANGED,
+            0,
+            "same directory as the previous iteration should clear DirChanged"
+        );
+
+        match_next(&mut heap, &mut mem, &mut dos, ap).expect("leave work/");
+        assert_ne!(flags(&mem, ap) & APF_DIDDIR, 0);
+        assert_ne!(
+            flags(&mem, ap) & APF_DIR_CHANGED,
+            0,
+            "leaving a directory should also set DirChanged"
+        );
+    }
+
+    #[test]
+    fn non_wildcard_directory_match_can_still_be_descended_into() {
+        // Real `List DIR:` (a bare, non-wildcard directory argument)
+        // still lists DIR:'s contents -- confirmed against the real
+        // Workbench 3.1.4 List binary, which locks the directory
+        // directly via MatchFirst, then sets APF_DODIR itself before
+        // the next MatchNext.
+        let tmp = TempDir::new("nonwild-descend");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        fs::write(tmp.path().join("work/a.txt"), b"a").unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        let ap = alloc_ap(&mut heap, &mut mem, 0);
+
+        match_first(&mut heap, &mut mem, &mut dos, b"SYS:work", ap).expect("match");
+        assert_eq!(fib_name(&mem, ap), b"work");
+        assert_eq!(flags(&mem, ap) & APF_ITSWILD, 0, "no wildcard was used");
+
+        set_flag_bit(&mut mem, ap, APF_DODIR, true);
+        match_next(&mut heap, &mut mem, &mut dos, ap).expect("descend into work/");
+        assert_eq!(
+            fib_name(&mem, ap),
+            b"a.txt",
+            "should now list work/'s contents"
+        );
+
+        // work/ has only one entry, so the next call pops back out,
+        // restoring ap_Info to "work" itself and signaling DIDDIR --
+        // same cascade as the wildcard recursive-descent case.
+        match_next(&mut heap, &mut mem, &mut dos, ap).expect("leave work/");
+        assert_ne!(flags(&mem, ap) & APF_DIDDIR, 0);
+        assert_eq!(fib_name(&mem, ap), b"work");
+
+        set_flag_bit(&mut mem, ap, APF_DIDDIR, false);
+        let err = match_next(&mut heap, &mut mem, &mut dos, ap).unwrap_err();
+        assert_eq!(err, ERROR_NO_MORE_ENTRIES);
+
+        match_end(&mut heap, &mut dos, ap);
+        assert!(dos.locks.is_empty());
     }
 
     #[test]
