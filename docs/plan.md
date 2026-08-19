@@ -3338,4 +3338,91 @@ extension using AROS's own command-line equivalents (openly licensed,
 buildable/committable, per the empirical-corpus decision's own
 "follow-on" note) is a real idea for later, once the real three-way
 harness exists and there's something to validate an AROS-based
-substitute against — not started now.
+substitute against — not started now. Bar for switching CI over to
+it: not just "AROS commands exist" but volamos's results against the
+AROS corpus agreeing with the other two oracles as reliably as it
+already does against the real Hyperion corpus -- the AROS corpus is a
+CI-safe *substitute* only once it's shown to carry the same signal,
+not assumed to by default.
+
+## First local three-way harness (`tools/compare_three_way.py`) — 2026-08-19
+
+Built the actual local-only harness the two entries above scoped.
+**Never wired into CI, never will be** -- imports nothing from this
+repo's own CI config, takes `--corpus`/`--rom` as explicit local paths
+(an AmiBake-built `os3.1.4` directory and a real Kickstart ROM,
+neither ever fetched or committed by the script itself).
+
+**How the Copperline column captures output**: `--run` has no
+redirect-to-file mechanism (that's a Shell feature, applied before a
+program starts; `--run`'s generated boot script just launches the
+target directly) and the control protocol has no higher-level
+"type this string" input primitive, only individual raw keystrokes --
+both screen-scraping and keystroke injection would have worked but are
+needlessly fragile for plain text. Simpler: copy the corpus into a
+scratch dir, overwrite its own `S/Startup-Sequence` with one line
+running the target command with output redirected to a file on that
+same (host-visible, real `[[filesys]]` mount) volume plus a captured
+`$RC` and a completion marker, boot Copperline pointed at the scratch
+copy, and just poll the **host filesystem** for the result file to
+appear -- no CCP screen-reading or memory access needed for completion
+detection at all. Verified fast in practice: the deterministic unpaced
+core means polling `run_until` past increasing emulated-second targets
+resolves in real seconds, not proportional wall-clock time.
+
+**Corpus scoping, and a real structural finding**: `vamos` doesn't
+understand `.uaem` sidecars at all -- mounting the same corpus
+directly, it lists them as ordinary Amiga files (102 entries instead
+of 51 for `List SYS:C`) and falls back to host mtime/permissions for
+dates and protection bits instead of the sidecar data. This isn't a
+bug to normalize away; it's a structural difference in how the two
+projects model AmigaOS metadata on a host filesystem. Simon's call:
+two-way (volamos vs. Copperline) only for any corpus entry whose
+output depends on dates/protection bits; each `CORPUS` entry now
+declares which of the three engines it's actually meaningful to
+compare across.
+
+**Local `vamos` install gotcha found along the way**: plain
+`pip install amitools` resolves the newest `machine68k` (0.4.1),
+which is API-incompatible (`AttributeError: 'machine68k.Traps' object
+has no attribute 'set_exc_func'`) -- `pip install 'amitools[vamos]'`
+pins a compatible version (0.3.0, matching what
+`ghcr.io/sidick/amiga-dev:1` has) automatically. Documented in the
+script's own `--vamos` help text and module doc.
+
+**Two more real, previously-unknown volamos bugs found running the
+first corpus entry (`List SYS:C`) for real**, both filed rather than
+fixed here (out of scope for "build the harness" itself, same
+discipline as issues #6/#8 from earlier tonight):
+
+- **#9**: `List` doesn't do AmigaDOS's `Today`/`Yesterday`
+  relative-date substitution -- always prints the literal stored date;
+  real `List` (confirmed against real Kickstart 3.1 40.68 via
+  Copperline) substitutes the word when a file's date matches the
+  guest's current day. Cosmetic, not urgent -- everything else about
+  the listing (sizes, protection bits, filenames) was byte-identical
+  between volamos and real Kickstart once this was set aside. This
+  entry's own `KNOWN_DIVERGENCES`.
+- **#10**: a real `MatchFirst`+`CurrentDir`+relative-`Open` bug, found
+  chasing a second corpus entry (`Type` of a nested-path file) that
+  turned out to be blocked by it rather than by `.uaem`/vamos issues:
+  `Type SYS:C/Assign` (or any nested path) fails to open, while a
+  top-level file opens fine. Trace shows `Type`'s real internal logic
+  -- `MatchFirst` to resolve the argument (supporting wildcards),
+  `CurrentDir` to the matched lock, then a **relative** `Open` of the
+  bare matched filename -- fails at the `Open` step
+  (`ERROR_OBJECT_NOT_FOUND`). Not root-caused further (worth checking
+  `dosanchor.rs`/`doslock.rs`/`dosfile.rs` together, since `MatchFirst`
+  and `CurrentDir`/relative-`Open` each work fine in isolation -- it's
+  specifically their composition that's broken); likely affects any
+  real binary using this common idiom for a nested-path argument, not
+  just `Type`, so worth prioritizing. The `Type`-based corpus entry
+  this was chasing is deferred until #10 is fixed.
+
+**Verified**: full run against the real corpus reports `list-c KNOWN`
+(issue #9) and exits 0; manually confirmed the `FAIL` path still
+reports and exits non-zero for an untracked mismatch; no leaked
+Copperline processes after a run (the `finally: proc.kill()` cleanup
+path). Corpus intentionally stays at one entry for now -- `Type`'s
+addition is blocked on #10, and `Version`/`Avail`/`Date` need their
+own configuration-alignment work first (noted inline in the script).
