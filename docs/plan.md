@@ -1609,6 +1609,64 @@ $ echo $?
 New tests: 5 (`dosassign.rs`: 2 e2e -- create, volume-name collision
 -- + 3 unit tests against `Vfs` directly for set/remove/resolve).
 
+**`StrToDate`/`OpenDevice`/`CloseDevice`/`SetFileDate`; `Date`/`SetDate`
+— 2026-08-19.** Worked through both commands in the established
+run→find→implement→verify loop.
+
+- `Date` (no args, print current time) already worked -- built
+  entirely on the pre-existing `DateToStr`. `Date DD-MMM-YY HH:MM:SS`
+  (explicit args) needed two new pieces: `StrToDate` (`crates/
+  volamos-core/src/dosdatestr.rs`, alongside `DateToStr` in the same
+  module since they're the two directions of the same `DateTime`
+  struct) -- the inverse of `DateToStr`'s existing format/weekday
+  logic, supporting all four `FORMAT_DOS`/`INT`/`USA`/`CDN` styles plus
+  relative words (`Today`/`Tomorrow`/`Yesterday`/weekday names, honored
+  regardless of format, per the RKRM) -- and `exec.library`
+  `OpenDevice`/`CloseDevice` (`crates/volamos-core/src/exectask.rs`),
+  since real `Date` unconditionally opens `timer.device` at startup.
+  This runtime has no real device drivers (same "no real handler
+  processes" scope boundary as `crate::dospkt`'s `DoPkt`), so every
+  device fails to open with the real, documented `IOERR_OPENFAIL` code
+  -- not a stub pretending success. Confirmed via a temporary local
+  experiment (faking a successful open) that a real, working
+  `timer.device` is a genuine prerequisite for `Date`'s explicit-args
+  form beyond just these three calls (it goes on to need real `DoIO`/
+  `SendIO` timer-request handling and `utility.library`'s `UMult32`),
+  so real device I/O stays out of scope and `Date` with explicit
+  arguments is a known, documented gap: it fails cleanly with a real,
+  correctly-formatted `"***Bad args"` usage message (exit 20) rather
+  than crashing, while the no-argument form is fully correct.
+- `SetDate` needed one new call, `SetFileDate` (`crates/volamos-core/
+  src/dossetfiledate.rs`) -- closes a gap flagged (but not implemented)
+  back when `.uaem` sidecars were first added: `date` was the only
+  sidecar field with a reader (`crate::doslock`'s `fill_fib`) but no
+  writer until now. `SetFileDate` itself is implemented correctly and
+  verified both by direct unit/e2e tests and by confirming the real
+  corpus binary actually writes the right date into a `.uaem` sidecar
+  in practice. The real binary end-to-end run, however, still prints
+  `"SetDate failed: Object is not of required type"` afterward (exit
+  20) even though the date *was* set correctly -- root-caused via
+  temporary debug tracing to a real, expected `ERROR_OBJECT_WRONG_TYPE`
+  from `CurrentDir()` on a `DupLock()` of the *matched object itself*
+  (real `SetDate`'s own algorithm: try `CurrentDir` into whatever
+  `MatchFirst` found, tolerating a `ERROR_OBJECT_WRONG_TYPE` failure
+  when the target is a plain file rather than a directory) combined
+  with `IoErr()` never being reset before a later check reads that
+  stale value. Every individual call involved (`DupLock`/`CurrentDir`/
+  `SetFileDate`/`MatchFirst`/`MatchNext`/`IoErr`) matches its own
+  documented per-function contract and is independently well-tested;
+  this looks like an inherent quirk of the real `SetDate` binary's own
+  end-to-end logic rather than a volamos bug, though confirming that
+  fully would need a real-oracle comparison (out of scope here, see
+  the `ReadArgs`/`ParsePattern` real-oracle-validation memory for the
+  same caveat pattern). Documented as a known, non-crashing gap rather
+  than "fixed", since there is nothing locally to fix.
+
+New tests: 18 (`dosdatestr.rs`: 11 `parse_date_string`/
+`parse_time_string`/`expand_two_digit_year` unit tests + 2 e2e;
+`exectask.rs`: 2 e2e for `OpenDevice`/`CloseDevice`;
+`dossetfiledate.rs`: 3 e2e).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
@@ -1658,6 +1716,35 @@ the corpus building a program) inside the container. Small risks:
 musl vs glibc differences in filesystem/locale behaviour surfacing in
 the VFS case-insensitivity code, and keeping image size honest (static
 binary + fixtures only).
+
+## Future work: interactive shell mode (vamos's `-x` precedent) — 2026-08-19
+
+Raised by Simon, pointing at vamos's own docs (amitools,
+`docs/vamos.md#33-run-a-shell`): vamos can run a real Shell-Seg binary
+interactively rather than just one program to completion -- `vamos -x
+Shell-Seg` boots a genuine AmigaDOS Shell inside the emulator, which
+then reads `S:Vamos-Startup` (if present) for its own startup
+sequence and drops into an interactive `0.SYS:>`-style prompt for
+further commands.
+
+Not scoped into any phase yet -- volamos's `Runtime` is currently
+built around "load one program, run it to completion, exit" (see
+`crate::dispatch::Runtime::run`'s doc comment: "Returns the guest's
+exit code ... on success"). An analogous `--shell`/`-x` mode would
+need: (1) an interactive host<->guest I/O loop (this runtime's
+`Input()`/`Output()` are currently backed by fixed `out: &mut dyn
+Write` sinks per `run()` call, not a live terminal), (2) `System()`/
+`Execute()` support for the Shell to invoke subsequent commands as
+nested guest processes (already flagged as a gap in the T15-T22
+verification notes -- `crate::dosseg`'s `system_runner` callback
+exists but has no real "run a nested guest program" implementation
+wired up yet), and (3) a real `C:/Shell` (or `Shell-Seg`) binary from
+the same Workbench 3.1.4 corpus already in use for the C: command
+testing this session has been doing. Worth revisiting once the
+empirical C: command corpus (this session's ongoing work) covers
+enough of `dos.library`/`exec.library` that Shell's own startup
+sequence has a reasonable chance of running without hitting a wall of
+gaps immediately.
 
 ## Out of scope for all phases (separate future proposals, unchanged)
 

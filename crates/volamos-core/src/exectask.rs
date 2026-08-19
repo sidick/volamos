@@ -711,9 +711,64 @@ pub fn check_stack_bounds<M: AddressSpace>(
     Ok(())
 }
 
+/// `IOERR_OPENFAIL` (`exec/errors.h`): "device/unit failed to open".
+const IOERR_OPENFAIL: i8 = -1;
+
+/// `struct IORequest.io_Error` byte offset (`io_Message` is 20 bytes:
+/// `mn_Node` 14 + `mn_ReplyPort` 4 + `mn_Length` 2; then `io_Device` 4,
+/// `io_Unit` 4, `io_Command` 2, `io_Flags` 1, `io_Error` 1 -- 32 bytes
+/// total, the standard `sizeof(struct IORequest)`).
+const IO_ERROR_OFFSET: u32 = 31;
+
+/// `exec.library`'s `OpenDevice` (LVO -444: `A0` = device name
+/// `CString*`, `D0` = unit, `A1` = `struct IORequest*`, `D1` = flags).
+/// `D0` = an error code (`0` on success). This runtime has no real
+/// device drivers at all (no `timer.device`/`console.device`/... --
+/// same "no real handler processes" scope boundary `crate::dospkt`'s
+/// `DoPkt` and `crate::dosdevproc`'s `GetDeviceProc` already establish
+/// for `dos.library` handlers), so every device fails to open with
+/// `IOERR_OPENFAIL`, matching the real, documented "device/unit failed
+/// to open" convention -- not a stub pretending success.
+///
+/// Found missing running the real Workbench 3.1.4 `C:/Date` binary,
+/// which opens `timer.device` unconditionally at startup. Its
+/// no-argument "print the current date" form tolerates the open
+/// failing and still works end-to-end. Its explicit `Date DD-MMM-YY
+/// HH:MM:SS` form does *not* tolerate it, though -- confirmed (via a
+/// temporary local experiment faking success) that a real, working
+/// `timer.device` is a genuine prerequisite for that form beyond just
+/// `StrToDate`/`OpenDevice`/`CloseDevice`: with a faked-successful
+/// open it goes on to need `DoIO`/`SendIO` timer request handling and
+/// `utility.library`'s `UMult32`. Real device I/O + timer semantics
+/// are out of scope (see `crate::dospkt`'s module docs for the same
+/// "no real handler processes" boundary), so `Date` with explicit
+/// arguments is a known, documented gap, not a bug: it fails cleanly
+/// with a real, correctly-formatted `"***Bad args"` usage message
+/// rather than crashing.
+fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    ctx.mem
+        .write_u8(ioreq + IO_ERROR_OFFSET, IOERR_OPENFAIL as u8);
+    ctx.cpu
+        .set_data_register(DataRegister(0), IOERR_OPENFAIL as i32 as u32);
+    Ok(())
+}
+
+/// `exec.library`'s `CloseDevice` (LVO -450: `A1` = `struct
+/// IORequest*`). No return value. A true no-op, matching
+/// [`open_device_handler`] (every device fails to open, so there's
+/// never a real device to close) -- real callers may call this even
+/// after a failed `OpenDevice` (confirmed via the real `C:/Date`
+/// binary, which does exactly that on its own failure path), so this
+/// must not assume `io_Device` is ever non-`NULL`.
+fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
 /// Registers every implemented task/signal handler: `exec.library`'s
 /// `FindTask`/`SetSignal`/`SetExcept`/`Wait`/`Signal`/`AllocSignal`/
-/// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`, plus `dos.library`'s
+/// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`/`OpenDevice`/
+/// `CloseDevice`, plus `dos.library`'s
 /// `CheckSignal` (registered from here rather than `dosfile.rs`, so that
 /// file needs no edits at all -- see the module docs). Called
 /// unconditionally from [`crate::dispatch::Runtime::new`].
@@ -745,6 +800,8 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("StackSwap", stack_swap_handler::<C>);
     reg_exec!("Forbid", forbid_handler::<C>);
     reg_exec!("Permit", permit_handler::<C>);
+    reg_exec!("OpenDevice", open_device_handler::<C>);
+    reg_exec!("CloseDevice", close_device_handler::<C>);
 
     table
         .register_by_name(
@@ -1582,5 +1639,81 @@ mod tests {
             code, 42,
             "Forbid/Permit should leave D0 untouched by anyone else"
         );
+    }
+
+    // --- OpenDevice ---
+
+    #[test]
+    fn open_device_always_fails_with_ioerr_openfail() {
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        let name_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        let ioreq_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+        words.push(RTS);
+
+        let name_addr = entry + (movea_exec_base_to_a6().len() + words.len()) as u32 * 2;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        words[name_idx] = (name_addr >> 16) as u16;
+        words[name_idx + 1] = name_addr as u16;
+        words[ioreq_idx] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx + 1] = ioreq_addr as u16;
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..32 {
+            mem.write_u8(ioreq_addr + i, 0);
+        }
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: ioreq_addr + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, IOERR_OPENFAIL as i32);
+        assert_eq!(
+            rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET),
+            IOERR_OPENFAIL as u8
+        );
+    }
+
+    // --- CloseDevice ---
+
+    #[test]
+    fn close_device_after_a_failed_open_is_a_harmless_no_op() {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(1)); // A1 = 0 (never-opened ioreq)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-450)); // CloseDevice
+        words.push(0x7000 | 0x2A); // moveq #42,d0
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
     }
 }

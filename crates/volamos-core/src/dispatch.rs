@@ -1238,6 +1238,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // dos.library SetComment -- see crate::dosnote's module docs.
         crate::dosnote::register_dosnote_handlers(&mut table, &mut mem);
 
+        // dos.library SetFileDate -- see crate::dossetfiledate's module
+        // docs.
+        crate::dossetfiledate::register_dossetfiledate_handlers(&mut table, &mut mem);
+
         // dos.library StrToLong (decimal string -> LONG) -- see
         // crate::dosstr's module docs.
         crate::dosstr::register_dosstr_handlers(&mut table, &mut mem);

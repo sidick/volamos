@@ -32,6 +32,7 @@ pub mod dospkt;
 pub mod dosprintf;
 pub mod dosprotect;
 pub mod dosseg;
+pub mod dossetfiledate;
 pub mod dosstr;
 pub mod dosvar;
 pub mod execfmt;
