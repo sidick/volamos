@@ -259,6 +259,35 @@ impl DosState {
         )
     }
 
+    /// `DeleteFile(name)`: removes a file, empty directory, or link.
+    /// Fails with [`crate::dosfile::ERROR_DIRECTORY_NOT_EMPTY`] for a
+    /// non-empty directory. This runtime never marks anything
+    /// delete-protected (`fill_fib` always reports `fib_Protection ==
+    /// 0`), so unlike real `DeleteFile` there's no
+    /// `ERROR_DELETE_PROTECTED` case here.
+    pub fn delete_file(&mut self, name: &str) -> Result<(), i32> {
+        let vfs = self
+            .vfs
+            .as_ref()
+            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+        let host_path = vfs
+            .resolve(name, ResolveMode::MustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        let meta = std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
+        if meta.is_dir() {
+            if std::fs::read_dir(&host_path)
+                .map_err(|e| map_io_error(&e))?
+                .next()
+                .is_some()
+            {
+                return Err(crate::dosfile::ERROR_DIRECTORY_NOT_EMPTY);
+            }
+            std::fs::remove_dir(&host_path).map_err(|e| map_io_error(&e))
+        } else {
+            std::fs::remove_file(&host_path).map_err(|e| map_io_error(&e))
+        }
+    }
+
     /// `SameLock(lock1, lock2)`: [`LOCK_SAME`]/[`LOCK_SAME_VOLUME`]/
     /// [`LOCK_DIFFERENT`]. Identical `BPTR`s (including two `ZERO`
     /// locks) are always [`LOCK_SAME`]; otherwise this compares the
@@ -631,6 +660,21 @@ fn same_lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// `DeleteFile` (`D1` = name `CString*`). `D0` = `DOSTRUE`/`DOSFALSE`
+/// (+ `IoErr()` set on failure).
+fn delete_file_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.data_register(DataRegister(1));
+    let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+    match ctx.dos.delete_file(&name) {
+        Ok(()) => ctx.cpu.set_data_register(DataRegister(0), DOSTRUE),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
+    Ok(())
+}
+
 /// `UnLock` (`D1` = `BPTR`). No return value (real `UnLock` is `void`).
 fn unlock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
@@ -771,6 +815,7 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("Lock", lock_handler::<C>);
     reg!("CreateDir", create_dir_handler::<C>);
     reg!("SameLock", same_lock_handler::<C>);
+    reg!("DeleteFile", delete_file_handler::<C>);
     reg!("UnLock", unlock_handler::<C>);
     reg!("DupLock", dup_lock_handler::<C>);
     reg!("Examine", examine_handler::<C>);
@@ -956,6 +1001,46 @@ mod tests {
             dos.create_dir(&mut heap, &mut mem, "SYS:nope/newdir")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn delete_file_removes_a_file() {
+        let tmp = TempDir::new("deletefile");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.delete_file("SYS:f.txt").unwrap();
+        assert!(!tmp.path().join("f.txt").exists());
+    }
+
+    #[test]
+    fn delete_file_removes_an_empty_directory() {
+        let tmp = TempDir::new("deletedir");
+        fs::create_dir(tmp.path().join("empty")).unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.delete_file("SYS:empty").unwrap();
+        assert!(!tmp.path().join("empty").exists());
+    }
+
+    #[test]
+    fn delete_file_non_empty_directory_fails() {
+        let tmp = TempDir::new("deletedir-nonempty");
+        fs::create_dir(tmp.path().join("full")).unwrap();
+        fs::write(tmp.path().join("full/f.txt"), b"hi").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos.delete_file("SYS:full").unwrap_err();
+        assert_eq!(err, crate::dosfile::ERROR_DIRECTORY_NOT_EMPTY);
+        assert!(
+            tmp.path().join("full").exists(),
+            "should not have been removed"
+        );
+    }
+
+    #[test]
+    fn delete_file_missing_object_fails() {
+        let tmp = TempDir::new("deletefile-missing");
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos.delete_file("SYS:nope.txt").unwrap_err();
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
     }
 
     #[test]
@@ -1424,5 +1509,29 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, LOCK_SAME);
         assert!(tmp.path().join("newdir").is_dir());
+    }
+
+    #[test]
+    fn end_to_end_delete_file_removes_the_host_file() {
+        let tmp = TempDir::new("e2e-deletefile");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -72); // DeleteFile(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert!(!tmp.path().join("f.txt").exists());
     }
 }

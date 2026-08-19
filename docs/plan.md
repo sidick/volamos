@@ -1164,6 +1164,52 @@ both together). Also fixed one now-stale pre-existing test
 that had hardcoded `CreateDir` (-120) as an example of a permanently
 unregistered LVO -- switched it to `Rename` (-78), still unimplemented.
 
+**`Delete` gap chain — implemented 2026-08-19.** Moved to the next real
+corpus binary (`C:/Delete`) once `Copy` ran cleanly; found and fixed
+two gaps:
+
+- **`GetDeviceProc`/`FreeDeviceProc`** (`crates/volamos-core/src/
+  dosdevproc.rs`): real `GetDeviceProc` returns a `struct DevProc`
+  whose `dvp_Port` is the live `MsgPort` of the handler process
+  responsible for a path -- this runtime has no such processes (see
+  `crate::execlist`'s "single-threaded" message-port scaffolding), so
+  before implementing this there was a real risk `Delete` would go on
+  to build and send a raw `DosPacket` to that port, which this runtime
+  fundamentally can't answer. Implemented the *locking* half faithfully
+  instead -- `dvp_Lock`, a `SHARED_LOCK` on the path's containing
+  directory, confirmed as `GetDeviceProc`'s actual role for e.g.
+  `CreateDir()` internally per the RKRM's own packet documentation --
+  and left `dvp_Port` `NULL`, betting that `Delete`'s actual algorithm
+  (like `Copy`'s) uses the higher-level `MatchFirst`/`MatchNext`/
+  `DeleteFile` functions rather than raw packets. The bet paid off:
+  running it confirmed `Delete` moves straight on to `MatchFirst` and
+  never touches `dvp_Port` at all.
+- **`DeleteFile`** (added to `crates/volamos-core/src/doslock.rs`):
+  removes a file or empty directory; fails with
+  `ERROR_DIRECTORY_NOT_EMPTY` for a non-empty one. This runtime never
+  marks anything delete-protected (`fill_fib` always reports
+  `fib_Protection == 0`), so unlike real `DeleteFile` there's no
+  `ERROR_DELETE_PROTECTED` case here.
+
+`Delete` now runs fully end-to-end against the real corpus binary:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Delete WORK:deleteme.txt
+WORK:WORK:deleteme.txt  Deleted
+```
+(The doubled `WORK:WORK:` in its own status line is `Delete`'s own
+message construction combining `NameFromLock` of the current directory
+with the already-fully-qualified argument via `AddPart` -- `AddPart`
+only resets to a device root on a *leading* colon in the appended
+name, not one appearing mid-string, so this is a faithful reproduction
+of what real `AddPart`'s documented algorithm would also produce given
+the same already-qualified argument, not a bug introduced here.)
+
+New tests: 8 (`dosdevproc.rs`: 4 unit-level for `get_device_proc`/
+`free_device_proc` plus 3 end-to-end trap-dispatch, covering the
+lock-and-wrap path, the missing-path failure, and the free/unlock
+effect), 5 (`doslock.rs`, for `DeleteFile`, including one end-to-end
+trap-dispatch test).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

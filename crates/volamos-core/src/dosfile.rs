@@ -117,6 +117,8 @@ pub const ERROR_INVALID_LOCK: i32 = 211;
 /// A write (or write-implying open) failed because the target is
 /// read-only from the host's point of view.
 pub const ERROR_DISK_WRITE_PROTECTED: i32 = 214;
+/// `DeleteFile` on a directory that still has entries in it.
+pub const ERROR_DIRECTORY_NOT_EMPTY: i32 = 216;
 /// `Seek` failed (out-of-range offset, or the handle isn't seekable --
 /// e.g. the `Input()`/`Output()` default handles).
 pub const ERROR_SEEK_ERROR: i32 = 219;

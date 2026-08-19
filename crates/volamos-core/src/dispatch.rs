@@ -1180,6 +1180,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // see crate::dosdatestr's module docs.
         crate::dosdatestr::register_dosdatestr_handlers(&mut table, &mut mem);
 
+        // dos.library GetDeviceProc/FreeDeviceProc -- see
+        // crate::dosdevproc's module docs.
+        crate::dosdevproc::register_dosdevproc_handlers(&mut table, &mut mem);
+
         // dos.library AddPart/FilePart/PathPart (pure path-string
         // helpers) -- see crate::dospath's module docs.
         crate::dospath::register_dospath_handlers(&mut table, &mut mem);
