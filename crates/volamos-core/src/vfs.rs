@@ -296,6 +296,11 @@ impl Vfs {
         &self.config.cwd
     }
 
+    /// The configured volumes (name, host root), in configuration order.
+    pub fn volumes(&self) -> &[(String, PathBuf)] {
+        &self.config.volumes
+    }
+
     /// Set the current directory. The new value is validated (assign/
     /// volume chain must resolve) before being accepted; on error the
     /// old cwd is left in place.

@@ -1214,6 +1214,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         // crate::dosdevproc's module docs.
         crate::dosdevproc::register_dosdevproc_handlers(&mut table, &mut mem);
 
+        // dos.library LockDosList/NextDosEntry/UnLockDosList -- see
+        // crate::dosdevlist's module docs.
+        crate::dosdevlist::register_dosdevlist_handlers(&mut table, &mut mem);
+
+        // dos.library DoPkt -- see crate::dospkt's module docs.
+        crate::dospkt::register_dospkt_handlers(&mut table, &mut mem);
+
         // dos.library AddPart/FilePart/PathPart (pure path-string
         // helpers) -- see crate::dospath's module docs.
         crate::dospath::register_dospath_handlers(&mut table, &mut mem);

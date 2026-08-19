@@ -384,6 +384,20 @@ pub struct DosState {
     /// `UnGetC(fh, -1)`, which pushes back "whatever was last read"
     /// rather than a caller-specified byte.
     pub(crate) last_getc: HashMap<u32, i32>,
+
+    /// Heap addresses allocated by the most recent `LockDosList` (the
+    /// header node, every `DosList` entry built, and their `dol_Name`
+    /// buffers) -- freed by `UnLockDosList`. See `crate::dosdevlist`'s
+    /// module docs for why a single session (rather than one keyed by
+    /// handle) is enough here.
+    pub(crate) dos_list_active: Vec<u32>,
+    /// Uppercased volume name -> a stable, process-lifetime, non-
+    /// dereferenceable synthetic `dol_Task` id, allocated lazily the
+    /// first time a `DosList` entry is built for that volume (see
+    /// `crate::dosdevlist::task_id_for_volume`). `crate::dospkt`'s
+    /// `DoPkt` uses this (in reverse) to tell which volume a packet's
+    /// destination `port` identifies.
+    pub(crate) volume_task_ids: HashMap<String, u32>,
 }
 
 impl DosState {
@@ -414,6 +428,8 @@ impl DosState {
             anchor_states: HashMap::new(),
             ungetc_buf: HashMap::new(),
             last_getc: HashMap::new(),
+            dos_list_active: Vec::new(),
+            volume_task_ids: HashMap::new(),
         }
     }
 
@@ -885,8 +901,12 @@ fn cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchEr
 
 /// A fixed, non-`NULL` sentinel `MsgPort*` for
 /// [`get_file_sys_task_handler`] -- see its own doc comment for why a
-/// real (dereferenceable) `MsgPort` isn't needed.
-const DEFAULT_FILE_SYS_TASK: u32 = 1;
+/// real (dereferenceable) `MsgPort` isn't needed. Also reused by
+/// `crate::dosdevlist` for `dol_Task` on the `DosList` entries it
+/// builds, for the same reason: real callers (`Info`, notably) check
+/// this field for `NULL` to decide whether a volume is "live" without
+/// ever dereferencing it.
+pub(crate) const DEFAULT_FILE_SYS_TASK: u32 = 1;
 
 /// `GetFileSysTask` (no args). `D0` = [`DosState::current_file_sys_task`]
 /// (initially [`DEFAULT_FILE_SYS_TASK`], a fixed non-`NULL` sentinel --

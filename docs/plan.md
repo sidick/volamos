@@ -1472,6 +1472,72 @@ New tests: 4 (`doslock.rs`: sidecar removed on delete, delete without a
 sidecar still succeeds, sidecar relocated on rename, rename without a
 sidecar still succeeds).
 
+**Device list + `Info` — 2026-08-19.** Following "test info next", ran
+the real `C:/Info` binary and worked through four successive gaps in
+the established run→find→implement→verify loop, each its own new
+module:
+
+- `crates/volamos-core/src/dosdevlist.rs` — `LockDosList`/
+  `NextDosEntry`/`FindDosEntry`/`UnLockDosList`. Only `LDF_VOLUMES`
+  entries are ever materialized (this runtime has no separate device/
+  assign `DosList` objects); struct `DosList` byte offsets (44 bytes
+  total, `dol_misc` a 24-byte union) came from the AmiBlitz3
+  `dosextens.ab3` include (RKRM prose doesn't give literal offsets),
+  the same external source already used earlier this session for the
+  `LOCK_SAME`-family constants. One footgun found and fixed along the
+  way: the scan-start header node's `dol_Type` must be a real
+  `DLT_PRIVATE` (`-1`) sentinel, not left zeroed -- a zeroed `dol_Type`
+  reads as `DLT_DEVICE` (`0`) and would spuriously self-match a
+  `FindDosEntry(header, NULL, LDF_DEVICES)` scan.
+- `crates/volamos-core/src/dospkt.rs` — `DoPkt` (direct packet
+  communication), needed because real `Info` bypasses the `Info()`
+  library wrapper and sends `ACTION_DISK_INFO`/`ACTION_INFO`/
+  `ACTION_IS_FILESYSTEM` packets straight to a volume's `dol_Task`.
+  Answers all three for a known volume with a fixed, host-independent
+  `InfoData` (100,000 512-byte blocks, `0` used) rather than querying
+  real host free-space (no portable way to get that without a new
+  dependency, and it would reintroduce host-state non-determinism this
+  project has deliberately avoided elsewhere, e.g. `fib_Date`
+  defaults). Any other packet type/unrecognized port fails cleanly
+  with `ERROR_ACTION_NOT_KNOWN`, the real documented convention.
+- Root-caused a non-obvious "`Object is not of required type`"
+  failure (from real `PrintFault`, no crash) via a temporary debug
+  trace: it wasn't `FindDosEntry` failing to match -- it was matching
+  correctly, but real `Info` then rejects any `DosList` entry whose
+  `dol_Task` is `NULL`, treating that as "not a live volume". Fixed by
+  giving every volume entry `crate::dosfile::DEFAULT_FILE_SYS_TASK`
+  (reused, doc comment extended) as a non-`NULL` sentinel `dol_Task` --
+  never dereferenced, matching the existing `GetFileSysTask`/
+  `GetDeviceProc` "no real handler processes" scope boundary. This in
+  turn meant every volume needed a *distinct* task id (not one shared
+  sentinel) so `DoPkt` could tell which volume a packet's `port`
+  addressed: `DosState::volume_task_ids` + `dosdevlist::
+  task_id_for_volume`/`volume_for_task_id`.
+- Known cosmetic gap, documented and left as-is: real `Info`'s
+  "Mounted disks" table (keyed by *device* unit, e.g. `DF0`) prints
+  `Invalid/unknown` for a volume this runtime backs, since this
+  runtime doesn't model device units distinct from volumes -- the
+  "Volumes available" table (keyed by volume name, all `DoPkt`
+  actually needs to answer) prints correctly and the command still
+  exits `0`. Modeling fake per-volume device units was judged not
+  worth it for a purely cosmetic gap.
+
+Confirmed against the real corpus binary, both forms:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Info WORK:
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Info
+Mounted disks:
+Unit      Size       Used       Free Full Errs   Status   Name
+WORK      Invalid/unknown
+
+Volumes available:
+WORK [Mounted]
+$ echo $?
+0
+```
+New tests: 13 (`dosdevlist.rs`: 8 unit + 2 e2e; `dospkt.rs`: 3 e2e,
+including the unknown-port failure case).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
