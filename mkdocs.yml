@@ -1,0 +1,56 @@
+# User documentation site (MkDocs Material), published per release via
+# mike to GitHub Pages, following the same convention as sibling
+# projects (userdocs/ is the single source of truth for user docs;
+# developer design notes stay in docs/ and are not part of this site).
+
+site_name: volamos
+site_description: A Rust-native, Wine-style runtime for classic AmigaOS m68k CLI binaries
+site_url: https://sidick.github.io/volamos/
+repo_url: https://github.com/sidick/volamos
+repo_name: sidick/volamos
+edit_uri: edit/main/userdocs/
+copyright: volamos — a Rust-native runtime for classic AmigaOS m68k CLI binaries. MIT OR Apache-2.0.
+
+docs_dir: userdocs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.action.edit
+    - content.code.copy
+
+extra:
+  version:
+    provider: mike
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - admonition
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Getting going:
+      - Installation: Installation.md
+      - Getting Started: Getting-Started.md
+  - Using volamos:
+      - CLI Reference: CLI-Reference.md
+      - Volumes and Assigns: Volumes-and-Assigns.md
+      - Supported Libraries: Supported-Libraries.md
+  - Help:
+      - Building from Source: Building-from-Source.md
+      - Changelog: Changelog.md

@@ -12,6 +12,14 @@ command-line tools, not games or Workbench applications. It is a spiritual
 successor to [`vamos`](https://github.com/cnvogelg/amitools), the Python
 implementation of the same idea from the `amitools` package.
 
+**User documentation:** the [`userdocs/`](userdocs/) directory
+(installation, CLI reference, volumes/assigns, supported libraries) is
+a full [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)
+site — no hosted build yet, so browse it directly on GitHub or run
+`mkdocs serve` locally (see
+[`userdocs/Building-from-Source.md`](userdocs/Building-from-Source.md)).
+This README stays a shorter overview.
+
 ## Platform support
 
 volamos targets macOS and Linux equally. Headless and CI use (e.g. running

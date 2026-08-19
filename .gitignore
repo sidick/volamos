@@ -4,6 +4,9 @@
 .DS_Store
 __pycache__/
 
+# mkdocs build output (userdocs/ is the source; this is generated)
+/site
+
 # Defense-in-depth for tools/ndk_verify.py: the official Amiga NDK carries
 # no redistribution license (see docs/plan.md and that script's module
 # doc), so it must never be vendored into this repo. `ndk_verify.py`
