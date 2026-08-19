@@ -1437,6 +1437,41 @@ metadata round-trip through `Examine` + sidecar-hiding), 1
 `quote_arg_if_needed` unit tests plus an end-to-end command-line
 re-quoting test).
 
+**`.uaem` sidecar lifecycle: `Rename`/`DeleteFile` — 2026-08-19.** Simon
+asked directly whether the sidecar was tied into every implemented
+comment/protection call; it was for the two *setters*
+(`SetProtection`/`SetComment`), but not for the two calls that move or
+remove the underlying object out from under it: `DeleteFile` left an
+orphaned `.uaem` behind (harmless -- already hidden from listings -- but
+a permanent disk-space leak), and `Rename` didn't move the sidecar at
+all, so a renamed object silently reverted to default protection/no
+comment and the old sidecar became an orphan under the stale name.
+
+Fixed both in `crates/volamos-core/src/doslock.rs`: `delete_file` now
+also removes `dosmeta::sidecar_path(&host_path)` after the primary
+object is gone; `rename` now also renames the sidecar (if one exists)
+to the new target's own sidecar path. Both are best-effort (a sidecar
+operation failure doesn't fail the whole call, since the primary
+file/directory operation -- the one with real `IoErr()` semantics --
+already succeeded by that point) and both are silent no-ops when there
+was no sidecar to begin with.
+
+Confirmed against the real corpus binaries in sequence -- `Filenote`
+(set a comment) → `Rename` (comment follows) → `List` (still shown on
+the new name) → `Delete` (sidecar cleaned up, no orphan left):
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Filenote WORK:f.txt COMMENT "before rename"
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Rename WORK:f.txt WORK:renamed.txt
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/List WORK:renamed.txt
+renamed.txt                    8 ----rwed 01-Jan-78 00:00:00
+: before rename
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Delete WORK:renamed.txt
+$ ls <vol>/renamed.txt*   # nothing -- no orphaned sidecar
+```
+New tests: 4 (`doslock.rs`: sidecar removed on delete, delete without a
+sidecar still succeeds, sidecar relocated on rename, rename without a
+sidecar still succeeds).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

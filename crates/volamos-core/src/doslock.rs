@@ -269,7 +269,11 @@ impl DosState {
     /// non-empty directory. This runtime never marks anything
     /// delete-protected (`fill_fib` always reports `fib_Protection ==
     /// 0`), so unlike real `DeleteFile` there's no
-    /// `ERROR_DELETE_PROTECTED` case here.
+    /// `ERROR_DELETE_PROTECTED` case here. Also removes the target's own
+    /// `.uaem` sidecar ([`crate::dosmeta`]), if it has one -- best-effort
+    /// (a sidecar removal failure doesn't fail the whole call, since the
+    /// primary object is already gone by that point), so a deleted
+    /// object doesn't leave an orphaned metadata file behind.
     pub fn delete_file(&mut self, name: &str) -> Result<(), i32> {
         let vfs = self
             .vfs
@@ -287,10 +291,12 @@ impl DosState {
             {
                 return Err(crate::dosfile::ERROR_DIRECTORY_NOT_EMPTY);
             }
-            std::fs::remove_dir(&host_path).map_err(|e| map_io_error(&e))
+            std::fs::remove_dir(&host_path).map_err(|e| map_io_error(&e))?;
         } else {
-            std::fs::remove_file(&host_path).map_err(|e| map_io_error(&e))
+            std::fs::remove_file(&host_path).map_err(|e| map_io_error(&e))?;
         }
+        let _ = std::fs::remove_file(dosmeta::sidecar_path(&host_path));
+        Ok(())
     }
 
     /// `Rename(old_name, new_name)`: renames and/or relocates a file
@@ -300,7 +306,13 @@ impl DosState {
     /// this; a cross-volume rename here just becomes a host
     /// `std::fs::rename`, which on most platforms fails on its own with
     /// an `IoErr()`-mappable error if the underlying filesystems truly
-    /// differ) or reject relocating a directory into itself.
+    /// differ) or reject relocating a directory into itself. Also
+    /// relocates the object's own `.uaem` sidecar ([`crate::dosmeta`]),
+    /// if it has one -- best-effort (a sidecar rename failure doesn't
+    /// fail the whole call, since the primary rename already succeeded
+    /// by that point), so a renamed object doesn't lose its recorded
+    /// protection bits/comment or leave an orphaned metadata file under
+    /// the old name.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), i32> {
         let vfs = self
             .vfs
@@ -315,7 +327,12 @@ impl DosState {
         if new_path.exists() {
             return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
         }
-        std::fs::rename(&old_path, &new_path).map_err(|e| map_io_error(&e))
+        std::fs::rename(&old_path, &new_path).map_err(|e| map_io_error(&e))?;
+        let old_sidecar = dosmeta::sidecar_path(&old_path);
+        if old_sidecar.exists() {
+            let _ = std::fs::rename(old_sidecar, dosmeta::sidecar_path(&new_path));
+        }
+        Ok(())
     }
 
     /// `SameLock(lock1, lock2)`: [`LOCK_SAME`]/[`LOCK_SAME_VOLUME`]/
@@ -1075,6 +1092,40 @@ mod tests {
     }
 
     #[test]
+    fn delete_file_also_removes_the_uaem_sidecar() {
+        let tmp = TempDir::new("deletefile-sidecar");
+        let path = tmp.path().join("f.txt");
+        fs::write(&path, b"hi").unwrap();
+        crate::dosmeta::write_sidecar(
+            &path,
+            &crate::dosmeta::Meta {
+                prot: 0x11,
+                date: (0, 0, 0),
+                comment: Some(b"note".to_vec()),
+            },
+        )
+        .unwrap();
+        assert!(crate::dosmeta::sidecar_path(&path).exists());
+
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.delete_file("SYS:f.txt").unwrap();
+
+        assert!(!path.exists());
+        assert!(
+            !crate::dosmeta::sidecar_path(&path).exists(),
+            "the sidecar should not be left behind as an orphan"
+        );
+    }
+
+    #[test]
+    fn delete_file_without_a_sidecar_still_succeeds() {
+        let tmp = TempDir::new("deletefile-no-sidecar");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.delete_file("SYS:f.txt").unwrap(); // must not fail trying to remove a nonexistent sidecar
+    }
+
+    #[test]
     fn delete_file_removes_an_empty_directory() {
         let tmp = TempDir::new("deletedir");
         fs::create_dir(tmp.path().join("empty")).unwrap();
@@ -1113,6 +1164,39 @@ mod tests {
         dos.rename("SYS:old.txt", "SYS:new.txt").unwrap();
         assert!(!tmp.path().join("old.txt").exists());
         assert_eq!(fs::read(tmp.path().join("new.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn rename_also_relocates_the_uaem_sidecar() {
+        let tmp = TempDir::new("rename-sidecar");
+        let old_path = tmp.path().join("old.txt");
+        let new_path = tmp.path().join("new.txt");
+        fs::write(&old_path, b"hi").unwrap();
+        let meta = crate::dosmeta::Meta {
+            prot: 0x11,
+            date: (0, 0, 0),
+            comment: Some(b"note".to_vec()),
+        };
+        crate::dosmeta::write_sidecar(&old_path, &meta).unwrap();
+
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.rename("SYS:old.txt", "SYS:new.txt").unwrap();
+
+        assert!(
+            !crate::dosmeta::sidecar_path(&old_path).exists(),
+            "the old sidecar should not be left behind as an orphan"
+        );
+        let read_back =
+            crate::dosmeta::read_sidecar(&new_path).expect("sidecar should follow the rename");
+        assert_eq!(read_back, meta);
+    }
+
+    #[test]
+    fn rename_without_a_sidecar_still_succeeds() {
+        let tmp = TempDir::new("rename-no-sidecar");
+        fs::write(tmp.path().join("old.txt"), b"hi").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.rename("SYS:old.txt", "SYS:new.txt").unwrap(); // must not fail trying to move a nonexistent sidecar
     }
 
     #[test]
