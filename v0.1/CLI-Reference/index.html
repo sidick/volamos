@@ -16,7 +16,7 @@
         <link rel="prev" href="../Getting-Started/">
       
       
-        <link rel="next" href="../Volumes-and-Assigns/">
+        <link rel="next" href="../Configuration/">
       
       
         
@@ -667,6 +667,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../Configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../Volumes-and-Assigns/" class="md-nav__link">
         
   
@@ -703,6 +731,34 @@
     
   
     Supported Libraries
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
   
 
     
@@ -1033,6 +1089,9 @@ through verbatim as the <em>guest</em> program's own command-line arguments
 (<code>A0</code>/<code>D0</code>, the real AmigaOS startup convention) — a guest program that
 parses its own arguments (e.g. via <code>ReadArgs</code>) reads them from there,
 unaffected by anything volamos itself understood before <code>&lt;program&gt;</code>.</p>
+<p>Every flag below can also be given a default value in <code>~/.volamos</code>/
+<code>.volamos</code> instead of retyping it every run — see
+<a href="../Configuration/">Configuration Files</a>.</p>
 <h2 id="exit-codes">Exit codes<a class="headerlink" href="#exit-codes" title="Permanent link">&para;</a></h2>
 <p>volamos propagates the <strong>guest program's own exit code</strong> on a normal
 run — whatever it returned in <code>D0</code> at <code>rts</code>, same as running it on a
@@ -1200,13 +1259,13 @@ first two examples rely on.</p>
         
         
           
-          <a href="../Volumes-and-Assigns/" class="md-footer__link md-footer__link--next" aria-label="Next: Volumes and Assigns">
+          <a href="../Configuration/" class="md-footer__link md-footer__link--next" aria-label="Next: Configuration Files">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                Volumes and Assigns
+                Configuration Files
               </div>
             </div>
             <div class="md-footer__button md-icon">

@@ -484,6 +484,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../Configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../Volumes-and-Assigns/" class="md-nav__link">
         
   
@@ -520,6 +548,34 @@
     
   
     Supported Libraries
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
   
 
     
@@ -810,9 +866,11 @@ will follow the version scheme in <code>Cargo.toml</code>.</p>
   <a href="https://crates.io/crates/m68k"><code>m68k</code></a> crate, real guest heap and
   stack regions (with overflow detection), a configurable total guest
   address space (<code>--ram</code>, default 16 MiB) with a clean upfront error
-  if <code>--stack</code> doesn't leave it room, and a host-backed volume/assign
+  if <code>--stack</code> doesn't leave it room, a host-backed volume/assign
   filesystem (<code>-V</code>/<code>-a</code>/<code>--auto-assign</code>, multi-assign search order,
-  real Amiga path semantics including <code>/</code>-as-parent-dir).</li>
+  real Amiga path semantics including <code>/</code>-as-parent-dir), and
+  <a href="../Configuration/">config files</a> (<code>~/.volamos</code>/<code>.volamos</code>) supplying
+  default flag values for repeated-use projects.</li>
 <li><strong><code>dos.library</code></strong>: file I/O, locks and directory traversal, pattern
   matching (<code>ParsePattern</code>/<code>MatchFirst</code>/<code>MatchNext</code>), <code>ReadArgs</code>/
   <code>FreeArgs</code>, a real <code>ENV:</code> volume for environment variables, <code>LoadSeg</code>/
