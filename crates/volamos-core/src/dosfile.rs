@@ -1016,6 +1016,108 @@ fn get_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
+/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- the only `AllocDosObject`
+/// `type` this runtime implements (see [`alloc_dos_object_handler`]'s
+/// doc for why). The other four documented types (`DOS_FILEHANDLE` 0,
+/// `DOS_EXALLCONTROL` 1, `DOS_FIB` 2, `DOS_STDPKT` 3, `DOS_CLI` 4)
+/// aren't -- `DOS_FILEHANDLE`/`DOS_CLI` in particular would need real
+/// integration with this runtime's own `FileHandle`/`pr_CLI`
+/// bookkeeping to be genuinely usable, not just a same-shaped zeroed
+/// block, so a real implementation of those is deferred until a corpus
+/// binary actually needs one.
+const DOS_RDARGS: u32 = 5;
+/// `sizeof(struct RDArgs)` per `<dos/rdargs.h>`: `RDA_Source` (a
+/// `struct CSource`: `CS_Buffer`/`CS_Length`/`CS_CurChr`, 4 each = 12)
+/// plus `RDA_DAList`/`RDA_Buffer`/`RDA_BufSiz`/`RDA_ExtHelp`/
+/// `RDA_Flags` (4 each = 20) = 32.
+const RDARGS_STRUCT_SIZE: u32 = 32;
+
+/// `AllocDosObject` (`D1` = `type`, `D2` = `struct TagItem*` tags).
+/// `D0` = the new object, or `0` (`NULL`) on failure. Real
+/// `AllocDosObject`'s `DOS_RDARGS` case (traced against AROS's
+/// `rom/dos/allocdosobject.c`, since the NDK autodoc doesn't spell out
+/// per-type initial contents) is just `AllocVec(sizeof(struct
+/// RDArgs), MEMF_CLEAR)` -- a plain zeroed block, no tag processing at
+/// all for this type (the caller, e.g. real `ReadArgs()` callers that
+/// want `RDA_ExtHelp`, fills in whatever fields it needs itself
+/// afterward) -- so `tags` is accepted but never read here, matching
+/// real behavior for this specific type exactly rather than only
+/// approximating it. Every other `type` fails loudly (see
+/// [`DOS_RDARGS`]'s doc) rather than silently returning a
+/// same-shaped-but-non-functional block. Found needed running the
+/// real `AmiSnap` binary, which calls `AllocDosObject(DOS_RDARGS,
+/// NULL)` to build the `RDArgs` its own `ReadArgs()` call needs.
+fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let object_type = ctx.cpu.data_register(DataRegister(1));
+
+    if object_type != DOS_RDARGS {
+        return Err(DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -228,
+            handler_name: "AllocDosObject".to_string(),
+            message: format!(
+                "AllocDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) is \
+                 implemented -- see DOS_RDARGS's doc for why the other types aren't"
+            ),
+        });
+    }
+
+    let addr = ctx
+        .heap
+        .alloc(RDARGS_STRUCT_SIZE)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -228,
+            handler_name: "AllocDosObject".to_string(),
+            message: format!("AllocDosObject(DOS_RDARGS): guest heap allocation failed: {e}"),
+        })?;
+    for i in 0..RDARGS_STRUCT_SIZE {
+        ctx.mem.write_u8(addr.wrapping_add(i), 0);
+    }
+    ctx.cpu.set_data_register(DataRegister(0), addr);
+    Ok(())
+}
+
+/// `FreeDosObject` (`D1` = `type`, `D2` = the object). No return value.
+/// Frees a [`DOS_RDARGS`] block allocated by
+/// [`alloc_dos_object_handler`]; a `NULL` object is a documented-legal
+/// no-op (matches every other free-half-of-a-pair convention in this
+/// runtime, e.g. `crate::execmem`'s `FreeVec`). Any other `type`
+/// fails loudly, same as the allocation side.
+fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let object_type = ctx.cpu.data_register(DataRegister(1));
+    let addr = ctx.cpu.data_register(DataRegister(2));
+
+    if addr == 0 {
+        return Ok(());
+    }
+
+    if object_type != DOS_RDARGS {
+        return Err(DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -234,
+            handler_name: "FreeDosObject".to_string(),
+            message: format!(
+                "FreeDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) is \
+                 implemented -- see DOS_RDARGS's doc for why the other types aren't"
+            ),
+        });
+    }
+
+    ctx.heap
+        .free(addr)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -234,
+            handler_name: "FreeDosObject".to_string(),
+            message: format!(
+                "FreeDosObject called on {addr:#010x}, which isn't a currently-live \
+             AllocDosObject(DOS_RDARGS) allocation (never allocated, already freed, or not an \
+             AllocDosObject pointer at all): {e}"
+            ),
+        })
+}
+
 /// A fixed, non-`NULL` sentinel `MsgPort*` for
 /// [`get_file_sys_task_handler`] -- see its own doc comment for why a
 /// real (dereferenceable) `MsgPort` isn't needed. Also reused by
@@ -1162,6 +1264,8 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("Cli", cli_handler::<C>);
     reg!("MaxCli", max_cli_handler::<C>);
     reg!("GetProgramName", get_program_name_handler::<C>);
+    reg!("AllocDosObject", alloc_dos_object_handler::<C>);
+    reg!("FreeDosObject", free_dos_object_handler::<C>);
     reg!("GetFileSysTask", get_file_sys_task_handler::<C>);
     reg!("SetFileSysTask", set_file_sys_task_handler::<C>);
     reg!("SelectInput", select_input_handler::<C>);
@@ -1985,6 +2089,90 @@ mod tests {
             b"Ami",
             "truncated to capacity - 1, still NUL-terminated"
         );
+    }
+
+    #[test]
+    fn end_to_end_alloc_and_free_dos_object_rdargs_round_trip() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = DOS_RDARGS (5)
+            0,
+            5,
+            move_imm_to_d(2), // D2 = NULL (no tags)
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-228i16) as u16]); // AllocDosObject(a6)
+        words.push(move_d0_to_d(3)); // D3 = the RDArgs* (save before D2 gets reused)
+        words.push(move_imm_to_d(1)); // D1 = DOS_RDARGS again
+        words.push(0);
+        words.push(5);
+        words.push(0x2E02); // move.l d3,d2 (the RDArgs* -> D2, FreeDosObject's arg)
+        words.extend_from_slice(&[jsr_disp16(6), (-234i16) as u16]); // FreeDosObject(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+    }
+
+    #[test]
+    fn end_to_end_alloc_dos_object_returns_a_real_zeroed_rdargs() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = DOS_RDARGS (5)
+            0,
+            5,
+            move_imm_to_d(2), // D2 = NULL (no tags)
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-228i16) as u16]); // AllocDosObject(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0);
+        for i in 0..32u32 {
+            assert_eq!(
+                rt.memory().read_u8(addr + i),
+                0,
+                "byte {i} of a fresh DOS_RDARGS block should be zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_alloc_dos_object_unknown_type_fails_loudly() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = DOS_CLI (4), not implemented
+            0,
+            4,
+            move_imm_to_d(2),
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-228i16) as u16]); // AllocDosObject(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let err = rt
+            .run(&mut out, None)
+            .expect_err("unimplemented AllocDosObject type should fail loudly");
+        match err {
+            crate::dispatch::RuntimeError::Dispatch(DispatchError::HandlerFailed {
+                library,
+                lvo,
+                handler_name,
+                ..
+            }) => {
+                assert_eq!(library, "dos.library");
+                assert_eq!(lvo, -228);
+                assert_eq!(handler_name, "AllocDosObject");
+            }
+            other => panic!("expected HandlerFailed, got {other:?}"),
+        }
     }
 
     #[test]

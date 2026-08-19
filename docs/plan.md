@@ -2572,6 +2572,42 @@ investigation already found in AmiSnap's own source
 `ReadArgs()` call needs), so implementing it should unblock argument
 parsing and get much closer to `AmiSnap` actually running its verbs.
 
+## `AmiSnap` continued: `dos.library`'s `AllocDosObject`/`FreeDosObject` -- 2026-08-19
+
+Implemented `DOS_RDARGS` only (in `dosfile.rs`, alongside `Cli`/
+`GetProgramName`) -- traced against AROS's `rom/dos/
+allocdosobject.c` since the NDK autodoc doesn't spell out per-type
+initial contents: `DOS_RDARGS` is just `AllocVec(sizeof(struct
+RDArgs), MEMF_CLEAR)`, a plain zeroed 32-byte block, no tag
+processing at all for this type. The other four documented types
+(`DOS_FILEHANDLE`/`DOS_EXALLCONTROL`/`DOS_FIB`/`DOS_STDPKT`/
+`DOS_CLI`) fail loudly instead of returning a same-shaped-but-
+non-functional block -- `DOS_FILEHANDLE`/`DOS_CLI` in particular would
+need real integration with this runtime's own `FileHandle`/`pr_CLI`
+bookkeeping to be genuinely usable, which is a bigger lift than this
+gap needed. `FreeDosObject` mirrors it, `NULL`-safe like every other
+free-half-of-a-pair in this runtime.
+
+**Result: `AmiSnap` now runs to completion with zero unhandled
+library calls at all**, for both a no-args invocation (prints its
+own real, correct usage/template error, `RETURN_ERROR` = exit 10 --
+exactly matching real AmigaOS behavior) and a real verb + `REPO=`
+invocation (also a real, correctly-formatted "bad arguments" message
+-- though *why* a syntactically-plausible `LIST REPO=SYS:tmp`
+invocation still fails `ReadArgs()` parsing is a separate, distinct
+question, likely related to the pre-existing "ReadArgs/ParsePattern
+need real-oracle validation" gap this project already tracks, not a
+new gap discovered this session -- not investigated further here).
+Full `cargo test --all` (503 passed), `cargo clippy --all-targets`,
+`cargo fmt --all` clean.
+
+This closes out this session's `AmiSnap` gap-chasing chain (`WaitPort`/
+`ExecBase.ThisTask`/`pr_CLI` -> `Alert` -> `InitSemaphore` family ->
+`GetProgramName` -> `Allocate`/`Deallocate` -> `AllocDosObject`/
+`FreeDosObject`), each found by running the real binary, diagnosed via
+its own `UnknownCall` candidate-offset diagnostic, and traced against
+a primary source (NDK headers and/or AROS) before implementing.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
