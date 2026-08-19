@@ -2102,6 +2102,43 @@ convention asserted; `AddTime`'s micro-carry path; `GetSysTime`/
 `ReadEClock` plausibility including a 64-bit-truncation guard on
 `ev_hi`).
 
+**Configurable CPU model/FPU: `--cpu`/`--fpu` — 2026-08-19.** Simon
+asked how volamos ended up defaulting to a plain M68000, and how easy
+configurability would be. Answer to the first: not a deliberated
+choice — Phase 1's original scaffold default, already flagged in
+`backend.rs`'s own doc comment as "later stages can expose a way to
+pick a different `CpuType` if that's ever needed." The `m68k` crate
+already carries everything needed (`CpuType::{M68000..M68060,
+SCC68070}` via `set_cpu_type`, plus a public `fpu_present: bool`), so
+this was genuinely small: `M68kCpu::new()` (still the M68000/no-FPU
+default every existing test relies on) now delegates to a new
+`M68kCpu::with_config(cpu_type, fpu_present)`; the CLI gained `--cpu
+MODEL` (parses all eleven real models) and `--fpu`/`--no-fpu`
+(default: no FPU), threaded through both the top-level `Runtime` and
+`run_nested_program` (`System()`/`Execute()` reuses the parent run's
+CPU config, same convention as `--stack`).
+
+One real fact surfaced while implementing this, confirmed empirically
+rather than assumed: the `m68k` crate models pre-68020 CPUs as having
+no coprocessor interface *at all* (`has_coproc_interface =
+!cpu.is_pre_68020` in its own decode logic) -- so `fpu_present` is a
+no-op below `--cpu 68020`; F-line always traps regardless, matching
+real 68000/68010 hardware. This is also why the F-line hardware
+exception delivery work earlier in this project's history (the real
+`Cpu::take_hardware_exception` plumbing, exercised by `PhxAss`'s own
+FPU probe) was correct without ever having to think about
+`fpu_present` explicitly -- volamos's hardcoded `CpuType::M68000`
+always took that path regardless of the field's (previously untouched,
+crate-default-`true`) value. Verified with three new unit tests
+constructing the exact same coprocessor-ID-1 F-line opcode word across
+`(M68000, fpu=true)`, `(M68020, fpu=false)`, and `(M68020, fpu=true)`
+-- the first two trap, the third doesn't.
+
+New tests: 9 (`backend.rs`: the three `with_config` FPU-trap-boundary
+cases above; `main.rs`: default is 68000/no-FPU, `--cpu` parses every
+documented model, unknown model is a clean error, missing value is a
+clean error, `--fpu` sets it, last-flag-wins for `--fpu`/`--no-fpu`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

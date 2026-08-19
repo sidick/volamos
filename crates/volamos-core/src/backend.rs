@@ -32,10 +32,15 @@
 //! `StopReason` gained a payload (see [`crate::cpu::TrapInfo`]) so callers
 //! can tell which trap fired and where.
 
-use m68k::{AddressBus, CpuCore, CpuType, StepResult};
+use m68k::{AddressBus, CpuCore, StepResult};
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapInfo, TrapKind};
 use crate::memory::{AddressSpace, FlatMemory};
+
+/// Re-exported so callers (the CLI's `--cpu` flag) can name a model
+/// without depending on the `m68k` crate directly -- see
+/// [`M68kCpu::with_config`].
+pub use m68k::CpuType;
 
 /// Start of the low guest-memory region reserved for a fake AmigaOS
 /// library jump table.
@@ -98,16 +103,35 @@ impl AddressBus for FlatMemory {
 
 /// A [`Cpu`] implementation backed by the `m68k` crate's `CpuCore`.
 ///
-/// Emulates a plain M68000 (no MMU, no FPU); later stages can expose a
-/// way to pick a different [`CpuType`] if that's ever needed for
-/// AmigaOS-version-specific behavior, but AmigaOS CLI binaries generally
-/// don't require anything past a 68000-level instruction set.
+/// [`M68kCpu::new`] emulates a plain M68000 with no FPU (`fpu_present =
+/// false`) -- the lowest common denominator every real Kickstart 3.1
+/// machine shares, and AmigaOS CLI binaries (this project's target)
+/// generally don't need anything past a 68000-level instruction set.
+/// [`M68kCpu::with_config`] picks a different [`CpuType`]/FPU presence
+/// for the rare binary that does (the CLI's `--cpu`/`--fpu` flags).
 pub struct M68kCpu {
     core: CpuCore,
 }
 
 impl M68kCpu {
-    /// Creates a new M68000 core.
+    /// Creates a new M68000 core with no FPU -- shorthand for
+    /// [`Self::with_config`]`(CpuType::M68000, false)`. See this
+    /// struct's doc comment for why that's the default.
+    pub fn new() -> Self {
+        Self::with_config(CpuType::M68000, false)
+    }
+
+    /// Creates a new core for `cpu_type`, with `fpu_present` controlling
+    /// whether F-line (coprocessor ID 1) opcodes execute as real FPU
+    /// instructions or trap out to [`Cpu::take_hardware_exception`] --
+    /// see that method's doc comment for the guest-visible difference
+    /// (a real, well-behaved AmigaOS program probes for an FPU exactly
+    /// this way, expecting the trap when one isn't fitted).
+    ///
+    /// `fpu_present` only matters for `cpu_type` `M68020` and later: the
+    /// `m68k` crate models pre-68020 CPUs as having no coprocessor
+    /// interface at all (matching real 68000/68010 hardware), so F-line
+    /// always traps on those regardless of this flag.
     ///
     /// Registers and the program counter start at `0`; callers are
     /// expected to set up the initial PC and stack pointer (typically via
@@ -119,9 +143,10 @@ impl M68kCpu {
     /// sequence (which reads the initial SSP/PC from guest addresses 0
     /// and 4): those addresses are reserved for the fake library jump
     /// table, not a real reset vector.
-    pub fn new() -> Self {
+    pub fn with_config(cpu_type: CpuType, fpu_present: bool) -> Self {
         let mut core = CpuCore::new();
-        core.set_cpu_type(CpuType::M68000);
+        core.set_cpu_type(cpu_type);
+        core.fpu_present = fpu_present;
         core.reset_soft();
         Self { core }
     }
@@ -315,6 +340,73 @@ mod tests {
         // though the trap is intercepted rather than taken as a hardware
         // exception.
         assert_eq!(cpu.pc(), start + 2);
+    }
+
+    #[test]
+    fn with_config_pre_68020_traps_fline_regardless_of_fpu_present() {
+        // A real coprocessor-ID-1 F-line opcode (the generic FPU
+        // instruction word format); pre-68020 CPUs have no coprocessor
+        // interface at all, so this always traps -- see
+        // M68kCpu::with_config's doc comment.
+        let mut cpu = M68kCpu::with_config(CpuType::M68000, true);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x2000);
+        load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
+
+        let reason = cpu.step(&mut mem);
+
+        assert!(
+            matches!(
+                reason,
+                StopReason::Trap(TrapInfo {
+                    kind: TrapKind::FLine { .. },
+                    ..
+                })
+            ),
+            "expected an FLine trap, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn with_config_68020_with_no_fpu_traps_fline() {
+        let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x2000);
+        load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
+
+        let reason = cpu.step(&mut mem);
+
+        assert!(
+            matches!(
+                reason,
+                StopReason::Trap(TrapInfo {
+                    kind: TrapKind::FLine { .. },
+                    ..
+                })
+            ),
+            "expected an FLine trap (no FPU fitted), got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn with_config_68020_with_fpu_does_not_trap_fline() {
+        let mut cpu = M68kCpu::with_config(CpuType::M68020, true);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x2000);
+        load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
+
+        let reason = cpu.step(&mut mem);
+
+        assert!(
+            !matches!(
+                reason,
+                StopReason::Trap(TrapInfo {
+                    kind: TrapKind::FLine { .. },
+                    ..
+                })
+            ),
+            "a fitted FPU should decode this as a real instruction, not trap: {reason:?}"
+        );
     }
 
     #[test]

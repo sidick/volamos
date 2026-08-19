@@ -38,12 +38,21 @@
 //! [`volamos_core::MIN_STACK_SIZE`] are silently clamped up to it by
 //! [`volamos_core::dispatch::Runtime::new`], mirroring real AmigaOS's
 //! own stack-size clamp.
+//!
+//! `--cpu MODEL` picks the emulated [`CpuType`] (default `68000`, the
+//! lowest common denominator every Kickstart 3.1 machine shares -- see
+//! [`volamos_core::backend::M68kCpu`]'s doc comment); `--fpu`/`--no-fpu`
+//! (default: no FPU) sets whether a coprocessor FPU is fitted, only
+//! meaningful for `--cpu 68020` and later -- see
+//! [`volamos_core::backend::M68kCpu::with_config`]. A nested `System()`/
+//! `Execute()` run (see [`run_nested_program`]) reuses the same CPU
+//! configuration as the top-level run, same as `--stack`.
 
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use volamos_core::backend::{M68kCpu, TRAP_TABLE_END};
+use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END};
 use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
 use volamos_core::exectask::install_host_break_handler;
 use volamos_core::memory::FlatMemory;
@@ -66,6 +75,8 @@ struct Options {
     cwd: Option<String>,
     auto_assign_root: Option<PathBuf>,
     stack_size: u32,
+    cpu_type: CpuType,
+    fpu: bool,
 }
 
 impl Options {
@@ -84,7 +95,8 @@ fn print_usage(program_name: &str) {
     eprintln!(
         "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
-         [--auto-assign HOSTDIR] [--stack SIZE] <program> [args...]"
+         [--auto-assign HOSTDIR] [--stack SIZE] [--cpu MODEL] [--fpu|--no-fpu] \
+         <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -114,6 +126,13 @@ fn print_usage(program_name: &str) {
         "  --stack SIZE              guest stack size in bytes (default {DEFAULT_STACK_SIZE});"
     );
     eprintln!("                            SIZE may be suffixed K (KiB) or M (MiB), e.g. 256K");
+    eprintln!("  --cpu MODEL               emulated CPU (default 68000): 68000, 68010, 68020,");
+    eprintln!("                            68ec020, 68030, 68ec030, 68040, 68ec040, 68lc040,");
+    eprintln!("                            68060, or scc68070");
+    eprintln!("  --fpu / --no-fpu          whether a coprocessor FPU is fitted (default: no FPU);");
+    eprintln!("                            only meaningful for --cpu 68020 and later -- earlier");
+    eprintln!("                            models have no coprocessor interface at all, so F-line");
+    eprintln!("                            (FPU) instructions always trap on them regardless");
     eprintln!();
     eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
     eprintln!();
@@ -145,6 +164,29 @@ fn parse_stack_size(s: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("--stack value {s:?} overflows"))
 }
 
+/// Parses a `--cpu MODEL` value (case-insensitive) into a [`CpuType`].
+/// Covers every real model the `m68k` crate models -- see
+/// [`print_usage`] for the accepted spellings.
+fn parse_cpu_type(s: &str) -> Result<CpuType, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "68000" => Ok(CpuType::M68000),
+        "68010" => Ok(CpuType::M68010),
+        "68020" => Ok(CpuType::M68020),
+        "68ec020" => Ok(CpuType::M68EC020),
+        "68030" => Ok(CpuType::M68030),
+        "68ec030" => Ok(CpuType::M68EC030),
+        "68040" => Ok(CpuType::M68040),
+        "68ec040" => Ok(CpuType::M68EC040),
+        "68lc040" => Ok(CpuType::M68LC040),
+        "68060" => Ok(CpuType::M68060),
+        "scc68070" => Ok(CpuType::SCC68070),
+        _ => Err(format!(
+            "--cpu expects one of 68000, 68010, 68020, 68ec020, 68030, 68ec030, 68040, \
+             68ec040, 68lc040, 68060, scc68070, got {s:?}"
+        )),
+    }
+}
+
 /// Splits `NAME:rest` on the *first* `:` -- a volume/assign name can't
 /// itself contain `:` (it's the Amiga path syntax's own separator), so
 /// this is unambiguous even though the `rest` (a host directory, or an
@@ -169,6 +211,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     let mut cwd = None;
     let mut auto_assign_root = None;
     let mut stack_size = DEFAULT_STACK_SIZE;
+    let mut cpu_type = CpuType::M68000;
+    let mut fpu = false;
 
     while let Some(arg) = args.next() {
         if program.is_some() {
@@ -212,6 +256,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
                     .ok_or_else(|| "--stack requires a SIZE argument".to_string())?;
                 stack_size = parse_stack_size(&value)?;
             }
+            "--cpu" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--cpu requires a MODEL argument".to_string())?;
+                cpu_type = parse_cpu_type(&value)?;
+            }
+            "--fpu" => fpu = true,
+            "--no-fpu" => fpu = false,
             _ => program = Some(arg),
         }
     }
@@ -227,6 +279,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         cwd,
         auto_assign_root,
         stack_size,
+        cpu_type,
+        fpu,
     })
 }
 
@@ -306,6 +360,8 @@ fn run_nested_program(
     args: &[String],
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
+    cpu_type: CpuType,
+    fpu: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
         return -1;
@@ -324,7 +380,7 @@ fn run_nested_program(
         args: args.to_vec(),
         stack_size,
     };
-    let mut runtime = Runtime::new(M68kCpu::new(), mem, config);
+    let mut runtime = Runtime::new(M68kCpu::with_config(cpu_type, fpu), mem, config);
 
     if let Some(vfs_config) = vfs_config {
         match Vfs::new(vfs_config) {
@@ -350,7 +406,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
         .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
 
-    let cpu = M68kCpu::new();
+    let cpu = M68kCpu::with_config(opts.cpu_type, opts.fpu);
     let config = StartConfig {
         entry: load_result.entry,
         load_end: load_result.end,
@@ -369,12 +425,16 @@ fn run(opts: &Options) -> Result<i32, String> {
     // run through run_nested_program, sharing this run's volumes/assigns
     // and --stack size -- see volamos_core::dosseg's module docs.
     let nested_stack_size = opts.stack_size;
+    let nested_cpu_type = opts.cpu_type;
+    let nested_fpu = opts.fpu;
     runtime.set_system_runner(move |req| {
         run_nested_program(
             &req.resolved_program_host_path,
             &req.args,
             vfs_config.clone(),
             nested_stack_size,
+            nested_cpu_type,
+            nested_fpu,
         )
     });
 
@@ -744,5 +804,61 @@ mod tests {
     fn default_stack_size_used_when_flag_absent() {
         let opts = parse_args(args(&["prog"])).unwrap();
         assert_eq!(opts.stack_size, DEFAULT_STACK_SIZE);
+    }
+
+    #[test]
+    fn default_cpu_is_68000_with_no_fpu() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert_eq!(opts.cpu_type, CpuType::M68000);
+        assert!(!opts.fpu);
+    }
+
+    #[test]
+    fn cpu_flag_parses_every_documented_model() {
+        let cases: &[(&str, CpuType)] = &[
+            ("68000", CpuType::M68000),
+            ("68010", CpuType::M68010),
+            ("68020", CpuType::M68020),
+            ("68EC020", CpuType::M68EC020),
+            ("68030", CpuType::M68030),
+            ("68ec030", CpuType::M68EC030),
+            ("68040", CpuType::M68040),
+            ("68ec040", CpuType::M68EC040),
+            ("68lc040", CpuType::M68LC040),
+            ("68060", CpuType::M68060),
+            ("scc68070", CpuType::SCC68070),
+        ];
+        for (name, expected) in cases {
+            let opts = parse_args(args(&["--cpu", name, "prog"])).unwrap();
+            assert_eq!(opts.cpu_type, *expected, "--cpu {name}");
+        }
+    }
+
+    #[test]
+    fn cpu_flag_with_an_unknown_model_is_an_error() {
+        let err = parse_args(args(&["--cpu", "68080", "prog"])).unwrap_err();
+        assert!(err.contains("--cpu"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn cpu_missing_value_is_an_error() {
+        let err = parse_args(args(&["--cpu"])).unwrap_err();
+        assert!(err.contains("--cpu requires"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn fpu_flag_enables_fpu() {
+        let opts = parse_args(args(&["--fpu", "prog"])).unwrap();
+        assert!(opts.fpu);
+    }
+
+    #[test]
+    fn no_fpu_flag_after_fpu_wins() {
+        // Last flag wins, same convention as every other boolean flag
+        // here (e.g. -v doesn't have an "un-verbose" counterpart to
+        // test this against, but the parse loop's plain assignment
+        // makes this the natural, unsurprising behavior either way).
+        let opts = parse_args(args(&["--fpu", "--no-fpu", "prog"])).unwrap();
+        assert!(!opts.fpu);
     }
 }
