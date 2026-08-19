@@ -1746,6 +1746,49 @@ New tests: 1 (`loader.rs`:
 `inter_hunk_drel32_applies_like_reloc32_despite_the_name`, including
 the alignment-padding edge case).
 
+**`OpenLibrary`: fail for missing disk-based libraries — 2026-08-19.**
+Simon raised a real design flaw in the "vamos escape hatch" fake-library
+behavior (`crates/volamos-core/src/dispatch.rs`'s `open_library_common`):
+auto-creating a fake base and always succeeding was ported from vamos
+verbatim, but it doesn't hold for **disk-based** libraries the way it
+does for **ROM-resident** ones. `exec.library`/`dos.library`/
+`utility.library` (everything this runtime actually implements) are
+unconditionally present on any real Kickstart -- always-succeed is
+correct there. Everything else (`locale.library`, `mathtrans.library`,
+...) is loaded from `LIBS:<name>` at `OpenLibrary` time on real
+AmigaOS, and only succeeds if that file is actually present on the
+disk being booted; real `OpenLibrary` genuinely fails (`NULL`) for a
+disk that doesn't have it. Many real programs (`PhxAss` included, per
+this session's own detour) `OpenLibrary` such libraries speculatively
+and gracefully disable the corresponding feature if the open fails --
+that's the normal, well-supported AmigaOS idiom, not an edge case, so
+always-succeeding was actively hiding it and forcing every such
+program down the "library did open" code path this runtime can't
+actually service.
+
+Fixed: unknown-library `OpenLibrary` now checks whether
+`LIBS:<name>` resolves on the configured `Vfs` first. Found on disk
+(or a real system genuinely can't tell without loading and running
+arbitrary disk library code, which this runtime doesn't implement) ->
+same fake-base-then-trap-on-first-real-call behavior as before. Not
+found (including "no `Vfs` configured at all", matching every other
+path-based call's established convention) -> `OpenLibrary` returns
+`NULL`, same as real AmigaOS with that library missing.
+
+Confirmed against the real `PhxAss` run from the `HUNK_DREL32` fix
+above: previously it hit the fake-lib trap on its first genuine
+`locale.library` call; now `OpenLibrary("mathtrans.library")` and
+`OpenLibrary("locale.library")` both cleanly return `NULL` (neither
+file exists in the scratch test volume's `LIBS:`), `PhxAss` degrades
+gracefully exactly as real AmigaOS software is designed to, and gets
+substantially further -- through `ReadArgs`, `Lock`/`Examine`, and
+actually opening the real `WORK:hello.asm` source file -- before
+hitting its next real gap (`dos.library`'s `NameFromFH`, an honest,
+specific "implement this next" pointer, not a generic fake-lib wall).
+
+New tests: 2 (`dispatch.rs`: found-on-disk succeeds as before,
+not-found-on-disk/no-`Vfs` both return `NULL`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

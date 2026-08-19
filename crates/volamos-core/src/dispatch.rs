@@ -66,7 +66,7 @@ use crate::exectask;
 use crate::guestmem::{DEFAULT_STACK_SIZE, GuestHeap, MIN_STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
-use crate::vfs::Vfs;
+use crate::vfs::{ResolveMode, Vfs};
 
 /// Number of distinct handler slots representable in an A-line opcode's
 /// low 12 bits (`0xA000`..=`0xAFFF`). One slot is reserved for the exit
@@ -838,19 +838,41 @@ impl LibraryRegistry {
 /// # vamos escape hatch
 ///
 /// Ported from vamos's own behavior (see `docs/plan.md`'s "vamos escape
-/// hatches" note): opening a library this runtime doesn't implement
-/// never fails here. Instead, a fake base is auto-created on first
-/// request (and reused on repeat requests for the same name, via
-/// [`LibraryRegistry`]) -- a block of [`FAKE_LIB_JUMP_TABLE_SIZE`] bytes
-/// carved from the guest heap, entirely prefilled with the shared
-/// [`FAKE_LIB_SLOT`] opcode, with the base set to the end of that block
-/// (so every plausible negative LVO offset lands inside it and traps).
-/// A run therefore never fails at `OpenLibrary` time for an unknown
-/// library -- only if/when the guest actually calls one of its vectors,
-/// which [`fake_lib_vector_handler`] turns into a diagnostic naming the
-/// library. This mirrors real (and vamos) behavior: many programs
-/// `OpenLibrary` a handful of libraries speculatively and only call
-/// into the ones that actually opened successfully.
+/// hatches" note), but refined to match a real distinction the naive
+/// "always auto-create a fake" version glossed over: **ROM-resident**
+/// libraries (`exec.library`, `dos.library`, `utility.library` -- every
+/// library this runtime actually implements, i.e. everything
+/// [`LibraryRegistry::lookup`] already finds) are unconditionally
+/// present on any real Kickstart, so those never fail here regardless
+/// of `Vfs` state. Everything else is a **disk-based** library on real
+/// AmigaOS (loaded from `LIBS:<name>` at `OpenLibrary` time) -- real
+/// `OpenLibrary` for one of *those* only succeeds if the file is
+/// actually present on the searched disk, and fails (`D0` = `0`) if
+/// it's missing, exactly like any other disk-based command or handler.
+/// So for a name not in the registry, this checks whether
+/// `LIBS:<name>` resolves on the configured `Vfs` (or fails outright if
+/// there's no `Vfs` at all, matching every other path-based call's
+/// established "no `Vfs`" convention):
+///
+/// - **Found on disk** (or genuinely no way to tell -- see below): a
+///   fake base is auto-created (and reused on repeat requests for the
+///   same name, via [`LibraryRegistry`]) -- a block of
+///   [`FAKE_LIB_JUMP_TABLE_SIZE`] bytes carved from the guest heap,
+///   entirely prefilled with the shared [`FAKE_LIB_SLOT`] opcode, base
+///   set to the end of that block (so every plausible negative LVO
+///   offset lands inside it and traps). This runtime doesn't implement
+///   loading and running arbitrary real disk library code (a real
+///   system would), so this is the best available stand-in: `OpenLibrary`
+///   succeeds like it would for real, and [`fake_lib_vector_handler`]
+///   turns the *first actual call* into a diagnostic naming exactly
+///   which library/LVO is missing -- still far more useful than
+///   silently limping along.
+/// - **Not found on disk**: `OpenLibrary` fails (`D0` = `0`), matching
+///   real behavior for a disk that doesn't have that library -- letting
+///   a well-behaved caller's own "library didn't open" fallback path run
+///   (many programs speculatively `OpenLibrary` optional libraries like
+///   `locale.library` and degrade gracefully) instead of masking that
+///   choice behind an always-succeeds fake.
 fn open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
@@ -877,6 +899,22 @@ fn open_library_common<C: Cpu>(
     if let Some((base, _kind)) = ctx.registry.lookup(name) {
         *ctx.call_detail = Some(format!("library {name:?} -> base {base:#010x} (real)"));
         ctx.cpu.set_data_register(DataRegister(0), base);
+        return Ok(());
+    }
+
+    // Not a ROM-resident library this runtime implements: on real
+    // AmigaOS this is a disk-based library, only openable if
+    // `LIBS:<name>` actually exists on the searched disk -- see this
+    // function's doc comment.
+    let libs_path = format!("LIBS:{name}");
+    let found_on_disk = ctx
+        .dos
+        .vfs
+        .as_ref()
+        .is_some_and(|vfs| vfs.resolve(&libs_path, ResolveMode::MustExist).is_ok());
+    if !found_on_disk {
+        *ctx.call_detail = Some(format!("library {name:?} -> NULL (not found on disk)"));
+        ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
     }
 
@@ -1612,6 +1650,44 @@ mod tests {
     use crate::backend::M68kCpu;
     use crate::cpu::DataRegister;
     use crate::memory::FlatMemory;
+    use crate::vfs::VfsConfig;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("volamos-dispatch-test-{tag}-{pid}-{n}"));
+            fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn vfs_over(root: &Path) -> Vfs {
+        Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), root.to_path_buf())],
+            assigns: vec![("LIBS".to_string(), vec!["SYS:libs".to_string()])],
+            auto_assign_root: None,
+            cwd: "SYS:".to_string(),
+        })
+        .expect("build vfs")
+    }
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
         let mut offset = addr;
@@ -2097,10 +2173,16 @@ mod tests {
     }
 
     #[test]
-    fn open_library_of_unknown_name_auto_creates_fake_and_succeeds() {
-        // OpenLibrary("xyz.library") must succeed (never fails at
-        // OpenLibrary time, per the vamos escape hatch), returning some
-        // fake base in D0; only calling a vector on that base fails.
+    fn open_library_of_unknown_name_found_on_disk_auto_creates_fake_and_succeeds() {
+        // OpenLibrary("xyz.library") succeeds (never fails at
+        // OpenLibrary time for a library actually present on the
+        // configured Vfs's LIBS: -- see open_library_common's doc
+        // comment), returning some fake base in D0; only calling a
+        // vector on that base fails.
+        let tmp = TempDir::new("open-library-found");
+        fs::create_dir(tmp.path().join("libs")).unwrap();
+        fs::write(tmp.path().join("libs").join("xyz.library"), b"").unwrap();
+
         let entry = TRAP_TABLE_END;
         let name = b"xyz.library\0";
 
@@ -2129,6 +2211,7 @@ mod tests {
                 ..StartConfig::default()
             },
         );
+        rt.set_vfs(vfs_over(tmp.path()));
 
         let mut out = Vec::new();
         let err = rt.run(&mut out, None).unwrap_err();
@@ -2139,6 +2222,89 @@ mod tests {
             }
             other => panic!("expected a HandlerFailed naming xyz.library, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_library_of_unknown_name_not_found_on_disk_returns_null() {
+        // No xyz.library file anywhere on the configured Vfs's LIBS: --
+        // real OpenLibrary would fail for a genuinely-missing
+        // disk-based library, so this must return NULL in D0 rather
+        // than auto-creating a fake.
+        let tmp = TempDir::new("open-library-missing");
+        fs::create_dir(tmp.path().join("libs")).unwrap();
+
+        let entry = TRAP_TABLE_END;
+        let name = b"xyz.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("xyz.library") -> D0
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs_over(tmp.path()));
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "OpenLibrary of a missing disk library should return NULL"
+        );
+    }
+
+    #[test]
+    fn open_library_of_unknown_name_with_no_vfs_returns_null() {
+        // No Vfs configured at all: same "no disk to search" reasoning
+        // as every other path-based dos.library call's established
+        // convention -- can't confirm the library exists, so this must
+        // not optimistically fake success either.
+        let entry = TRAP_TABLE_END;
+        let name = b"xyz.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("xyz.library") -> D0
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "OpenLibrary with no Vfs at all should return NULL");
     }
 
     #[test]
