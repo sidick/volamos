@@ -9,9 +9,11 @@ will follow the version scheme in `Cargo.toml`.
 
 - **Core runtime**: CPU + A-line trap dispatch plumbing over the
   [`m68k`](https://crates.io/crates/m68k) crate, real guest heap and
-  stack regions (with overflow detection), and a host-backed
-  volume/assign filesystem (`-V`/`-a`/`--auto-assign`, multi-assign
-  search order, real Amiga path semantics including `/`-as-parent-dir).
+  stack regions (with overflow detection), a configurable total guest
+  address space (`--ram`, default 16 MiB) with a clean upfront error
+  if `--stack` doesn't leave it room, and a host-backed volume/assign
+  filesystem (`-V`/`-a`/`--auto-assign`, multi-assign search order,
+  real Amiga path semantics including `/`-as-parent-dir).
 - **`dos.library`**: file I/O, locks and directory traversal, pattern
   matching (`ParsePattern`/`MatchFirst`/`MatchNext`), `ReadArgs`/
   `FreeArgs`, a real `ENV:` volume for environment variables, `LoadSeg`/
@@ -45,6 +47,3 @@ will follow the version scheme in `Cargo.toml`.
 - `exec.library`'s `MakeLibrary`/`SetFunction` (would need a real
   architectural extension — see
   [Supported Libraries](Supported-Libraries.md)).
-- A known crash (not a clean error) when `--stack` is close to or
-  exceeds the fixed 1 MiB total guest address space — see
-  [CLI Reference](CLI-Reference.md#-stack-size).

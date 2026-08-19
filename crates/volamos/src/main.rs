@@ -34,10 +34,19 @@
 //! `--stack SIZE` (Phase 3 stage 6) overrides the guest stack region's
 //! size (default [`volamos_core::DEFAULT_STACK_SIZE`], 64 KiB); `SIZE`
 //! is a plain byte count, optionally suffixed `K`/`k` (KiB) or `M`/`m`
-//! (MiB) -- see [`parse_stack_size`]. Values below
+//! (MiB) -- see [`parse_byte_size`]. Values below
 //! [`volamos_core::MIN_STACK_SIZE`] are silently clamped up to it by
 //! [`volamos_core::dispatch::Runtime::new`], mirroring real AmigaOS's
 //! own stack-size clamp.
+//!
+//! `--ram SIZE` overrides the total guest address space (default
+//! [`DEFAULT_RAM_SIZE`], 16 MiB), same `K`/`M`-suffixed syntax as
+//! `--stack`. `--stack` must leave real room within it for the loaded
+//! program and the runtime's own guest heap -- [`run`]/
+//! [`run_nested_program`] check this upfront and fail with a clear
+//! error (rather than letting [`volamos_core::dispatch::Runtime::new`]
+//! panic deep inside guest-heap setup) if `--stack` is too close to or
+//! exceeds `--ram`.
 //!
 //! `--cpu MODEL` picks the emulated [`CpuType`] (default `68000`, the
 //! lowest common denominator every Kickstart 3.1 machine shares -- see
@@ -59,10 +68,24 @@ use volamos_core::memory::FlatMemory;
 use volamos_core::vfs::{Vfs, VfsConfig};
 use volamos_core::{DEFAULT_STACK_SIZE, LoadError, loader};
 
-/// Guest address space size. Generous for the tiny CLI binaries this
-/// runtime currently targets; large enough to leave headroom above the
-/// loaded program for its stack.
-const GUEST_MEMORY_SIZE: usize = 1 << 20; // 1 MiB
+/// Default guest address space size, overridable with `--ram`. 16 MiB
+/// comfortably covers the tiny CLI binaries this runtime currently
+/// targets (with plenty of headroom for a much larger `--stack` than
+/// the previous fixed 1 MiB ceiling allowed) while staying trivial for
+/// any modern host to allocate.
+const DEFAULT_RAM_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Minimum bytes of address space [`run`]/[`run_nested_program`]
+/// require to remain between the loaded program's end and the top of
+/// the guest stack region, beyond `--stack` itself -- real room for
+/// [`Runtime::new`]'s own guest heap setup (the fake current task's
+/// `struct Process`, its `pr_CLI`, the command-line buffer, ...) plus
+/// headroom for the guest program's own `AllocMem`/etc. calls. Not
+/// tied precisely to those internal structures' exact sizes (a few
+/// hundred bytes today) -- a generous, stable margin that doesn't need
+/// to change every time something inside `Runtime::new` grows by a few
+/// bytes.
+const MIN_HEAP_HEADROOM: u32 = 4096;
 
 #[derive(Debug)]
 struct Options {
@@ -75,6 +98,7 @@ struct Options {
     cwd: Option<String>,
     auto_assign_root: Option<PathBuf>,
     stack_size: u32,
+    ram_size: u32,
     cpu_type: CpuType,
     fpu: bool,
 }
@@ -95,8 +119,8 @@ fn print_usage(program_name: &str) {
     eprintln!(
         "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
-         [--auto-assign HOSTDIR] [--stack SIZE] [--cpu MODEL] [--fpu|--no-fpu] \
-         <program> [args...]"
+         [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
+         [--fpu|--no-fpu] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -126,6 +150,13 @@ fn print_usage(program_name: &str) {
         "  --stack SIZE              guest stack size in bytes (default {DEFAULT_STACK_SIZE});"
     );
     eprintln!("                            SIZE may be suffixed K (KiB) or M (MiB), e.g. 256K");
+    eprintln!(
+        "  --ram SIZE                total guest address space in bytes (default \
+         {DEFAULT_RAM_SIZE});"
+    );
+    eprintln!("                            same K/M suffix syntax as --stack. --stack must leave");
+    eprintln!("                            real room within this for the loaded program and the");
+    eprintln!("                            runtime's own guest heap");
     eprintln!("  --cpu MODEL               emulated CPU (default 68000): 68000, 68010, 68020,");
     eprintln!("                            68ec020, 68030, 68ec030, 68040, 68ec040, 68lc040,");
     eprintln!("                            68060, or scc68070");
@@ -143,25 +174,27 @@ fn print_usage(program_name: &str) {
     );
 }
 
-/// Parses a `--stack SIZE` value: a plain non-negative byte count, or the
-/// same followed by a single `K`/`k` (KiB, `* 1024`) or `M`/`m` (MiB,
-/// `* 1024 * 1024`) suffix -- e.g. `"65536"`, `"64K"`, `"1M"`. Rejects
-/// empty input, non-digit content before the optional suffix, more than
-/// one suffix character, and multiplications that would overflow `u32`
-/// (a guest address space is at most 4 GiB, so an overflowing stack
-/// request is never satisfiable anyway).
-fn parse_stack_size(s: &str) -> Result<u32, String> {
+/// Parses a `SIZE` value shared by `--stack` and `--ram`: a plain
+/// non-negative byte count, or the same followed by a single `K`/`k`
+/// (KiB, `* 1024`) or `M`/`m` (MiB, `* 1024 * 1024`) suffix -- e.g.
+/// `"65536"`, `"64K"`, `"1M"`. Rejects empty input, non-digit content
+/// before the optional suffix, more than one suffix character, and
+/// multiplications that would overflow `u32` (a guest address space is
+/// at most 4 GiB, so an overflowing request is never satisfiable
+/// anyway). `flag` names the flag in the error message (`"--stack"` or
+/// `"--ram"`).
+fn parse_byte_size(flag: &str, s: &str) -> Result<u32, String> {
     let (digits, multiplier) = match s.as_bytes().last() {
         Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1024u32),
         Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1024 * 1024u32),
         _ => (s, 1u32),
     };
-    let value: u32 = digits.parse().map_err(|_| {
-        format!("--stack expects a byte count (optionally K/M-suffixed), got {s:?}")
-    })?;
+    let value: u32 = digits
+        .parse()
+        .map_err(|_| format!("{flag} expects a byte count (optionally K/M-suffixed), got {s:?}"))?;
     value
         .checked_mul(multiplier)
-        .ok_or_else(|| format!("--stack value {s:?} overflows"))
+        .ok_or_else(|| format!("{flag} value {s:?} overflows"))
 }
 
 /// Parses a `--cpu MODEL` value (case-insensitive) into a [`CpuType`].
@@ -300,6 +333,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     let mut cwd = None;
     let mut auto_assign_root = None;
     let mut stack_size = DEFAULT_STACK_SIZE;
+    let mut ram_size = DEFAULT_RAM_SIZE;
     let mut cpu_type = CpuType::M68000;
     let mut fpu = false;
 
@@ -343,7 +377,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
                 let value = args
                     .next()
                     .ok_or_else(|| "--stack requires a SIZE argument".to_string())?;
-                stack_size = parse_stack_size(&value)?;
+                stack_size = parse_byte_size("--stack", &value)?;
+            }
+            "--ram" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--ram requires a SIZE argument".to_string())?;
+                ram_size = parse_byte_size("--ram", &value)?;
             }
             "--cpu" => {
                 let value = args
@@ -368,6 +408,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         cwd,
         auto_assign_root,
         stack_size,
+        ram_size,
         cpu_type,
         fpu,
     })
@@ -457,11 +498,35 @@ fn program_name_from_path(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// Checks that `stack_size` plus [`MIN_HEAP_HEADROOM`] actually fits
+/// between `load_end` (the loaded program's own end address) and
+/// `ram_size` (the top of the guest address space) -- see
+/// [`MIN_HEAP_HEADROOM`]'s doc for why this check exists: without it,
+/// a `--stack` too close to or exceeding `--ram` leaves
+/// [`Runtime::new`]'s own guest heap setup no room at all, which
+/// panics deep inside guest-heap allocation instead of failing
+/// cleanly.
+fn check_ram_fits(load_end: u32, stack_size: u32, ram_size: u32) -> Result<(), String> {
+    let required = load_end
+        .checked_add(stack_size)
+        .and_then(|v| v.checked_add(MIN_HEAP_HEADROOM));
+    match required {
+        Some(required) if required <= ram_size => Ok(()),
+        _ => Err(format!(
+            "--stack {stack_size} is too large for --ram {ram_size}: the loaded program ends \
+             at {load_end:#x}, and there must be room for the stack plus at least \
+             {MIN_HEAP_HEADROOM} bytes of guest heap after that -- increase --ram or decrease \
+             --stack"
+        )),
+    }
+}
+
 fn run_nested_program(
     host_path: &std::path::Path,
     args: &[String],
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
+    ram_size: u32,
     cpu_type: CpuType,
     fpu: bool,
 ) -> i32 {
@@ -471,10 +536,13 @@ fn run_nested_program(
     let Ok(hunk_file) = loader::parse(&bytes) else {
         return -1;
     };
-    let mut mem = FlatMemory::new(GUEST_MEMORY_SIZE);
+    let mut mem = FlatMemory::new(ram_size as usize);
     let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
         return -1;
     };
+    if check_ram_fits(load_result.end, stack_size, ram_size).is_err() {
+        return -1;
+    }
 
     let config = StartConfig {
         entry: load_result.entry,
@@ -506,9 +574,10 @@ fn run(opts: &Options) -> Result<i32, String> {
         format!("'{}' is not a valid hunk executable: {e}", opts.program)
     })?;
 
-    let mut mem = FlatMemory::new(GUEST_MEMORY_SIZE);
+    let mut mem = FlatMemory::new(opts.ram_size as usize);
     let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
         .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
+    check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
 
     let cpu = M68kCpu::with_config(opts.cpu_type, opts.fpu);
     let config = StartConfig {
@@ -535,6 +604,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // Execute() (which have no such argument) fall back to this run's
     // own --stack/default.
     let nested_stack_size = opts.stack_size;
+    let nested_ram_size = opts.ram_size;
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
     runtime.set_system_runner(move |req| {
@@ -543,6 +613,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             &req.args,
             vfs_config.clone(),
             req.stack_size_override.unwrap_or(nested_stack_size),
+            nested_ram_size,
             nested_cpu_type,
             nested_fpu,
         )
@@ -849,38 +920,44 @@ mod tests {
         assert_eq!(default_cwd(&opts), "root:");
     }
 
-    // --- --stack / parse_stack_size ---
+    // --- --stack / --ram / parse_byte_size ---
 
     #[test]
-    fn parse_stack_size_plain_bytes() {
-        assert_eq!(parse_stack_size("65536").unwrap(), 65536);
-        assert_eq!(parse_stack_size("0").unwrap(), 0);
+    fn parse_byte_size_plain_bytes() {
+        assert_eq!(parse_byte_size("--stack", "65536").unwrap(), 65536);
+        assert_eq!(parse_byte_size("--stack", "0").unwrap(), 0);
     }
 
     #[test]
-    fn parse_stack_size_kib_suffix() {
-        assert_eq!(parse_stack_size("64K").unwrap(), 64 * 1024);
-        assert_eq!(parse_stack_size("64k").unwrap(), 64 * 1024);
+    fn parse_byte_size_kib_suffix() {
+        assert_eq!(parse_byte_size("--stack", "64K").unwrap(), 64 * 1024);
+        assert_eq!(parse_byte_size("--stack", "64k").unwrap(), 64 * 1024);
     }
 
     #[test]
-    fn parse_stack_size_mib_suffix() {
-        assert_eq!(parse_stack_size("1M").unwrap(), 1024 * 1024);
-        assert_eq!(parse_stack_size("2m").unwrap(), 2 * 1024 * 1024);
+    fn parse_byte_size_mib_suffix() {
+        assert_eq!(parse_byte_size("--ram", "1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_byte_size("--ram", "2m").unwrap(), 2 * 1024 * 1024);
     }
 
     #[test]
-    fn parse_stack_size_rejects_garbage() {
-        assert!(parse_stack_size("").is_err());
-        assert!(parse_stack_size("abc").is_err());
-        assert!(parse_stack_size("4KB").is_err());
-        assert!(parse_stack_size("-1").is_err());
-        assert!(parse_stack_size("1.5K").is_err());
+    fn parse_byte_size_rejects_garbage() {
+        assert!(parse_byte_size("--stack", "").is_err());
+        assert!(parse_byte_size("--stack", "abc").is_err());
+        assert!(parse_byte_size("--stack", "4KB").is_err());
+        assert!(parse_byte_size("--stack", "-1").is_err());
+        assert!(parse_byte_size("--stack", "1.5K").is_err());
     }
 
     #[test]
-    fn parse_stack_size_rejects_overflow() {
-        assert!(parse_stack_size("4294967295M").is_err());
+    fn parse_byte_size_rejects_overflow() {
+        assert!(parse_byte_size("--ram", "4294967295M").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_error_names_the_flag() {
+        let err = parse_byte_size("--ram", "abc").unwrap_err();
+        assert!(err.contains("--ram"), "unexpected message: {err}");
     }
 
     #[test]
@@ -914,6 +991,51 @@ mod tests {
     fn default_stack_size_used_when_flag_absent() {
         let opts = parse_args(args(&["prog"])).unwrap();
         assert_eq!(opts.stack_size, DEFAULT_STACK_SIZE);
+    }
+
+    // --- --ram ---
+
+    #[test]
+    fn ram_flag_sets_ram_size() {
+        let opts = parse_args(args(&["--ram", "2M", "prog"])).unwrap();
+        assert_eq!(opts.ram_size, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn ram_missing_value_is_an_error() {
+        let err = parse_args(args(&["--ram"])).unwrap_err();
+        assert!(err.contains("--ram requires"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn ram_invalid_value_is_an_error() {
+        let err = parse_args(args(&["--ram", "notanumber", "prog"])).unwrap_err();
+        assert!(err.contains("--ram"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn default_ram_size_used_when_flag_absent() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert_eq!(opts.ram_size, DEFAULT_RAM_SIZE);
+    }
+
+    // --- check_ram_fits ---
+
+    #[test]
+    fn check_ram_fits_accepts_when_there_is_room() {
+        assert!(check_ram_fits(0x1000, 0x1000, DEFAULT_RAM_SIZE).is_ok());
+    }
+
+    #[test]
+    fn check_ram_fits_rejects_when_stack_leaves_no_heap_room() {
+        let err = check_ram_fits(0x1000, 0x1000, 0x2000).unwrap_err();
+        assert!(err.contains("--stack"), "unexpected message: {err}");
+        assert!(err.contains("--ram"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn check_ram_fits_rejects_on_overflowing_sum() {
+        assert!(check_ram_fits(u32::MAX, u32::MAX, u32::MAX).is_err());
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
-        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--cpu MODEL]
-        [--fpu|--no-fpu] <program> [args...]
+        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
+        [--cpu MODEL] [--fpu|--no-fpu] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself.
@@ -120,12 +120,32 @@ mirroring real AmigaOS's own stack-size clamp behavior rather than
 erroring. See [Getting Started](Getting-Started.md#4-see-a-runtime-safety-check-in-action)
 for what happens when a guest program actually overflows its stack.
 
-!!! warning "Known limitation"
-    Total guest address space is a fixed 1 MiB. A `--stack` value close
-    to or exceeding that (leaving no room for the loaded program and
-    its heap) currently crashes volamos with a Rust panic rather than a
-    clean error message — a few hundred KiB is safe; don't reach for
-    multi-megabyte stacks yet.
+If `--stack` is close to or exceeds `--ram` (below), leaving no room
+for the loaded program and the runtime's own guest heap, volamos fails
+with a clear error rather than running at all:
+
+```sh
+$ volamos --ram 8K --stack 8K fixtures/hello
+volamos: --stack 8192 is too large for --ram 8192: the loaded program ends
+at 0x2224, and there must be room for the stack plus at least 4096 bytes
+of guest heap after that -- increase --ram or decrease --stack
+```
+
+## `--ram SIZE`
+
+Overrides the total guest address space — default 16 MiB (16777216
+bytes). Same `SIZE` syntax as `--stack`: a plain byte count, optionally
+suffixed `K`/`k` (KiB) or `M`/`m` (MiB):
+
+```sh
+volamos --ram 4M fixtures/hello
+volamos --ram 64M --stack 1M fixtures/hello   # room for a much larger stack
+```
+
+The default comfortably covers the tiny CLI binaries volamos currently
+targets, with plenty of headroom for a larger-than-default `--stack`.
+Raise it if a guest program needs more address space than that (e.g. a
+larger `--stack`, or a program that allocates a lot via `AllocMem`).
 
 ## `--cpu MODEL`
 

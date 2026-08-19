@@ -3006,3 +3006,48 @@ module's own docs.)
 the newest release as of 2026-08-18 — no churn action needed; and
 ReadArgs placement is decided — stretch goal in T12, otherwise Phase
 3.)
+
+## Configurable guest RAM size (`--ram`) — 2026-08-19
+
+While verifying the userdocs `--stack` examples (see the userdocs
+work above), found a real bug: total guest address space was a fixed
+`GUEST_MEMORY_SIZE = 1 MiB` constant in `crates/volamos/src/main.rs`,
+and a `--stack` value close to or exceeding it left
+[`Runtime::new`]'s own guest heap setup no room at all, panicking deep
+inside `exectask.rs`'s `create_current_task` (`.expect("guest heap has
+room for the fake current task struct")`) instead of failing cleanly.
+Simon: *"I'd rather make the max ram configurable, 1mb feels quite
+low"* — fix it now, not just file an issue.
+
+Changes, all in `crates/volamos/src/main.rs`:
+
+- New `--ram SIZE` flag (same `K`/`M`-suffixed byte-count syntax as
+  `--stack`), replacing the fixed `GUEST_MEMORY_SIZE` constant with
+  `DEFAULT_RAM_SIZE = 16 MiB` (comfortable headroom over the old 1 MiB
+  ceiling, still trivial for any modern host to allocate) and an
+  `Options.ram_size: u32` field threaded through `run()` and
+  `run_nested_program()` (so a nested `System()`/`Execute()`/
+  `RunCommand` run gets the same `--ram` as its parent, mirroring how
+  `--stack`/`--cpu`/`--fpu` already propagate).
+- Generalized `parse_stack_size` into `parse_byte_size(flag, s)` so
+  both flags share one parser/error-message path.
+- New `MIN_HEAP_HEADROOM = 4096` constant and `check_ram_fits(load_end,
+  stack_size, ram_size)` helper: called upfront in both `run()` and
+  `run_nested_program()` right after the program is loaded (so
+  `load_end` is known), before `Runtime::new` ever runs. `run()`
+  returns a clean `Err` describing exactly what's too big; nested runs
+  return `-1`, consistent with `run_nested_program`'s existing "couldn't
+  run it" convention (no message — the same as its other early-return
+  failure paths).
+- Manually verified both directions: `--stack 4194304 fixtures/hello`
+  (previously a panic) now runs cleanly under the new 16 MiB default;
+  `--ram 8K --stack 8K fixtures/hello` now produces a clear
+  `--stack ... is too large for --ram ...` error instead of a panic.
+- Updated `userdocs/CLI-Reference.md` (new `--ram` section, replaced
+  the "Known limitation" panic warning under `--stack` with the new
+  clean-error example) and `userdocs/Changelog.md` (removed the
+  now-fixed limitation bullet, noted `--ram` under Unreleased). Full
+  `mkdocs build --strict` re-verified clean.
+- `cargo build --all`/`test --all`/`clippy --all-targets`/`fmt --all --
+  check` all clean (new unit tests for `parse_byte_size` under both
+  flag names and for `check_ram_fits`'s accept/reject/overflow cases).
