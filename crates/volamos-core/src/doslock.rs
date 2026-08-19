@@ -94,6 +94,11 @@ use crate::vfs::ResolveMode;
 pub const SHARED_LOCK: i32 = -2;
 /// `Lock`'s `accessMode` argument: exclusive access.
 pub const EXCLUSIVE_LOCK: i32 = -1;
+
+/// `SameLock`'s return codes (`dos/dos.h`).
+pub const LOCK_DIFFERENT: i32 = -1;
+pub const LOCK_SAME: i32 = 0;
+pub const LOCK_SAME_VOLUME: i32 = 1;
 /// Alias for [`SHARED_LOCK`] used by some callers/headers.
 pub const ACCESS_READ: i32 = SHARED_LOCK;
 /// Alias for [`EXCLUSIVE_LOCK`] used by some callers/headers.
@@ -221,6 +226,74 @@ impl DosState {
             resolved.amiga_path,
             access_mode,
         )
+    }
+
+    /// `CreateDir(name)`: creates a new, empty directory -- its parent
+    /// must already exist; this doesn't create intermediate directories
+    /// -- and returns an [`EXCLUSIVE_LOCK`] on it. Fails with
+    /// [`crate::dosfile::ERROR_OBJECT_EXISTS`] if a file or directory of
+    /// that name already exists.
+    pub fn create_dir(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        name: &str,
+    ) -> Result<u32, i32> {
+        let vfs = self
+            .vfs
+            .as_ref()
+            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+        let resolved = vfs
+            .resolve_with_amiga_path(name, ResolveMode::ParentMustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        if resolved.host_path.exists() {
+            return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
+        }
+        std::fs::create_dir(&resolved.host_path).map_err(|e| map_io_error(&e))?;
+        self.new_lock(
+            heap,
+            mem,
+            resolved.host_path,
+            resolved.amiga_path,
+            EXCLUSIVE_LOCK,
+        )
+    }
+
+    /// `SameLock(lock1, lock2)`: [`LOCK_SAME`]/[`LOCK_SAME_VOLUME`]/
+    /// [`LOCK_DIFFERENT`]. Identical `BPTR`s (including two `ZERO`
+    /// locks) are always [`LOCK_SAME`]; otherwise this compares the
+    /// locks' resolved, canonicalized host paths for [`LOCK_SAME`], and
+    /// falls back to comparing their Amiga volume names for
+    /// [`LOCK_SAME_VOLUME`]. An unknown (already-freed, or never a
+    /// lock) address that isn't `ZERO` -- or a `ZERO` lock compared
+    /// against a non-`ZERO` one -- is [`LOCK_DIFFERENT`], matching the
+    /// RKRM's own "does not identify the ZERO lock as identical with a
+    /// lock on the root of the boot volume" caveat.
+    pub fn same_lock(&self, addr1: u32, addr2: u32) -> i32 {
+        if addr1 == addr2 {
+            return LOCK_SAME;
+        }
+        let (Some(e1), Some(e2)) = (self.locks.get(&addr1), self.locks.get(&addr2)) else {
+            return LOCK_DIFFERENT;
+        };
+        let c1 = e1
+            .host_path
+            .canonicalize()
+            .unwrap_or_else(|_| e1.host_path.clone());
+        let c2 = e2
+            .host_path
+            .canonicalize()
+            .unwrap_or_else(|_| e2.host_path.clone());
+        if c1 == c2 {
+            return LOCK_SAME;
+        }
+        let vol1 = e1.amiga_path.split(':').next().unwrap_or("");
+        let vol2 = e2.amiga_path.split(':').next().unwrap_or("");
+        if vol1.eq_ignore_ascii_case(vol2) {
+            LOCK_SAME_VOLUME
+        } else {
+            LOCK_DIFFERENT
+        }
     }
 
     /// `UnLock(lock)`: frees the guest struct, the registry entry, and
@@ -531,6 +604,33 @@ fn lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     Ok(())
 }
 
+/// `CreateDir` (`D1` = name `CString*`). `D0` = `BPTR` (an
+/// [`EXCLUSIVE_LOCK`] on the new directory) or `0` (+`IoErr()` set).
+fn create_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.data_register(DataRegister(1));
+    let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+    match ctx.dos.create_dir(ctx.heap, ctx.mem, &name) {
+        Ok(bptr) => ctx.cpu.set_data_register(DataRegister(0), bptr),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+    }
+    Ok(())
+}
+
+/// `SameLock` (`D1`/`D2` = `BPTR`s). `D0` = `LOCK_SAME`/
+/// `LOCK_SAME_VOLUME`/`LOCK_DIFFERENT`.
+fn same_lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr1 = ctx.cpu.data_register(DataRegister(1));
+    let bptr2 = ctx.cpu.data_register(DataRegister(2));
+    let result = ctx
+        .dos
+        .same_lock(addr_from_bptr(bptr1), addr_from_bptr(bptr2));
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
 /// `UnLock` (`D1` = `BPTR`). No return value (real `UnLock` is `void`).
 fn unlock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
@@ -669,6 +769,8 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
         };
     }
     reg!("Lock", lock_handler::<C>);
+    reg!("CreateDir", create_dir_handler::<C>);
+    reg!("SameLock", same_lock_handler::<C>);
     reg!("UnLock", unlock_handler::<C>);
     reg!("DupLock", dup_lock_handler::<C>);
     reg!("Examine", examine_handler::<C>);
@@ -817,6 +919,95 @@ mod tests {
         let mut mem = FlatMemory::new(0x4000);
         let mut dos = DosState::new(None);
         assert_eq!(dos.dup_lock(&mut heap, &mut mem, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn create_dir_makes_a_new_directory_and_locks_it_exclusively() {
+        let tmp = TempDir::new("createdir");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos.create_dir(&mut heap, &mut mem, "SYS:newdir").unwrap();
+        assert!(tmp.path().join("newdir").is_dir());
+        let addr = addr_from_bptr(bptr);
+        assert_eq!(dos.locks.get(&addr).unwrap().access, EXCLUSIVE_LOCK);
+    }
+
+    #[test]
+    fn create_dir_existing_object_is_object_exists() {
+        let tmp = TempDir::new("createdir-exists");
+        fs::create_dir(tmp.path().join("already")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos
+            .create_dir(&mut heap, &mut mem, "SYS:already")
+            .unwrap_err();
+        assert_eq!(err, crate::dosfile::ERROR_OBJECT_EXISTS);
+    }
+
+    #[test]
+    fn create_dir_missing_parent_fails() {
+        let tmp = TempDir::new("createdir-noparent");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        assert!(
+            dos.create_dir(&mut heap, &mut mem, "SYS:nope/newdir")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn same_lock_identical_bptrs_is_lock_same() {
+        let dos = DosState::new(None);
+        assert_eq!(dos.same_lock(0, 0), LOCK_SAME);
+        assert_eq!(dos.same_lock(0x100, 0x100), LOCK_SAME);
+    }
+
+    #[test]
+    fn same_lock_two_locks_on_the_same_object_is_lock_same() {
+        let tmp = TempDir::new("samelock-same");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let b1 = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        let b2 = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        assert_eq!(
+            dos.same_lock(addr_from_bptr(b1), addr_from_bptr(b2)),
+            LOCK_SAME
+        );
+    }
+
+    #[test]
+    fn same_lock_two_locks_on_the_same_volume_is_lock_same_volume() {
+        let tmp = TempDir::new("samelock-volume");
+        fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        fs::write(tmp.path().join("b.txt"), b"b").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let b1 = dos
+            .lock(&mut heap, &mut mem, "SYS:a.txt", SHARED_LOCK)
+            .unwrap();
+        let b2 = dos
+            .lock(&mut heap, &mut mem, "SYS:b.txt", SHARED_LOCK)
+            .unwrap();
+        assert_eq!(
+            dos.same_lock(addr_from_bptr(b1), addr_from_bptr(b2)),
+            LOCK_SAME_VOLUME
+        );
+    }
+
+    #[test]
+    fn same_lock_unknown_addresses_are_lock_different() {
+        let dos = DosState::new(None);
+        assert_eq!(dos.same_lock(0x1111, 0x2222), LOCK_DIFFERENT);
     }
 
     #[test]
@@ -1195,5 +1386,43 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, DOSTRUE as i32);
         assert_eq!(read_c_string(rt.memory(), buf_addr), b"SYS:work");
+    }
+
+    #[test]
+    fn end_to_end_create_dir_then_same_lock_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-createdir-samelock");
+        let name = b"SYS:newdir\0";
+
+        // CreateDir(name) -> D0 = lock #1, saved in D3. Lock(name,
+        // SHARED_LOCK) -> D0 = lock #2 on the same (now-existing)
+        // directory, moved to D1. D3 -> D2. SameLock(D1, D2) -> D0.
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -120); // CreateDir(a6): D0 = lock #1
+        words.push(0x2600); // move.l d0,d3 (save lock #1)
+
+        let name_idx2 = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name again (patched)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32); // D2 = access mode
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = lock #2
+        words.push(0x2200); // move.l d0,d1 (D1 = lock #2)
+        words.push(0x2403); // move.l d3,d2 (D2 = lock #1)
+        push_jsr(&mut words, 6, -420); // SameLock(a6): D0 = LOCK_SAME
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, name_idx2, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, LOCK_SAME);
+        assert!(tmp.path().join("newdir").is_dir());
     }
 }

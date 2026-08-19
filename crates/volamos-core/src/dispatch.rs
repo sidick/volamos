@@ -1187,6 +1187,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // dos.library IsFileSystem -- see crate::dosfs's module docs.
         crate::dosfs::register_dosfs_handlers(&mut table, &mut mem);
 
+        // dos.library SetProtection -- see crate::dosprotect's module
+        // docs.
+        crate::dosprotect::register_dosprotect_handlers(&mut table, &mut mem);
+
         // dos.library StrToLong (decimal string -> LONG) -- see
         // crate::dosstr's module docs.
         crate::dosstr::register_dosstr_handlers(&mut table, &mut mem);
@@ -1882,12 +1886,10 @@ mod tests {
         use crate::lvos::dos::DOS_LVOS;
 
         // Register PutStr by name (populates the base -> table map), then
-        // jsr an unrelated, unregistered LVO on the same base: -120 is
-        // CreateDir's real offset, but no handler is registered for it
-        // (T10/T11 register Open/Close/.../Lock/.../ParentDir, but not
-        // CreateDir).
+        // jsr an unrelated, unregistered LVO on the same base: -78 is
+        // Rename's real offset, but no handler is registered for it.
         let entry = TRAP_TABLE_END;
-        let words = [0x4EAE, (-120i16) as u16, 0x4E75]; // jsr -120(a6) ; rts
+        let words = [0x4EAE, (-78i16) as u16, 0x4E75]; // jsr -78(a6) ; rts
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
         let mut rt = Runtime::new(
@@ -1918,8 +1920,8 @@ mod tests {
                 assert!(
                     candidates
                         .iter()
-                        .any(|(lib, offset)| lib == "dos.library/CreateDir" && *offset == -120),
-                    "expected a dos.library/CreateDir (-120) candidate, got {candidates:?}"
+                        .any(|(lib, offset)| lib == "dos.library/Rename" && *offset == -78),
+                    "expected a dos.library/Rename (-78) candidate, got {candidates:?}"
                 );
             }
             other => panic!("expected UnknownCall, got {other:?}"),

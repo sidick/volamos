@@ -1115,6 +1115,55 @@ failure-handling path still falls through to printing an entry from
 unpopulated `ap_Info`. Lower priority than the working-directory case;
 revisit if a future corpus binary trips on the same class of bug.
 
+**`Copy` gap chain — implemented 2026-08-19.** Moved to the next real
+corpus binary (`C:/Copy`) once `List` ran cleanly; found and fixed four
+gaps in sequence:
+
+- **`SetProtection`** (`crates/volamos-core/src/dosprotect.rs`):
+  `Copy` calls this after copying a file, to replicate the source's
+  protection bits onto the new copy. Scoped to just the `FIBB_WRITE`
+  bit, mapped onto the host file's real writability
+  (`std::fs::Permissions::set_readonly`) -- the only protection bit
+  with a meaningful host-level equivalent. This is narrower than real
+  AmigaDOS and one-way: `crate::doslock`'s `fill_fib` still always
+  reports `fib_Protection == 0`, so the effect isn't reflected back
+  through a later `Examine`/`ExNext`. Revisit (threading real
+  permissions back through `fill_fib`) if a future corpus binary reads
+  back what it just set.
+- **`CreateDir`** (added to `crates/volamos-core/src/doslock.rs`):
+  needed for `Copy ... ALL` (recursive directory copy) to create the
+  destination directory tree. Reuses the existing `new_lock` machinery
+  `Lock`/`DupLock`/`ParentDir` already share, resolving the parent via
+  `ResolveMode::ParentMustExist` and failing with `ERROR_OBJECT_EXISTS`
+  if the target already exists.
+- **`SameLock`** (added to `crates/volamos-core/src/doslock.rs`):
+  `LOCK_SAME`/`LOCK_SAME_VOLUME`/`LOCK_DIFFERENT` aren't defined
+  anywhere in the RKRM skill's reference material (only described in
+  words); their real numeric values (`0`/`1`/`-1` respectively) were
+  confirmed against AmiBlitz3's public Amiga `dos.ab3`/`dos.h`
+  translation on GitHub before implementing, rather than guessed --
+  getting these wrong would have been a silent behavioral bug (the
+  compiled guest binary compares against the real constant values, not
+  our runtime's choice of them). Compares canonicalized host paths for
+  `LOCK_SAME`, falling back to Amiga volume-name comparison for
+  `LOCK_SAME_VOLUME`.
+
+`Copy` now runs fully end-to-end against the real corpus binary, both
+for a simple file copy and for `Copy ... ALL` (recursive directory
+copy, exercising `CreateDir` + `SameLock` together):
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Copy WORK:deep WORK:subdir_copy ALL
+   WORK:subdir_copy   [created]
+        sub (Dir)   [created]
+           d.txt..copied.
+```
+New tests: 3 (`dosprotect.rs`), 9 (`doslock.rs`, for `CreateDir` and
+`SameLock`, including one end-to-end trap-dispatch test exercising
+both together). Also fixed one now-stale pre-existing test
+(`dispatch::tests::unknown_call_diagnostic_names_the_function_when_table_is_known`)
+that had hardcoded `CreateDir` (-120) as an example of a permanently
+unregistered LVO -- switched it to `Rename` (-78), still unimplemented.
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

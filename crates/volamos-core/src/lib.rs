@@ -24,6 +24,7 @@ pub mod doslock;
 pub mod dospath;
 pub mod dospattern;
 pub mod dosprintf;
+pub mod dosprotect;
 pub mod dosseg;
 pub mod dosstr;
 pub mod dosvar;
