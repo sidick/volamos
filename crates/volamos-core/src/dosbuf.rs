@@ -70,11 +70,14 @@ fn fgetc(ctx: &mut HandlerContext<'_, impl Cpu>, addr: u32) -> i32 {
     value
 }
 
-/// Core of `FPutC`/`FPuts`/`FWrite`/`WriteChars`: writes `data` to `addr`,
-/// routing through [`HandlerContext::out`] for the `Output()` default
-/// handle exactly like [`crate::dosfile`]'s own `Write` handler does.
-/// Returns the number of bytes actually written, or an `IoErr()` code.
-fn write_bytes(
+/// Core of `FPutC`/`FPuts`/`FWrite`/`WriteChars` (and, via `crate::
+/// dosprintf`/`crate::dosfile`'s `PutStr`, of any other call that
+/// writes to an already-resolved `FileHandle*` address): writes `data`
+/// to `addr`, routing through [`HandlerContext::out`] for the `Output()`
+/// default handle exactly like [`crate::dosfile`]'s own `Write` handler
+/// does. Returns the number of bytes actually written, or an `IoErr()`
+/// code.
+pub(crate) fn write_bytes(
     ctx: &mut HandlerContext<'_, impl Cpu>,
     addr: u32,
     data: &[u8],

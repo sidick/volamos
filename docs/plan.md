@@ -974,6 +974,40 @@ and EOF, `FPutC` to `Output()`, `UnGetC`→`FGetC` pushback round-trip,
 `FGets` line read, `FWrite`/`FRead` block-record semantics,
 `Flush`/`SetVBuf` no-op success).
 
+**`SelectInput`/`SelectOutput` — implemented 2026-08-19**
+(`crates/volamos-core/src/dosfile.rs`), found by running the real
+`Type WORK:hello.txt TO WORK:out.txt` invocation: it opens the target
+file, calls `SelectOutput` to make it the process's default output,
+then writes every line via `VPrintf` (not `Write`/`FPutC` on an
+explicit handle). `SelectOutput`/`SelectInput` didn't exist yet, and
+worse, `VPrintf` and `PutStr` had both been hard-wired straight to
+`ctx.out` (real host stdout) regardless of any selection -- a Phase 1
+simplification that was correct only because nothing had ever redirected
+`Output()` before. Fixed by splitting `DosState`'s single `output_handle`/
+`input_handle` fields in two: the *default*, stdin/stdout-backed handle
+(`input_handle`/`output_handle`, used by `is_output_default`/`Close`'s
+no-op case -- must never be repointed, or a direct `Write()` to a
+`SelectOutput`-selected real file would get hijacked back to stdout) and
+the *currently selected* one (`current_input`/`current_output`, what
+`Input()`/`Output()` actually return, and what `SelectInput`/
+`SelectOutput` repoint). `VPrintf`/`PutStr`/`VFPrintf` were all switched
+to route through the same `dosbuf::write_bytes` helper `FPutC`/`FWrite`
+already used, rather than three separate ad-hoc `ctx.out`-vs-`dos.write`
+branches. `Type ... TO file` now writes only to the file, with clean
+(empty) stdout:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Type WORK:hello.txt TO WORK:out.txt
+$ cat <vol>/out.txt
+Hello from volamos!
+This is a test file.
+Line three here.
+```
+5 new tests: 2 unit-level (`select_output`/`select_input` redirect and
+report the previous handle, `is_output_default` unaffected by
+selection), 1 end-to-end trap-dispatch test (`Open` → `SelectOutput` →
+`PutStr`, asserting both the file contents and that `ctx.out` stays
+empty).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

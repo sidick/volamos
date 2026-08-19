@@ -12,7 +12,7 @@
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::dosfile::map_io_error;
+use crate::dosbuf::write_bytes;
 use crate::execfmt::render_format;
 use crate::guestmem::{addr_from_bptr, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
@@ -20,7 +20,9 @@ use crate::lvos::dos::DOS_LVOS;
 const RESULT_ERROR: u32 = 0xFFFF_FFFF;
 
 /// `VPrintf` (`D1` = format string, `D2` = data stream). `D0` = number
-/// of characters written, or `-1` (+ `IoErr()` set).
+/// of characters written, or `-1` (+ `IoErr()` set). Writes to the
+/// *current* `Output()` selection, so a preceding `SelectOutput` (e.g.
+/// `Type FROM x TO y`) redirects it, exactly like real `VPrintf`.
 fn vprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let fmt_ptr = ctx.cpu.data_register(DataRegister(1));
     let data_ptr = ctx.cpu.data_register(DataRegister(2));
@@ -28,12 +30,18 @@ fn vprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let fmt = read_c_string(ctx.mem, fmt_ptr);
     let (rendered, _) = render_format(ctx.mem, &fmt, data_ptr);
 
-    match ctx.out.write_all(&rendered) {
-        Ok(()) => ctx
-            .cpu
-            .set_data_register(DataRegister(0), rendered.len() as u32),
-        Err(e) => {
-            ctx.dos.set_io_err(map_io_error(&e));
+    let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
+        Ok(addr) => addr,
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
+            return Ok(());
+        }
+    };
+    match write_bytes(ctx, out_addr, &rendered) {
+        Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
     }
@@ -52,20 +60,7 @@ fn vfprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let fmt = read_c_string(ctx.mem, fmt_ptr);
     let (rendered, _) = render_format(ctx.mem, &fmt, data_ptr);
 
-    if ctx.dos.is_output_default(addr) {
-        match ctx.out.write_all(&rendered) {
-            Ok(()) => ctx
-                .cpu
-                .set_data_register(DataRegister(0), rendered.len() as u32),
-            Err(e) => {
-                ctx.dos.set_io_err(map_io_error(&e));
-                ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
-            }
-        }
-        return Ok(());
-    }
-
-    match ctx.dos.write(addr, &rendered) {
+    match write_bytes(ctx, addr, &rendered) {
         Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
         Err(code) => {
             ctx.dos.set_io_err(code);

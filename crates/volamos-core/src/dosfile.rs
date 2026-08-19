@@ -239,11 +239,27 @@ pub struct DosState {
     /// The current `IoErr()` value.
     io_err: i32,
     /// Guest address of the lazily-created `Input()` default handle's
-    /// `FileHandle` struct.
+    /// `FileHandle` struct -- always backed by [`HostHandle::Stdin`].
+    /// Distinct from `current_input`: this is only ever the *host stdin*
+    /// handle, used by [`Self::close`]'s no-op case, regardless of
+    /// what `SelectInput` has redirected `Input()` to.
     input_handle: Option<u32>,
     /// Guest address of the lazily-created `Output()` default handle's
-    /// `FileHandle` struct.
+    /// `FileHandle` struct -- always backed by [`HostHandle::Stdout`].
+    /// Distinct from `current_output`: this is only ever the *host
+    /// stdout* handle, used by [`Self::is_output_default`]/
+    /// [`Self::close`], regardless of what `SelectOutput` has
+    /// redirected `Output()` to.
     output_handle: Option<u32>,
+    /// The handle `Input()`/`FGetC` et al currently read from -- starts
+    /// out mirroring `input_handle` once that's created, but
+    /// `SelectInput` can repoint it at any open handle.
+    current_input: Option<u32>,
+    /// The handle `Output()`/`WriteChars`/`FPuts` et al currently write
+    /// to -- starts out mirroring `output_handle` once that's created,
+    /// but `SelectOutput` can repoint it at any open handle (e.g. a real
+    /// file, as `Type ... TO file` does).
+    current_output: Option<u32>,
     /// Monotonic counter used only to give each opened handle a distinct
     /// debug id written into `fh_Arg1` (see the module docs) -- not used
     /// for lookups.
@@ -360,6 +376,8 @@ impl DosState {
             io_err: 0,
             input_handle: None,
             output_handle: None,
+            current_input: None,
+            current_output: None,
             next_debug_id: 0,
             locks: HashMap::new(),
             exnext: HashMap::new(),
@@ -544,8 +562,9 @@ impl DosState {
         }
     }
 
-    /// `Input()`: returns the guest address of the (lazily-created)
-    /// default input `FileHandle`, or an `IoErr()` code if the guest
+    /// `Input()`: returns the guest address of the *currently selected*
+    /// input handle (lazily-creating and selecting the default,
+    /// stdin-backed one on first use), or an `IoErr()` code if the guest
     /// heap has no room to create it (extremely unlikely; the struct is
     /// 44 bytes).
     pub fn input_addr(
@@ -553,31 +572,73 @@ impl DosState {
         heap: &mut GuestHeap,
         mem: &mut dyn AddressSpace,
     ) -> Result<u32, i32> {
-        if let Some(addr) = self.input_handle {
+        if let Some(addr) = self.current_input {
             return Ok(addr);
         }
-        let id = self.next_id();
-        let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
-        self.handles.insert(addr, HostHandle::Stdin);
-        self.input_handle = Some(addr);
+        let addr = match self.input_handle {
+            Some(addr) => addr,
+            None => {
+                let id = self.next_id();
+                let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+                self.handles.insert(addr, HostHandle::Stdin);
+                self.input_handle = Some(addr);
+                addr
+            }
+        };
+        self.current_input = Some(addr);
         Ok(addr)
     }
 
-    /// `Output()`: as [`Self::input_addr`], for the default output
+    /// `Output()`: as [`Self::input_addr`], for the current output
     /// handle.
     pub fn output_addr(
         &mut self,
         heap: &mut GuestHeap,
         mem: &mut dyn AddressSpace,
     ) -> Result<u32, i32> {
-        if let Some(addr) = self.output_handle {
+        if let Some(addr) = self.current_output {
             return Ok(addr);
         }
-        let id = self.next_id();
-        let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
-        self.handles.insert(addr, HostHandle::Stdout);
-        self.output_handle = Some(addr);
+        let addr = match self.output_handle {
+            Some(addr) => addr,
+            None => {
+                let id = self.next_id();
+                let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+                self.handles.insert(addr, HostHandle::Stdout);
+                self.output_handle = Some(addr);
+                addr
+            }
+        };
+        self.current_output = Some(addr);
         Ok(addr)
+    }
+
+    /// `SelectInput` (`D1` = new input `FileHandle` `BPTR`): repoints
+    /// [`Self::input_addr`]/`Input()` at `new_addr`, returning the
+    /// *previous* selection's address (lazily creating the stdin-backed
+    /// default first if nothing had been selected yet, matching a real
+    /// process always having a valid `pr_CIS`).
+    pub fn select_input(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        new_addr: u32,
+    ) -> Result<u32, i32> {
+        let old = self.input_addr(heap, mem)?;
+        self.current_input = Some(new_addr);
+        Ok(old)
+    }
+
+    /// `SelectOutput`: as [`Self::select_input`], for `Output()`.
+    pub fn select_output(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        new_addr: u32,
+    ) -> Result<u32, i32> {
+        let old = self.output_addr(heap, mem)?;
+        self.current_output = Some(new_addr);
+        Ok(old)
     }
 }
 
@@ -743,6 +804,40 @@ fn output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     Ok(())
 }
 
+/// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
+/// `BPTR`.
+fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let new_addr = addr_from_bptr(bptr);
+    match ctx.dos.select_input(ctx.heap, ctx.mem, new_addr) {
+        Ok(old) => ctx
+            .cpu
+            .set_data_register(DataRegister(0), bptr_from_addr(old)),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+    }
+    Ok(())
+}
+
+/// `SelectOutput` (`D1` = `BPTR`). `D0` = the previous output handle's
+/// `BPTR`.
+fn select_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let new_addr = addr_from_bptr(bptr);
+    match ctx.dos.select_output(ctx.heap, ctx.mem, new_addr) {
+        Ok(old) => ctx
+            .cpu
+            .set_data_register(DataRegister(0), bptr_from_addr(old)),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+    }
+    Ok(())
+}
+
 /// `IoErr()`. `D0` = current `IoErr()` value.
 fn ioerr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.cpu
@@ -759,17 +854,25 @@ fn setioerr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 }
 
 /// `PutStr` (`D1` = `CString*`). `D0` = 0 on success, -1 on failure.
-/// Always writes to `Output()`, which -- per this runtime's convention
-/// (see the module docs) -- means `ctx.out` directly, exactly like
-/// Phase 1's hand-registered `PutStr` did, so output still lands
-/// wherever the caller of `Runtime::run` pointed it.
+/// Writes to the *current* `Output()` selection (so a preceding
+/// `SelectOutput` redirects it, exactly like real `PutStr`), which by
+/// default is `ctx.out` directly, so output still lands wherever the
+/// caller of `Runtime::run` pointed it.
 fn putstr_via_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ptr = ctx.cpu.data_register(DataRegister(1));
     let bytes = read_c_string(ctx.mem, ptr);
-    match ctx.out.write_all(&bytes) {
-        Ok(()) => ctx.cpu.set_data_register(DataRegister(0), 0),
-        Err(e) => {
-            ctx.dos.set_io_err(map_io_error(&e));
+    let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
+        Ok(addr) => addr,
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
+            return Ok(());
+        }
+    };
+    match crate::dosbuf::write_bytes(ctx, out_addr, &bytes) {
+        Ok(_) => ctx.cpu.set_data_register(DataRegister(0), 0),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
     }
@@ -804,6 +907,8 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("Seek", seek_handler::<C>);
     reg!("Input", input_handler::<C>);
     reg!("Output", output_handler::<C>);
+    reg!("SelectInput", select_input_handler::<C>);
+    reg!("SelectOutput", select_output_handler::<C>);
     reg!("IoErr", ioerr_handler::<C>);
     reg!("SetIoErr", setioerr_handler::<C>);
     reg!("PutStr", putstr_via_output_handler::<C>);
@@ -970,6 +1075,43 @@ mod tests {
         // Repeat calls return the same handle.
         assert_eq!(dos.input_addr(&mut heap, &mut mem).unwrap(), in_addr);
         assert_eq!(dos.output_addr(&mut heap, &mut mem).unwrap(), out_addr);
+    }
+
+    #[test]
+    fn select_output_redirects_output_addr_and_returns_the_previous_handle() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let default_out = dos.output_addr(&mut heap, &mut mem).unwrap();
+
+        let new_addr = 0x1234;
+        let old = dos.select_output(&mut heap, &mut mem, new_addr).unwrap();
+        assert_eq!(old, default_out, "should return the previous selection");
+        assert_eq!(dos.output_addr(&mut heap, &mut mem).unwrap(), new_addr);
+
+        // is_output_default must still only recognize the real
+        // stdout-backed handle -- not whatever's currently selected --
+        // so a direct Write() to the redirected handle isn't hijacked.
+        assert!(dos.is_output_default(default_out));
+        assert!(!dos.is_output_default(new_addr));
+
+        // Selecting back restores the previous value on the next call.
+        let old2 = dos.select_output(&mut heap, &mut mem, default_out).unwrap();
+        assert_eq!(old2, new_addr);
+        assert_eq!(dos.output_addr(&mut heap, &mut mem).unwrap(), default_out);
+    }
+
+    #[test]
+    fn select_input_redirects_input_addr_and_returns_the_previous_handle() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let default_in = dos.input_addr(&mut heap, &mut mem).unwrap();
+
+        let new_addr = 0x5678;
+        let old = dos.select_input(&mut heap, &mut mem, new_addr).unwrap();
+        assert_eq!(old, default_in);
+        assert_eq!(dos.input_addr(&mut heap, &mut mem).unwrap(), new_addr);
     }
 
     #[test]
@@ -1241,6 +1383,47 @@ mod tests {
             "Write should return the byte count (2) as the exit code"
         );
         assert_eq!(out, b"hi");
+    }
+
+    #[test]
+    fn end_to_end_select_output_redirects_putstr_to_a_real_file() {
+        let tmp = TempDir::new("e2e-selectoutput");
+        let name = b"SYS:redirected.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched below)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, MODE_NEWFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = BPTR
+        words.push(move_d0_to_d(1)); // D1 = the new file's handle
+        push_jsr(&mut words, 6, -300); // SelectOutput(a6): D0 = old handle (discarded)
+        let msg_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = message (patched below)
+        push_jsr(&mut words, 6, -948); // PutStr(a6): D0 = 0 on success
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let msg = b"hello redirected\0";
+        let msg_addr = name_addr + name.len() as u32;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, msg_idx, msg_addr);
+
+        let mut extra = name.to_vec();
+        extra.extend_from_slice(msg);
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, &extra, Some(tmp.path()));
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "PutStr should report success");
+        assert!(
+            out.is_empty(),
+            "nothing should reach ctx.out after redirection"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("redirected.txt")).unwrap(),
+            b"hello redirected"
+        );
     }
 
     #[test]
