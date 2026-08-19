@@ -1890,10 +1890,10 @@ mod tests {
         use crate::lvos::dos::DOS_LVOS;
 
         // Register PutStr by name (populates the base -> table map), then
-        // jsr an unrelated, unregistered LVO on the same base: -78 is
-        // Rename's real offset, but no handler is registered for it.
+        // jsr an unrelated, unregistered LVO on the same base: -180 is
+        // SetComment's real offset, but no handler is registered for it.
         let entry = TRAP_TABLE_END;
-        let words = [0x4EAE, (-78i16) as u16, 0x4E75]; // jsr -78(a6) ; rts
+        let words = [0x4EAE, (-180i16) as u16, 0x4E75]; // jsr -180(a6) ; rts
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
         let mut rt = Runtime::new(
@@ -1924,8 +1924,8 @@ mod tests {
                 assert!(
                     candidates
                         .iter()
-                        .any(|(lib, offset)| lib == "dos.library/Rename" && *offset == -78),
-                    "expected a dos.library/Rename (-78) candidate, got {candidates:?}"
+                        .any(|(lib, offset)| lib == "dos.library/SetComment" && *offset == -180),
+                    "expected a dos.library/SetComment (-180) candidate, got {candidates:?}"
                 );
             }
             other => panic!("expected UnknownCall, got {other:?}"),

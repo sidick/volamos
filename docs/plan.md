@@ -1250,6 +1250,64 @@ New tests: 7, all in `dosfile.rs` (2 unit-level for the
 interactive/non-interactive `fh_Port` distinction, 3 end-to-end
 trap-dispatch for `IsInteractive`/`SetMode`/`WaitForChar`).
 
+**`MakeDir`/`Rename` — 2026-08-19.** `MakeDir` already worked with no
+new gaps (built entirely on `CreateDir`, from the `Copy` work above).
+`Rename` needed the `Rename` LVO itself (added to `doslock.rs`,
+mirroring `DeleteFile`'s shape: resolve both paths, fail with
+`ERROR_OBJECT_EXISTS` if the target already exists, `std::fs::rename`)
+-- but that surfaced a real, more interesting bug first.
+
+**`dospattern.rs`'s tokenized-encoding redesign**: the real Workbench
+3.1.4 `Rename` binary calls `ParsePattern` on its own source-name
+argument, then passes *that same buffer's pointer* straight to
+`Rename()`'s `oldName` parameter -- i.e. it reuses `ParsePattern`'s
+output as a plain `STRPTR` when the name has no wildcard. This
+runtime's original `dospattern.rs` (see `docs/plan.md`'s Phase 3 entry)
+took the RKRM's "the byte encoding ... should be considered internal"
+literally and used an arbitrary length-prefixed binary serialization
+(`OP_LITERAL` + byte per character, `OP_SEQ` + count header, ...) --
+which meant a plain 15-character path like `"WORK:hello2.txt"` encoded
+to `04 0f 00 57 00 4f ...` (an `OP_SEQ` header, then each letter
+individually prefixed by an `OP_LITERAL` tag byte) instead of the
+literal text. `Rename` reading that back as a C string produced
+garbage, and the rename silently failed with a spurious "Object not
+found".
+
+Root-caused via a temporary `eprintln!` dump of the raw bytes at the
+argument pointer (no disassembler available, same technique as the
+`Version`/`fib_FileName` investigations earlier). Once diagnosed, the
+fix follows directly from real `ParsePattern`'s actual, empirically
+necessary property: for a pattern with **no wildcards at all**, its
+tokenized output must be byte-for-byte identical to the input (plus a
+`NUL` terminator). Rewrote the encoding as a literal transliteration of
+the original wildcard syntax instead of an opaque serialization:
+ordinary characters pass through as themselves; only the wildcard
+*operators* (`?`, `#`, `~`, `%`, `(`/`|`/`)`, `[`/`]`) become single
+reserved bytes in the `0x80`-`0x9f` C1 control range, which (per the
+RKRM's own `paths-and-filenames.md`) can never legally appear in a real
+AmigaOS path character -- so the encoding needs no length prefixes
+anywhere, self-terminating on a trailing `0x00` exactly like a normal
+C string. A `#`/`~` prefix's inner atom needed one subtlety: since
+`parse_group`'s single-branch collapse means `~(#?.info)` parses to
+`Not(Seq([...]))` with no group wrapper left in the tree, a bare `Seq`
+directly under `Not`/`Repeat` has to be *re*-wrapped in synthetic group
+markers on encode (nothing else besides an explicit `(...)` could have
+produced a multi-atom inner for a prefix operator, so this is the only
+case needing it) -- found immediately by the pattern module's own
+pre-existing round-trip test, which caught the regression before it
+ever reached the corpus binary.
+
+`Rename` now runs fully end-to-end against the real corpus binary:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Rename WORK:hello2.txt WORK:renamed.txt
+$ ls <vol>/renamed.txt   # hello2.txt is gone, renamed.txt has its contents
+```
+New tests: 5 (`doslock.rs`, for `Rename`, including one end-to-end
+trap-dispatch test), 1 (`dospattern.rs`, asserting the no-wildcard
+byte-identical property directly, alongside the pre-existing
+`encode_decode_round_trip` test that caught the `Not(Seq(...))`
+regression during the rewrite itself).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

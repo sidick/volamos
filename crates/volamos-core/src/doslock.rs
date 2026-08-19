@@ -288,6 +288,31 @@ impl DosState {
         }
     }
 
+    /// `Rename(old_name, new_name)`: renames and/or relocates a file
+    /// system object. Fails with [`crate::dosfile::ERROR_OBJECT_EXISTS`]
+    /// if `new_name` already exists. This runtime doesn't check that
+    /// both paths are on the same volume/device (real `Rename` requires
+    /// this; a cross-volume rename here just becomes a host
+    /// `std::fs::rename`, which on most platforms fails on its own with
+    /// an `IoErr()`-mappable error if the underlying filesystems truly
+    /// differ) or reject relocating a directory into itself.
+    pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), i32> {
+        let vfs = self
+            .vfs
+            .as_ref()
+            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+        let old_path = vfs
+            .resolve(old_name, ResolveMode::MustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        let new_path = vfs
+            .resolve(new_name, ResolveMode::ParentMustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        if new_path.exists() {
+            return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
+        }
+        std::fs::rename(&old_path, &new_path).map_err(|e| map_io_error(&e))
+    }
+
     /// `SameLock(lock1, lock2)`: [`LOCK_SAME`]/[`LOCK_SAME_VOLUME`]/
     /// [`LOCK_DIFFERENT`]. Identical `BPTR`s (including two `ZERO`
     /// locks) are always [`LOCK_SAME`]; otherwise this compares the
@@ -675,6 +700,23 @@ fn delete_file_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
+/// `Rename` (`D1` = old name `CString*`, `D2` = new name `CString*`).
+/// `D0` = `DOSTRUE`/`DOSFALSE` (+ `IoErr()` set on failure).
+fn rename_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let old_ptr = ctx.cpu.data_register(DataRegister(1));
+    let new_ptr = ctx.cpu.data_register(DataRegister(2));
+    let old_name = String::from_utf8_lossy(&read_c_string(ctx.mem, old_ptr)).into_owned();
+    let new_name = String::from_utf8_lossy(&read_c_string(ctx.mem, new_ptr)).into_owned();
+    match ctx.dos.rename(&old_name, &new_name) {
+        Ok(()) => ctx.cpu.set_data_register(DataRegister(0), DOSTRUE),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
+    Ok(())
+}
+
 /// `UnLock` (`D1` = `BPTR`). No return value (real `UnLock` is `void`).
 fn unlock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
@@ -816,6 +858,7 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("CreateDir", create_dir_handler::<C>);
     reg!("SameLock", same_lock_handler::<C>);
     reg!("DeleteFile", delete_file_handler::<C>);
+    reg!("Rename", rename_handler::<C>);
     reg!("UnLock", unlock_handler::<C>);
     reg!("DupLock", dup_lock_handler::<C>);
     reg!("Examine", examine_handler::<C>);
@@ -1040,6 +1083,47 @@ mod tests {
         let tmp = TempDir::new("deletefile-missing");
         let mut dos = DosState::new(Some(vfs_over(tmp.path())));
         let err = dos.delete_file("SYS:nope.txt").unwrap_err();
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn rename_renames_a_file_in_place() {
+        let tmp = TempDir::new("rename-inplace");
+        fs::write(tmp.path().join("old.txt"), b"hi").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.rename("SYS:old.txt", "SYS:new.txt").unwrap();
+        assert!(!tmp.path().join("old.txt").exists());
+        assert_eq!(fs::read(tmp.path().join("new.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn rename_relocates_into_another_directory() {
+        let tmp = TempDir::new("rename-relocate");
+        fs::create_dir(tmp.path().join("dest")).unwrap();
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.rename("SYS:f.txt", "SYS:dest/f.txt").unwrap();
+        assert!(!tmp.path().join("f.txt").exists());
+        assert_eq!(fs::read(tmp.path().join("dest/f.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn rename_target_already_exists_fails() {
+        let tmp = TempDir::new("rename-exists");
+        fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        fs::write(tmp.path().join("b.txt"), b"b").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos.rename("SYS:a.txt", "SYS:b.txt").unwrap_err();
+        assert_eq!(err, crate::dosfile::ERROR_OBJECT_EXISTS);
+        assert_eq!(fs::read(tmp.path().join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(tmp.path().join("b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn rename_missing_source_fails() {
+        let tmp = TempDir::new("rename-missing");
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos.rename("SYS:nope.txt", "SYS:new.txt").unwrap_err();
         assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
     }
 
@@ -1533,5 +1617,39 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, DOSTRUE as i32);
         assert!(!tmp.path().join("f.txt").exists());
+    }
+
+    #[test]
+    fn end_to_end_rename_renames_the_host_file() {
+        let tmp = TempDir::new("e2e-rename");
+        fs::write(tmp.path().join("old.txt"), b"hi").unwrap();
+        let old_name = b"SYS:old.txt\0";
+        let new_name = b"SYS:new.txt\0";
+
+        let mut words = Vec::new();
+        let old_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = old name (patched)
+        words.push(0);
+        words.push(0);
+        let new_idx = words.len();
+        words.push(move_imm_to_d(2)); // D2 = new name (patched)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -78); // Rename(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let old_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let new_addr = old_addr + old_name.len() as u32;
+        patch_imm32(&mut words, old_idx, old_addr);
+        patch_imm32(&mut words, new_idx, new_addr);
+
+        let mut extra = old_name.to_vec();
+        extra.extend_from_slice(new_name);
+        let mut rt = runtime_with_program_and_extra(&words, old_addr, &extra, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert!(!tmp.path().join("old.txt").exists());
+        assert_eq!(fs::read(tmp.path().join("new.txt")).unwrap(), b"hi");
     }
 }

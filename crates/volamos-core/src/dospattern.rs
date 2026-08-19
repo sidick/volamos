@@ -40,14 +40,35 @@
 //! # Tokenized encoding
 //!
 //! The real dos.library documents its tokenized format only as "use
-//! `ParsePattern`/`MatchPattern` as a pair" and explicitly calls the
-//! byte encoding internal (ISO-Latin-1 C1 control codes, "should be
-//! considered internal"). Nothing in a real program is meant to inspect
-//! those bytes -- only `MatchPattern(NoCase)` ever reads them back -- so
-//! this runtime is free to use its own self-delimiting recursive
-//! encoding (see [`encode`]/[`decode`]) rather than replicate the real
-//! byte-for-byte format; the two are only ever exchanged between this
-//! module's own `ParsePattern` and `MatchPattern` handlers.
+//! `ParsePattern`/`MatchPattern` as a pair" and calls the byte encoding
+//! internal (ISO-Latin-1 C1 control codes, "should be considered
+//! internal"). An earlier version of this module took that at face
+//! value and used an arbitrary length-prefixed binary serialization
+//! instead -- until the real Workbench 3.1.4 `Rename` binary broke
+//! against it: real `ParsePattern`'s actual, empirically-observed
+//! property is that for a pattern with **no wildcards at all**, the
+//! tokenized output is byte-for-byte identical to the input string
+//! (plus a `NUL` terminator) -- i.e. real programs *do* rely on being
+//! able to reuse a `ParsePattern` destination buffer as a plain
+//! `STRPTR` when there was nothing to tokenize, and `Rename` is exactly
+//! such a program (it `ParsePattern`s its source-name argument, then
+//! passes that same buffer's pointer straight to `Rename()`'s own
+//! `oldName` argument).
+//!
+//! This module now matches that property directly: [`encode`] is a
+//! literal transliteration of the original wildcard syntax --
+//! ordinary characters (`Node::Literal`) are written as themselves, and
+//! only the wildcard *operators* (`?`, `#`, `~`, `%`, `(`/`|`/`)`,
+//! `[`/`]`) become single reserved bytes in the `0x80`-`0x9F` C1
+//! control range, which can never legally appear in a real AmigaOS path
+//! character (RKRM `paths-and-filenames.md`: printable characters are
+//! `0x20`-`0x7e` and `0xa0`-`0xff` only). The encoding is
+//! self-terminating on a trailing `0x00` (which also can never appear
+//! in a literal, since the source is always read via
+//! [`read_c_string`]), so [`decode_from_mem`] never needs a length
+//! prefix either -- structurally, this mirrors the original pattern
+//! text almost exactly, just with each operator character swapped for
+//! its reserved-byte equivalent.
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
@@ -243,162 +264,275 @@ pub(crate) fn parse(source: &[u8]) -> Result<(Node, bool), i32> {
     Ok((node, parser.has_wildcard))
 }
 
-// --- Self-delimiting byte encoding (module docs) ---
+// --- Byte encoding: a literal transliteration (module docs) ---
 
-const OP_LITERAL: u8 = 0x00;
-const OP_ANY: u8 = 0x01;
-const OP_EMPTY: u8 = 0x02;
-const OP_CLASS: u8 = 0x03;
-const OP_SEQ: u8 = 0x04;
-const OP_ALT: u8 = 0x05;
-const OP_NOT: u8 = 0x06;
-const OP_REPEAT: u8 = 0x07;
+/// `?`.
+const C_ANY: u8 = 0x80;
+/// `%`.
+const C_EMPTY: u8 = 0x81;
+/// `#`, prefixing the one atom it repeats.
+const C_REPEAT: u8 = 0x82;
+/// `~`, prefixing the one atom it negates.
+const C_NOT: u8 = 0x83;
+/// `(`.
+const C_GROUP_START: u8 = 0x84;
+/// `|`.
+const C_ALT_SEP: u8 = 0x85;
+/// `)`.
+const C_GROUP_END: u8 = 0x86;
+/// `[` (or `[~` -- see [`C_CLASS_NEGATE`]).
+const C_CLASS_START: u8 = 0x87;
+/// The `~` immediately after `[` negating a class; only ever appears
+/// right after [`C_CLASS_START`].
+const C_CLASS_NEGATE: u8 = 0x88;
+/// `]`.
+const C_CLASS_END: u8 = 0x89;
+/// The `-` inside a class denoting a range (`lo`-`hi`); a single-byte
+/// class member is written without one.
+const C_RANGE_DASH: u8 = 0x8A;
 
 fn encode(node: &Node, out: &mut Vec<u8>) {
     match node {
-        Node::Literal(c) => {
-            out.push(OP_LITERAL);
-            out.push(*c);
-        }
-        Node::Any => out.push(OP_ANY),
-        Node::Empty => out.push(OP_EMPTY),
+        Node::Literal(c) => out.push(*c),
+        Node::Any => out.push(C_ANY),
+        Node::Empty => out.push(C_EMPTY),
         Node::Class { negate, ranges } => {
-            out.push(OP_CLASS);
-            out.push(u8::from(*negate));
-            out.push(ranges.len() as u8);
+            out.push(C_CLASS_START);
+            if *negate {
+                out.push(C_CLASS_NEGATE);
+            }
             for (lo, hi) in ranges {
                 out.push(*lo);
-                out.push(*hi);
+                if hi != lo {
+                    out.push(C_RANGE_DASH);
+                    out.push(*hi);
+                }
             }
+            out.push(C_CLASS_END);
         }
         Node::Seq(nodes) => {
-            out.push(OP_SEQ);
-            out.push(nodes.len() as u8);
             for n in nodes {
                 encode(n, out);
             }
         }
         Node::Alt(branches) => {
-            out.push(OP_ALT);
-            out.push(branches.len() as u8);
-            for b in branches {
+            out.push(C_GROUP_START);
+            for (i, b) in branches.iter().enumerate() {
+                if i > 0 {
+                    out.push(C_ALT_SEP);
+                }
                 encode(b, out);
             }
+            out.push(C_GROUP_END);
         }
         Node::Not(inner) => {
-            out.push(OP_NOT);
-            encode(inner, out);
+            out.push(C_NOT);
+            encode_prefixed_atom(inner, out);
         }
         Node::Repeat(inner) => {
-            out.push(OP_REPEAT);
-            encode(inner, out);
+            out.push(C_REPEAT);
+            encode_prefixed_atom(inner, out);
         }
     }
 }
 
-/// Decodes one [`Node`] starting at `buf[*pos]`, advancing `*pos` past
-/// it. `None` on truncated/corrupt input (should never happen for
-/// buffers this module's own `ParsePattern` wrote). Only used by the
-/// round-trip test now -- [`decode_from_mem`] is what `MatchPattern`
-/// actually calls, since it must read from guest memory rather than a
-/// pre-fetched byte slice.
+/// Encodes the single atom a `#`/`~` prefix applies to. Both operators'
+/// grammar (`parse_atom`) only ever consumes exactly one following atom
+/// -- the only way that atom ends up being a bare, multi-child
+/// `Node::Seq` (rather than some other self-delimiting single node) is
+/// via a parenthesized group whose single branch was collapsed
+/// (`parse_group`'s "if branches.len() == 1" case, e.g. `~(#?.info)`).
+/// [`encode`] alone would concatenate that `Seq`'s children with no
+/// boundary, making them indistinguishable from separate atoms
+/// *outside* the `#`/`~`'s scope once decoded -- so a bare `Seq` here
+/// is re-wrapped in the same group markers the original `(...)` would
+/// have produced, giving [`decode_atom`]'s existing `C_GROUP_START`
+/// case (which already collapses a single branch back to a bare `Seq`)
+/// something it can decode as one atom. Every other node kind already
+/// self-delimits and needs no wrapping.
+fn encode_prefixed_atom(inner: &Node, out: &mut Vec<u8>) {
+    if matches!(inner, Node::Seq(_)) {
+        out.push(C_GROUP_START);
+        encode(inner, out);
+        out.push(C_GROUP_END);
+    } else {
+        encode(inner, out);
+    }
+}
+
+/// A one-byte-lookahead source of encoded-pattern bytes, generic over
+/// where those bytes actually live ([`SliceSource`] for the round-trip
+/// test, [`MemSource`] for [`decode_from_mem`]/`MatchPattern`). Also
+/// enforces a byte budget so a corrupt/foreign buffer (not written by
+/// this module's own `ParsePattern`) can't send decoding into an
+/// unbounded scan of guest memory looking for a terminator that will
+/// never come.
+trait ByteSource {
+    fn next(&mut self) -> u8;
+}
+
 #[cfg(test)]
-fn decode(buf: &[u8], pos: &mut usize) -> Option<Node> {
-    let op = *buf.get(*pos)?;
-    *pos += 1;
-    match op {
-        OP_LITERAL => {
-            let c = *buf.get(*pos)?;
-            *pos += 1;
-            Some(Node::Literal(c))
+struct SliceSource<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+#[cfg(test)]
+impl ByteSource for SliceSource<'_> {
+    fn next(&mut self) -> u8 {
+        let b = self.buf.get(self.pos).copied().unwrap_or(0);
+        if self.pos < self.buf.len() {
+            self.pos += 1;
         }
-        OP_ANY => Some(Node::Any),
-        OP_EMPTY => Some(Node::Empty),
-        OP_CLASS => {
-            let negate = *buf.get(*pos)? != 0;
-            *pos += 1;
-            let n = *buf.get(*pos)? as usize;
-            *pos += 1;
-            let mut ranges = Vec::with_capacity(n);
-            for _ in 0..n {
-                let lo = *buf.get(*pos)?;
-                let hi = *buf.get(*pos + 1)?;
-                *pos += 2;
-                ranges.push((lo, hi));
+        b
+    }
+}
+
+struct MemSource<'a> {
+    mem: &'a dyn AddressSpace,
+    addr: u32,
+}
+
+impl ByteSource for MemSource<'_> {
+    fn next(&mut self) -> u8 {
+        let b = self.mem.read_u8(self.addr);
+        self.addr = self.addr.wrapping_add(1);
+        b
+    }
+}
+
+/// Max bytes a single decode may consume, guarding against a
+/// corrupt/foreign buffer with no `0x00` terminator ever turning up.
+const DECODE_BYTE_BUDGET: u32 = 4096;
+
+struct Stream<S: ByteSource> {
+    src: S,
+    peeked: Option<u8>,
+    budget: u32,
+}
+
+impl<S: ByteSource> Stream<S> {
+    fn new(src: S) -> Self {
+        Self {
+            src,
+            peeked: None,
+            budget: DECODE_BYTE_BUDGET,
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        if self.peeked.is_none() {
+            if self.budget == 0 {
+                return None;
+            }
+            self.peeked = Some(self.src.next());
+        }
+        self.peeked
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let b = self.peek()?;
+        self.peeked = None;
+        self.budget -= 1;
+        Some(b)
+    }
+}
+
+/// Decodes a run of atoms until a `0x00`/[`C_ALT_SEP`]/[`C_GROUP_END`]
+/// terminator (consumed), returning the built [`Node`] and which byte
+/// ended it.
+fn decode_seq<S: ByteSource>(s: &mut Stream<S>) -> Option<(Node, u8)> {
+    let mut atoms = Vec::new();
+    loop {
+        let b = s.peek()?;
+        if b == 0 || b == C_ALT_SEP || b == C_GROUP_END {
+            s.bump();
+            let node = if atoms.len() == 1 {
+                atoms.pop().unwrap()
+            } else {
+                Node::Seq(atoms)
+            };
+            return Some((node, b));
+        }
+        atoms.push(decode_atom(s)?);
+    }
+}
+
+fn decode_atom<S: ByteSource>(s: &mut Stream<S>) -> Option<Node> {
+    match s.bump()? {
+        C_ANY => Some(Node::Any),
+        C_EMPTY => Some(Node::Empty),
+        C_REPEAT => decode_atom(s).map(|n| Node::Repeat(Box::new(n))),
+        C_NOT => decode_atom(s).map(|n| Node::Not(Box::new(n))),
+        C_GROUP_START => {
+            let mut branches = Vec::new();
+            loop {
+                let (branch, term) = decode_seq(s)?;
+                branches.push(branch);
+                if term == C_GROUP_END {
+                    break;
+                }
+                if term != C_ALT_SEP {
+                    return None; // hit 0x00 (unterminated group) -- malformed
+                }
+            }
+            Some(if branches.len() == 1 {
+                branches.pop().unwrap()
+            } else {
+                Node::Alt(branches)
+            })
+        }
+        C_CLASS_START => {
+            let negate = if s.peek()? == C_CLASS_NEGATE {
+                s.bump();
+                true
+            } else {
+                false
+            };
+            let mut ranges = Vec::new();
+            loop {
+                if s.peek()? == C_CLASS_END {
+                    s.bump();
+                    break;
+                }
+                let lo = s.bump()?;
+                if s.peek()? == C_RANGE_DASH {
+                    s.bump();
+                    let hi = s.bump()?;
+                    ranges.push((lo, hi));
+                } else {
+                    ranges.push((lo, lo));
+                }
             }
             Some(Node::Class { negate, ranges })
         }
-        OP_SEQ => {
-            let n = *buf.get(*pos)? as usize;
-            *pos += 1;
-            let mut nodes = Vec::with_capacity(n);
-            for _ in 0..n {
-                nodes.push(decode(buf, pos)?);
-            }
-            Some(Node::Seq(nodes))
-        }
-        OP_ALT => {
-            let n = *buf.get(*pos)? as usize;
-            *pos += 1;
-            let mut branches = Vec::with_capacity(n);
-            for _ in 0..n {
-                branches.push(decode(buf, pos)?);
-            }
-            Some(Node::Alt(branches))
-        }
-        OP_NOT => decode(buf, pos).map(|n| Node::Not(Box::new(n))),
-        OP_REPEAT => decode(buf, pos).map(|n| Node::Repeat(Box::new(n))),
-        _ => None,
+        c => Some(Node::Literal(c)),
     }
+}
+
+/// Decodes one top-level [`Node`] starting at `buf[*pos]`, advancing
+/// `*pos` past it (including the terminating `0x00`). `None` on
+/// truncated/corrupt input (should never happen for buffers this
+/// module's own `ParsePattern` wrote). Only used by the round-trip test
+/// now -- [`decode_from_mem`] is what `MatchPattern` actually calls,
+/// since it must read from guest memory rather than a pre-fetched byte
+/// slice.
+#[cfg(test)]
+fn decode(buf: &[u8], pos: &mut usize) -> Option<Node> {
+    let mut stream = Stream::new(SliceSource { buf, pos: *pos });
+    let (node, _) = decode_seq(&mut stream)?;
+    *pos = stream.src.pos;
+    Some(node)
 }
 
 /// Same decoding as [`decode`], but reading directly from guest memory
-/// at `*addr` (advancing it past the node) rather than a pre-fetched
-/// byte slice. Used instead of `read_c_string` + [`decode`] because the
-/// tokenized encoding embeds raw `0x00` bytes ([`OP_LITERAL`]'s tag) that
-/// a NUL-terminated read would truncate on.
+/// at `*addr` (advancing it past the node, including the terminating
+/// `0x00`) rather than a pre-fetched byte slice.
 fn decode_from_mem(mem: &dyn AddressSpace, addr: &mut u32) -> Option<Node> {
-    let mut next = || {
-        let b = mem.read_u8(*addr);
-        *addr = addr.wrapping_add(1);
-        b
-    };
-    let op = next();
-    match op {
-        OP_LITERAL => Some(Node::Literal(next())),
-        OP_ANY => Some(Node::Any),
-        OP_EMPTY => Some(Node::Empty),
-        OP_CLASS => {
-            let negate = next() != 0;
-            let n = next() as usize;
-            let mut ranges = Vec::with_capacity(n);
-            for _ in 0..n {
-                let lo = next();
-                let hi = next();
-                ranges.push((lo, hi));
-            }
-            Some(Node::Class { negate, ranges })
-        }
-        OP_SEQ => {
-            let n = next() as usize;
-            let mut nodes = Vec::with_capacity(n);
-            for _ in 0..n {
-                nodes.push(decode_from_mem(mem, addr)?);
-            }
-            Some(Node::Seq(nodes))
-        }
-        OP_ALT => {
-            let n = next() as usize;
-            let mut branches = Vec::with_capacity(n);
-            for _ in 0..n {
-                branches.push(decode_from_mem(mem, addr)?);
-            }
-            Some(Node::Alt(branches))
-        }
-        OP_NOT => decode_from_mem(mem, addr).map(|n| Node::Not(Box::new(n))),
-        OP_REPEAT => decode_from_mem(mem, addr).map(|n| Node::Repeat(Box::new(n))),
-        _ => None,
-    }
+    let mut stream = Stream::new(MemSource { mem, addr: *addr });
+    let (node, _) = decode_seq(&mut stream)?;
+    *addr = stream.src.addr;
+    Some(node)
 }
 
 // --- Matching ---
@@ -521,6 +655,7 @@ fn parse_pattern(
     };
     let mut bytes = Vec::new();
     encode(&node, &mut bytes);
+    bytes.push(0); // terminator -- see the module docs' "Tokenized encoding" section
     if bytes.len() as u32 > dest_len {
         dos.set_io_err(ERROR_LINE_TOO_LONG);
         return -1;
@@ -716,6 +851,23 @@ mod tests {
         let mut pos = 0;
         let decoded = decode(&bytes, &mut pos).expect("decode");
         assert_eq!(decoded, node);
+    }
+
+    #[test]
+    fn a_pattern_with_no_wildcard_encodes_to_its_own_literal_bytes() {
+        // The real property (confirmed against the real Workbench
+        // 3.1.4 Rename binary, which reuses ParsePattern's own output
+        // buffer as a plain STRPTR for a non-wildcard name): with no
+        // wildcard characters at all, the tokenized encoding is
+        // byte-for-byte identical to the source, NUL-terminated.
+        let source = b"WORK:hello2.txt";
+        let (node, has_wildcard) = parse(source).expect("parse");
+        assert!(!has_wildcard);
+        let mut bytes = Vec::new();
+        encode(&node, &mut bytes);
+        bytes.push(0);
+        assert_eq!(&bytes[..bytes.len() - 1], source);
+        assert_eq!(*bytes.last().unwrap(), 0);
     }
 
     // --- End-to-end: real A-line trap dispatch ---
