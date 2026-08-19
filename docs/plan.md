@@ -2608,6 +2608,46 @@ This closes out this session's `AmiSnap` gap-chasing chain (`WaitPort`/
 its own `UnknownCall` candidate-offset diagnostic, and traced against
 a primary source (NDK headers and/or AROS) before implementing.
 
+## vamos coverage gap audit + `utility.library`'s `AllocateTagItems`/`FreeTagItems` -- 2026-08-19
+
+Simon shared a summary of which library/device calls the reference
+emulator vamos (amitools) implements, as a signal of what real corpus
+binaries commonly lean on. Cross-checked every function it names
+against volamos's current registered handlers (`grep`-verified against
+every `reg!`/`register_by_name` call site and the `lvos/*.rs` tables).
+Full findings and a phased plan saved for reuse; short version:
+everything vamos lists for `exec.library`/`dos.library`/`timer.device`
+and most of `utility.library` is already covered. Real gaps, roughly
+by size: `utility.library`'s `AllocateTagItems`/`FreeTagItems` and a
+whole new `mathffp.library` (cheap -- LVO table entries already exist
+or the pattern is well-established); the rest of the `SignalSemaphore`
+family (`FindSemaphore`/`AddSemaphore`/`RemSemaphore`/
+`ObtainSemaphoreList`/`ReleaseSemaphoreList`, needing a public
+`SysBase`-level semaphore list analogous to the existing `LibList`)
+and `dos.library`'s `RunCommand` (moderate); `locale.library` and an
+`intuition.library` stub (bigger -- brand new library bases). Deliberately
+excluded: `exec.library`'s `MakeLibrary`/`SetFunction`, which would need
+a real architectural extension (a jump-table slot that means "call back
+into guest code," which nothing in this runtime does today) rather than
+a mechanical LVO fill-in.
+
+First implemented: `AllocateTagItems`/`FreeTagItems` (LVO -66/-78,
+`crates/volamos-core/src/utility.rs`, alongside the existing
+`FindTagItem`/`GetTagData`/`NextTagItem`). Traced against AROS's
+`rom/utility/allocatetagitems.c`/`freetagitems.c` since the NDK autodoc
+doesn't spell out the exact underlying allocation: `AllocateTagItems`
+is `AllocMem(numTags * sizeof(TagItem), MEMF_CLEAR)` (`sizeof(TagItem)`
+already matches this module's existing `TAG_ITEM_SIZE` constant, 8);
+`FreeTagItems` takes no explicit count, so it recovers the array's
+size by walking to `TAG_DONE` with the same `next_tag_item_impl`
+traversal every other handler in this module already shares, then
+frees via `GuestHeap`. Both follow `crate::execmem`'s established
+conventions (`AllocMem(0, ...)`/`NULL`-free-is-a-no-op), and
+`FreeTagItems` on a never-allocated address fails loudly, matching
+`crate::execmem`'s `FreeVec`/`crate::execchunk`'s established
+diagnostic style. Full `cargo test --all` (508 passed), `cargo clippy
+--all-targets`, `cargo fmt --all` clean.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

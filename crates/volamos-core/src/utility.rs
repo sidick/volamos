@@ -247,6 +247,94 @@ fn next_tag_item_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
+/// `AllocateTagItems` (LVO -66): `D0` = `numTags` (the count *including*
+/// the terminating `TAG_DONE` -- real callers allocate one extra slot
+/// for it, per the Autodocs' `NOTES`). `D0` = a fresh `TagItem` array of
+/// that length, zeroed, or `0` (`NULL`) on failure -- traced against
+/// AROS's `rom/utility/allocatetagitems.c` since the NDK Autodoc names
+/// the underlying allocation call (`AllocMem(numTags *
+/// sizeof(struct TagItem), MEMF_CLEAR)`) without spelling out the exact
+/// wording used here. A `numTags` of `0` returns `NULL` without
+/// touching the heap, matching [`crate::execmem`]'s `AllocMem(0, ...)`
+/// convention (this module doesn't duplicate that module's
+/// `round_up_8` since `TAG_ITEM_SIZE` (8) already keeps every request
+/// a multiple of it).
+fn allocate_tag_items_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let num_tags = ctx.cpu.data_register(DataRegister(0));
+
+    if num_tags == 0 {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+
+    let byte_size = num_tags.saturating_mul(TAG_ITEM_SIZE);
+    match ctx.heap.alloc(byte_size) {
+        Ok(addr) => {
+            for i in 0..byte_size {
+                ctx.mem.write_u8(addr.wrapping_add(i), 0);
+            }
+            ctx.cpu.set_data_register(DataRegister(0), addr);
+        }
+        Err(_) => {
+            // Real AllocateTagItems returns NULL on failure rather than
+            // documenting an IoErr()-style secondary code -- matches
+            // AllocMem's own convention (crate::execmem).
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+    }
+    Ok(())
+}
+
+/// `FreeTagItems` (LVO -78): `A0` = a `TagItem` array allocated by
+/// [`allocate_tag_items_handler`] (or [`crate::execmem`]'s `AllocVec`
+/// via `CloneTagItems`, not implemented here). No return value. A
+/// `NULL` list is a documented-legal no-op (Autodocs' own `NOTES`:
+/// "The memory will only be freed if the input is non-NULL"). Real
+/// `FreeTagItems` takes no explicit count -- it recovers the
+/// allocation's size by walking to `TAG_DONE` via the same
+/// [`next_tag_item_impl`] traversal every other handler in this module
+/// uses (traced against AROS's `rom/utility/freetagitems.c`, which
+/// documents the *what* -- "must have been allocated by
+/// AllocateTagItems()" -- but not this exact recovery mechanism).
+fn free_tag_items_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let list = ctx.cpu.address_register(AddressRegister(0));
+    if list == 0 {
+        return Ok(());
+    }
+
+    // Count entries up to and including TAG_DONE (TAG_MORE/TAG_SKIP/
+    // TAG_IGNORE never legitimately appear in an AllocateTagItems-built
+    // array -- it's a flat, unchained block -- but walking with the
+    // shared traversal primitive costs nothing and stays correct even
+    // if a caller built one by hand with control tags in it).
+    let mut count: u32 = 0;
+    let mut cur = list;
+    loop {
+        let (found, resume) = next_tag_item_impl(ctx.mem, cur);
+        count += 1;
+        if found == 0 {
+            break;
+        }
+        cur = resume;
+    }
+
+    let byte_size = count.saturating_mul(TAG_ITEM_SIZE);
+    ctx.heap
+        .free(list)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "utility.library".to_string(),
+            lvo: -78,
+            handler_name: "FreeTagItems".to_string(),
+            message: format!(
+                "FreeTagItems called on {list:#010x} (walked to a {byte_size}-byte TagItem \
+             array), which isn't a currently-live AllocateTagItems allocation: {e}"
+            ),
+        })?;
+    Ok(())
+}
+
 /// Reads a NUL-terminated string and compares it against another,
 /// case-insensitively via [`amiga_tolower`], for at most `max_len` bytes
 /// (`u32::MAX` for the unbounded `Stricmp` case). Matches the Autodocs'
@@ -602,6 +690,8 @@ pub fn register_utility_handlers<C: Cpu + 'static>(
     reg!("FindTagItem", find_tag_item_handler::<C>);
     reg!("GetTagData", get_tag_data_handler::<C>);
     reg!("NextTagItem", next_tag_item_handler::<C>);
+    reg!("AllocateTagItems", allocate_tag_items_handler::<C>);
+    reg!("FreeTagItems", free_tag_items_handler::<C>);
     reg!("Stricmp", stricmp_handler::<C>);
     reg!("Strnicmp", strnicmp_handler::<C>);
     reg!("ToUpper", to_upper_handler::<C>);
@@ -855,6 +945,114 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 777);
+    }
+
+    // --- AllocateTagItems/FreeTagItems ---
+
+    /// `move.l D0,An`.
+    fn move_d0_to_a(n: u16) -> u16 {
+        0x2040 | (n << 9)
+    }
+
+    #[test]
+    fn allocate_tag_items_returns_a_zeroed_block() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = numTags (3)
+        words.push(0);
+        words.push(3);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // AllocateTagItems
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0);
+        for i in 0..(3 * TAG_ITEM_SIZE) {
+            assert_eq!(
+                rt.memory().read_u8(addr + i),
+                0,
+                "byte {i} of a fresh AllocateTagItems block should be zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_tag_items_zero_returns_null() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = 0
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // AllocateTagItems
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn end_to_end_allocate_then_free_tag_items_round_trip() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = numTags (2)
+        words.push(0);
+        words.push(2);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // AllocateTagItems -> D0
+        words.push(move_d0_to_a(0)); // A0 = the array
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // FreeTagItems
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+    }
+
+    #[test]
+    fn free_tag_items_null_is_a_no_op() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = NULL
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // FreeTagItems
+        words.push(move_imm_to_d(0)); // D0 = 42, proving control returned here
+        words.push(0);
+        words.push(42);
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn free_tag_items_on_a_never_allocated_address_fails_loudly() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = some address never returned by AllocateTagItems
+        words.push((TRAP_TABLE_END >> 16) as u16);
+        words.push(TRAP_TABLE_END as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // FreeTagItems
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let err = rt
+            .run(&mut out, None)
+            .expect_err("freeing a never-allocated address should fail loudly");
+        match err {
+            crate::dispatch::RuntimeError::Dispatch(DispatchError::HandlerFailed {
+                library,
+                lvo,
+                handler_name,
+                ..
+            }) => {
+                assert_eq!(library, "utility.library");
+                assert_eq!(lvo, -78);
+                assert_eq!(handler_name, "FreeTagItems");
+            }
+            other => panic!("expected HandlerFailed, got {other:?}"),
+        }
     }
 
     // --- Stricmp/Strnicmp ---
