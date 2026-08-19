@@ -2686,6 +2686,61 @@ Full `cargo test --all` (518 passed), `cargo clippy --all-targets`,
 `cargo fmt --all` clean. This closes out Tier 1 of the vamos coverage
 audit; Tier 2 (semaphore list functions, `RunCommand`) next.
 
+## `exec.library`'s public `SemaphoreList` family (vamos gap audit, Tier 2) -- 2026-08-19
+
+`FindSemaphore`/`AddSemaphore`/`RemSemaphore`/`ObtainSemaphoreList`/
+`ReleaseSemaphoreList` -- the rest of the `SignalSemaphore` API not
+already covered by `crates/volamos-core/src/execsem.rs`'s existing
+`InitSemaphore`/`ObtainSemaphore`/`ReleaseSemaphore`/`AttemptSemaphore`.
+These all revolve around `ExecBase.SemaphoreList`, a real public,
+named-semaphore list this runtime didn't have yet -- but `ExecBase.LibList`
+(`EXEC_BASE_LIBLIST_OFFSET`) already established exactly this pattern
+(a real walkable `struct List` on the fake `ExecBase`, initialized by
+`Runtime::new`), so this was "do that again," not a new design.
+
+New `EXEC_BASE_SEMAPHORELIST_OFFSET` (532), derived field-by-field the
+same way as `EXEC_BASE_LIBLIST_OFFSET`/`EXEC_BASE_ATTNFLAGS_OFFSET`
+(continuing past `LibList` through `PortList`/`TaskReady`/`TaskWait`/
+`SoftInts[5]`/`LastAlert[4]`/`VBlankFrequency`/`PowerSupplyFrequency`),
+cross-checked by landing exactly on the two already-verified offsets
+(296, 378) along the way. `Runtime::new`'s zero-then-populate span
+extended to cover it, initialized as a real empty list via
+`crate::execlist::init_list_header` (the same helper `ExecBase.LibList`
+uses).
+
+Algorithms traced against AROS's `rom/exec/addsemaphore.c`/
+`remsemaphore.c`/`findsemaphore.c`/`obtainsemaphorelist.c`/
+`releasesemaphorelist.c` (NDK documents the API shape, not the
+algorithm): `AddSemaphore` calls `InitSemaphore` then `Enqueue`s
+(priority-ordered, not a plain `AddTail`) onto `SemaphoreList`;
+`RemSemaphore` is a plain `Remove`; `FindSemaphore` is `FindName` over
+the list; `ObtainSemaphoreList`/`ReleaseSemaphoreList` iterate an
+arbitrary caller-supplied list (not necessarily `SemaphoreList`
+itself -- real callers often build their own), applying the same
+per-semaphore obtain/release algorithm as the singular calls. Reused
+`crate::execlist`'s existing `enqueue_impl`/`remove_impl`/
+`find_name_impl` (all promoted from private to `pub(crate)` for this)
+rather than reimplementing list traversal a third time.
+
+`execsem.rs`'s existing `obtain_semaphore_handler`/
+`release_semaphore_handler` were refactored to share their core
+algorithm (`obtain_semaphore_impl`/`release_semaphore_impl`, returning
+`Result<(), u32>` -- the conflicting owner -- rather than a
+`DispatchError` directly) with the new List variants, so each call
+site wraps the same logic in its own LVO/handler-name-correct
+diagnostic. Same "single-tasking means contention is always a bug"
+philosophy as the original four calls: `ObtainSemaphoreList` fails the
+whole call loudly at the first semaphore it can't obtain, rather than
+attempting the real algorithm's partial-wait-then-retry dance (which
+needs another task to eventually release it -- impossible here).
+
+Full `cargo test --all` (522 passed), `cargo clippy --all-targets`,
+`cargo fmt --all` clean. This closes out Tier 2's semaphore half; only
+`RunCommand` (needs the nested-run callback wiring `System()`/
+`Execute()` already use) remains before Tier 3 (`locale.library`/
+`intuition.library`, pending Simon's always-present-vs-disk-gated
+design call).
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

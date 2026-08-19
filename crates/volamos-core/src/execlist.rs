@@ -263,7 +263,7 @@ pub(crate) fn add_tail_impl<M: AddressSpace + ?Sized>(mem: &mut M, list: u32, no
 /// `Remove` (LVO -252): unlinks `node` from whichever list it's currently
 /// on (determined purely from its own `ln_Succ`/`ln_Pred`, per real
 /// `Remove`'s contract -- it doesn't take a list argument at all).
-fn remove_impl<M: AddressSpace>(mem: &mut M, node: u32) {
+pub(crate) fn remove_impl<M: AddressSpace>(mem: &mut M, node: u32) {
     let pred = mem.read_u32(node + LN_PRED);
     let succ = mem.read_u32(node + LN_SUCC);
     mem.write_u32(pred + LN_SUCC, succ);
@@ -311,7 +311,7 @@ fn insert_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32, pred: u32) {
 /// node with a priority `>= node`'s (i.e. FIFO order among nodes sharing
 /// the same priority) and before the first node with a strictly lower
 /// priority.
-fn enqueue_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32) {
+pub(crate) fn enqueue_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32) {
     let pri = mem.read_u8(node + LN_PRI) as i8;
     let mut next = mem.read_u32(list + LH_HEAD);
     loop {
@@ -334,7 +334,7 @@ fn enqueue_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32) {
 /// search from -- see the module docs) for the first node whose `ln_Name`
 /// case-sensitively equals `name`. Returns that node's address, or `0` if
 /// not found.
-fn find_name_impl<M: AddressSpace>(mem: &M, list: u32, name: &[u8]) -> u32 {
+pub(crate) fn find_name_impl<M: AddressSpace>(mem: &M, list: u32, name: &[u8]) -> u32 {
     let mut node = mem.read_u32(list + LH_HEAD);
     loop {
         let succ = mem.read_u32(node + LN_SUCC);

@@ -398,6 +398,19 @@ fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
 /// direct source ([`EXEC_BASE_SOFTVER_OFFSET`]) rather than this list.
 const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 
+/// Byte offset of `ExecBase.SemaphoreList` from [`EXEC_LIBRARY_BASE`] --
+/// same field-by-field derivation as [`EXEC_BASE_LIBLIST_OFFSET`],
+/// continuing past it: `LibList` (14) + `PortList`/`TaskReady`/
+/// `TaskWait` (14 each, 42) + `SoftInts[5]` (`struct SoftIntList` is a
+/// `struct List` plus one `UWORD` pad, 16 bytes each, 80) +
+/// `LastAlert[4]` (4 each, 16) + `VBlankFrequency`/
+/// `PowerSupplyFrequency` (1 each, 2) = 378 + 14 + 42 + 80 + 16 + 2 =
+/// 532. `crate::execsem`'s `FindSemaphore`/`AddSemaphore`/
+/// `RemSemaphore`/`ObtainSemaphoreList`/`ReleaseSemaphoreList` need a
+/// real, walkable public semaphore list here, same reasoning as
+/// `LibList` above.
+pub(crate) const EXEC_BASE_SEMAPHORELIST_OFFSET: u32 = 532;
+
 /// Byte offset of `ExecBase.SoftVer` from [`EXEC_LIBRARY_BASE`]: right
 /// after `LibNode` ([`LIB_STRUCT_SIZE`], 34). Documented in NDK
 /// `exec/execbase.h` as "kickstart release number (obs.)" -- a single
@@ -1614,17 +1627,19 @@ impl<C: Cpu + 'static> Runtime<C> {
         // Real struct ExecBase (NDK exec/execbase.h) extends well past
         // struct Library -- SoftVer, ChkBase, the Capture vectors,
         // MemList/ResourceList/DeviceList/IntrList, etc. -- all the way
-        // out to LibList at EXEC_BASE_LIBLIST_OFFSET. This runtime
-        // doesn't populate most of those with real values, but real
-        // guest code (real Version included -- see the module-level
-        // empirical-corpus notes in docs/plan.md) can and does read
-        // them. Zero the whole span so an unpopulated field reads as a
-        // clean, unsurprising `0` rather than the sentinel prefill's
-        // `0xA000` trap opcode pattern -- EXEC_BASE_SOFTVER_OFFSET below
-        // and write_library_list_nodes' LibList both then overwrite
-        // their own portion of this same span with real data.
-        for addr in
-            (EXEC_LIBRARY_BASE + LIB_STRUCT_SIZE)..(EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET)
+        // out to SemaphoreList at EXEC_BASE_SEMAPHORELIST_OFFSET (past
+        // LibList at EXEC_BASE_LIBLIST_OFFSET). This runtime doesn't
+        // populate most of those with real values, but real guest code
+        // (real Version included -- see the module-level empirical-
+        // corpus notes in docs/plan.md) can and does read them. Zero
+        // the whole span so an unpopulated field reads as a clean,
+        // unsurprising `0` rather than the sentinel prefill's `0xA000`
+        // trap opcode pattern -- EXEC_BASE_SOFTVER_OFFSET below,
+        // write_library_list_nodes' LibList, and SemaphoreList's own
+        // init_list_header call all then overwrite their own portion
+        // of this same span with real data.
+        for addr in (EXEC_LIBRARY_BASE + LIB_STRUCT_SIZE)
+            ..(EXEC_LIBRARY_BASE + EXEC_BASE_SEMAPHORELIST_OFFSET)
         {
             mem.write_u8(addr, 0);
         }
@@ -1638,6 +1653,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         );
         mem.write_u32(CACHE_BITS_ADDR, CACHE_BITS_DEFAULT);
         write_library_list_nodes(&mut mem);
+        crate::execlist::init_list_header(
+            &mut mem,
+            EXEC_LIBRARY_BASE + EXEC_BASE_SEMAPHORELIST_OFFSET,
+        );
 
         let mut registry = LibraryRegistry::new();
         registry.register_real("dos.library", DOS_LIBRARY_BASE);
