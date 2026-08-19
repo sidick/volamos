@@ -672,6 +672,25 @@ fn stack_swap_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
+/// `exec.library`'s `Forbid`/`Permit` (LVO -132/-138, no args, no
+/// return value): real `Forbid` disables task switching until a
+/// matching `Permit`, protecting a critical section (e.g. walking a
+/// shared list) from being preempted mid-scan. This runtime is
+/// single-threaded and never preempts the running guest task for
+/// anything (see the module docs' "fake current task" section), so
+/// there's nothing a critical section could ever be preempted by --
+/// both are true no-ops. Found missing running the real Workbench
+/// 3.1.4 `C:/Avail` binary, which calls `Forbid` before walking exec's
+/// memory-pool list and `Permit` after.
+fn forbid_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// See [`forbid_handler`].
+fn permit_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
 /// Checks `a7` against the current task's `tc_SPLower`/`tc_SPUpper`
 /// bounds, read fresh from guest memory (so this sees whatever
 /// [`stack_swap_handler`] last set them to). Called once per dispatched
@@ -694,10 +713,10 @@ pub fn check_stack_bounds<M: AddressSpace>(
 
 /// Registers every implemented task/signal handler: `exec.library`'s
 /// `FindTask`/`SetSignal`/`SetExcept`/`Wait`/`Signal`/`AllocSignal`/
-/// `FreeSignal`/`StackSwap`, plus `dos.library`'s `CheckSignal`
-/// (registered from here rather than `dosfile.rs`, so that file needs no
-/// edits at all -- see the module docs). Called unconditionally from
-/// [`crate::dispatch::Runtime::new`].
+/// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`, plus `dos.library`'s
+/// `CheckSignal` (registered from here rather than `dosfile.rs`, so that
+/// file needs no edits at all -- see the module docs). Called
+/// unconditionally from [`crate::dispatch::Runtime::new`].
 pub fn register_exectask_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -724,6 +743,8 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("AllocSignal", alloc_signal_handler::<C>);
     reg_exec!("FreeSignal", free_signal_handler::<C>);
     reg_exec!("StackSwap", stack_swap_handler::<C>);
+    reg_exec!("Forbid", forbid_handler::<C>);
+    reg_exec!("Permit", permit_handler::<C>);
 
     table
         .register_by_name(
@@ -1541,5 +1562,25 @@ mod tests {
         let task = rt.current_task();
         assert_eq!(rt.memory().read_u32(task + TC_SPLOWER), new_stack_block);
         assert_eq!(rt.memory().read_u32(task + TC_SPUPPER), new_stack_top);
+    }
+
+    // --- Forbid/Permit ---
+
+    #[test]
+    fn forbid_then_permit_is_a_harmless_no_op() {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        words.extend_from_slice(&jsr_disp16_a6(-132)); // Forbid
+        words.extend_from_slice(&jsr_disp16_a6(-138)); // Permit
+        words.push(0x7000 | 0x2A); // moveq #42,d0
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 42,
+            "Forbid/Permit should leave D0 untouched by anyone else"
+        );
     }
 }

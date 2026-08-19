@@ -1538,6 +1538,32 @@ $ echo $?
 New tests: 13 (`dosdevlist.rs`: 8 unit + 2 e2e; `dospkt.rs`: 3 e2e,
 including the unknown-port failure case).
 
+**`Forbid`/`Permit`; unblock `Avail` — 2026-08-19.** Ran the real
+`C:/Avail` binary next; its only gap was `exec.library`'s `Forbid`
+(LVO -132)/`Permit` (-138), called around its walk of exec's
+memory-pool list to protect against concurrent modification.
+Implemented as true no-ops in `crates/volamos-core/src/exectask.rs`
+(alongside the module's other task/signal primitives): this runtime
+is single-threaded and never preempts the running guest task for
+anything, so there is no critical section to protect and no
+simplification involved -- a no-op *is* the correct behavior here,
+not an approximation of it. `AvailMem` itself was already implemented
+in Phase 3 (T16), so no further gaps surfaced.
+
+Confirmed against the real corpus binary, both plain and with an
+argument:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Avail
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Avail FLUSH
+Type  Available    In-Use   Maximum   Largest
+chip     977624         0    977624    977624
+fast     977624         0    977624    977624
+total   1955248         0   1955248    977624
+$ echo $?
+0
+```
+New tests: 1 (`exectask.rs`: `forbid_then_permit_is_a_harmless_no_op`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
