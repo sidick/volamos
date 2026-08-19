@@ -3127,3 +3127,63 @@ crate tests, up from 59)/`clippy --all-targets -- -D warnings`/`fmt
 `userdocs/Configuration.md` (grammar/precedence/worked example) plus
 cross-links from `index.md`/`CLI-Reference.md`/`Getting-Started.md`/
 `Changelog.md`/README.md.
+
+## Two-oracle comparison harness (volamos vs. `vamos`) in CI — 2026-08-19
+
+Phase 4's three-oracle harness (volamos vs. `vamos` vs. real Kickstart)
+stays blocked on AmiBake's OS 3.x-base milestone (unchanged from the
+2026-08-18 decision) -- but the two-oracle *subset* (volamos vs.
+`vamos` only) needs none of that: Simon's `ghcr.io/sidick/amiga-dev:1`
+Docker image has `vamos` 0.8.1 already installed and ROM-free (same
+HLE approach as volamos), so it can run against volamos's own
+committed `fixtures/` in CI today. The real Workbench 3.1.4 `C:`
+corpus stays local/opt-in only, per its existing licensing note --
+unaffected by this.
+
+Scoped by hand first (pulling the image, running every candidate
+fixture against `vamos -q`) before writing any harness code:
+
+- **`hello`/`recurse` excluded from the corpus** -- `hello` uses a
+  Phase-1-only convention (runtime pre-loads A6 with a fake dos.library
+  base, no real `OpenLibrary`), not valid real-AmigaOS-startup input
+  (`vamos` crashes on it with `InvalidMemoryAccessError`, correctly, on
+  bogus input). `recurse` deliberately trips volamos's own
+  stack-overflow guard, which `vamos` has no equivalent of -- no shared
+  expected output to diff.
+- **`echoargs`/`filetest`/`systest` match exactly** once `vamos -q`
+  quiets its own diagnostic logging (the `CloseLibrary`-never-called
+  warnings on these fixtures are a deliberate fixture simplification,
+  not a bug -- `-q` is the correct fix, not text-scrubbing).
+- **`dirtest` matches in content, not line order** -- real AmigaOS
+  directory order isn't guaranteed sorted, and this differs between
+  host filesystems (macOS vs. the Linux container); the harness sorts
+  both sides' output for this one fixture specifically.
+- **Two real, unexplained divergences found and filed**: issue #6
+  (`exectest`'s step 9 -- `CheckSignal(1<<5)` after
+  `SetSignal(1<<5,1<<5)` doesn't return 32 under `vamos`) and issue #7
+  (`runcmdtest` -- missing newline between the `RunCommand()`-nested
+  program's own output and the parent's, under `vamos`). Neither is
+  root-caused (which side matches real AmigaOS is genuinely open for
+  both) -- that's deliberately out of scope here; standing up the
+  harness that keeps finding this kind of thing is the point, not
+  rushing a diagnosis while doing it.
+
+New `tools/compare_vamos.py` (no dependencies, matching
+`gen_lvos.py`/`ndk_verify.py`'s existing one-shot-tool convention):
+runs each corpus fixture under both `<volamos-bin>` and `vamos -q`
+(fresh temp `TEST:` host directory per run, never shared between the
+two sides or between fixtures), compares stdout + exit code, and
+prints PASS/KNOWN/FAIL per fixture -- `KNOWN` entries (issues #6/#7)
+don't fail the run; anything untracked does. New `compare` job in
+`.github/workflows/ci.yml`: `container: ghcr.io/sidick/amiga-dev:1`
+(no Rust preinstalled there, so `dtolnay/rust-toolchain@stable` same
+as the `test` job), builds volamos release, runs the script.
+
+**Verification**: ran the script by hand inside the pulled image first
+(installing Rust into a bind-mounted checkout, matching what CI does)
+-- confirmed the PASS/KNOWN/FAIL summary and exit code 0 for the real
+corpus, then deliberately dropped the `exectest` `KNOWN_DIVERGENCES`
+entry to confirm the FAIL path/diff output/exit code 1 also work
+before trusting the PASS path. No `volamos`/`volamos-core` source
+changes in this piece -- new script + CI job only, so `cargo build/
+test/clippy/fmt` are unaffected (still verified clean).

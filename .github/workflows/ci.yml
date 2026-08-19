@@ -59,3 +59,30 @@ jobs:
 
       - name: Strict MkDocs build
         run: mkdocs build --strict
+
+  compare:
+    name: Compare against vamos (two-oracle harness)
+    runs-on: ubuntu-latest
+    container: ghcr.io/sidick/amiga-dev:1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compare-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            compare-cargo-
+
+      - name: Build volamos (release)
+        run: cargo build --release -p volamos
+
+      - name: Run comparison harness
+        run: python3 tools/compare_vamos.py --volamos target/release/volamos
