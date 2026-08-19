@@ -313,6 +313,13 @@ pub struct SystemRequest {
     /// splitting -- no quoting/escaping support, matching this module's
     /// documented scope cuts.
     pub args: Vec<String>,
+    /// `RunCommand`'s explicit `stack` argument, threaded through so the
+    /// nested run gets the *real* requested stack size instead of
+    /// silently falling back to the parent's own `--stack`/default --
+    /// `None` for `System()`/`Execute()`, which have no such argument at
+    /// all (a runner should fall back to whatever it already uses for
+    /// those in that case).
+    pub stack_size_override: Option<u32>,
 }
 
 /// The host-side `System()`/`Execute()` runner callback's type -- what
@@ -348,6 +355,8 @@ impl DosState {
         let seglist = build_seglist(&hunk_file, heap, mem).map_err(|_| ERROR_NO_FREE_STORE)?;
         self.seglists
             .insert(seglist.first_bptr, seglist.alloc_addrs);
+        self.seglist_host_paths
+            .insert(seglist.first_bptr, host_path);
         Ok(seglist.first_bptr)
     }
 
@@ -366,6 +375,7 @@ impl DosState {
                  returned by LoadSeg)"
             ));
         };
+        self.seglist_host_paths.remove(&bptr);
         for addr in addrs {
             heap.free(addr).map_err(|e| {
                 format!(
@@ -403,6 +413,55 @@ impl DosState {
             command_line: command_line.to_string(),
             resolved_program_host_path: host_path,
             args,
+            stack_size_override: None,
+        };
+        Ok(runner(&request))
+    }
+
+    /// `RunCommand(seg, stack, paramptr, paramlen)`: re-runs the program
+    /// a prior [`Self::load_seg`] call loaded, via the same
+    /// [`Self::system_runner`] nested-execution path `System()`/
+    /// `Execute()` use -- see [`crate::dosfile::DosState::
+    /// seglist_host_paths`]'s doc for why this re-runs from the
+    /// remembered host path rather than executing the already-loaded
+    /// seglist bytes in place, and the faithfulness trade-off that
+    /// implies. `paramptr`/`paramlen` (the raw command-tail buffer, not
+    /// necessarily NUL-terminated) is decoded as UTF-8 (lossily) and
+    /// split on whitespace into `args`, matching `System()`/`Execute()`'s
+    /// own documented no-quoting scope cut -- real `RunCommand` callers
+    /// pass exactly this kind of plain, space-separated argument buffer
+    /// in the overwhelming majority of real-world use. Returns the
+    /// invoked command's exit code, or `-1` with `IoErr()` set if it
+    /// couldn't be run at all (unknown `seg`, or no runner installed --
+    /// same [`ERROR_OBJECT_NOT_FOUND`] "couldn't run it" bucket
+    /// [`Self::resolve_and_run`] uses).
+    pub fn run_command(&mut self, seg: u32, args: Vec<String>, stack_size: u32) -> i32 {
+        match self.resolve_and_run_command(seg, args, stack_size) {
+            Ok(code) => code,
+            Err(io_err) => {
+                self.set_io_err(io_err);
+                -1
+            }
+        }
+    }
+
+    fn resolve_and_run_command(
+        &mut self,
+        seg: u32,
+        args: Vec<String>,
+        stack_size: u32,
+    ) -> Result<i32, i32> {
+        let host_path = self
+            .seglist_host_paths
+            .get(&seg)
+            .cloned()
+            .ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        let runner = self.system_runner.as_mut().ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        let request = SystemRequest {
+            command_line: args.join(" "),
+            resolved_program_host_path: host_path,
+            args,
+            stack_size_override: Some(stack_size),
         };
         Ok(runner(&request))
     }
@@ -501,6 +560,29 @@ fn execute_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     Ok(())
 }
 
+/// `RunCommand` (`D1` = seglist `BPTR` from a prior `LoadSeg`, `D2` =
+/// requested stack size, `D3` = param buffer, `D4` = param buffer
+/// length). `D0` = the invoked command's exit code, or `-1` with
+/// `IoErr()` set if it couldn't be run at all -- see
+/// [`DosState::run_command`]'s doc.
+fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let seg = ctx.cpu.data_register(DataRegister(1));
+    let stack_size = ctx.cpu.data_register(DataRegister(2));
+    let param_ptr = ctx.cpu.data_register(DataRegister(3));
+    let param_len = ctx.cpu.data_register(DataRegister(4));
+
+    let mut param_bytes = Vec::with_capacity(param_len as usize);
+    for i in 0..param_len {
+        param_bytes.push(ctx.mem.read_u8(param_ptr.wrapping_add(i)));
+    }
+    let param_str = String::from_utf8_lossy(&param_bytes);
+    let args: Vec<String> = param_str.split_whitespace().map(str::to_string).collect();
+
+    let code = ctx.dos.run_command(seg, args, stack_size);
+    ctx.cpu.set_data_register(DataRegister(0), code as u32);
+    Ok(())
+}
+
 /// `FindSegment` (`D1` = name `CString*`, `D2` = previous match `BPTR`,
 /// `D3` = system flag). `D0` = `0` (`NULL`), always -- this runtime has
 /// no list of resident segments (no `AddSegment`/`Resident` support),
@@ -540,6 +622,7 @@ pub fn register_dosseg_handlers<C: Cpu + 'static>(
     reg!("UnLoadSeg", unloadseg_handler::<C>);
     reg!("SystemTagList", system_tag_list_handler::<C>);
     reg!("Execute", execute_handler::<C>);
+    reg!("RunCommand", run_command_handler::<C>);
     reg!("FindSegment", find_segment_handler::<C>);
 }
 

@@ -328,6 +328,23 @@ pub struct DosState {
     ///
     /// [`LoadSeg`]: crate::dosseg
     pub(crate) seglists: HashMap<u32, Vec<u32>>,
+    /// The same keys as [`Self::seglists`], mapping instead to the host
+    /// path [`LoadSeg`] actually read the seglist's bytes from --
+    /// [`crate::dosseg::run_command_handler`] (`RunCommand`) needs this
+    /// to re-run the program via the same [`Self::system_runner`]
+    /// nested-execution path `System()`/`Execute()` use, since re-using
+    /// the already-loaded (and already-relocated-in-place) seglist bytes
+    /// directly isn't possible without a real "call into guest code
+    /// while still processing library-call traps normally" execution
+    /// mode this runtime doesn't have (see `crate::dosseg`'s module docs
+    /// for the full reasoning). A deliberate approximation: faithful for
+    /// the overwhelmingly common `LoadSeg` immediately followed by
+    /// `RunCommand` (never re-run the same seglist to run *different*,
+    /// hand-patched code), not for a guest that pokes the loaded
+    /// seglist's memory before calling `RunCommand`.
+    ///
+    /// [`LoadSeg`]: crate::dosseg
+    pub(crate) seglist_host_paths: HashMap<u32, std::path::PathBuf>,
     /// Host-side callback installed by a CLI (never by library code
     /// itself) to actually run a resolved `System()`/`Execute()` command
     /// as a nested guest invocation -- see `crate::dosseg`'s module docs
@@ -423,6 +440,7 @@ impl DosState {
             initial_cwd: None,
             next_lock_id: 0,
             seglists: HashMap::new(),
+            seglist_host_paths: HashMap::new(),
             system_runner: None,
             cmdline: None,
             cmdline_pos: 0,

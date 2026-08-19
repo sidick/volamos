@@ -527,9 +527,13 @@ fn run(opts: &Options) -> Result<i32, String> {
         runtime.set_vfs(vfs);
     }
 
-    // System()/Execute (Phase 3 stage 7): a nested program is loaded and
-    // run through run_nested_program, sharing this run's volumes/assigns
-    // and --stack size -- see volamos_core::dosseg's module docs.
+    // System()/Execute/RunCommand (Phase 3 stage 7): a nested program is
+    // loaded and run through run_nested_program, sharing this run's
+    // volumes/assigns and --stack size -- see volamos_core::dosseg's
+    // module docs. RunCommand's own explicit stack argument
+    // (req.stack_size_override) takes priority when present; System()/
+    // Execute() (which have no such argument) fall back to this run's
+    // own --stack/default.
     let nested_stack_size = opts.stack_size;
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
@@ -538,7 +542,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             &req.resolved_program_host_path,
             &req.args,
             vfs_config.clone(),
-            nested_stack_size,
+            req.stack_size_override.unwrap_or(nested_stack_size),
             nested_cpu_type,
             nested_fpu,
         )

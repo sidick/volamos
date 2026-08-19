@@ -2741,6 +2741,66 @@ Full `cargo test --all` (522 passed), `cargo clippy --all-targets`,
 `intuition.library`, pending Simon's always-present-vs-disk-gated
 design call).
 
+## `dos.library`'s `RunCommand` (vamos gap audit, Tier 2 complete) -- 2026-08-19
+
+Simon confirmed the design question above (`locale.library`/
+`intuition.library` should join `STANDARD_WORKBENCH_LIBRARIES` --
+always present, matching real ROM-resident hardware behavior; deferred
+to Tier 3, next).
+
+`RunCommand(seg, stack, paramptr, paramlen)` turned out architecturally
+bigger than "reuse `System()`/`Execute()`'s nested-run wiring
+directly," the way the plan first estimated -- worth recording why, not
+just what shipped. Real `RunCommand` takes an *already-`LoadSeg`'d*
+seglist and runs it in place; this runtime's `build_seglist` bakes
+absolute addresses into that seglist's code via one-time `RELOC32`
+fixups (see `crate::dosseg`'s module docs), so the loaded bytes are
+only valid at the exact guest addresses they were relocated for --
+copying them into a fresh nested `Runtime`'s own memory (a different
+base address) the way `System()`/`Execute()`'s `run_nested_program`
+does for a *host path* would silently corrupt every such pointer.
+Running the segment in place, in the parent's own memory, was also
+ruled out: `execfmt.rs`'s `Supervisor` handler is this runtime's only
+precedent for "step the CPU mid-handler," and it explicitly does *not*
+support the stepped routine making further library calls (a real,
+documented limitation, not an oversight) -- exactly what running a
+whole independent AmigaOS program needs.
+
+Resolved by leaning on the *very* common real-world pattern instead:
+`LoadSeg` immediately followed by `RunCommand` on that same, unmodified
+seglist (never "patch the loaded code, then run it," a genuine but rare
+technique this approach doesn't support -- documented as a deliberate
+trade-off, not silently). `crate::dosfile::DosState` gained
+`seglist_host_paths: HashMap<u32, PathBuf>`, populated by `LoadSeg`
+alongside the existing `seglists` map, remembering *where the bytes
+originally came from* rather than reusing the already-loaded copy.
+`RunCommand` looks that host path back up and re-runs it through the
+exact same `System()`/`Execute()` nested-run callback (`SystemRunner`),
+sidestepping the relocation problem entirely (a fresh load into a
+fresh memory space gets fresh relocations, exactly like `System()`
+already does) at the cost of that one documented edge case.
+
+`SystemRequest` gained a `stack_size_override: Option<u32>` field so
+`RunCommand`'s own explicit `stack` argument (which `System()`/
+`Execute()` don't have) actually reaches the nested run instead of
+silently falling back to the parent's `--stack`/default --
+`crates/volamos/src/main.rs`'s installed runner now does
+`req.stack_size_override.unwrap_or(nested_stack_size)`.
+
+New fixture `fixtures/runcmdtest` (`.s` + `gen_runcmdtest.py`, same dual
+convention as `systest`), reusing the existing `echoargs` fixture as
+the nested target: `LoadSeg("TEST:echoargs")` -> `RunCommand(seg, 8192,
+"run cmd", 7)` -> `UnLoadSeg` -> distinctive exit 43. New end-to-end
+test `crates/volamos/tests/runcmdtest_e2e.rs` (mirroring
+`dosseg_e2e.rs`) proves the nested run's output interleaves correctly
+and control returns to the parent afterward, both with and without a
+`Vfs` installed.
+
+Full `cargo test --all` (526 passed, including the 2 new end-to-end
+tests), `cargo clippy --all-targets`, `cargo fmt --all` clean. This
+closes out Tier 2 of the vamos coverage audit entirely; only Tier 3
+(`locale.library`, `intuition.library`) remains.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

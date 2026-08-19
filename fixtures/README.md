@@ -231,6 +231,37 @@ Run e.g. `volamos -V TEST:/dir/containing/echoargs fixtures/systest`;
 `crates/volamos/tests/dosseg_e2e.rs` drives exactly that. Regenerate
 with `python3 fixtures/gen_systest.py` (or vasm, same rule as above).
 
+## vamos gap audit fixture: `runcmdtest`
+
+Source: `runcmdtest.s`; generator: `gen_runcmdtest.py` (same dual
+convention and `amiga_asm.py` assembler as the other fixtures above).
+The `LoadSeg`+`RunCommand`+`UnLoadSeg` counterpart to `systest`'s
+`SystemTagList()` test, added implementing `RunCommand` as part of
+closing gaps found comparing volamos's `dos.library`/`exec.library`
+coverage against vamos's own (`docs/plan.md`'s dated entry).
+
+1. Real startup (as above).
+2. `LoadSeg("TEST:echoargs")` (`-150(a6)`, `D1` = name string): resolves
+   `TEST:echoargs` through the `Vfs`, reads and parses it, and builds a
+   seglist. `D0` = the seglist's own `BPTR`, saved to `D1`.
+3. `RunCommand(seg, stack=8192, paramptr="run cmd", paramlen=7)`
+   (`-504(a6)`): the runtime's host-side system runner re-runs the
+   program the seglist was loaded from as a *nested* guest program (the
+   same nested-execution path `SystemTagList` uses, via
+   `DosState::run_command` -- see `crate::dosseg`'s module docs), with
+   `run`/`cmd` as its guest command-line args -- its output (`run
+   cmd\n`, see the `echoargs` section above) appears on stdout before
+   anything the parent prints afterward.
+4. If `RunCommand`'s `D0` (the nested program's exit code, or -1 on
+   failure to invoke) is nonzero, exit 99.
+5. Otherwise `UnLoadSeg(seg)` (`-156(a6)`, `D1` still holds the seglist
+   `BPTR`), `PutStr("after runcommand\n")`, and exit with the
+   distinctive success code 43.
+
+Run e.g. `volamos -V TEST:/dir/containing/echoargs fixtures/runcmdtest`;
+`crates/volamos/tests/runcmdtest_e2e.rs` drives exactly that. Regenerate
+with `python3 fixtures/gen_runcmdtest.py` (or vasm, same rule as above).
+
 ## Phase 3 (stage 8) fixtures: `exectest`, `recurse`
 
 Two more fixtures, in the same dual `.s` + `gen_*.py` style, added for
