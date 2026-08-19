@@ -23,13 +23,24 @@ system, or any Amiga hardware.
 
 **Phases 1-3 — complete**: CPU + trap plumbing, `dos.library` file I/O
 and volumes/assigns, and `exec.library`/`utility.library` essentials.
+Since then, substantial empirical hardening against a real Workbench
+3.1.4 `C:` command corpus (`List`, `Copy`, `Delete`, `Rename`, `Sort`,
+`Search`, `Join`, `CPU`, `Date`, `SetDate`, `Wait`, `Break`, `Info`, and
+more) plus real third-party binaries (the PhxAss assembler, and
+Simon's own AmiSnap project) has closed many further gaps beyond
+Phase 3's original scope, and a full audit against
+[`vamos`](https://github.com/cnvogelg/amitools)'s own library/device
+coverage closed the remaining ones it flagged. Phase 4 (the
+three-oracle parity harness against `vamos`/real Kickstart) hasn't
+formally started yet.
 
 The runtime loads an AmigaOS hunk executable, runs it on an interpreted
 m68k CPU (the [`m68k`](https://crates.io/crates/m68k) crate behind a
-swappable `Cpu` trait), intercepts library calls made the real AmigaOS
-way (`OpenLibrary` via `AbsExecBase` at address 4, then `jsr` through the
-returned library base) via A-line trap dispatch, services them with
-native Rust handlers, and propagates the guest's exit code. Try it:
+swappable `Cpu` trait, with `--cpu`/`--fpu` to pick the emulated model),
+intercepts library calls made the real AmigaOS way (`OpenLibrary` via
+`AbsExecBase` at address 4, then `jsr` through the returned library
+base) via A-line trap dispatch, services them with native Rust
+handlers, and propagates the guest's exit code. Try it:
 
 ```sh
 cargo run -p volamos -- fixtures/hello
@@ -37,6 +48,7 @@ cargo run -p volamos -- -V TEST:/tmp/some-hostdir fixtures/filetest
 cargo run -p volamos -- fixtures/echoargs foo bar
 cargo run -p volamos -- fixtures/exectest
 cargo run -p volamos -- --stack 4096 fixtures/recurse  # demonstrates overflow detection
+cargo run -p volamos -- -V TEST:/tmp/some-hostdir fixtures/runcmdtest  # LoadSeg+RunCommand+UnLoadSeg
 ```
 
 Implemented so far:
@@ -44,34 +56,57 @@ Implemented so far:
 - **dos.library**: file I/O (`Open`/`Read`/`Write`/`Seek`/`Close`,
   `Input`/`Output`, `IoErr`/`SetIoErr`), locks and directory traversal
   (`Lock`/`UnLock`/`DupLock`/`Examine`/`ExNext`/`CurrentDir`/`ParentDir`),
-  `CheckSignal`, `LoadSeg`/`UnLoadSeg` (real BPTR seglists), and
+  pattern matching (`MatchFirst`/`MatchNext`/`ParsePattern`),
+  `ReadArgs`/`FreeArgs`, environment variables (`GetVar`/`SetVar` over a
+  real `ENV:` volume), date/time (`StrToDate`/`DateToStr`/`DateStamp`),
+  process/CLI bits (`Cli`/`GetProgramName`/`MaxCli`/`AllocDosObject`),
+  the `DosList` (`LockDosList`/`FindDosEntry`/`Info`), `CheckSignal`,
+  `LoadSeg`/`UnLoadSeg` (real BPTR seglists), `RunCommand`, and
   `SystemTagList`/`Execute` for tools that shell out.
 - **exec.library**: `OpenLibrary`/`CloseLibrary` (unknown libraries get
   an auto-created fake base rather than failing outright, mirroring
-  `vamos`), `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem` over a
-  flat guest heap, real guest-visible List/Node primitives and minimal
-  single-threaded message ports, and task/signal basics
-  (`FindTask`/`SetSignal`/`Wait`/`Signal`/`AllocSignal`/`FreeSignal`)
-  including host `SIGINT`/`SIGTERM` delivered to the guest as
-  `SIGBREAKF_CTRL_C`.
+  `vamos`), memory (`AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem`/
+  memory pools/`Allocate`/`Deallocate` over a real `MemHeader`/
+  `MemChunk` free list), real guest-visible List/Node primitives and
+  minimal single-threaded message ports, task/signal basics
+  (`FindTask`/`SetSignal`/`Wait`/`Signal`/`AllocSignal`/`FreeSignal`,
+  including host `SIGINT`/`SIGTERM` delivered as `SIGBREAKF_CTRL_C`),
+  the full `SignalSemaphore` API (`InitSemaphore`/`Obtain`/`Release`/
+  `Attempt`/`Find`/`Add`/`Rem`/`ObtainSemaphoreList`/
+  `ReleaseSemaphoreList`), `Alert`, `RawDoFmt`, and CPU-detection
+  plumbing (`AttnFlags`, `CacheControl`, `Supervisor`).
 - **utility.library**: tag-list handling (`GetTagData`/`NextTagItem`/
-  `FindTagItem`), `Stricmp`/`Strnicmp`/`ToUpper`/`ToLower`, and Amiga
-  date conversions.
+  `FindTagItem`/`AllocateTagItems`/`FreeTagItems`), `Stricmp`/
+  `Strnicmp`/`ToUpper`/`ToLower`, 32-bit math helpers, and Amiga date
+  conversions.
+- **locale.library**: character classification (`IsAlpha`/`IsDigit`/
+  etc.), case conversion, locale-aware `StrnCmp`, and a minimal
+  `OpenLocale`/`CloseLocale` — matching `vamos`'s own scope, not a real
+  multi-locale/catalog system.
+- **intuition.library**: a thin stub (`DisplayAlert`/`AutoRequest`/
+  `EasyRequestArgs`/`CurrentTime`) — just enough that a console tool's
+  stray Intuition call doesn't crash, no real windowing/GUI.
+- **Math libraries**: `mathffp`, `mathtrans`, `mathieeedoubbas`,
+  `mathieeedoubtrans` — real FFP/IEEE arithmetic, not fake traps.
+- **timer.device**: real time-arithmetic (`AddTime`/`SubTime`/
+  `CmpTime`/`ReadEClock`/`GetSysTime`) via the documented
+  `io_Device`-as-library-base idiom.
 - A host-backed volume/assign filesystem (`-V`/`-a`/`--auto-assign` CLI
-  flags, multi-assign search order, Amiga `:`/`/` semantics), a guest
-  heap with BPTR/BSTR helpers, and configurable guest stack size
-  (`--stack`, with overflow detection). Run `cargo run -p volamos --
-  --help` for the full CLI surface.
+  flags, multi-assign search order, Amiga `:`/`/` semantics), `.uaem`
+  sidecar metadata for protection bits/comments, a guest heap with
+  BPTR/BSTR helpers, and configurable guest stack size (`--stack`, with
+  overflow detection). Run `cargo run -p volamos -- --help` for the
+  full CLI surface.
 
-Math libraries (`mathffp`, `mathieee*`), `ReadArgs`, and the three-oracle
-parity harness against `vamos`/real Kickstart are Phase 4+. See
-[`docs/plan.md`](docs/plan.md) for the full phase breakdown, the
-fd/SFD licensing analysis, and current status.
+The three-oracle parity harness against `vamos`/real Kickstart is
+Phase 4+. See [`docs/plan.md`](docs/plan.md) for the full phase
+breakdown, the fd/SFD licensing analysis, and current status.
 
 ## Workspace layout
 
-- `crates/volamos-core` — library crate: CPU/memory abstractions, and
-  (later) the `exec.library`/`dos.library` implementations.
+- `crates/volamos-core` — library crate: CPU/memory abstractions and
+  the `exec.library`/`dos.library`/`utility.library`/`locale.library`/
+  `intuition.library`/math-library implementations.
 - `crates/volamos` — binary crate: the `volamos` CLI.
 
 ## License
