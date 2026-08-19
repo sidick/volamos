@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cpu;
 pub mod dispatch;
+pub mod dosanchor;
 pub mod dosargs;
 pub mod dosfile;
 pub mod doslock;
@@ -39,6 +40,7 @@ pub use dispatch::{
     LibraryTable, MAX_LIBRARY_SLOTS, Runtime, RuntimeError, StartConfig, TraceEvent,
     UTILITY_LIBRARY_BASE,
 };
+pub use dosanchor::ERROR_BUFFER_OVERFLOW;
 pub use dosargs::{
     ERROR_BAD_NUMBER, ERROR_BAD_TEMPLATE, ERROR_KEY_NEEDS_ARG, ERROR_REQUIRED_ARG_MISSING,
     ERROR_TOO_MANY_ARGS, ERROR_UNMATCHED_QUOTES, RdArgsEntry,

@@ -1155,10 +1155,13 @@ impl<C: Cpu + 'static> Runtime<C> {
 
         // dos.library ParsePattern(NoCase)/MatchPattern(NoCase) (the
         // wildcard engine `List`/`Copy`/`Delete`/`Dir` rely on) -- see
-        // crate::dospattern's module docs. `MatchFirst`/`MatchNext`/
-        // `MatchEnd` (the AnchorPath-based directory scanner built on
-        // top of this) are not yet implemented, per that module's docs.
+        // crate::dospattern's module docs.
         crate::dospattern::register_dospattern_handlers(&mut table, &mut mem);
+
+        // dos.library MatchFirst/MatchNext/MatchEnd (the AnchorPath-based
+        // directory scanner built on the pattern engine above) -- see
+        // crate::dosanchor's module docs.
+        crate::dosanchor::register_dosanchor_handlers(&mut table, &mut mem);
 
         // dos.library StrToLong (decimal string -> LONG) -- see
         // crate::dosstr's module docs.

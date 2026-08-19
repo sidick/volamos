@@ -906,6 +906,50 @@ hand-adding and removing temporary `eprintln!`s in `open_library_handler`/
 `RawDoFmt`/`CopyMem` -- reach for it first on the next corpus binary
 that needs this kind of diagnosis.
 
+**`MatchFirst`/`MatchNext`/`MatchEnd` — implemented 2026-08-19**
+(`crates/volamos-core/src/dosanchor.rs`), prompted by the real
+Workbench 3.1.4 `C:/Type` binary: even a plain non-wildcard filename
+argument goes through `MatchFirst` in real AmigaOS (per its own
+documented behavior, a `Lock()` on the object directly), so `Type`
+needed this before it could open anything at all. Real, byte-accurate
+`struct AnchorPath`/`struct AChain` (NDK `dos/dosasl.h`) in guest
+memory (unlike `ReadArgs`'s opaque `RDArgs` anchor -- real guest code
+reads `ap_Info`/`ap_Current->an_Lock` directly). Scoped to a single
+wildcard component (split at the pattern's last `/`/`:`) but with
+*full* `APF_DODIR` recursive descent reapplying that same pattern at
+every directory level -- covers the NDK's own `ScanDirectories()`
+worked example completely. `APF_DIDDIR` restores `ap_Info` to the
+just-exited directory's own descriptor (`ScanLevel::self_name`) before
+signaling, matching the documented `"leaving %s"` example precisely --
+an early version of this got that wrong (leaving stale info from the
+last file matched inside the directory) and was caught only by a
+dedicated recursive-descent test, not the simpler single-level ones.
+
+**Found and fixed a real, pre-existing bug while building this**:
+`doslock.rs`'s `fill_fib` wrote `fib_FileName`/`fib_Comment` as
+length-prefixed BSTRs, but the real NDK `struct FileInfoBlock`
+declares both as plain `NUL`-terminated `TEXT[]` buffers -- confirmed
+against `dos/dos.h` directly. This silently affected `Examine`/`ExNext`
+too, not just the new `MatchFirst` code; only surfaced now because
+`Type`'s own algorithm (`MatchFirst` → `CurrentDir` into the matched
+lock → `Open(ap_Info.fib_FileName, ...)`) was the first real corpus
+binary to read `fib_FileName` back out as a plain string. The
+Phase 2 `dirtest` fixture (`fixtures/dirtest.s`/`gen_dirtest.py`) had
+independently been written to *expect* the BSTR encoding, so it never
+caught this -- both the fixture and `fixtures/amiga_asm.py` (a new
+`move_b_d_to_postinc` opcode helper, needed for the corrected copy
+loop) were fixed and regenerated alongside the runtime fix. Recorded as
+a reminder that a fixture can quietly enshrine an implementation bug
+it was originally written *against*, rather than against the real
+spec -- `docs/plan.md`'s Phase 4 three-oracle harness is exactly the
+kind of check that would have caught this far earlier.
+
+8 new tests in `dosanchor.rs` (unit-level non-wildcard/wildcard/
+overflow/recursive-descent coverage, plus one real trap-dispatch
+end-to-end test), plus the two corrected `doslock.rs` unit tests and
+the regenerated `dirtest` fixture's own e2e coverage in
+`crates/volamos/tests/phase2_e2e.rs`.
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

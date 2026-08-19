@@ -331,6 +331,12 @@ pub struct DosState {
     /// byte content. No `ENV:`-backed global-variable storage is
     /// implemented; see that module's docs.
     pub(crate) local_vars: HashMap<String, Vec<u8>>,
+
+    /// Live `MatchFirst`/`MatchNext` scan state, keyed by the guest
+    /// `AnchorPath*` address -- see `crate::dosanchor`'s module docs.
+    /// `MatchEnd` (and this runtime's own error paths) remove entries
+    /// and unlock every directory lock a scan is still holding.
+    pub(crate) anchor_states: HashMap<u32, crate::dosanchor::AnchorMatchState>,
 }
 
 impl DosState {
@@ -355,6 +361,7 @@ impl DosState {
             cmdline_pos: 0,
             rdargs: HashMap::new(),
             local_vars: HashMap::new(),
+            anchor_states: HashMap::new(),
         }
     }
 

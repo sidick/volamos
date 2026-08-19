@@ -182,6 +182,10 @@ class CodeBuilder:
         """`move.b (Asrc)+,(Adst)+`."""
         self.word(0x1000 | (dst_an << 9) | 0xD8 | src_an)
 
+    def move_b_d_to_postinc(self, an: int, dn: int) -> None:
+        """`move.b Dn,(An)+`."""
+        self.word(0x1000 | (an << 9) | 0xC0 | dn)
+
     def move_b_imm_to_postinc(self, an: int, imm: int) -> None:
         """`move.b #imm,(An)+`. Byte immediates still occupy a full
         extension word (data in the low byte)."""

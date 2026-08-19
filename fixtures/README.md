@@ -158,9 +158,9 @@ Source: `dirtest.s`; generator: `gen_dirtest.py`.
    convention as `filetest`).
 3. `Examine(lock, fib)` to initialize the `ExNext` iterator, then loop:
    `ExNext(lock, fib)` until it returns `DOSFALSE` (no more entries).
-   Each iteration copies `fib_FileName` (a BSTR at `fib+8`: one length
-   byte then that many data bytes, *not* NUL-terminated) into a scratch
-   buffer as `"<name>\n\0"`, and `PutStr`s it.
+   Each iteration copies `fib_FileName` (a NUL-terminated C string,
+   `TEXT[108]`, at `fib+8` -- NDK `dos/dos.h`) into a scratch buffer as
+   `"<name>\n\0"`, and `PutStr`s it.
 4. `UnLock(lock)`, exit 0.
 
 Run with a volume mapping providing a `TEST:dir` directory, e.g.

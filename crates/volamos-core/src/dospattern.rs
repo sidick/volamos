@@ -10,13 +10,9 @@
 //! This module is the string-matching engine only: `ParsePattern`/
 //! `MatchPattern` and their `NoCase` counterparts. `MatchFirst`/
 //! `MatchNext`/`MatchEnd` (the `AnchorPath`-based recursive directory
-//! scanner built on top of this engine) are a separate, not-yet-
-//! implemented follow-up -- see `docs/plan.md`'s Phase 3 notes for why
-//! they were split out (real `AnchorPath`/`AChain` struct-layout
-//! fidelity is a distinct chunk of work from the matcher itself, and
-//! `List`/`Copy`/`Delete` can be exercised against this module directly
-//! by a corpus command doing its own `ExNext` + `MatchPattern` loop even
-//! before that lands).
+//! scanner built on top of this engine) live in `crate::dosanchor`,
+//! split out because real `AnchorPath`/`AChain` struct-layout fidelity
+//! is a distinct chunk of work from the matcher itself.
 //!
 //! # Wildcard syntax
 //!
@@ -66,7 +62,7 @@ use crate::utility::amiga_toupper;
 pub const ERROR_LINE_TOO_LONG: i32 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Node {
+pub(crate) enum Node {
     Literal(u8),
     Any,
     Empty,
@@ -241,7 +237,7 @@ impl<'a> Parser<'a> {
 }
 
 /// Parses `source` into a [`Node`] tree, returning `(node, has_wildcard)`.
-fn parse(source: &[u8]) -> Result<(Node, bool), i32> {
+pub(crate) fn parse(source: &[u8]) -> Result<(Node, bool), i32> {
     let mut parser = Parser::new(source);
     let node = parser.parse_top()?;
     Ok((node, parser.has_wildcard))
@@ -497,7 +493,7 @@ fn match_seq(
     })
 }
 
-fn full_match(node: &Node, input: &[u8], fold: bool) -> bool {
+pub(crate) fn full_match(node: &Node, input: &[u8], fold: bool) -> bool {
     match_node(node, input, 0, fold, &|j| j == input.len())
 }
 

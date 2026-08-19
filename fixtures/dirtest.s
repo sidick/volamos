@@ -2,7 +2,7 @@
 ;
 ; Locks a directory, then Examine/ExNext's its way through every entry,
 ; printing each entry's name -- exercising Lock/UnLock, Examine/ExNext,
-; and BSTR handling (fib_FileName), on top of the same real OpenLibrary
+; and fib_FileName handling, on top of the same real OpenLibrary
 ; startup flow as filetest.s.
 ;
 ; --- Calling convention ---
@@ -14,16 +14,15 @@
 ; If the initial Lock("TEST:dir", SHARED_LOCK) fails, prints "ERR\n" and
 ; exits with D0 = 1 (same convention as filetest.s).
 ;
-; --- fib_FileName BSTR -> C string conversion ---
+; --- fib_FileName copy ---
 ;
-; struct FileInfoBlock's fib_FileName (offset 8) is a BSTR: one length
-; byte followed by that many data bytes, *not* NUL-terminated. This
-; program copies it byte-for-byte into a scratch buffer, appends '\n'
-; then a NUL, and PutStr's that -- the simplest way to turn a BSTR into
-; something PutStr (which wants a C string) can print. The copy loop
-; uses DBRA (decrement-and-branch-unless--1) seeded with (length - 1),
-; so it always runs at least once: this assumes every entry's name is
-; non-empty, true for any real directory entry.
+; struct FileInfoBlock's fib_FileName (offset 8, TEXT[108] per NDK
+; dos/dos.h) is a plain NUL-terminated C string -- *not* a BSTR (an
+; earlier version of this fixture assumed the latter, which happened to
+; go unnoticed until a real corpus binary's own fib_FileName read
+; exposed the bug this fixture was quietly matching; see docs/plan.md).
+; This program copies it byte-for-byte into a scratch buffer up to (not
+; including) the NUL, appends '\n' then a NUL, and PutStr's that.
 ;
 ; --- Regenerating fixtures/dirtest ---
 ;
@@ -64,15 +63,16 @@ exloop:
         tst.l   d0
         beq     done                     ; DOSFALSE: no more entries
 
-        move.l  #fib+FIB_FILENAME,a2    ; A2 -> BSTR (len byte, then chars)
+        move.l  #fib+FIB_FILENAME,a2    ; A2 -> NUL-terminated C string
         move.l  #namebuf,a3             ; A3 -> destination C string
-        clr.l   d6
-        move.b  (a2)+,d6                 ; D6 = BSTR length; A2 -> chars
-        subq.l  #1,d6                    ; D6 = length - 1, for dbra
 
 copyloop:
-        move.b  (a2)+,(a3)+
-        dbra    d6,copyloop
+        move.b  (a2)+,d6                 ; D6 = next source byte
+        beq     copydone                 ; stop on NUL (not copied)
+        move.b  d6,(a3)+
+        bra     copyloop
+
+copydone:
         move.b  #10,(a3)+                ; '\n'
         move.b  #0,(a3)+                 ; NUL terminator
 

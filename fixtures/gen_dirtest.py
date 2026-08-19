@@ -13,9 +13,10 @@ Program flow (real startup -- OpenLibrary, not a pre-seeded A6):
    and exit 1.
 3. Examine(lock, fib) to (re)initialize the ExNext iterator.
 4. Loop: ExNext(lock, fib); on DOSFALSE (no more entries), fall out of
-   the loop. Otherwise, copy `fib_FileName` (a BSTR: one length byte then
-   that many data bytes, at fib+8) into a scratch buffer, append '\\n'
-   and a NUL, and PutStr it.
+   the loop. Otherwise, copy `fib_FileName` (a NUL-terminated C string,
+   TEXT[108], at fib+8 -- NDK dos/dos.h; *not* a BSTR, despite an
+   earlier version of this fixture assuming otherwise) into a scratch
+   buffer, append '\\n' and a NUL, and PutStr it.
 5. UnLock(lock); exit 0.
 
 Run directly to (re)write fixtures/dirtest:
@@ -34,7 +35,7 @@ OUT_PATH = HERE / "dirtest"
 
 FIB_SIZE = 260  # sizeof(struct FileInfoBlock)
 FIB_FILENAME_OFFSET = 8
-NAMEBUF_SIZE = 116  # 1 (BSTR len, unused here) + up to 107 chars + '\n' + NUL + slack
+NAMEBUF_SIZE = 116  # up to 107 chars + '\n' + NUL + slack
 
 LVO_OPENLIBRARY = -552
 LVO_LOCK = -84
@@ -88,19 +89,17 @@ def build_program() -> bytes:
     code.tst_l_d(D0)
     code.branch(CodeBuilder.BEQ, "done")  # DOSFALSE -> no more entries
 
-    # Copy the fib_FileName BSTR (fib+8: 1 length byte, then that many
-    # chars) into namebuf as a C string: "<name>\n\0". Known limitation
-    # (documented in fixtures/README.md): this assumes a nonempty name,
-    # which every real directory entry has -- dbra's "loop at least
-    # once" shape would mis-copy a zero-length name.
+    # Copy the fib_FileName C string (fib+8, NUL-terminated) into namebuf
+    # as "<name>\n\0": read a byte to D6, stop (without copying it) on a
+    # NUL, otherwise write it and loop.
     code.move_l_label_to_a(A2, "fib", addend=FIB_FILENAME_OFFSET)
     code.move_l_label_to_a(A3, "namebuf")
-    code.clr_l_d(D6)
-    code.move_b_postinc_to_d(D6, A2)  # D6 = BSTR length byte; A2 -> chars
-    code.subq_l_imm_d(D6, 1)  # D6 = length - 1, for dbra's count
     code.label("copyloop")
-    code.move_b_postinc_to_postinc(A3, A2)
-    code.dbra(D6, "copyloop")
+    code.move_b_postinc_to_d(D6, A2)
+    code.branch(CodeBuilder.BEQ, "copydone")
+    code.move_b_d_to_postinc(A3, D6)
+    code.branch(CodeBuilder.BRA, "copyloop")
+    code.label("copydone")
     code.move_b_imm_to_postinc(A3, 10)  # '\n'
     code.move_b_imm_to_postinc(A3, 0)  # NUL terminator
 

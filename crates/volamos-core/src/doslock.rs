@@ -82,7 +82,7 @@ use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTa
 use crate::dosfile::{
     DosState, ERROR_INVALID_LOCK, ERROR_OBJECT_WRONG_TYPE, map_io_error, map_vfs_error,
 };
-use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr, read_c_string, write_bstr};
+use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr, read_c_string, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 use crate::vfs::ResolveMode;
@@ -118,13 +118,12 @@ const FL_ACCESS_OFFSET: u32 = 8;
 
 /// `sizeof(struct FileInfoBlock)`: 260 bytes. Allocated by the *guest
 /// program*, never by this runtime -- see [`fill_fib`].
-#[allow(dead_code)]
-const FIB_SIZE: u32 = 260;
+pub(crate) const FIB_SIZE: u32 = 260;
 const FIB_DISKKEY_OFFSET: u32 = 0;
 const FIB_DIRENTRYTYPE_OFFSET: u32 = 4;
 const FIB_FILENAME_OFFSET: u32 = 8;
-/// `fib_FileName` is a BSTR: one length byte + up to 107 data bytes
-/// (108-byte buffer total).
+/// `fib_FileName` is a `NUL`-terminated `TEXT[108]` (NDK `dos/dos.h`) --
+/// 107 usable characters plus the terminator.
 const FIB_FILENAME_MAX_CHARS: usize = 107;
 const FIB_PROTECTION_OFFSET: u32 = 116;
 const FIB_ENTRYTYPE_OFFSET: u32 = 120;
@@ -423,7 +422,7 @@ impl DosState {
 /// The "own name" of a lock's target, for `Examine`: the last component
 /// of its normalized Amiga path, or (for a volume root, which has no
 /// components) the volume name itself.
-fn own_display_name(amiga_path: &str) -> String {
+pub(crate) fn own_display_name(amiga_path: &str) -> String {
     let (vol, rest) = amiga_path.split_once(':').unwrap_or((amiga_path, ""));
     match rest.rsplit('/').find(|c| !c.is_empty()) {
         Some(last) => last.to_string(),
@@ -453,7 +452,13 @@ fn alloc_lock_struct(
 /// length; `size` is ignored -- written as `0` -- for a directory). See
 /// the module docs for the field-by-field layout and the fixed
 /// `DateStamp`/empty-comment choices.
-fn fill_fib(mem: &mut dyn AddressSpace, fib_addr: u32, name: &str, is_dir: bool, size: u32) {
+pub(crate) fn fill_fib(
+    mem: &mut dyn AddressSpace,
+    fib_addr: u32,
+    name: &str,
+    is_dir: bool,
+    size: u32,
+) {
     let entry_type = if is_dir {
         ENTRY_TYPE_DIR
     } else {
@@ -471,7 +476,7 @@ fn fill_fib(mem: &mut dyn AddressSpace, fib_addr: u32, name: &str, is_dir: bool,
         }
         &name[..end]
     };
-    write_bstr(
+    write_c_string(
         mem,
         fib_addr + FIB_FILENAME_OFFSET,
         truncated_name.as_bytes(),
@@ -486,8 +491,9 @@ fn fill_fib(mem: &mut dyn AddressSpace, fib_addr: u32, name: &str, is_dir: bool,
     mem.write_u32(fib_addr + FIB_DATE_OFFSET, 0);
     mem.write_u32(fib_addr + FIB_DATE_OFFSET + 4, 0);
     mem.write_u32(fib_addr + FIB_DATE_OFFSET + 8, 0);
-    // fib_Comment: empty BSTR.
-    write_bstr(mem, fib_addr + FIB_COMMENT_OFFSET, b"");
+    // fib_Comment: empty NUL-terminated string (TEXT fib_Comment[80],
+    // NDK dos/dos.h -- not a BSTR, same fix as fib_FileName above).
+    write_c_string(mem, fib_addr + FIB_COMMENT_OFFSET, b"");
 }
 
 // --- LVO handlers ---
@@ -631,7 +637,6 @@ mod tests {
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
     use crate::dispatch::{Runtime, StartConfig};
     use crate::dosfile::{ERROR_OBJECT_NOT_FOUND, MODE_NEWFILE};
-    use crate::guestmem::read_bstr;
     use crate::memory::FlatMemory;
     use crate::vfs::{Vfs, VfsConfig};
     use std::fs;
@@ -789,11 +794,14 @@ mod tests {
             mem.read_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET) as i32,
             ENTRY_TYPE_DIR
         );
-        assert_eq!(read_bstr(&mem, fib_addr + FIB_FILENAME_OFFSET), b"work");
+        assert_eq!(read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET), b"work");
 
         // Sorted order: a.txt, b.txt, c_dir.
         dos.ex_next(&mut mem, addr, fib_addr).expect("first entry");
-        assert_eq!(read_bstr(&mem, fib_addr + FIB_FILENAME_OFFSET), b"a.txt");
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+            b"a.txt"
+        );
         assert_eq!(mem.read_u32(fib_addr + FIB_SIZE_OFFSET), 1);
         assert_eq!(
             mem.read_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET) as i32,
@@ -801,11 +809,17 @@ mod tests {
         );
 
         dos.ex_next(&mut mem, addr, fib_addr).expect("second entry");
-        assert_eq!(read_bstr(&mem, fib_addr + FIB_FILENAME_OFFSET), b"b.txt");
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+            b"b.txt"
+        );
         assert_eq!(mem.read_u32(fib_addr + FIB_SIZE_OFFSET), 2);
 
         dos.ex_next(&mut mem, addr, fib_addr).expect("third entry");
-        assert_eq!(read_bstr(&mem, fib_addr + FIB_FILENAME_OFFSET), b"c_dir");
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+            b"c_dir"
+        );
         assert_eq!(
             mem.read_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET) as i32,
             ENTRY_TYPE_DIR
@@ -834,7 +848,10 @@ mod tests {
             ENTRY_TYPE_FILE
         );
         assert_eq!(mem.read_u32(fib_addr + FIB_SIZE_OFFSET), 5);
-        assert_eq!(read_bstr(&mem, fib_addr + FIB_FILENAME_OFFSET), b"f.txt");
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+            b"f.txt"
+        );
 
         let err = dos.ex_next(&mut mem, addr, fib_addr).unwrap_err();
         assert_eq!(err, ERROR_OBJECT_WRONG_TYPE);
