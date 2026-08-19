@@ -132,8 +132,12 @@ const CLOCK_DATA_SIZE: u32 = 14;
 
 /// Amiga "international mode" lowercase mapping -- see the module docs'
 /// "Case-insensitive comparison" section for why this convention (rather
-/// than plain ASCII) was chosen, and its provenance.
-fn amiga_tolower(c: u8) -> u8 {
+/// than plain ASCII) was chosen, and its provenance. `pub(crate)` so
+/// [`crate::locale`] can reuse the exact same mapping for its own
+/// `ConvToLower`/`IsUpper`/etc. -- both modules implement the same real
+/// "no locale installed" default (`loc_CodeSet == 0`, the classic
+/// built-in Amiga charset), see that module's own docs.
+pub(crate) fn amiga_tolower(c: u8) -> u8 {
     if c.is_ascii_uppercase() || ((0xC0..=0xDE).contains(&c) && c != 0xD7) {
         c + 0x20
     } else {

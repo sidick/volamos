@@ -138,6 +138,7 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "mathieeedoubbas.library",
     "mathieeedoubtrans.library",
     "mathffp.library",
+    "locale.library",
 ];
 
 /// Guest address of the exit sentinel: the last word inside the reserved
@@ -299,6 +300,14 @@ pub const TIMER_DEVICE_BASE: u32 = 0x19B0;
 /// `SPNeg`/`SPAdd`/`SPSub`/`SPMul`/`SPDiv`/`SPFloor`/`SPCeil`, `-30`
 /// through `-96`).
 pub const MATHFFP_LIBRARY_BASE: u32 = 0x1BB0;
+
+/// Real `locale.library` base address -- same chunked layout as
+/// [`MATHTRANS_LIBRARY_BASE`], in the `0x1C00`..`0x1E00` chunk. Deepest
+/// real (public) LVO: `StrnCmp` at `-180` (private slots continue
+/// deeper still, but no handler is ever registered for those --
+/// `crate::locale`'s LVO table only names them so unknown-call
+/// diagnostics can print a real function name).
+pub const LOCALE_LIBRARY_BASE: u32 = 0x1DB0;
 
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
@@ -1575,6 +1584,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         // traps -- see crate::mathlibs's module docs.
         crate::mathlibs::register_mathlibs_handlers(&mut table, &mut mem);
 
+        // locale.library: character classification/case-conversion/
+        // string-compare + a minimal OpenLocale/CloseLocale -- see
+        // crate::locale's module docs for why every function ignores
+        // its `locale` argument (no real locale/catalog system).
+        crate::locale::register_locale_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -1616,6 +1631,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHIEEEDOUBBAS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBTRANS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHFFP_LIBRARY_BASE);
+        write_library_node(&mut mem, LOCALE_LIBRARY_BASE);
         write_library_node(&mut mem, TIMER_DEVICE_BASE);
         // A device's node type is NT_DEVICE, not write_library_node's
         // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
@@ -1667,6 +1683,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("mathieeedoubbas.library", MATHIEEEDOUBBAS_LIBRARY_BASE);
         registry.register_real("mathieeedoubtrans.library", MATHIEEEDOUBTRANS_LIBRARY_BASE);
         registry.register_real("mathffp.library", MATHFFP_LIBRARY_BASE);
+        registry.register_real("locale.library", LOCALE_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using

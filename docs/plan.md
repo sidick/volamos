@@ -2801,6 +2801,55 @@ tests), `cargo clippy --all-targets`, `cargo fmt --all` clean. This
 closes out Tier 2 of the vamos coverage audit entirely; only Tier 3
 (`locale.library`, `intuition.library`) remains.
 
+## `locale.library` (vamos gap audit, Tier 3 first half) -- 2026-08-19
+
+Simon confirmed the design question flagged in Tier 2's entry:
+`locale.library` (and `intuition.library`, next) join
+`STANDARD_WORKBENCH_LIBRARIES` -- always present, matching real
+ROM-resident KS/WB 3.1 behavior, not disk-gated.
+
+Scope matches vamos's own (per the original audit): character
+classification, case conversion, locale-aware string compare, and a
+minimal `OpenLocale`/`CloseLocale` -- explicitly *not* a real
+multi-locale/catalog system (no `LC:`-directory scanning, no
+translated catalogs). Every function ignores its `locale` argument:
+this runtime only ever has one behavior to offer (the classic Amiga
+"international mode" charset), so a real vs. fake `Locale*` can't
+change anything.
+
+**Charset verification, prompted by Simon's own note to double-check
+"Latin-7" before assuming it**: the NDK's `libraries/locale.h`
+documents `loc_CodeSet` as "always 0 for now" -- no numbered codeset
+registry existed yet in the V40-era library this runtime targets, and
+codeset 0 conventionally means the classic built-in Amiga charset,
+which is Latin-1 (ISO-8859-1), not Latin-7 (the Baltic variant) --
+confirmed with Simon directly rather than silently picking either.
+Reuses `crate::utility`'s existing `amiga_tolower`/`amiga_toupper`
+(now `pub(crate)`) directly rather than re-deriving the same
+case-mapping data a second time, keeping the two modules' charset
+behavior identically consistent by construction.
+
+**LVO table provenance note, a genuine exception worth recording**:
+AROS's own `locale.conf` has drifted from real V40's function
+ordering -- it defines a real `LocalePrefsUpdate` function occupying
+the exact slot real Kickstart 3.1's ROM only ever reserved as an
+anonymous, uncallable private vector (confirmed by cross-checking
+against the local NDK's `locale_lib.fd`, the same "cross-check, don't
+source from" pattern the `mathffp.library` session entry used). The
+generated table still needed only a mechanical parameter change to
+stay correct: `--start-bias 30` instead of the usual `24` (one extra
+reserved slot specific to `locale.library`'s real ROM history, beyond
+the standard 4-slot `OpenLib`/`CloseLib`/`Expunge`/`Reserved`
+preamble) -- every real, implemented LVO offset (`CloseCatalog`
+through `StrnCmp`) lands exactly on real V40's numbers with that one
+flag, sanity-checked in the generated file's own test.
+
+Verified: 8 new unit/end-to-end tests (including a real regression
+catch mid-session -- an early test draft called `ConvToUpper` at the
+wrong LVO, caught immediately by the test itself rather than shipped
+silently). Full `cargo test --all` (530 passed), `cargo clippy
+--all-targets`, `cargo fmt --all` clean.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

@@ -43,6 +43,7 @@ pub mod execsem;
 pub mod exectask;
 pub mod guestmem;
 pub mod loader;
+pub mod locale;
 pub mod lvos;
 pub mod mathlibs;
 pub mod memory;
