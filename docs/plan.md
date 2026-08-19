@@ -3269,3 +3269,60 @@ Phase 4's three-oracle harness (this session only built the
 rather than staying deferred; not started as part of this entry --
 flagging the status change for the next time Phase 4 itself is picked
 up.
+
+## Phase 4 scoping: AmiBake is ready, all three oracles demonstrated live — 2026-08-19
+
+Followed up on the AmiBake M8 update (above) by actually looking at
+`~/src/amibake` rather than just noting its milestone status. Findings:
+
+- **`recipes/os3.1.4` + `manifests/os314.toml` already exist and
+  build cleanly** against Simon's real Hyperion media
+  (`assets/hyperion/AmigaOS-3.1.4-A500_A600_A2000.zip`, already
+  present, never committed): `amibake build manifests/os314.toml
+  --assets assets` produces `os314.hdf`, a `os314/` host directory
+  tree, `os314.copperline.toml`, and `os314-amiberry.uae` in seconds.
+- **The `dir` output is immediately usable as volamos's own real-world
+  test corpus** — exactly the "real Workbench 3.1.4 `C:` commands"
+  corpus this project decided on 2026-08-18 but hadn't actually run
+  against yet. `os314/C/` has the real 51 Hyperion `C:` binaries (List,
+  Copy, Delete, CPU, Sort, ...) plus one `.uaem` sidecar per file —
+  and those sidecars are the *exact* format `crates/volamos-core/src/
+  dosmeta.rs` already implements (its own doc even says it was
+  "checked against real captured Copperline `.uaem` output" — this is
+  that same output, just produced by AmiBake's extraction instead of a
+  live Copperline capture).
+- **Verified live, all three oracles, using this exact corpus:**
+  1. **volamos**: `volamos -V SYS:<os314 dir> <os314 dir>/C/List
+     SYS:C` — ran the genuine Hyperion `List` binary, produced a
+     correctly-formatted real directory listing with real protection
+     bits (`--p-rwed`), first try.
+  2. **`vamos`**: covered by the two-oracle harness above (different
+     corpus, same principle — this session didn't re-run `vamos`
+     against the AmiBake corpus specifically, but nothing about it
+     would behave differently).
+  3. **Real Kickstart via Copperline**: `copperline --model A1200
+     --cpu 68020 --fast 8M "<KS 3.1 r40.68 ROM>" --run <os314 dir>/C/
+     List --control :0 --control-info ... --noaudio --windowed`
+     (the exact recipe from the Copperline ground-truth memory) booted
+     straight into the real `List` binary and produced a real
+     AmigaDOS listing on real Kickstart 3.1 (40.68) -- confirmed via
+     `capture.screenshot`.
+  The genuine V40 ROM Phase 4's own decision pinned as the baseline
+  (not just V46/3.1.4's own ROM) is already on hand for this too:
+  `/Users/simond/src/external/Copperline/test-assets/Kickstart v3.1
+  r40.68 (1993)(Commodore)(A4000).rom`.
+
+**Not started**: an actual three-way comparison harness (extending
+`tools/compare_vamos.py`'s pattern, or a new script, to add a
+Copperline `--run`+CCP-driven third column and normalize its output
+against the other two -- Copperline's `--run` mode has no built-in
+"program exited, here's stdout" signal the way a native process does,
+so completion detection needs a CCP-driven poll/breakpoint strategy,
+not just a subprocess wait), CI wiring (this corpus is real
+Hyperion-copyrighted media under `assets/`, same never-commit
+constraint as everywhere else this project touches real Amiga
+media -- stays local/opt-in, same as the existing empirical-corpus
+decision), and doc updates. This entry is scoping/verification only,
+done in response to Simon's "start looking at amibake for phase 4" --
+next step is deciding how much of the actual harness to build and in
+what order.
