@@ -50,6 +50,9 @@ console-tool use case.
 - [Supported Libraries](Supported-Libraries.md) — exactly which
   `exec.library`/`dos.library`/`utility.library`/etc. calls are
   implemented today.
+- [Examples](Examples.md) — task-oriented recipes: nested program
+  execution, directory listing, scripting volamos in CI, diagnosing an
+  unfamiliar binary.
 
 ## A note on where volamos is today
 

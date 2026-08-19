@@ -51,6 +51,7 @@ nav:
       - CLI Reference: CLI-Reference.md
       - Volumes and Assigns: Volumes-and-Assigns.md
       - Supported Libraries: Supported-Libraries.md
+      - Examples: Examples.md
   - Help:
       - Building from Source: Building-from-Source.md
       - Changelog: Changelog.md

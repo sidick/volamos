@@ -116,6 +116,9 @@ foo bar
 
 ## Where to go next
 
+- [Examples](Examples.md) for more task-oriented recipes: nested
+  program execution, directory listing, and scripting volamos in a
+  shell/CI pipeline.
 - [CLI Reference](CLI-Reference.md) for every flag, including `--cpu`/
   `--fpu` (to run 68020+/FPU-requiring binaries) and `--stack`/`--ram`.
 - [Volumes and Assigns](Volumes-and-Assigns.md) for multi-assign search
