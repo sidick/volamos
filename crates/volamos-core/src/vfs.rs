@@ -301,6 +301,35 @@ impl Vfs {
         &self.config.volumes
     }
 
+    /// Creates or replaces the assign `name:` -> `targets` (an ordered
+    /// list of Amiga paths, per [`VfsConfig::assigns`]'s own
+    /// convention -- a single-element list for a regular assign,
+    /// multiple for a multi-assign). Case-insensitive on `name`, like
+    /// every other lookup in this module. Used by `crate::dosassign`'s
+    /// `AssignLock`/`AssignPath`/`AssignAdd` handlers, which resolve
+    /// their `lock`/`path` arguments down to Amiga path strings before
+    /// calling this.
+    pub fn set_assign(&mut self, name: &str, targets: Vec<String>) {
+        match self
+            .config
+            .assigns
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            Some((_, existing)) => *existing = targets,
+            None => self.config.assigns.push((name.to_string(), targets)),
+        }
+    }
+
+    /// Removes the assign `name:` if one exists (a no-op otherwise).
+    /// Used by `crate::dosassign`'s `AssignLock(name, 0)` ("cancel"
+    /// form).
+    pub fn remove_assign(&mut self, name: &str) {
+        self.config
+            .assigns
+            .retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+    }
+
     /// Set the current directory. The new value is validated (assign/
     /// volume chain must resolve) before being accepted; on error the
     /// old cwd is left in place.

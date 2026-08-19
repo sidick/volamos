@@ -1564,6 +1564,51 @@ $ echo $?
 ```
 New tests: 1 (`exectask.rs`: `forbid_then_permit_is_a_harmless_no_op`).
 
+**`AssignLock`; unblock `Assign` — 2026-08-19.** `Assign` with no
+arguments (list current volumes/assigns/devices) already worked with
+no gaps -- it's built entirely out of `LockDosList`/`NextDosEntry`/
+`UnLockDosList`, already implemented for `Info`. Its primary form,
+`Assign NAME: TARGET`, needed one new call: `AssignLock` (`crates/
+volamos-core/src/dosassign.rs`). Scoped to `AssignLock` only, not the
+other four RKRM-documented assign functions (`AssignPath`/
+`AssignLate`/`AssignAdd`/`RemAssignList`) -- non-binding/late-binding
+assigns and multi-assign extension are real gaps, left as honest
+unhandled-trap failures for a future corpus binary that needs them,
+not silently stubbed.
+
+Implementation deliberately doesn't build a real `DosList` entry (the
+way `crate::dosdevlist::lock_dos_list` does for volumes) -- it reuses
+this runtime's existing `Vfs` assign model directly (two new methods,
+`Vfs::set_assign`/`remove_assign`, the same representation `-a`/
+`--assign` on the CLI already produces), keyed on the Amiga path
+string the target lock resolved to. This means an assign made with
+`AssignLock` immediately works for every other path-resolving call in
+the same process (confirmed with a direct `Vfs`-level test), which is
+all a corpus binary needs -- but it does *not* show up in a later
+`LockDosList(LDF_ASSIGNS)` walk, since `dosdevlist` only ever
+materializes `LDF_VOLUMES` entries. A real, documented gap if a future
+binary needs to *enumerate* assigns it just created, not just resolve
+paths through them.
+
+Confirmed against the real corpus binary, all three forms -- create,
+cancel, and the "can't turn a volume into an assign" collision case
+(`ERROR_OBJECT_EXISTS`, which real `Assign` renders as its own
+`"Can't cancel %s"` client-side message):
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Assign FOO: WORK:libs
+$ echo $?
+0
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Assign FOO:
+$ echo $?
+0
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Assign WORK: WORK:libs
+Can't cancel WORK
+$ echo $?
+20
+```
+New tests: 5 (`dosassign.rs`: 2 e2e -- create, volume-name collision
+-- + 3 unit tests against `Vfs` directly for set/remove/resolve).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

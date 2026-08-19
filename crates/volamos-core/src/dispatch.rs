@@ -1183,6 +1183,9 @@ impl<C: Cpu + 'static> Runtime<C> {
         // line buffer, set on `dos` just below), not a Vfs.
         crate::dosargs::register_dosargs_handlers(&mut table, &mut mem);
 
+        // dos.library AssignLock -- see crate::dosassign's module docs.
+        crate::dosassign::register_dosassign_handlers(&mut table, &mut mem);
+
         // dos.library ParsePattern(NoCase)/MatchPattern(NoCase) (the
         // wildcard engine `List`/`Copy`/`Delete`/`Dir` rely on) -- see
         // crate::dospattern's module docs.
