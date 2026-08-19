@@ -137,6 +137,7 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "mathieeesingtrans.library",
     "mathieeedoubbas.library",
     "mathieeedoubtrans.library",
+    "mathffp.library",
 ];
 
 /// Guest address of the exit sentinel: the last word inside the reserved
@@ -290,6 +291,14 @@ pub const MATHIEEEDOUBTRANS_LIBRARY_BASE: u32 = 0x17B0;
 /// through the placeholder sentinel `1` this field used to hold. See
 /// `crate::exectask`'s timer handlers.
 pub const TIMER_DEVICE_BASE: u32 = 0x19B0;
+
+/// Real `mathffp.library` base address -- same chunked layout as
+/// [`MATHTRANS_LIBRARY_BASE`], in the `0x1A00`..`0x1C00` chunk. Deepest
+/// real LVO: `SPCeil` at `-96` (per its `.fd` file, `##bias 30` then 12
+/// entries at `-6` apart: `SPFix`/`SPFlt`/`SPCmp`/`SPTst`/`SPAbs`/
+/// `SPNeg`/`SPAdd`/`SPSub`/`SPMul`/`SPDiv`/`SPFloor`/`SPCeil`, `-30`
+/// through `-96`).
+pub const MATHFFP_LIBRARY_BASE: u32 = 0x1BB0;
 
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
@@ -1593,6 +1602,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHTRANS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBBAS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBTRANS_LIBRARY_BASE);
+        write_library_node(&mut mem, MATHFFP_LIBRARY_BASE);
         write_library_node(&mut mem, TIMER_DEVICE_BASE);
         // A device's node type is NT_DEVICE, not write_library_node's
         // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
@@ -1637,6 +1647,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("mathtrans.library", MATHTRANS_LIBRARY_BASE);
         registry.register_real("mathieeedoubbas.library", MATHIEEEDOUBBAS_LIBRARY_BASE);
         registry.register_real("mathieeedoubtrans.library", MATHIEEEDOUBTRANS_LIBRARY_BASE);
+        registry.register_real("mathffp.library", MATHFFP_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using

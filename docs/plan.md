@@ -2648,6 +2648,44 @@ conventions (`AllocMem(0, ...)`/`NULL`-free-is-a-no-op), and
 diagnostic style. Full `cargo test --all` (508 passed), `cargo clippy
 --all-targets`, `cargo fmt --all` clean.
 
+## `mathffp.library` (vamos gap audit, Tier 1 continued) -- 2026-08-19
+
+Second cheap item from the vamos coverage audit: a whole new library
+base, but the FFP encoding machinery (`ffp_to_f32`/`f32_to_ffp`) already
+existed in `crates/volamos-core/src/mathlibs.rs` from `mathtrans.library`'s
+transcendental functions, so this was mostly a thin arithmetic wrapper
+layer. LVO table generated with the existing `tools/gen_lvos.py`
+against AROS's `workbench/libs/mathffp/mathffp.conf` (commit
+`bfc27c04c63b89288a1ef066cbdd370dc4fc7130`), `--start-bias 24` (the
+`.conf` omits the standard 4-slot `OpenLib`/`CloseLib`/`Expunge`/
+`Reserved` preamble other `.conf`s spell out explicitly) -- cross-checked
+against the NDK's own `mathffp_lib.fd` (`##bias 30`) before trusting it,
+same result. New `MATHFFP_LIBRARY_BASE` (`0x1BB0`), `TRAP_TABLE_SIZE`
+grown by one more `0x200` chunk (`0x1A00` -> `0x1C00`) for it, same
+established pattern as every previous math-library addition. Added to
+`STANDARD_WORKBENCH_LIBRARIES` (always-present, like its siblings).
+
+**Real, well-known historical AmigaOS quirk, confirmed rather than
+assumed**: `SPSub`/`SPDiv`'s arguments are effectively reversed from
+what their names suggest. Traced against AROS's own `spsub.c`/`spdiv.c`
+(the NDK Autodoc/`.fd`/`.conf` only give parameter *names*
+`leftParm`/`rightParm`, not which one wins): `SPSub(leftParm=D1,
+rightParm=D0)` literally computes `rightParm - leftParm`, and
+`SPDiv` computes `rightParm / leftParm` -- confirmed empirically here
+too (`sp_sub_computes_right_minus_left_not_left_minus_right`/
+`sp_div_computes_right_divided_by_left_not_left_divided_by_right`
+end-to-end tests, which would have caught the naive "obviously
+correct" order immediately -- and initially did, in a first draft of
+the handler before the AROS source was checked). `SPAdd`/`SPMul`/
+`SPCmp` are natural, commutative/left-vs-right order as expected --
+only the subtract/divide pair has this bug-for-compatibility behavior.
+Reproduced faithfully rather than "fixed," since real guest code
+compiled against real `mathffp.library` already accounts for it.
+
+Full `cargo test --all` (518 passed), `cargo clippy --all-targets`,
+`cargo fmt --all` clean. This closes out Tier 1 of the vamos coverage
+audit; Tier 2 (semaphore list functions, `RunCommand`) next.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

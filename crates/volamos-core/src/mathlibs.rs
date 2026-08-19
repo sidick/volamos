@@ -474,7 +474,180 @@ fn register_mathtrans_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, me
     reg!("SPLog10", sp_log10_handler::<C>);
 }
 
-/// Registers every implemented handler for all three math libraries.
+/// `mathffp.library`'s `SPFix` (LVO -30: `D0` = `parm`, FFP-encoded).
+/// `D0` = `parm` truncated toward zero to a 32-bit integer. Real
+/// `SPFix` (traced against AROS's `workbench/libs/mathffp/spfix.c`,
+/// since the NDK Autodoc doesn't spell out the overflow behavior)
+/// saturates to `i32::MIN`/`i32::MAX` on an out-of-range magnitude
+/// rather than wrapping -- Rust's `as i32` float-to-int cast already
+/// saturates the same way (stable behavior since Rust 1.45), so no
+/// extra clamping code is needed here.
+fn sp_fix_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let parm = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), parm as i32 as u32);
+    Ok(())
+}
+
+/// `mathffp.library`'s `SPFlt` (LVO -36: `D0` = 32-bit integer).
+/// `D0` = that integer converted to FFP.
+fn sp_flt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let inum = ctx.cpu.data_register(DataRegister(0)) as i32;
+    ctx.cpu
+        .set_data_register(DataRegister(0), f32_to_ffp(inum as f32));
+    Ok(())
+}
+
+/// `mathffp.library`'s `SPCmp` (LVO -42: `D1` = `leftParm`, `D0` =
+/// `rightParm`, both FFP). `D0` = `1` if `leftParm > rightParm`, `0` if
+/// equal, `-1` if `leftParm < rightParm` -- traced against AROS's
+/// `spcmp.c` for the exact tri-state values (the NDK Autodoc only says
+/// "positive"/"zero"/"negative"). Natural left-vs-right order, *unlike*
+/// [`sp_sub_handler`]/[`sp_div_handler`] below.
+fn sp_cmp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
+    let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    let result: i32 = if left > right {
+        1
+    } else if left < right {
+        -1
+    } else {
+        0
+    };
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
+/// `mathffp.library`'s `SPTst` (LVO -48: `D1` = `parm`, FFP). `D0` =
+/// `1` if positive, `0` if zero, `-1` if negative -- traced against
+/// AROS's `sptst.c` (equivalent to `SPCmp(parm, 0)`, per its own
+/// `SEE ALSO`).
+fn sp_tst_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let parm = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
+    let result: i32 = if parm > 0.0 {
+        1
+    } else if parm < 0.0 {
+        -1
+    } else {
+        0
+    };
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
+/// One-FFP-argument `mathffp.library` function (`D0` in, `D0` out).
+fn sp_unary_ffp<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    f: impl FnOnce(f32) -> f32,
+) -> Result<(), DispatchError> {
+    let parm = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), f32_to_ffp(f(parm)));
+    Ok(())
+}
+
+macro_rules! sp_unary_ffp_handler {
+    ($fn_name:ident, $op:expr) => {
+        fn $fn_name<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+            sp_unary_ffp(ctx, $op)
+        }
+    };
+}
+
+sp_unary_ffp_handler!(sp_abs_handler, f32::abs);
+sp_unary_ffp_handler!(sp_neg_handler, |x: f32| -x);
+sp_unary_ffp_handler!(sp_floor_handler, f32::floor);
+sp_unary_ffp_handler!(sp_ceil_handler, f32::ceil);
+
+/// `mathffp.library`'s `SPAdd` (LVO -66: `D1` = `leftParm`, `D0` =
+/// `rightParm`, both FFP). `D0` = their sum, FFP-encoded. Natural,
+/// commutative order.
+fn sp_add_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
+    let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), f32_to_ffp(left + right));
+    Ok(())
+}
+
+/// `mathffp.library`'s `SPSub` (LVO -72: `D1` = `leftParm`, `D0` =
+/// `rightParm`, both FFP). **Real `SPSub` computes `rightParm -
+/// leftParm`, not `leftParm - rightParm`** -- a genuine, well-known
+/// historical AmigaOS quirk (the "arguments effectively swapped"
+/// behavior of `mathffp.library`'s subtract/divide, confirmed here by
+/// reading AROS's `spsub.c` literally: `SPAdd(fnum2, fnum1 ^
+/// FFPSign_Mask)`, i.e. `fnum2 + (-fnum1)` where `fnum1`/`fnum2` are
+/// `leftParm`/`rightParm` in bias order -- not a guess from the
+/// function name, which would suggest the opposite). This runtime
+/// reproduces that quirk faithfully rather than the "obviously
+/// correct" order, since real guest code compiled against real
+/// `mathffp.library` already accounts for it.
+fn sp_sub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
+    let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), f32_to_ffp(right - left));
+    Ok(())
+}
+
+/// `mathffp.library`'s `SPMul` (LVO -78: `D1` = `leftParm`, `D0` =
+/// `rightParm`, both FFP). `D0` = their product, FFP-encoded. Natural,
+/// commutative order.
+fn sp_mul_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
+    let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), f32_to_ffp(left * right));
+    Ok(())
+}
+
+/// `mathffp.library`'s `SPDiv` (LVO -84: `D1` = `leftParm`, `D0` =
+/// `rightParm`, both FFP). **Real `SPDiv` computes `rightParm /
+/// leftParm`, not `leftParm / rightParm`** -- the same historical
+/// argument-order quirk as [`sp_sub_handler`] (confirmed against
+/// AROS's `spdiv.c`, which treats its second bias-order parameter as
+/// the dividend and its first as the divisor). Reproduced faithfully
+/// for the same reason.
+fn sp_div_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
+    let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), f32_to_ffp(right / left));
+    Ok(())
+}
+
+/// Registers every implemented `mathffp.library` handler onto
+/// [`crate::dispatch::MATHFFP_LIBRARY_BASE`].
+fn register_mathffp_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem: &mut C::Memory) {
+    macro_rules! reg {
+        ($name:literal, $handler:expr) => {
+            table
+                .register_by_name(
+                    mem,
+                    crate::dispatch::MATHFFP_LIBRARY_BASE,
+                    crate::lvos::mathffp::MATHFFP_LVOS,
+                    "mathffp.library",
+                    $name,
+                    $handler,
+                )
+                .unwrap_or_else(|e| panic!("{} should be in MATHFFP_LVOS: {e}", $name));
+        };
+    }
+    reg!("SPFix", sp_fix_handler::<C>);
+    reg!("SPFlt", sp_flt_handler::<C>);
+    reg!("SPCmp", sp_cmp_handler::<C>);
+    reg!("SPTst", sp_tst_handler::<C>);
+    reg!("SPAbs", sp_abs_handler::<C>);
+    reg!("SPNeg", sp_neg_handler::<C>);
+    reg!("SPAdd", sp_add_handler::<C>);
+    reg!("SPSub", sp_sub_handler::<C>);
+    reg!("SPMul", sp_mul_handler::<C>);
+    reg!("SPDiv", sp_div_handler::<C>);
+    reg!("SPFloor", sp_floor_handler::<C>);
+    reg!("SPCeil", sp_ceil_handler::<C>);
+}
+
+/// Registers every implemented handler for all four math libraries.
 /// Called unconditionally from [`crate::dispatch::Runtime::new`].
 pub fn register_mathlibs_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
@@ -483,6 +656,7 @@ pub fn register_mathlibs_handlers<C: Cpu + 'static>(
     register_mathieeedoubbas_handlers(table, mem);
     register_mathieeedoubtrans_handlers(table, mem);
     register_mathtrans_handlers(table, mem);
+    register_mathffp_handlers(table, mem);
 }
 
 #[cfg(test)]
@@ -515,5 +689,200 @@ mod tests {
         // from this module's doc comment's bit layout, not just a
         // round-trip check.
         assert_eq!(f32_to_ffp(1.0), (0x0080_0000u32 << 8) | (65 << 1));
+    }
+
+    // --- mathffp.library, via the actual jump-table dispatch ---
+    //
+    // The SPSub/SPDiv argument-order quirk (see sp_sub_handler's/
+    // sp_div_handler's doc) is exactly the kind of thing a future
+    // refactor could accidentally "fix" back to the naive order --
+    // worth a real end-to-end regression test, not just unit coverage
+    // of the FFP encoding.
+
+    use crate::backend::{M68kCpu, TRAP_TABLE_END};
+    use crate::dispatch::{MATHFFP_LIBRARY_BASE, Runtime, StartConfig};
+    use crate::memory::FlatMemory;
+
+    fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
+        let mut offset = addr;
+        for &w in words {
+            mem.write_u16(offset, w);
+            offset += 2;
+        }
+    }
+
+    /// `move.l #imm32,Dn`.
+    fn move_imm_to_d(n: u16) -> u16 {
+        0x203C | (n << 9)
+    }
+
+    /// `jsr <disp16>(a6)`.
+    fn jsr_disp16_a6(disp: i32) -> [u16; 2] {
+        [0x4EAE, disp as u16]
+    }
+
+    const RTS: u16 = 0x4E75;
+
+    /// `move.l #imm32,An`.
+    fn move_imm_to_a(n: u16) -> u16 {
+        0x207C | (n << 9)
+    }
+
+    /// Prepends `movea.l #MATHFFP_LIBRARY_BASE,a6` and builds a runtime.
+    fn mathffp_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (MATHFFP_LIBRARY_BASE >> 16) as u16,
+            MATHFFP_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    /// `D1 = left` (FFP), `D0 = right` (FFP), calls the LVO at `disp`,
+    /// returns `D0` as FFP-decoded `f32`.
+    fn run_binary_ffp(disp: i32, left: f32, right: f32) -> f32 {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(1));
+        let left_bits = f32_to_ffp(left);
+        words.push((left_bits >> 16) as u16);
+        words.push(left_bits as u16);
+        words.push(move_imm_to_d(0));
+        let right_bits = f32_to_ffp(right);
+        words.push((right_bits >> 16) as u16);
+        words.push(right_bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(disp));
+        words.push(RTS);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        ffp_to_f32(code as u32)
+    }
+
+    #[test]
+    fn sp_add_is_commutative_natural_order() {
+        let result = run_binary_ffp(-66, 3.0, 4.0);
+        assert!((result - 7.0).abs() < 1e-4, "got {result}");
+    }
+
+    #[test]
+    fn sp_sub_computes_right_minus_left_not_left_minus_right() {
+        // leftParm=D1=10, rightParm=D0=3 -- real SPSub returns
+        // rightParm - leftParm = 3 - 10 = -7, per sp_sub_handler's doc.
+        let result = run_binary_ffp(-72, 10.0, 3.0);
+        assert!((result - (-7.0)).abs() < 1e-4, "got {result}");
+    }
+
+    #[test]
+    fn sp_mul_is_commutative_natural_order() {
+        let result = run_binary_ffp(-78, 3.0, 4.0);
+        assert!((result - 12.0).abs() < 1e-4, "got {result}");
+    }
+
+    #[test]
+    fn sp_div_computes_right_divided_by_left_not_left_divided_by_right() {
+        // leftParm=D1=2, rightParm=D0=10 -- real SPDiv returns
+        // rightParm / leftParm = 10 / 2 = 5, per sp_div_handler's doc.
+        let result = run_binary_ffp(-84, 2.0, 10.0);
+        assert!((result - 5.0).abs() < 1e-4, "got {result}");
+    }
+
+    #[test]
+    fn sp_cmp_natural_left_vs_right_order() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(1));
+        let left_bits = f32_to_ffp(2.0);
+        words.push((left_bits >> 16) as u16);
+        words.push(left_bits as u16);
+        words.push(move_imm_to_d(0));
+        let right_bits = f32_to_ffp(5.0);
+        words.push((right_bits >> 16) as u16);
+        words.push(right_bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // SPCmp
+        words.push(RTS);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -1, "leftParm (2) < rightParm (5)");
+    }
+
+    #[test]
+    fn sp_tst_sign_of_d1() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(1));
+        let bits = f32_to_ffp(-2.5);
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-48)); // SPTst
+        words.push(RTS);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn sp_fix_and_sp_flt_round_trip() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(42); // D0 = 42
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // SPFlt -> D0 = FFP(42.0)
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // SPFix -> D0 = 42
+        words.push(RTS);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn sp_abs_and_neg() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        let bits = f32_to_ffp(-3.0);
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // SPAbs
+        words.push(RTS);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert!((ffp_to_f32(code as u32) - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sp_floor_and_ceil() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        let bits = f32_to_ffp(2.7);
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // SPCeil
+        words.push(RTS);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert!((ffp_to_f32(code as u32) - 3.0).abs() < 1e-4);
     }
 }
