@@ -501,6 +501,18 @@ fn execute_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     Ok(())
 }
 
+/// `FindSegment` (`D1` = name `CString*`, `D2` = previous match `BPTR`,
+/// `D3` = system flag). `D0` = `0` (`NULL`), always -- this runtime has
+/// no list of resident segments (no `AddSegment`/`Resident` support),
+/// so nothing can ever be found. Sets `IoErr()` to
+/// [`ERROR_OBJECT_NOT_FOUND`], matching real `FindSegment`'s own
+/// "no matching segment" convention.
+fn find_segment_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.dos.set_io_err(ERROR_OBJECT_NOT_FOUND);
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
 /// Registers `LoadSeg`/`UnLoadSeg`/`SystemTagList`/`Execute` onto
 /// [`DOS_LIBRARY_BASE`], looked up by name through [`DOS_LVOS`] -- same
 /// registration style as `dosfile.rs`'s `register_dos_handlers`. Called
@@ -528,6 +540,7 @@ pub fn register_dosseg_handlers<C: Cpu + 'static>(
     reg!("UnLoadSeg", unloadseg_handler::<C>);
     reg!("SystemTagList", system_tag_list_handler::<C>);
     reg!("Execute", execute_handler::<C>);
+    reg!("FindSegment", find_segment_handler::<C>);
 }
 
 #[cfg(test)]
@@ -971,6 +984,33 @@ mod tests {
 
         let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
 
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn end_to_end_find_segment_never_finds_anything() {
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(2)); // D2 = 0 (no previous match)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(3)); // D3 = 0 (system flag)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -780); // FindSegment(a6): D0 = 0
+        push_jsr(&mut words, 6, -132); // IoErr(a6): D0 = current IoErr()
+        words.push(RTS);
+
+        let name = b"anything\0";
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, None);
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, ERROR_OBJECT_NOT_FOUND);

@@ -276,6 +276,10 @@ pub struct DosState {
     /// but `SelectOutput` can repoint it at any open handle (e.g. a real
     /// file, as `Type ... TO file` does).
     current_output: Option<u32>,
+    /// `GetFileSysTask`/`SetFileSysTask`'s current value -- see
+    /// [`get_file_sys_task_handler`]'s doc comment for why a fixed
+    /// sentinel (never a real, dereferenceable `MsgPort`) is sufficient.
+    current_file_sys_task: u32,
     /// Monotonic counter used only to give each opened handle a distinct
     /// debug id written into `fh_Arg1` (see the module docs) -- not used
     /// for lookups.
@@ -394,6 +398,7 @@ impl DosState {
             output_handle: None,
             current_input: None,
             current_output: None,
+            current_file_sys_task: DEFAULT_FILE_SYS_TASK,
             next_debug_id: 0,
             locks: HashMap::new(),
             exnext: HashMap::new(),
@@ -866,6 +871,50 @@ fn wait_for_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
+/// `Cli` (no args). `D0` = `0` (`NULL`), always -- this runtime execs a
+/// guest binary directly, with no simulated Shell process wrapping it
+/// (no `CommandLineInterface` structure at all), so honestly reporting
+/// "the caller is not part of a shell" (real `Cli()`'s own documented
+/// return for that case -- e.g. also true for real programs launched
+/// from Workbench) is the correct answer here, not a missing feature.
+/// Doesn't touch `IoErr()`, matching the real function.
+fn cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
+/// A fixed, non-`NULL` sentinel `MsgPort*` for
+/// [`get_file_sys_task_handler`] -- see its own doc comment for why a
+/// real (dereferenceable) `MsgPort` isn't needed.
+const DEFAULT_FILE_SYS_TASK: u32 = 1;
+
+/// `GetFileSysTask` (no args). `D0` = [`DosState::current_file_sys_task`]
+/// (initially [`DEFAULT_FILE_SYS_TASK`], a fixed non-`NULL` sentinel --
+/// real callers use this value only to compare against other
+/// `MsgPort*`s or pass it along to other calls this runtime doesn't
+/// implement (e.g. `DoPkt`, see [`crate::dosdevproc`]'s module docs for
+/// why raw packets are out of scope), never to actually dereference it,
+/// so a real backing `MsgPort` struct isn't needed. Real
+/// `GetFileSysTask` never returns `NULL` on a booted system, so `0`
+/// would be the wrong choice here (unlike [`crate::dosdevproc`]'s
+/// `dvp_Port`, which real callers do check for `NULL`)). Doesn't touch
+/// `IoErr()`, matching the real function.
+fn get_file_sys_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu
+        .set_data_register(DataRegister(0), ctx.dos.current_file_sys_task);
+    Ok(())
+}
+
+/// `SetFileSysTask` (`D1` = new `MsgPort*`). `D0` = the previous value
+/// of [`DosState::current_file_sys_task`]. Doesn't touch `IoErr()`,
+/// matching the real function.
+fn set_file_sys_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let new_task = ctx.cpu.data_register(DataRegister(1));
+    let old_task = std::mem::replace(&mut ctx.dos.current_file_sys_task, new_task);
+    ctx.cpu.set_data_register(DataRegister(0), old_task);
+    Ok(())
+}
+
 /// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
 /// `BPTR`.
 fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -972,6 +1021,9 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("IsInteractive", is_interactive_handler::<C>);
     reg!("SetMode", set_mode_handler::<C>);
     reg!("WaitForChar", wait_for_char_handler::<C>);
+    reg!("Cli", cli_handler::<C>);
+    reg!("GetFileSysTask", get_file_sys_task_handler::<C>);
+    reg!("SetFileSysTask", set_file_sys_task_handler::<C>);
     reg!("SelectInput", select_input_handler::<C>);
     reg!("SelectOutput", select_output_handler::<C>);
     reg!("IoErr", ioerr_handler::<C>);
@@ -1597,6 +1649,45 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, DOSFALSE as i32);
+    }
+
+    #[test]
+    fn end_to_end_get_file_sys_task_returns_a_nonzero_sentinel() {
+        let words = [jsr_disp16(6), (-522i16) as u16, RTS]; // jsr GetFileSysTask(a6); rts
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(code, 0, "GetFileSysTask() should never report NULL");
+    }
+
+    #[test]
+    fn end_to_end_set_file_sys_task_returns_previous_and_updates_get() {
+        let words = [
+            move_imm_to_d(1),
+            0,
+            0x2A, // D1 = 42 (new "task")
+            jsr_disp16(6),
+            (-528i16) as u16, // SetFileSysTask(a6): D0 = old value (discarded)
+            jsr_disp16(6),
+            (-522i16) as u16, // GetFileSysTask(a6): D0 = 42
+            RTS,
+        ];
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn end_to_end_cli_returns_null() {
+        let words = [jsr_disp16(6), (-492i16) as u16, RTS]; // jsr Cli(a6); rts
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "Cli() should report NULL -- not running in a shell"
+        );
     }
 
     #[test]

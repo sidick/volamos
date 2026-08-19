@@ -1308,6 +1308,48 @@ byte-identical property directly, alongside the pre-existing
 `encode_decode_round_trip` test that caught the `Not(Seq(...))`
 regression during the rewrite itself).
 
+**`Protect`/`Which` — 2026-08-19.** `Protect` already worked with no
+new gaps (built entirely on `SetProtection`, from the `Copy` work
+above) -- confirmed it actually flips the host file's real
+writability. `Which` needed five small gaps in sequence, all reachable
+only once the previous one was fixed:
+
+- **`Cli`** (`dosfile.rs`): always returns `NULL` -- this runtime execs
+  a guest binary directly, with no simulated Shell process wrapping it,
+  so "the caller is not part of a shell" (real `Cli()`'s own documented
+  return for that case, also true for programs launched from
+  Workbench) is honestly correct here, not a missing feature.
+- **`FindSegment`** (`dosseg.rs`): always reports "not found" -- this
+  runtime has no list of resident segments (no `AddSegment`/`Resident`
+  support), so nothing can ever be found.
+- **`GetFileSysTask`/`SetFileSysTask`** (`dosfile.rs`): a fixed
+  non-`NULL` `MsgPort*` sentinel, now backed by real mutable state
+  (`DosState::current_file_sys_task`) so `SetFileSysTask` round-trips
+  correctly -- unlike `GetDeviceProc`'s `dvp_Port` (deliberately `NULL`,
+  see `crate::dosdevproc`'s module docs), real callers of
+  `GetFileSysTask` never expect `NULL`, so a fixed non-zero sentinel is
+  the correct choice here, not `0`.
+- **`VFWritef`** (registered in `dosprintf.rs`): functionally identical
+  to the already-implemented `VFPrintf` (same `D1`/`D2`/`D3` signature,
+  same `RawDoFmt`-based formatting) -- confirmed via the RKRM's own
+  `#define VWritef(format,argv) VFWritef(Output(),(format),(argv))`
+  macro documentation, mirroring `WriteStr(s) = FPuts(Output(),s)`.
+  Registered onto the same handler as `VFPrintf` rather than
+  duplicating it.
+
+`Which` now runs fully end-to-end against the real corpus binary, both
+for a found command and a cleanly-reported "not found":
+```
+$ volamos -V "C:$HOME/amiga/wb314/full/C" ~/amiga/wb314/full/C/Which Which
+C:Which
+$ volamos -V "C:$HOME/amiga/wb314/full/C" ~/amiga/wb314/full/C/Which Nonexistent
+[exit 5, no crash]
+```
+New tests: 4 (`dosfile.rs`, for `Cli`/`GetFileSysTask`/
+`SetFileSysTask`), 1 (`dosseg.rs`, for `FindSegment`), 1 (`dosprintf.rs`,
+end-to-end for `VFWritef` reached under its own LVO name rather than
+via `VFPrintf`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

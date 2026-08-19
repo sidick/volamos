@@ -93,6 +93,11 @@ pub fn register_dosprintf_handlers<C: Cpu + 'static>(
     }
     reg!("VPrintf", vprintf_handler::<C>);
     reg!("VFPrintf", vfprintf_handler::<C>);
+    // VFWritef(fh, fmt, argv) is functionally identical to VFPrintf --
+    // same D1/D2/D3 signature, same RawDoFmt-based formatting -- per the
+    // RKRM's own `#define VWritef(format,argv) VFWritef(Output(),
+    // (format),(argv))` macro, mirroring `WriteStr(s) = FPuts(Output(),s)`.
+    reg!("VFWritef", vfprintf_handler::<C>);
 }
 
 #[cfg(test)]
@@ -170,5 +175,48 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 17, "\"Fish have 2 eyes.\" is 17 characters");
         assert_eq!(out, b"Fish have 2 eyes.");
+    }
+
+    #[test]
+    fn end_to_end_vfwritef_writes_to_the_given_handle_via_trap_dispatch() {
+        // VFWritef(fh, fmt, argv) -- same signature as VFPrintf, just
+        // reached under its own LVO name (real Which calls it this way,
+        // not via VFPrintf).
+        let mut words = Vec::new();
+        push_jsr(&mut words, 6, -60); // Output(a6): D0 = BPTR
+        words.push(0x2200); // move.l d0,d1 (D1 = fh)
+        let fmt_idx = push_move_imm_to_d(&mut words, 2, 0);
+        let data_idx = push_move_imm_to_d(&mut words, 3, 0);
+        push_jsr(&mut words, 6, -348); // VFWritef(a6)
+        words.push(RTS);
+
+        let fmt_str = b"found %s";
+        let name_str = b"Which";
+        let fmt_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let name_addr = fmt_addr + fmt_str.len() as u32 + 1;
+        let data_addr = (name_addr + name_str.len() as u32 + 1 + 3) & !3;
+        patch_imm32(&mut words, fmt_idx, fmt_addr);
+        patch_imm32(&mut words, data_idx, data_addr);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        write_c_string(&mut mem, fmt_addr, fmt_str);
+        write_c_string(&mut mem, name_addr, name_str);
+        mem.write_u32(data_addr, name_addr);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: data_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 11, "\"found Which\" is 11 characters");
+        assert_eq!(out, b"found Which");
     }
 }
