@@ -1252,6 +1252,16 @@ pub struct StartConfig {
     /// M68000, no FPU -- `M68kCpu::new`'s own default), matching every
     /// AttnFlags-unaware call site's existing behavior unchanged.
     pub attn_flags: u16,
+    /// The guest program's own name, written into the fake process's
+    /// `pr_CLI`'s `cli_CommandName` (a `BSTR`) -- see
+    /// [`crate::exectask::create_current_task`] and
+    /// [`crate::dosfile::get_program_name_handler`]. Real AmigaOS's
+    /// `dos.library`'s `GetProgramName()` reads exactly this field.
+    /// Defaults to empty, matching every call site that doesn't care
+    /// (an empty `cli_CommandName` is a legal, if uninformative, BSTR --
+    /// unlike `pr_CLI` itself, which must be non-`NULL`, see
+    /// [`crate::exectask::PR_CLI_OFFSET`]'s doc).
+    pub program_name: String,
 }
 
 impl Default for StartConfig {
@@ -1262,6 +1272,7 @@ impl Default for StartConfig {
             args: Vec::new(),
             stack_size: DEFAULT_STACK_SIZE,
             attn_flags: 0,
+            program_name: String::new(),
         }
     }
 }
@@ -1510,6 +1521,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         // crate::execmem's module docs for the flat-allocator design.
         crate::execmem::register_execmem_handlers(&mut table, &mut mem);
 
+        // exec.library SignalSemaphore API (InitSemaphore/
+        // ObtainSemaphore/ReleaseSemaphore/AttemptSemaphore) -- see
+        // crate::execsem's module docs for why this single-tasking
+        // runtime never needs the real waiter-queue machinery.
+        crate::execsem::register_execsem_handlers(&mut table, &mut mem);
+
         // exec.library RawDoFmt (the printf-like formatter every AmigaOS
         // C startup library's own sprintf/Printf builds on) -- see
         // crate::execfmt's module docs, including how it steps the CPU
@@ -1643,7 +1660,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         // check below have real bounds to work with. See
         // crate::exectask's module docs for exactly which fields are
         // maintained.
-        let task = exectask::create_current_task(&mut mem, &mut heap, stack_base, top);
+        let task = exectask::create_current_task(
+            &mut mem,
+            &mut heap,
+            stack_base,
+            top,
+            &config.program_name,
+        );
         mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, task);
 
         // Command-line buffer: args joined with spaces, '\n'-terminated
@@ -2076,6 +2099,7 @@ mod tests {
                 args: Vec::new(),
                 stack_size: 1, // far below MIN_STACK_SIZE
                 attn_flags: 0,
+                ..StartConfig::default()
             },
         );
         let task = rt.current_task();
@@ -2209,6 +2233,7 @@ mod tests {
                 args: Vec::new(),
                 stack_size: MIN_STACK_SIZE,
                 attn_flags: 0,
+                ..StartConfig::default()
             },
         );
 

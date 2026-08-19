@@ -972,6 +972,50 @@ fn max_cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     Ok(())
 }
 
+/// `GetProgramName` (`D1` = buffer, `D2` = buffer size in bytes). `D0` =
+/// `DOSTRUE`/`DOSFALSE`. Copies `cli_CommandName` (a `BSTR`, see
+/// [`crate::exectask::create_current_task`]) into the caller's buffer,
+/// NUL-terminated, truncating (and returning `DOSFALSE` with `IoErr()`
+/// = [`crate::dospattern::ERROR_LINE_TOO_LONG`]) if it doesn't fit --
+/// traced against AROS's `rom/dos/getprogramname.c` since the NDK
+/// autodoc for this function is thin on exactly which error codes it
+/// sets. `pr_CLI` is always non-`NULL` in this runtime (see
+/// [`crate::exectask::PR_CLI_OFFSET`]'s doc -- this runtime represents
+/// CLI-style execution, never a Workbench launch), so the "no CLI
+/// structure" failure branch real `GetProgramName` also has is
+/// unreachable here. Found needed running the real `AmiSnap` binary.
+fn get_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let buf = ctx.cpu.data_register(DataRegister(1));
+    let len = ctx.cpu.data_register(DataRegister(2)) as i32;
+
+    let cli_bptr = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_CLI_OFFSET);
+    let cli_addr = addr_from_bptr(cli_bptr);
+    let name_bptr = ctx
+        .mem
+        .read_u32(cli_addr + crate::exectask::CLI_COMMAND_NAME_OFFSET);
+    let name = crate::guestmem::read_bstr(ctx.mem, addr_from_bptr(name_bptr));
+
+    let capacity = (len - 1).max(0) as usize;
+    let (copy_len, ok) = if name.len() > capacity {
+        (capacity, false)
+    } else {
+        (name.len(), true)
+    };
+    for (i, &b) in name[..copy_len].iter().enumerate() {
+        ctx.mem.write_u8(buf.wrapping_add(i as u32), b);
+    }
+    ctx.mem.write_u8(buf.wrapping_add(copy_len as u32), 0);
+
+    if !ok {
+        ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+    }
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
 /// A fixed, non-`NULL` sentinel `MsgPort*` for
 /// [`get_file_sys_task_handler`] -- see its own doc comment for why a
 /// real (dereferenceable) `MsgPort` isn't needed. Also reused by
@@ -1117,6 +1161,7 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("WaitForChar", wait_for_char_handler::<C>);
     reg!("Cli", cli_handler::<C>);
     reg!("MaxCli", max_cli_handler::<C>);
+    reg!("GetProgramName", get_program_name_handler::<C>);
     reg!("GetFileSysTask", get_file_sys_task_handler::<C>);
     reg!("SetFileSysTask", set_file_sys_task_handler::<C>);
     reg!("SelectInput", select_input_handler::<C>);
@@ -1859,6 +1904,86 @@ mod tests {
         assert_eq!(
             code, 0,
             "MaxCli() should report an empty table -- no simulated CLI process table"
+        );
+    }
+
+    #[test]
+    fn end_to_end_get_program_name_copies_cli_command_name() {
+        let buf_addr: u32 = 0x1_8000;
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = buf_addr
+            (buf_addr >> 16) as u16,
+            buf_addr as u16,
+            move_imm_to_d(2), // D2 = 64 (buffer size)
+            0,
+            64,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-576i16) as u16]); // GetProgramName(a6)
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                program_name: "AmiSnap".to_string(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, DOSTRUE as i32,
+            "buffer was big enough, should succeed"
+        );
+        assert_eq!(
+            crate::guestmem::read_c_string(rt.memory(), buf_addr),
+            b"AmiSnap"
+        );
+    }
+
+    #[test]
+    fn end_to_end_get_program_name_truncates_and_fails_when_buffer_too_small() {
+        let buf_addr: u32 = 0x1_8000;
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = buf_addr
+            (buf_addr >> 16) as u16,
+            buf_addr as u16,
+            move_imm_to_d(2), // D2 = 4 (too small for "AmiSnap\0")
+            0,
+            4,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-576i16) as u16]); // GetProgramName(a6)
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                program_name: "AmiSnap".to_string(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSFALSE as i32, "buffer too small, should fail");
+        assert_eq!(
+            crate::guestmem::read_c_string(rt.memory(), buf_addr),
+            b"Ami",
+            "truncated to capacity - 1, still NUL-terminated"
         );
     }
 

@@ -38,6 +38,7 @@ pub mod dosvar;
 pub mod execfmt;
 pub mod execlist;
 pub mod execmem;
+pub mod execsem;
 pub mod exectask;
 pub mod guestmem;
 pub mod loader;

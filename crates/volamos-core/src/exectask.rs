@@ -231,7 +231,7 @@ use crate::dispatch::{
     TIMER_DEVICE_BASE,
 };
 use crate::execlist::{LN_NAME, LN_TYPE, init_msg_port_fields};
-use crate::guestmem::{GuestHeap, bptr_from_addr, write_c_string};
+use crate::guestmem::{GuestHeap, bptr_from_addr, write_bstr, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
@@ -325,6 +325,13 @@ pub const PROCESS_STRUCT_SIZE: u32 = 230;
 /// fields, all 4 bytes each (`LONG`/`BPTR`/`BSTR`, every one
 /// pointer-or-longword-sized) = 64.
 const CLI_STRUCT_SIZE: u32 = 64;
+/// `cli_CommandName`: `BSTR`, offset 16 within `struct
+/// CommandLineInterface` (`cli_Result2`/`cli_SetName`/`cli_CommandDir`/
+/// `cli_ReturnCode` 4 each = 16, `cli_CommandName` is the 5th field).
+/// Real `dos.library`'s `GetProgramName()` reads exactly this field
+/// (see [`crate::dosfile::get_program_name_handler`]) -- found needed
+/// running the real `AmiSnap` binary.
+pub(crate) const CLI_COMMAND_NAME_OFFSET: u32 = 16;
 
 // --- struct StackSwapStruct field offsets (bytes from the struct's own
 // address) -- per <exec/execbase.h>: `struct StackSwapStruct { APTR
@@ -453,6 +460,7 @@ pub fn create_current_task<M: AddressSpace>(
     heap: &mut GuestHeap,
     sp_lower: u32,
     sp_upper: u32,
+    program_name: &str,
 ) -> u32 {
     let task = heap
         .alloc(PROCESS_STRUCT_SIZE)
@@ -503,6 +511,20 @@ pub fn create_current_task<M: AddressSpace>(
         mem.write_u8(cli_addr.wrapping_add(i), 0);
     }
     mem.write_u32(task + PR_CLI_OFFSET, bptr_from_addr(cli_addr));
+
+    // cli_CommandName: a real BSTR with the guest program's own name
+    // (an empty BSTR if the caller didn't supply one -- see
+    // CLI_COMMAND_NAME_OFFSET's doc), so GetProgramName() has real
+    // data to read instead of NUL/zero bytes.
+    let name_bytes = program_name.as_bytes();
+    let cli_command_name_addr = heap
+        .alloc(1 + (name_bytes.len().min(255) as u32))
+        .expect("guest heap has room for the fake cli_CommandName BSTR");
+    write_bstr(mem, cli_command_name_addr, name_bytes);
+    mem.write_u32(
+        cli_addr + CLI_COMMAND_NAME_OFFSET,
+        bptr_from_addr(cli_command_name_addr),
+    );
 
     task
 }

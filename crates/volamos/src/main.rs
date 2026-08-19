@@ -444,6 +444,19 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
 /// own "couldn't run it" sentinel, reused here since a load/run failure
 /// deep inside a nested program is, from the parent guest's point of
 /// view, indistinguishable from "the command couldn't be invoked".
+/// The guest-visible program name for `pr_CLI`'s `cli_CommandName`
+/// (`dos.library`'s `GetProgramName()`): the host path's own file name,
+/// matching how a real AmigaOS Shell records just the command as typed
+/// (not a full path) in `cli_CommandName`. Falls back to the whole path
+/// string verbatim if it has no file-name component (e.g. `.` or `/`),
+/// which should never happen for an actual loadable program path but
+/// costs nothing to handle rather than panic.
+fn program_name_from_path(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 fn run_nested_program(
     host_path: &std::path::Path,
     args: &[String],
@@ -469,6 +482,7 @@ fn run_nested_program(
         args: args.to_vec(),
         stack_size,
         attn_flags: attn_flags_for(cpu_type, fpu),
+        program_name: program_name_from_path(host_path),
     };
     let mut runtime = Runtime::new(M68kCpu::with_config(cpu_type, fpu), mem, config);
 
@@ -503,6 +517,7 @@ fn run(opts: &Options) -> Result<i32, String> {
         args: opts.guest_args.clone(),
         stack_size: opts.stack_size,
         attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
+        program_name: program_name_from_path(std::path::Path::new(&opts.program)),
     };
     let mut runtime = Runtime::new(cpu, mem, config);
 

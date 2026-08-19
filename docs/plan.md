@@ -2485,6 +2485,57 @@ vendored forks can differ (confirmed here: this `amiga-gcc`
 distribution's `__cpucheck.o` diverges from `adtools/libnix`
 master's `__cpucheck.c`).
 
+## `AmiSnap` continued: `InitSemaphore`/`ObtainSemaphore`/`ReleaseSemaphore`/`AttemptSemaphore`, `GetProgramName` -- 2026-08-19
+
+With `--cpu 68020` clearing the false-alarm `Alert`, the run advanced
+to two more real gaps in sequence, each implemented and re-verified
+in turn (same "find gap -> implement -> verify -> keep going" loop):
+
+1. **`exec.library`'s `SignalSemaphore` API** (new module
+   `crates/volamos-core/src/execsem.rs`): `InitSemaphore`/
+   `ObtainSemaphore`/`ReleaseSemaphore`/`AttemptSemaphore`. Struct
+   layout and the nesting/ownership algorithm (`ss_QueueCount`
+   incremented speculatively, `== 0` means "got it uncontended",
+   `ss_Owner == ThisTask` means "recursive nest") traced against
+   AROS's `rom/exec/semaphores.c`/`obtainsemaphore.c`/
+   `releasesemaphore.c`/`attemptsemaphore.c`, since the NDK header
+   documents the struct fields but not the algorithm. Design: this
+   runtime only ever has one task, so the real "some other task holds
+   it, block" branch can never legitimately fire -- treated as a loud
+   `HandlerFailed` (uninitialized/corrupt semaphore) for
+   `ObtainSemaphore`/`ReleaseSemaphore`, but as a faithful `FALSE`
+   return for `AttemptSemaphore`, whose whole contract is "never
+   blocks, tells you whether it worked". The waiter-queue machinery
+   (`ss_WaitQueue`, shared-vs-exclusive locks,
+   `ObtainSemaphoreShared`/`AttemptSemaphoreShared`) is consequently
+   unimplemented -- never reachable here.
+2. **`dos.library`'s `GetProgramName`**: copies `pr_CLI`'s
+   `cli_CommandName` (a `BSTR`) into the caller's buffer, truncating
+   with `ERROR_LINE_TOO_LONG` if it doesn't fit -- traced against
+   AROS's `rom/dos/getprogramname.c` for the exact truncation/error
+   contract. Needed populating `cli_CommandName` for the first time
+   (previously always `NULL`/empty since `create_current_task`'s CLI
+   struct was all-zeroed): `StartConfig` gained a `program_name`
+   field, threaded from `main.rs`'s new `program_name_from_path`
+   helper (the host path's file name, matching how a real Shell
+   records just the command as typed, not a full path) through both
+   the top-level and nested (`System()`/`Execute`) run paths.
+
+Verified: both gaps are gone from the real `AmiSnap` binary (`--cpu
+68020`), which now advances further still. Full `cargo test --all`
+(494 passed), `cargo clippy --all-targets`, `cargo fmt --all` clean.
+
+**Next gap, not yet implemented**: `exec.library`'s `Allocate` (LVO
+-186) -- the raw free-list `struct MemHeader`/`struct MemChunk`
+primitive `AllocMem` et al. are themselves built on. This is a bigger
+one: `execmem.rs`'s own module docs explicitly deferred real
+`MemHeader`/`MemChunk` emulation ("start flat, add emulation only
+when a corpus binary trips on it," Phase 3 scope) in favor of a flat
+`GuestHeap`-backed model with no guest-visible chunk chain -- and this
+is that trip. Needs a design decision before implementing (a real,
+walkable `MemHeader`/`MemChunk` chain vs. some other faithful-enough
+approximation), not just a mechanical LVO fill-in like the two above.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
