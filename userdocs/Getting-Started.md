@@ -83,7 +83,7 @@ x
 [... several hundred more lines, one per recursion level ...]
 x
 x
-volamos: fixtures/recurse: stack overflow: A7 0x000feffc is outside the current task's stack bounds [0x000ff000, 0x00100000] -- try running with a larger --stack
+volamos: fixtures/recurse: stack overflow: A7 0x00ffeffc is outside the current task's stack bounds [0x00fff000, 0x01000000] -- try running with a larger --stack
 ```
 
 `fixtures/recurse` recurses until it overflows its stack on purpose;
@@ -117,7 +117,7 @@ foo bar
 ## Where to go next
 
 - [CLI Reference](CLI-Reference.md) for every flag, including `--cpu`/
-  `--fpu` (to run 68020+/FPU-requiring binaries) and `--stack`.
+  `--fpu` (to run 68020+/FPU-requiring binaries) and `--stack`/`--ram`.
 - [Volumes and Assigns](Volumes-and-Assigns.md) for multi-assign search
   order, `--auto-assign`, and the exact Amiga path semantics volamos
   implements.
