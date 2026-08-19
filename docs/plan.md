@@ -2438,9 +2438,52 @@ Full `cargo test --all` (487 passed), `cargo clippy --all-targets`,
 caller (proven by a following instruction actually executing); a
 dead-end alert fails with the expected `HandlerFailed` details.
 
-Follow-on gap noticed while re-testing: `AmiSnap --help` exits 0 but
-prints no output at all -- likely a `libnix` buffered-stdio flush gap
-(`Flush`/`SetVBuf`-adjacent), not yet investigated.
+Also added, per Simon's request: `Alert` now unconditionally
+`eprintln!`s a decoded diagnostic (`AT_DeadEnd`/`AT_Recovery`,
+`SubSysId`/`GeneralError`/`SpecificError` per `<exec/alerts.h>`'s
+documented bit layout) straight to stderr, not gated behind
+`--verbose`/`--snoop` like every other handler -- a real Guru
+Meditation is never silent on real hardware, and a *recoverable*
+alert in particular would otherwise vanish the instant the guest
+continues past it (there's no later error for anything to surface it
+through).
+
+**Follow-up investigation, same session:** tried `AmiSnap --help`
+(invented, not a real AmiSnap flag) and `AmiSnap ?` (the real
+`RDA_ExtHelp` convention, confirmed against AmiSnap's own
+`ReadArgs()`/`RDA_ExtHelp` usage) -- both printed nothing and exited
+20. First guess (a `libnix` buffered-stdio flush bug) was wrong.
+`dosargs.rs`'s own module docs already document `?`-extended-help as
+a deliberate, out-of-scope gap (interactive-only, needs a real
+console), so that alone wasn't the explanation either. The decoded
+`Alert` diagnostic (added above) revealed the real cause immediately:
+every invocation logged the exact same alert, `AG_IOError|AO_CIARsrc`
+(`0x00068020`), regardless of arguments -- meaning something in
+process startup, before `argv` is even parsed, was failing
+identically every time.
+
+Traced (via `m68k-amigaos-objdump`/`ar x` on the actual toolchain's
+`libnix.a`, not just the public `adtools/libnix` GitHub source, which
+turned out to differ) to `__cpucheck.o`: this toolchain's bundled
+`libnix` startup calls `Alert()` directly (not `__request()`+`exit()`
+like the current public source) when the running CPU doesn't meet the
+binary's compiled-in floor. AmiSnap's own `Makefile` compiles with
+`-m68020` (its documented target floor, `docs/proposal.md`'s
+"Toolchain and testing"), but it was run under volamos's *default*
+`--cpu 68000` -- not a volamos bug at all, a test-setup mismatch.
+`--cpu 68020` makes the `Alert` disappear entirely and the run gets
+substantially further, to a new, genuine, not-yet-implemented gap:
+`PC - EXEC_LIBRARY_BASE == -558` exactly matches `exec.library`'s
+`InitSemaphore`. Not yet investigated.
+
+**Lesson for future gap-chasing**: when a real binary's early failure
+looks argument-independent, suspect process-startup/environment
+mismatch (CPU/FPU floor, missing assigns, wrong stack size) before
+assuming a runtime bug -- and check the *actual* linked toolchain's
+object code, not just a same-named upstream GitHub source, since
+vendored forks can differ (confirmed here: this `amiga-gcc`
+distribution's `__cpucheck.o` diverges from `adtools/libnix`
+master's `__cpucheck.c`).
 
 ## Out of scope for all phases (separate future proposals, unchanged)
 

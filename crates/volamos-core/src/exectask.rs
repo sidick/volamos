@@ -524,18 +524,40 @@ fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// returns to the caller so execution continues.
 const AT_DEAD_END: u32 = 0x8000_0000;
 
+/// `alertNum`'s `SubSysId` field (bits 24-30, 7 bits), per
+/// `<exec/alerts.h>`'s documented layout: `D | SubSysId(7) |
+/// GeneralError(8) | SubSystemSpecificError(16)`.
+const ALERT_SUBSYS_ID_SHIFT: u32 = 24;
+const ALERT_SUBSYS_ID_MASK: u32 = 0x7F;
+/// `alertNum`'s `General Error` field (bits 16-23, 8 bits).
+const ALERT_GENERAL_SHIFT: u32 = 16;
+const ALERT_GENERAL_MASK: u32 = 0xFF;
+/// `alertNum`'s `SubSystem Specific Error` field (bits 0-15, 16 bits).
+const ALERT_SPECIFIC_MASK: u32 = 0xFFFF;
+
 /// `Alert` (LVO -108): `D7` = `alertNum` (per [`crate::lvos::exec::EXEC_LVOS`],
 /// already verified against a primary source). This runtime has no
 /// Guru Meditation display to show, so both cases are handled as
 /// honestly as a headless runtime can: a recoverable alert
 /// ([`AT_DEAD_END`] clear) is impossible to usefully act on either, so
-/// it's simply logged (via the handler's own `CallInfo` -- see
-/// `--verbose`) and returned from, matching real `Alert()`'s documented
-/// "flashes and returns" behavior for this case. A dead-end alert
-/// ([`AT_DEAD_END`] set) means the guest itself has declared system
-/// integrity can no longer be guaranteed, so this fails loudly instead
-/// of pretending to continue past it -- the real machine wouldn't
-/// either. Found needed while running the real `AmiSnap` binary
+/// it's simply logged (see below) and returned from, matching real
+/// `Alert()`'s documented "flashes and returns" behavior for this
+/// case. A dead-end alert ([`AT_DEAD_END`] set) means the guest itself
+/// has declared system integrity can no longer be guaranteed, so this
+/// fails loudly instead of pretending to continue past it -- the real
+/// machine wouldn't either.
+///
+/// Unlike every other handler in this runtime, `Alert` always prints
+/// its own diagnostic straight to stderr, unconditionally (not gated
+/// behind `--verbose`/`--snoop`): on real hardware a Guru Meditation
+/// is never silent, and a *recoverable* alert in particular would
+/// otherwise vanish without a trace the moment the guest continues
+/// past it -- there's no later error for anything to surface it
+/// through. `dos/dispatch.rs`'s module docs on `CallInfo::detail`
+/// explain why ad hoc `eprintln!`s in handlers are otherwise
+/// discouraged; this is the deliberate, documented exception, for the
+/// same reason a dead-end `HandlerFailed`'s message is never
+/// optional. Found needed while running the real `AmiSnap` binary
 /// (`~/src/amisnap`): `PC - EXEC_LIBRARY_BASE == -108` exactly matched
 /// this LVO in the `UnknownCall` diagnostic's candidate list, i.e. the
 /// guest really was calling `Alert()`, not some math/AmiSSL library (a
@@ -543,7 +565,20 @@ const AT_DEAD_END: u32 = 0x8000_0000;
 /// conditionally and this runtime never even attempts it).
 fn alert_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let alert_num = ctx.cpu.data_register(DataRegister(7));
-    if alert_num & AT_DEAD_END != 0 {
+    let dead_end = alert_num & AT_DEAD_END != 0;
+    let subsys_id = (alert_num >> ALERT_SUBSYS_ID_SHIFT) & ALERT_SUBSYS_ID_MASK;
+    let general = (alert_num >> ALERT_GENERAL_SHIFT) & ALERT_GENERAL_MASK;
+    let specific = alert_num & ALERT_SPECIFIC_MASK;
+    eprintln!(
+        "volamos: Alert({alert_num:#010x}): {} -- SubSysId={subsys_id:#04x} \
+         GeneralError={general:#04x} SpecificError={specific:#06x}",
+        if dead_end {
+            "AT_DeadEnd"
+        } else {
+            "AT_Recovery"
+        }
+    );
+    if dead_end {
         return Err(DispatchError::HandlerFailed {
             library: "exec.library".to_string(),
             lvo: -108,
