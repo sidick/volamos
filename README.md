@@ -19,6 +19,36 @@ an original Amiga toolchain as part of a build) is a first-class use case,
 not an afterthought — there's no dependency on a display, windowing
 system, or any Amiga hardware.
 
+## Building
+
+Requires a recent stable Rust toolchain (via [rustup](https://rustup.rs)
+or your OS package manager) with edition 2024 support — no other system
+dependencies.
+
+```sh
+git clone https://github.com/sidick/volamos.git
+cd volamos
+cargo build --release
+```
+
+The binary is at `target/release/volamos`. Run it directly:
+
+```sh
+target/release/volamos fixtures/hello
+```
+
+To put `volamos` on your `PATH` instead:
+
+```sh
+cargo install --path crates/volamos --locked
+volamos fixtures/hello
+```
+
+(`cargo uninstall volamos` removes it again.) The `cargo run -p volamos
+--` form used throughout the rest of this README is the quick
+edit-compile-run loop for development — for everyday use, build once
+and run the binary directly, as above.
+
 ## Status
 
 **Phases 1-3 — complete**: CPU + trap plumbing, `dos.library` file I/O
