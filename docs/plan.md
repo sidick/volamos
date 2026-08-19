@@ -3326,3 +3326,16 @@ decision), and doc updates. This entry is scoping/verification only,
 done in response to Simon's "start looking at amibake for phase 4" --
 next step is deciding how much of the actual harness to build and in
 what order.
+
+**Decided, 2026-08-19**: the full three-way comparison (the real-
+Kickstart-via-Copperline column) stays **local-only, never CI** —
+same reasoning as everywhere else real Hyperion-copyrighted media
+touches this project (`docs/plan.md`'s own `REAL_ROM_B64`/empirical-
+corpus notes). `tools/compare_vamos.py`'s existing two-oracle
+(volamos vs. `vamos`) subset is the only piece that stays CI-eligible,
+since it needs no proprietary media at all. A future, CI-safe
+extension using AROS's own command-line equivalents (openly licensed,
+buildable/committable, per the empirical-corpus decision's own
+"follow-on" note) is a real idea for later, once the real three-way
+harness exists and there's something to validate an AROS-based
+substitute against — not started now.
