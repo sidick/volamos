@@ -1706,6 +1706,46 @@ New tests: 9 (`dosargs.rs`: 2 for the empty-name template item;
 `utility.rs`: 5 for the four math primitives; `dosdate.rs`: 1 for
 `Delay`; `dosfile.rs`: 1 for `MaxCli`).
 
+**Loader: `HUNK_DREL32` support — 2026-08-19.** For a change of pace,
+tried a real third-party tool instead of a `C:` command: `PhxAss`
+4.40, a real Amiga macro assembler, downloaded from its actual Aminet
+package (`dev/asm/PhxAss.lha`, freeware, unlike the Workbench `C:`
+corpus this isn't Commodore/Hyperion-copyrighted so no vendoring
+concern either way -- still not committed to the repo, same opt-in
+local-file treatment). Its own executable failed to load at all:
+`crates/volamos-core/src/loader.rs`'s hunk parser didn't recognize
+block type `0x3F7`.
+
+That's `HUNK_DREL32` -- despite the name suggesting a self-relative
+("data-relative") fixup, confirmed via
+<https://amiga-dev.wikidot.com/file-format:hunk> that the real AmigaOS
+ROM loader treats it identically to `HUNK_RELOC32SHORT`: the same
+*absolute* `mem[loc] += target_hunk_addr` arithmetic as
+`HUNK_RELOC32`, just a more compact on-disk encoding (`uint16`
+count/hunk-number/offset fields instead of `HUNK_RELOC32`'s `uint32`,
+realigned to a 4-byte boundary afterward since an odd-length list
+leaves the read position mid-longword). Note this correction: the
+first implementation attempt assumed real PC-relative subtraction
+arithmetic and a same-width-as-RELOC32 list format, both wrong --
+worth remembering that "DREL" is a misleading name for what's actually
+implemented, if this comes up again for `HUNK_DREL16`/`HUNK_DREL8`
+(not yet needed by any corpus binary).
+
+With that fixed, `PhxAss` now loads and actually runs real code:
+`OpenLibrary`s dos.library/utility.library/three math libraries
+(`mathtrans`/`mathieeedoubbas`/`mathieeedoubtrans`, all auto-created
+fake handles per this runtime's existing "unknown library" fallback)
+and `locale.library`, then fails cleanly the first time it makes a
+real call into `locale.library` (LVO -156) -- an entire subsystem this
+project has never modeled (out of the established `dos.library`/
+`exec.library`/`utility.library` scope), not a crash. A reasonable
+stopping point for this detour; `locale.library` support would be a
+much larger, separate scope decision if ever pursued.
+
+New tests: 1 (`loader.rs`:
+`inter_hunk_drel32_applies_like_reloc32_despite_the_name`, including
+the alignment-padding edge case).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

@@ -9,7 +9,22 @@
 //! - `HUNK_DATA`   (0x3EA)
 //! - `HUNK_BSS`    (0x3EB)
 //! - `HUNK_RELOC32`(0x3EC)
+//! - `HUNK_DREL32` (0x3F7)
 //! - `HUNK_END`    (0x3F2)
+//!
+//! `HUNK_DREL32` (found running the real `PhxAss` assembler -- itself a
+//! `.lha` archive from Aminet -- against a trivial test source: its own
+//! executable uses this hunk type). Despite the name suggesting a
+//! self-relative ("data-relative") fixup, the real AmigaOS ROM loader
+//! treats it identically to `HUNK_RELOC32SHORT` (confirmed against
+//! <https://amiga-dev.wikidot.com/file-format:hunk>, which documents
+//! `HUNK_DREL32` as "handled exactly the same as `HUNK_RELOC32SHORT`"):
+//! same *absolute* `mem[loc] += target_hunk_addr` arithmetic as
+//! `HUNK_RELOC32`, just a more compact on-disk list encoding --
+//! `uint16` count/hunk-number/offsets instead of `HUNK_RELOC32`'s
+//! `uint32` fields (realigned to a 4-byte boundary after the
+//! `count == 0`-terminated list, since 16-bit entries can leave the
+//! read position mid-longword).
 //!
 //! `HUNK_SYMBOL` (0x3F0) and `HUNK_DEBUG` (0x3F1) blocks are recognized and
 //! skipped (their contents are discarded) so binaries built with `-nosym`
@@ -43,6 +58,7 @@ const HUNK_RELOC32: u32 = 0x3EC;
 const HUNK_SYMBOL: u32 = 0x3F0;
 const HUNK_DEBUG: u32 = 0x3F1;
 const HUNK_END: u32 = 0x3F2;
+const HUNK_DREL32: u32 = 0x3F7;
 
 /// Mask for the memory-flag bits (`MEMF_CHIP`/`MEMF_FAST`/extended-flag
 /// marker) that can be packed into the top bits of a hunk-size longword in
@@ -149,7 +165,9 @@ pub enum HunkKind {
 
 /// A single 32-bit relocation within a hunk: the longword at `offset`
 /// (relative to the start of the hunk it belongs to) needs the load
-/// address of `target_hunk` added to it.
+/// address of `target_hunk` added to it. Built from either
+/// `HUNK_RELOC32` or `HUNK_DREL32` (see the module docs -- both apply
+/// identically despite `HUNK_DREL32`'s on-disk encoding differing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reloc32 {
     /// Byte offset within the owning hunk of the longword to fix up.
@@ -248,6 +266,29 @@ impl<'a> Reader<'a> {
         }
         self.pos = end;
         Ok(())
+    }
+
+    /// Reads a big-endian 16-bit word (used by `HUNK_DREL32`'s more
+    /// compact list encoding -- see the module docs).
+    fn read_u16(&mut self) -> Result<u16, LoadError> {
+        let end = self.pos.checked_add(2).ok_or(LoadError::UnexpectedEof)?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(LoadError::UnexpectedEof)?;
+        self.pos = end;
+        Ok(u16::from_be_bytes([slice[0], slice[1]]))
+    }
+
+    /// Realigns to the next 4-byte boundary if `read_u16` calls left the
+    /// position mid-longword (the rest of the hunk format is entirely
+    /// longword-based, so a `HUNK_DREL32` list -- an odd number of
+    /// 16-bit reads -- must pad back up before the next block-type
+    /// longword is read).
+    fn align_to_longword(&mut self) {
+        if !self.pos.is_multiple_of(4) {
+            self.pos += 2;
+        }
     }
 }
 
@@ -354,6 +395,23 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
                         });
                     }
                 },
+                HUNK_DREL32 => {
+                    loop {
+                        let count = r.read_u16()?;
+                        if count == 0 {
+                            break;
+                        }
+                        let target_hunk = r.read_u16()? as usize;
+                        for _ in 0..count {
+                            let offset = r.read_u16()? as u32;
+                            relocs.push(Reloc32 {
+                                offset,
+                                target_hunk,
+                            });
+                        }
+                    }
+                    r.align_to_longword();
+                }
                 HUNK_SYMBOL => loop {
                     let name_longwords = r.read_u32()?;
                     if name_longwords == 0 {
@@ -623,6 +681,59 @@ mod tests {
         assert_eq!(result.hunk_addrs, vec![0x100, 0x104]);
         assert_eq!(mem.read_u32(0x100), 0x104); // relocated pointer to hunk 1
         assert_eq!(mem.read_u32(0x104), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn inter_hunk_drel32_applies_like_reloc32_despite_the_name() {
+        // Same shape as inter_hunk_reloc32_targets_second_hunk, but two
+        // offsets (an odd count -> the u16-based list ends mid-longword
+        // and needs realigning before HUNK_END is read) against
+        // HUNK_DREL32 instead, to confirm it's parsed with the
+        // RELOC32SHORT-style u16 list and applied with the same
+        // absolute-add arithmetic as HUNK_RELOC32 -- not a self-relative
+        // subtraction, despite the "DREL" name (see the module docs).
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 2); // hunk 0 size: 2 longwords
+        push_u32(&mut buf, 1); // hunk 1 size: 1 longword
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0); // addend placeholder, offset 0
+        push_u32(&mut buf, 0); // addend placeholder, offset 4
+        push_u32(&mut buf, HUNK_DREL32);
+        buf.extend_from_slice(&2u16.to_be_bytes()); // count = 2 offsets
+        buf.extend_from_slice(&1u16.to_be_bytes()); // target hunk 1
+        buf.extend_from_slice(&0u16.to_be_bytes()); // offset 0
+        buf.extend_from_slice(&4u16.to_be_bytes()); // offset 4
+        buf.extend_from_slice(&0u16.to_be_bytes()); // terminate (count=0)
+        // Odd number of u16 reads (count,hunk,off,off,terminator = 5)
+        // leaves the position mid-longword; a real file pads with 2
+        // zero bytes here so the next block-type u32 read (HUNK_END,
+        // below) lands back on a longword boundary -- the parser must
+        // consume that padding rather than just assuming it away.
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        push_u32(&mut buf, HUNK_END);
+
+        push_u32(&mut buf, HUNK_DATA);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).unwrap();
+        assert_eq!(file.hunks[0].relocs.len(), 2);
+
+        let mut mem = FlatMemory::new(0x1000);
+        let result = load(&file, &mut mem, 0x100).unwrap();
+
+        // Hunk 0 at 0x100 (8 bytes), hunk 1 at 0x108.
+        assert_eq!(result.hunk_addrs, vec![0x100, 0x108]);
+        assert_eq!(mem.read_u32(0x100), 0x108, "offset 0 relocated");
+        assert_eq!(mem.read_u32(0x104), 0x108, "offset 4 relocated");
     }
 
     #[test]
