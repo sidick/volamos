@@ -98,7 +98,13 @@
 //! `mp_MsgList`, returning `NULL` on an empty port instead of suspending
 //! the (nonexistent) calling task -- exactly matching real `GetMsg`'s own
 //! contract ("does NOT wait ... returns NULL if the port was empty"; the
-//! *blocking* wait is a separate call, `WaitPort`, not implemented here).
+//! *blocking* wait is a separate call, [`WaitPort`]). [`WaitPort`] peeks
+//! the first message *without* dequeuing it (real `WaitPort`'s
+//! documented difference from `GetMsg`) when `mp_MsgList` is already
+//! non-empty; if it's empty, this single-tasking runtime has no other
+//! task that could ever `PutMsg` to unblock it, so -- same convention
+//! `crate::exectask`'s `Wait` already establishes for exec signals --
+//! it fails loudly instead of hanging the host process forever.
 //! [`PutMsg`] never signals anything (no task to signal). [`ReplyMsg`]
 //! follows the real contract precisely: if the message's `mn_ReplyPort`
 //! is non-`NULL`, it's queued there (as [`PutMsg`] would) with
@@ -425,6 +431,34 @@ fn get_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     Ok(())
 }
 
+/// `WaitPort` (LVO -384: `A0` = `struct MsgPort*`). `D0` = the first
+/// message at the port, *without* dequeuing it (unlike [`GetMsg`],
+/// which does) -- see this module's doc comment for the full contract,
+/// including why an empty port fails loudly here instead of blocking.
+/// Found missing while running the real `AmiSnap` binary (Simon's own
+/// project, `~/src/amisnap`), which waits on its own reply port after
+/// `PutMsg`ing a request to itself synchronously (so the port is
+/// already non-empty by the time `WaitPort` runs).
+fn wait_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let port = ctx.cpu.address_register(AddressRegister(0));
+    let list = port + MP_MSGLIST;
+    let node = ctx.mem.read_u32(list + LH_HEAD);
+    if ctx.mem.read_u32(node + LN_SUCC) != 0 {
+        ctx.cpu.set_data_register(DataRegister(0), node);
+        return Ok(());
+    }
+
+    Err(DispatchError::HandlerFailed {
+        library: "exec.library".to_string(),
+        lvo: -384,
+        handler_name: "WaitPort".to_string(),
+        message: format!(
+            "WaitPort({port:#010x}) would block forever: this is a single-tasking \
+             runtime with no other task that could ever PutMsg to this port"
+        ),
+    })
+}
+
 fn reply_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let message = ctx.cpu.address_register(AddressRegister(1));
     let reply_port = ctx.mem.read_u32(message + MN_REPLYPORT);
@@ -453,24 +487,31 @@ fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
             return Ok(());
         }
     };
-
-    // mp_Node: not yet linked onto any list (ln_Succ/ln_Pred left 0),
-    // type NT_MSGPORT, default priority 0, no name.
-    ctx.mem.write_u32(port + LN_SUCC, 0);
-    ctx.mem.write_u32(port + LN_PRED, 0);
-    ctx.mem.write_u8(port + LN_TYPE, NT_MSGPORT);
-    ctx.mem.write_u8(port + LN_PRI, 0);
-    ctx.mem.write_u32(port + LN_NAME, 0);
-
-    ctx.mem.write_u8(port + MP_FLAGS, PA_SIGNAL);
-    ctx.mem
-        .write_u8(port + MP_SIGBIT, MSGPORT_SIGBIT_PLACEHOLDER);
-    ctx.mem.write_u32(port + MP_SIGTASK, ctx.current_task);
-
-    init_list_header(ctx.mem, port + MP_MSGLIST);
-
+    init_msg_port_fields(ctx.mem, port, ctx.current_task);
     ctx.cpu.set_data_register(DataRegister(0), port);
     Ok(())
+}
+
+/// Initializes a `struct MsgPort` at `port` in place -- shared by
+/// [`create_msg_port_handler`] (a heap-allocated, standalone port) and
+/// [`crate::exectask::create_current_task`] (the fake current process's
+/// own embedded `pr_MsgPort`, at a fixed offset within its `struct
+/// Process`, not a separate allocation). See the module docs for the
+/// `mp_Flags`/`mp_SigBit`/`mp_SigTask` simplifications.
+pub(crate) fn init_msg_port_fields<M: AddressSpace + ?Sized>(mem: &mut M, port: u32, owner: u32) {
+    // mp_Node: not yet linked onto any list (ln_Succ/ln_Pred left 0),
+    // type NT_MSGPORT, default priority 0, no name.
+    mem.write_u32(port + LN_SUCC, 0);
+    mem.write_u32(port + LN_PRED, 0);
+    mem.write_u8(port + LN_TYPE, NT_MSGPORT);
+    mem.write_u8(port + LN_PRI, 0);
+    mem.write_u32(port + LN_NAME, 0);
+
+    mem.write_u8(port + MP_FLAGS, PA_SIGNAL);
+    mem.write_u8(port + MP_SIGBIT, MSGPORT_SIGBIT_PLACEHOLDER);
+    mem.write_u32(port + MP_SIGTASK, owner);
+
+    init_list_header(mem, port + MP_MSGLIST);
 }
 
 /// `DeleteMsgPort` (LVO -672): frees a port allocated by
@@ -604,6 +645,7 @@ pub fn register_execlist_handlers<C: Cpu + 'static>(
     reg!("FindName", find_name_handler::<C>);
     reg!("PutMsg", put_msg_handler::<C>);
     reg!("GetMsg", get_msg_handler::<C>);
+    reg!("WaitPort", wait_port_handler::<C>);
     reg!("ReplyMsg", reply_msg_handler::<C>);
     reg!("CreateMsgPort", create_msg_port_handler::<C>);
     reg!("DeleteMsgPort", delete_msg_port_handler::<C>);

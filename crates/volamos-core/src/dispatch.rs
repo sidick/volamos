@@ -418,6 +418,26 @@ const EXEC_BASE_SOFTVER_OFFSET: u32 = 34;
 /// "System: <model> <fpu> ..." based on it.
 const EXEC_BASE_ATTNFLAGS_OFFSET: u32 = 296;
 
+/// `ExecBase.ThisTask` -- `<exec/execbase.h>`: `LibNode` (34) +
+/// `SoftVer` (2) + `LowMemChkSum` (2) + `ChkBase` (4) +
+/// `ColdCapture`/`CoolCapture`/`WarmCapture` (12) + `SysStkUpper`/
+/// `SysStkLower` (8) + `MaxLocMem` (4) + `DebugEntry`/`DebugData`/
+/// `AlertData`/`MaxExtMem` (16) + `ChkSum` (2) + `IntVects[16]` (192) =
+/// 276 -- same field-by-field derivation as
+/// [`EXEC_BASE_ATTNFLAGS_OFFSET`]'s doc, just stopping right before it
+/// (`ThisTask` immediately precedes `IdleCount`). Real guest code reads
+/// this directly (an inline `struct Task*` field read, not a library
+/// call -- `FindTask(NULL)` is the documented equivalent, but plenty of
+/// real startup code, e.g. libnix's Workbench-vs-CLI detection, reads
+/// the field inline instead) to find its own current task/process.
+/// Found missing while running the real `AmiSnap` binary (Simon's own
+/// project, `~/src/amisnap`, linked with libnix): with this never
+/// written, guest code reading `ExecBase->ThisTask` got `0`, then added
+/// `pr_MsgPort`'s offset (92, see
+/// [`crate::exectask::PR_MSGPORT_OFFSET`]) to get a bogus port address
+/// (`0x5c`) for its startup-time `WaitPort` call.
+pub(crate) const EXEC_BASE_THISTASK_OFFSET: u32 = 276;
+
 /// Guest address of the `u32` cell holding the current `CACRF_*` cache-
 /// control bits -- see [`EXEC_LIBRARY_BASE`]'s "Reserved-region memory
 /// map" doc.
@@ -1624,6 +1644,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         // crate::exectask's module docs for exactly which fields are
         // maintained.
         let task = exectask::create_current_task(&mut mem, &mut heap, stack_base, top);
+        mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, task);
 
         // Command-line buffer: args joined with spaces, '\n'-terminated
         // (the length reported in D0 includes this '\n'), plus one extra

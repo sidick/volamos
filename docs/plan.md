@@ -2340,6 +2340,72 @@ enough of `dos.library`/`exec.library` that Shell's own startup
 sequence has a reasonable chance of running without hitting a wall of
 gaps immediately.
 
+## `AmiSnap` real-project run: `ExecBase.ThisTask` + `struct Process`/`pr_CLI` gap — 2026-08-19
+
+Simon asked to run his own real AmigaOS project, `~/src/amisnap`
+(built with `libnix`), through volamos as the next empirical test
+after the `C:` command corpus. First attempt hit `exec.library`'s
+`WaitPort` as the *very first* library call in the program, before
+any `OpenLibrary`/`FindTask`, with `A0` pointing at the implausibly
+low address `0x0000005c`.
+
+Root cause traced via the `libnix` skill (confirming the universal
+libnix/SAS-C Workbench-vs-CLI startup idiom: check `pr_CLI`, and only
+if `NULL` -- a real Workbench launch -- `WaitPort(&pr_MsgPort)` for
+the `WBStartup` message) plus a primary NDK source fetch
+(`dos/dosextens.h`) for exact `struct Process`/`struct
+CommandLineInterface` field layouts:
+
+- `ExecBase.ThisTask` (offset 276) was never written by
+  `Runtime::new` -- guest code that reads it inline (not via
+  `FindTask()`) got `0`.
+- The fake "current task" volamos builds was only `sizeof(struct
+  Task)` (92 bytes), with no `pr_MsgPort`/`pr_CLI` fields at all.
+- `0x5c` = 92 decimal = `pr_MsgPort`'s real offset within `struct
+  Process` -- exactly what you get computing `NULL + pr_MsgPort`,
+  confirming the guest read `ExecBase->ThisTask` (got `0`) then
+  offset from it.
+
+Fix (`crates/volamos-core/src/exectask.rs`,
+`crates/volamos-core/src/dispatch.rs`,
+`crates/volamos-core/src/dosfile.rs`):
+
+- `create_current_task` now allocates a full `PROCESS_STRUCT_SIZE`
+  (230-byte) `struct Process`, not just `TASK_STRUCT_SIZE`, and
+  initializes the embedded `pr_MsgPort` (offset 92) as a real, valid,
+  empty `MsgPort` (reusing `execlist`'s `init_msg_port_fields`,
+  factored out of `CreateMsgPort`'s handler for this) and `pr_CLI`
+  (offset 172) as a `BPTR` to a real, heap-allocated, zeroed `struct
+  CommandLineInterface` (`CLI_STRUCT_SIZE` = 64 bytes) -- non-`NULL`,
+  matching this runtime's CLI-style direct-execution model (never a
+  Workbench launch).
+- `dispatch.rs` gained `EXEC_BASE_THISTASK_OFFSET` (276, derived
+  field-by-field like the existing `EXEC_BASE_ATTNFLAGS_OFFSET`/
+  `EXEC_BASE_LIBLIST_OFFSET`) and now writes the real task address
+  there in `Runtime::new`, right after `create_current_task`.
+- `dosfile.rs`'s `Cli()` handler now reads and returns `pr_CLI`
+  instead of hardcoding `0` -- its old doc comment's rationale ("this
+  runtime execs a guest binary directly ... honestly reporting 'not
+  part of a shell'") is exactly the bug: running a binary through
+  this runtime *is* the CLI-launch case, not the Workbench case.
+
+Verified: `AmiSnap` no longer touches `WaitPort` at all -- it now
+runs well past process startup and hits a new, unrelated gap
+(`unhandled library call: opcode 0xa000` -- an ambiguous ROM-vector
+call at a fake-library address shared by several auto-created fake
+libraries, ~`mathieeedoubbas.library`/`mathtrans.library`/etc.,
+consistent with `AmiSnap`'s use of AmiSSL/floating-point code paths).
+Full `cargo test --all` (485 passed), `cargo clippy --all-targets`,
+`cargo fmt --all` clean. New unit tests: `pr_CLI` non-`NULL` and
+`pr_MsgPort` a valid empty `MsgPort` after `create_current_task`;
+`ExecBase.ThisTask` matches the real task address; `Cli()` returns
+that same value via dispatch (existing `end_to_end_cli_returns_null`
+test flipped to `end_to_end_cli_returns_non_null` since the old
+`NULL` behavior was the bug).
+
+The opcode-`0xa000` gap is a distinct, unrelated investigation, not
+yet started.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

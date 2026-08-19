@@ -936,15 +936,26 @@ fn wait_for_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
-/// `Cli` (no args). `D0` = `0` (`NULL`), always -- this runtime execs a
-/// guest binary directly, with no simulated Shell process wrapping it
-/// (no `CommandLineInterface` structure at all), so honestly reporting
-/// "the caller is not part of a shell" (real `Cli()`'s own documented
-/// return for that case -- e.g. also true for real programs launched
-/// from Workbench) is the correct answer here, not a missing feature.
-/// Doesn't touch `IoErr()`, matching the real function.
+/// `Cli` (no args). `D0` = the current task's `pr_CLI` field (a `BPTR` to
+/// a real, heap-allocated `struct CommandLineInterface` -- see
+/// [`crate::exectask::PR_CLI_OFFSET`]'s doc). This runtime represents
+/// CLI-style direct execution (running a binary through volamos is
+/// equivalent to running it from a real Shell), not a Workbench icon
+/// launch, so `pr_CLI` is always non-`NULL` and this always returns a
+/// real `BPTR`. Found needed while running the real `AmiSnap` binary
+/// (`~/src/amisnap`, linked with libnix): its startup code checks
+/// `pr_CLI` directly (an inline struct-field read, not a call through
+/// this handler) to decide whether to `WaitPort()` for a `WBStartup`
+/// message that this runtime never sends -- returning `0` here would
+/// have been consistent with that same (wrong) inline read, but real
+/// `Cli()` and a real, non-`NULL` `pr_CLI` are the correct match for a
+/// CLI-launched program either way. Doesn't touch `IoErr()`, matching
+/// the real function.
 fn cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    ctx.cpu.set_data_register(DataRegister(0), 0);
+    let cli = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_CLI_OFFSET);
+    ctx.cpu.set_data_register(DataRegister(0), cli);
     Ok(())
 }
 
@@ -1827,14 +1838,15 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_cli_returns_null() {
+    fn end_to_end_cli_returns_non_null() {
         let words = [jsr_disp16(6), (-492i16) as u16, RTS]; // jsr Cli(a6); rts
         let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
-        assert_eq!(
+        assert_ne!(
             code, 0,
-            "Cli() should report NULL -- not running in a shell"
+            "Cli() should report a real, non-NULL BPTR -- this runtime represents \
+             CLI-style direct execution, not a Workbench launch"
         );
     }
 

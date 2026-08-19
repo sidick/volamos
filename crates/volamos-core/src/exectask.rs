@@ -230,8 +230,8 @@ use crate::dispatch::{
     DOS_LIBRARY_BASE, DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable,
     TIMER_DEVICE_BASE,
 };
-use crate::execlist::{LN_NAME, LN_TYPE};
-use crate::guestmem::{GuestHeap, write_c_string};
+use crate::execlist::{LN_NAME, LN_TYPE, init_msg_port_fields};
+use crate::guestmem::{GuestHeap, bptr_from_addr, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
@@ -275,6 +275,56 @@ pub const TC_SPUPPER: u32 = 62;
 
 /// `sizeof(struct Task)` per `<exec/tasks.h>`.
 pub const TASK_STRUCT_SIZE: u32 = 92;
+
+// --- struct Process fields this module maintains beyond struct Task
+// (`<dos/dosextens.h>`: `struct Process { struct Task pr_Task; struct
+// MsgPort pr_MsgPort; WORD pr_Pad; BPTR pr_SegList; ... BPTR pr_CLI;
+// ... }`) -- offsets verified field-by-field against a primary NDK
+// source, the same methodology `crate::dispatch`'s `EXEC_BASE_*`
+// offsets use.
+
+/// `pr_MsgPort`: `struct MsgPort`, immediately after the embedded
+/// `struct Task` -- offset [`TASK_STRUCT_SIZE`] (92). Found needed
+/// while running the real `AmiSnap` binary (Simon's own project,
+/// `~/src/amisnap`, linked with libnix): its startup code's classic
+/// Workbench-vs-CLI detection idiom reads `pr_CLI` (see
+/// [`PR_CLI_OFFSET`]) and, only if that's `NULL` (a real Workbench
+/// launch), does `WaitPort(&pr_MsgPort)` for the `WBStartup` message --
+/// this runtime never delivers one, so `pr_CLI` must be non-`NULL` for
+/// any libnix/SAS-C-style CLI-launched program (which is what running
+/// a binary through this runtime actually represents) to avoid that
+/// branch and never call `WaitPort` on this port at all. Still
+/// initialized as a real, valid (if perpetually empty) `MsgPort` via
+/// [`init_msg_port_fields`] regardless, in case some other real binary
+/// legitimately posts to or waits on its own process port.
+pub const PR_MSGPORT_OFFSET: u32 = TASK_STRUCT_SIZE;
+/// `pr_CLI`: `BPTR`, offset 172 (`pr_Task` 92 + `pr_MsgPort` 34 +
+/// `pr_Pad` 2 + `pr_SegList` 4 + `pr_StackSize` 4 + `pr_GlobVec` 4 +
+/// `pr_TaskNum` 4 + `pr_StackBase` 4 + `pr_Result2` 4 + `pr_CurrentDir`
+/// 4 + `pr_CIS` 4 + `pr_COS` 4 + `pr_ConsoleTask` 4 +
+/// `pr_FileSystemTask` 4 = 172). `0` means "not running under a CLI"
+/// (a real Workbench launch); this runtime sets it to a real,
+/// heap-allocated (if otherwise empty) `struct CommandLineInterface`
+/// instead -- see [`PR_MSGPORT_OFFSET`]'s doc for why, and
+/// [`crate::dosfile::cli_handler`] (`dos.library`'s `Cli()`, which
+/// just returns this same field) for the guest-visible read path.
+pub const PR_CLI_OFFSET: u32 = 172;
+/// `sizeof(struct Process)` per `<dos/dosextens.h>` -- `pr_CLI`'s own
+/// offset (172) plus every field after it (`pr_ReturnAddr`/
+/// `pr_PktWait`/`pr_WindowPtr`/`pr_HomeDir` 4 each = 16, `pr_Flags` 4,
+/// `pr_ExitCode`/`pr_ExitData`/`pr_Arguments` 4 each = 12,
+/// `pr_LocalVars` (`struct MinList`) 14, `pr_ShellPrivate` 4, `pr_CES`
+/// 4) = 172 + 16 + 4 + 12 + 14 + 4 + 4 = 226... plus `pr_CLI` itself
+/// (4) = 230. This runtime's fake current task is allocated at this
+/// full size (not just [`TASK_STRUCT_SIZE`]) so real guest code that
+/// treats it as a full `struct Process` -- as any libnix/SAS-C startup
+/// does -- reads real, in-bounds (if mostly zeroed) memory rather than
+/// running off the end of a bare `struct Task`-sized block.
+pub const PROCESS_STRUCT_SIZE: u32 = 230;
+/// `sizeof(struct CommandLineInterface)` per `<dos/dosextens.h>`: 16
+/// fields, all 4 bytes each (`LONG`/`BPTR`/`BSTR`, every one
+/// pointer-or-longword-sized) = 64.
+const CLI_STRUCT_SIZE: u32 = 64;
 
 // --- struct StackSwapStruct field offsets (bytes from the struct's own
 // address) -- per <exec/execbase.h>: `struct StackSwapStruct { APTR
@@ -405,15 +455,17 @@ pub fn create_current_task<M: AddressSpace>(
     sp_upper: u32,
 ) -> u32 {
     let task = heap
-        .alloc(TASK_STRUCT_SIZE)
+        .alloc(PROCESS_STRUCT_SIZE)
         .expect("guest heap has room for the fake current task struct");
 
     // Zero the whole struct first -- every field this module doesn't
     // maintain (tc_Flags, tc_State, tc_IDNestCnt, tc_TDNestCnt, and
-    // everything past tc_SPUpper) stays zeroed, matching a freshly
-    // allocated block; nothing in this runtime reads those fields.
-    // tc_SPLower/tc_SPUpper are overwritten with real values below.
-    for i in 0..TASK_STRUCT_SIZE {
+    // everything past tc_SPUpper, plus every pr_* field beyond
+    // pr_MsgPort/pr_CLI) stays zeroed, matching a freshly allocated
+    // block; nothing in this runtime reads those fields. tc_SPLower/
+    // tc_SPUpper/pr_MsgPort/pr_CLI are overwritten with real values
+    // below.
+    for i in 0..PROCESS_STRUCT_SIZE {
         mem.write_u8(task.wrapping_add(i), 0);
     }
 
@@ -436,6 +488,21 @@ pub fn create_current_task<M: AddressSpace>(
     // this function's doc).
     mem.write_u32(task + TC_SPLOWER, sp_lower);
     mem.write_u32(task + TC_SPUPPER, sp_upper);
+
+    // pr_MsgPort: a real, valid (if perpetually empty) MsgPort owned by
+    // this task -- see PR_MSGPORT_OFFSET's doc.
+    init_msg_port_fields(mem, task + PR_MSGPORT_OFFSET, task);
+
+    // pr_CLI: a real, heap-allocated (if otherwise empty) struct
+    // CommandLineInterface, written as a BPTR -- see PR_CLI_OFFSET's doc
+    // for why this must be non-NULL.
+    let cli_addr = heap
+        .alloc(CLI_STRUCT_SIZE)
+        .expect("guest heap has room for the fake CLI struct");
+    for i in 0..CLI_STRUCT_SIZE {
+        mem.write_u8(cli_addr.wrapping_add(i), 0);
+    }
+    mem.write_u32(task + PR_CLI_OFFSET, bptr_from_addr(cli_addr));
 
     task
 }
@@ -1259,6 +1326,46 @@ mod tests {
             crate::guestmem::read_c_string(rt.memory(), name_ptr),
             PROCESS_NAME
         );
+    }
+
+    #[test]
+    fn create_current_task_populates_pr_msgport_and_pr_cli() {
+        let rt = runtime_with_program(&[RTS]);
+        let task = rt.current_task();
+
+        // pr_CLI is a real, non-NULL BPTR (see PR_CLI_OFFSET's doc).
+        let cli_bptr = rt.memory().read_u32(task + PR_CLI_OFFSET);
+        assert_ne!(cli_bptr, 0, "pr_CLI must be non-NULL for a CLI-style run");
+
+        // pr_MsgPort is a real, valid, empty MsgPort owned by this task.
+        let port = task + PR_MSGPORT_OFFSET;
+        assert_eq!(
+            rt.memory().read_u8(port + crate::execlist::LN_TYPE),
+            crate::execlist::NT_MSGPORT
+        );
+        assert_eq!(
+            rt.memory().read_u32(port + crate::execlist::MP_SIGTASK),
+            task
+        );
+        let list_head = rt
+            .memory()
+            .read_u32(port + crate::execlist::MP_MSGLIST + crate::execlist::LH_HEAD);
+        // An empty list's head node has a NULL ln_Succ (real AmigaOS
+        // empty-list-header convention: head -> tail sentinel, whose own
+        // ln_Succ is NULL).
+        assert_eq!(
+            rt.memory().read_u32(list_head + crate::execlist::LN_SUCC),
+            0
+        );
+    }
+
+    #[test]
+    fn execbase_thistask_matches_current_task() {
+        let rt = runtime_with_program(&[RTS]);
+        let this_task = rt.memory().read_u32(
+            crate::dispatch::EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_THISTASK_OFFSET,
+        );
+        assert_eq!(this_task, rt.current_task());
     }
 
     #[test]
