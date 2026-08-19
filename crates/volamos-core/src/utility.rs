@@ -526,6 +526,56 @@ fn check_date_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
+/// `SMult32`/`UMult32` (LVO -138/-144: `D0` = `arg1`, `D1` = `arg2`).
+/// `D0` = the 32-bit truncated product (per the real Autodoc: "32 by
+/// 32 bit multiply with 32 bit result", i.e. only the low 32 bits of
+/// the true product, discarding overflow -- not a 64-bit result).
+/// Signed and unsigned truncated-to-32-bit multiplication produce the
+/// identical bit pattern (two's complement), so both handlers share
+/// one `wrapping_mul` -- there's no actual behavioral difference to
+/// implement separately.
+///
+/// Found missing while running the real Workbench 3.1.4 `C:/Wait`
+/// binary, which uses `SMult32` to convert a duration argument (in
+/// seconds/minutes) into ticks.
+fn mult32_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let arg1 = ctx.cpu.data_register(DataRegister(0));
+    let arg2 = ctx.cpu.data_register(DataRegister(1));
+    ctx.cpu
+        .set_data_register(DataRegister(0), arg1.wrapping_mul(arg2));
+    Ok(())
+}
+
+/// `SDivMod32` (LVO -150: `D0` = signed dividend, `D1` = signed
+/// divisor). `D0` = quotient, `D1` = remainder (both signed,
+/// truncating division -- Rust's `/`/`%` on `i32` already match this).
+/// A zero divisor triggers a CPU-level "divide by zero" exception on
+/// real hardware, which this runtime doesn't model (no exception
+/// vector table) -- both results are `0` instead, rather than
+/// panicking the host process.
+fn sdivmod32_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dividend = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let divisor = ctx.cpu.data_register(DataRegister(1)) as i32;
+    let q = dividend.checked_div(divisor).unwrap_or(0);
+    let r = dividend.checked_rem(divisor).unwrap_or(0);
+    ctx.cpu.set_data_register(DataRegister(0), q as u32);
+    ctx.cpu.set_data_register(DataRegister(1), r as u32);
+    Ok(())
+}
+
+/// `UDivMod32` (LVO -156: `D0` = unsigned dividend, `D1` = unsigned
+/// divisor). `D0` = quotient, `D1` = remainder. See
+/// [`sdivmod32_handler`] for the zero-divisor handling.
+fn udivmod32_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dividend = ctx.cpu.data_register(DataRegister(0));
+    let divisor = ctx.cpu.data_register(DataRegister(1));
+    let q = dividend.checked_div(divisor).unwrap_or(0);
+    let r = dividend.checked_rem(divisor).unwrap_or(0);
+    ctx.cpu.set_data_register(DataRegister(0), q);
+    ctx.cpu.set_data_register(DataRegister(1), r);
+    Ok(())
+}
+
 /// Registers every implemented `utility.library` handler onto
 /// [`crate::dispatch::UTILITY_LIBRARY_BASE`], looked up by name through
 /// [`UTILITY_LVOS`] (the T7-style generated table), following
@@ -559,6 +609,10 @@ pub fn register_utility_handlers<C: Cpu + 'static>(
     reg!("Amiga2Date", amiga2date_handler::<C>);
     reg!("Date2Amiga", date2amiga_handler::<C>);
     reg!("CheckDate", check_date_handler::<C>);
+    reg!("SMult32", mult32_handler::<C>);
+    reg!("UMult32", mult32_handler::<C>);
+    reg!("SDivMod32", sdivmod32_handler::<C>);
+    reg!("UDivMod32", udivmod32_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1147,5 +1201,194 @@ mod tests {
         let mut out2 = Vec::new();
         let code2 = rt2.run(&mut out2, None).expect("run should succeed");
         assert_eq!(code2, 0, "invalid date should return 0");
+    }
+
+    // --- SMult32/UMult32/SDivMod32/UDivMod32 ---
+
+    /// `move.l Dn,(addr).L` (absolute long destination addressing).
+    fn move_d_to_abs_long(dn: u16) -> u16 {
+        0x23C0 | dn
+    }
+
+    #[test]
+    fn smult32_and_umult32_multiply_and_truncate_to_32_bits() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0x0001);
+        words.push(0x0000); // D0 = 0x10000
+        words.push(move_imm_to_d(1));
+        words.push(0x0001);
+        words.push(0x0000); // D1 = 0x10000
+        words.extend_from_slice(&jsr_disp16_a6(-138)); // SMult32
+        words.push(RTS);
+
+        let mut full = movea_utility_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &full);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + (full.len() as u32) * 2 + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        // 0x10000 * 0x10000 = 0x1_0000_0000, truncated to 32 bits = 0.
+        assert_eq!(
+            code, 0,
+            "the true product overflows 32 bits and is truncated"
+        );
+    }
+
+    #[test]
+    fn smult32_ordinary_product() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(6); // D0 = 6
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(7); // D1 = 7
+        words.extend_from_slice(&jsr_disp16_a6(-138)); // SMult32
+        words.push(RTS);
+
+        let mut full = movea_utility_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &full);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + (full.len() as u32) * 2 + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn sdivmod32_quotient_and_remainder() {
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0xFFFF); // -17 high word
+        words.push((-17i16) as u16); // D0 = -17
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(5); // D1 = 5
+        words.extend_from_slice(&jsr_disp16_a6(-150)); // SDivMod32
+        words.push(move_d_to_abs_long(1)); // remainder -> abs addr
+        let rem_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(RTS);
+
+        let full_len_before_patch = movea_utility_base_to_a6().len() + words.len();
+        let rem_addr = entry + (full_len_before_patch as u32) * 2;
+        words[rem_idx] = (rem_addr >> 16) as u16;
+        words[rem_idx + 1] = rem_addr as u16;
+
+        let mut full = movea_utility_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: rem_addr + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        // -17 / 5 == -3 remainder -2 (truncating division).
+        assert_eq!(code, -3);
+        assert_eq!(rt.memory().read_u32(rem_addr) as i32, -2);
+    }
+
+    #[test]
+    fn udivmod32_quotient_and_remainder() {
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(17); // D0 = 17
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(5); // D1 = 5
+        words.extend_from_slice(&jsr_disp16_a6(-156)); // UDivMod32
+        words.push(move_d_to_abs_long(1));
+        let rem_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(RTS);
+
+        let full_len_before_patch = movea_utility_base_to_a6().len() + words.len();
+        let rem_addr = entry + (full_len_before_patch as u32) * 2;
+        words[rem_idx] = (rem_addr >> 16) as u16;
+        words[rem_idx + 1] = rem_addr as u16;
+
+        let mut full = movea_utility_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: rem_addr + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 3);
+        assert_eq!(rt.memory().read_u32(rem_addr), 2);
+    }
+
+    #[test]
+    fn udivmod32_by_zero_does_not_panic() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(17);
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0); // D1 = 0 (divisor)
+        words.extend_from_slice(&jsr_disp16_a6(-156)); // UDivMod32
+        words.push(RTS);
+
+        let mut full = movea_utility_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &full);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + (full.len() as u32) * 2 + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "zero divisor should not panic the host");
     }
 }

@@ -135,16 +135,23 @@ fn parse_template(template: &[u8]) -> Result<Vec<TemplateArg>, i32> {
     for part in template.split(|&b| b == b',') {
         let mut pieces = part.split(|&b| b == b'/');
         let name_part = pieces.next().unwrap_or(b"");
-        if name_part.is_empty() {
-            return Err(ERROR_BAD_TEMPLATE);
-        }
-        let names: Vec<Vec<u8>> = name_part
-            .splitn(2, |&b| b == b'=')
-            .map(|n| n.to_ascii_uppercase())
-            .collect();
-        if names.iter().any(|n| n.is_empty()) {
-            return Err(ERROR_BAD_TEMPLATE);
-        }
+        // An empty name (a template item that's just modifiers, e.g.
+        // the real `C:/Wait` binary's own template "/N,SEC=SECS/S,...")
+        // is legal real AmigaDOS syntax: the item can only ever be
+        // filled positionally, never matched by a `NAME=value` keyword
+        // (there's no name to match against) -- see the module docs.
+        let names: Vec<Vec<u8>> = if name_part.is_empty() {
+            Vec::new()
+        } else {
+            let names: Vec<Vec<u8>> = name_part
+                .splitn(2, |&b| b == b'=')
+                .map(|n| n.to_ascii_uppercase())
+                .collect();
+            if names.iter().any(|n| n.is_empty()) {
+                return Err(ERROR_BAD_TEMPLATE);
+            }
+            names
+        };
 
         let mut kind = ArgKind::String;
         let mut kind_set = false;
@@ -846,6 +853,36 @@ mod tests {
         let (mut heap, mut mem, mut dos) = setup(&["x"]);
         let err = call_read_args_err(&mut heap, &mut mem, &mut dos, "NAME/Z", 1);
         assert_eq!(err, ERROR_BAD_TEMPLATE);
+    }
+
+    #[test]
+    fn template_item_with_an_empty_name_is_legal_and_positional_only() {
+        // The real Workbench 3.1.4 C:/Wait binary's own template:
+        // an anonymous /N item (numeric, no name -- can only ever be
+        // filled positionally) followed by ordinary named items.
+        let (mut heap, mut mem, mut dos) = setup(&["5"]);
+        let (_, array_addr) = call_read_args(
+            &mut heap,
+            &mut mem,
+            &mut dos,
+            "/N,SEC=SECS/S,MIN=MINS/S,UNTIL/K,FILE=DIR/K",
+            5,
+        );
+        let num_ptr = mem.read_u32(array_addr);
+        assert_ne!(num_ptr, 0, "the anonymous /N slot should be filled");
+        assert_eq!(mem.read_u32(num_ptr), 5);
+    }
+
+    #[test]
+    fn template_item_with_an_empty_name_cannot_be_matched_by_keyword() {
+        // Since it has no name, "5" can only bind positionally; a
+        // template with just the anonymous item and nothing else still
+        // parses and works the same way.
+        let (mut heap, mut mem, mut dos) = setup(&["5"]);
+        let (_, array_addr) = call_read_args(&mut heap, &mut mem, &mut dos, "/N", 1);
+        let num_ptr = mem.read_u32(array_addr);
+        assert_ne!(num_ptr, 0);
+        assert_eq!(mem.read_u32(num_ptr), 5);
     }
 
     #[test]

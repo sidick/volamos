@@ -1667,6 +1667,45 @@ New tests: 18 (`dosdatestr.rs`: 11 `parse_date_string`/
 `exectask.rs`: 2 e2e for `OpenDevice`/`CloseDevice`;
 `dossetfiledate.rs`: 3 e2e).
 
+**`Wait`/`Break` — 2026-08-19.** Worked through both in the established
+loop.
+
+- `Wait`'s template is real AmigaDOS syntax this project's `ReadArgs`
+  hadn't seen before: `"/N,SEC=SECS/S,MIN=MINS/S,UNTIL/K,FILE=DIR/K"`
+  -- the first item has an *empty* name (just `/N`, no name before the
+  slash), which is legal (an anonymous, positional-only argument, real
+  syntax used by several real AmigaDOS commands). `crates/volamos-core/
+  src/dosargs.rs`'s `parse_template` was rejecting this outright
+  (`ERROR_BAD_TEMPLATE`) -- fixed to allow an empty name, producing a
+  `TemplateArg` with no keyword synonyms (it can only ever be filled
+  positionally, which `matches_keyword` already handled correctly for
+  free once the empty-names vector reached it). Once that parsed, `Wait
+  1` needed two more calls: `utility.library`'s `SMult32` (Wait uses it
+  to convert seconds/minutes into ticks) and `dos.library`'s `Delay`.
+  Implemented all four `utility.library` 32-bit math primitives
+  together while at it (`SMult32`/`UMult32`/`SDivMod32`/`UDivMod32`,
+  `crates/volamos-core/src/utility.rs`) -- confirmed exact register
+  convention (`D0`/`D1` in, `D0` [`D0`:`D1` for div/mod] out, truncated
+  32-bit results not 64-bit) against the real NDK Autodoc text rather
+  than guessing. `Delay` (`crates/volamos-core/src/dosdate.rs`,
+  alongside `DateStamp`) is a genuine, faithfully-implementable
+  `std::thread::sleep` -- unlike the `exec.library` device-I/O
+  primitives that stay unimplemented (`crate::exectask`'s `OpenDevice`/
+  `CloseDevice`), `Delay`'s contract is simple and fully specified, so
+  there's no scope reason to fake it. `Wait 1`/`Wait 1 SEC` both now
+  really block for ~1 real second and exit `0`.
+- `Break` needed one call, `MaxCli` (`crates/volamos-core/src/
+  dosfile.rs`, next to the existing `Cli` handler) -- returns `0`
+  (empty CLI-process table), consistent with `Cli()`'s own existing
+  choice to report "not running in a shell" (this runtime never
+  simulates a `CommandLineInterface`/process table at all). `Break 1`
+  now correctly reports `"Process 1 does not exist"` (exit 20) instead
+  of crashing.
+
+New tests: 9 (`dosargs.rs`: 2 for the empty-name template item;
+`utility.rs`: 5 for the four math primitives; `dosdate.rs`: 1 for
+`Delay`; `dosfile.rs`: 1 for `MaxCli`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

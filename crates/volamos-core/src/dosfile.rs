@@ -899,6 +899,19 @@ fn cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchEr
     Ok(())
 }
 
+/// `MaxCli` (no args). `D0` = `0` -- consistent with [`cli_handler`]'s
+/// own choice: this runtime never simulates a CLI process table at
+/// all (no `CommandLineInterface`/`rn_CliList`), so honestly reporting
+/// "the table holds zero entries" is the correct answer, not a missing
+/// feature. Found missing while running the real Workbench 3.1.4
+/// `C:/Break` binary, which calls this (under `Forbid()`, per the
+/// RKRM's documented calling convention) to learn the valid CLI-number
+/// range before validating its own numeric argument.
+fn max_cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
 /// A fixed, non-`NULL` sentinel `MsgPort*` for
 /// [`get_file_sys_task_handler`] -- see its own doc comment for why a
 /// real (dereferenceable) `MsgPort` isn't needed. Also reused by
@@ -1042,6 +1055,7 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("SetMode", set_mode_handler::<C>);
     reg!("WaitForChar", wait_for_char_handler::<C>);
     reg!("Cli", cli_handler::<C>);
+    reg!("MaxCli", max_cli_handler::<C>);
     reg!("GetFileSysTask", get_file_sys_task_handler::<C>);
     reg!("SetFileSysTask", set_file_sys_task_handler::<C>);
     reg!("SelectInput", select_input_handler::<C>);
@@ -1707,6 +1721,18 @@ mod tests {
         assert_eq!(
             code, 0,
             "Cli() should report NULL -- not running in a shell"
+        );
+    }
+
+    #[test]
+    fn end_to_end_max_cli_returns_zero() {
+        let words = [jsr_disp16(6), (-552i16) as u16, RTS]; // jsr MaxCli(a6); rts
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "MaxCli() should report an empty table -- no simulated CLI process table"
         );
     }
 

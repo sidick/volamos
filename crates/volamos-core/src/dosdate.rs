@@ -1,10 +1,22 @@
-//! `dos.library` `DateStamp`: fills a `struct DateStamp` with the
-//! current date/time.
+//! `dos.library` `DateStamp`/`Delay`: current date/time, and
+//! suspending the calling process for a tick count.
 //!
-//! Found missing while running the real Workbench 3.1.4 `C:/List`
-//! binary: it calls `DateStamp()` (presumably to timestamp its own run,
-//! or to compare against file dates for `SINCE`/`UPTO`-style filtering)
-//! before it ever gets to printing a single directory entry.
+//! `DateStamp` found missing while running the real Workbench 3.1.4
+//! `C:/List` binary: it calls `DateStamp()` (presumably to timestamp
+//! its own run, or to compare against file dates for `SINCE`/`UPTO`-
+//! style filtering) before it ever gets to printing a single directory
+//! entry. `Delay` found missing while running the real `C:/Wait`
+//! binary -- unlike `exec.library`'s device-I/O primitives
+//! (`crate::exectask`'s `OpenDevice`/`CloseDevice`, always failing
+//! since this runtime models no real device drivers), `Delay` has
+//! simple, fully-specifiable semantics this runtime *can* implement
+//! faithfully: it just blocks the host thread for the requested
+//! duration via `std::thread::sleep`. Real `Delay` is "system-friendly"
+//! (per the RKRM: the process is suspended, not busy-waiting) --
+//! irrelevant here since this runtime is single-threaded and there's
+//! no other guest task that could run in the meantime anyway, but a
+//! real sleep is still the correct, literal behavior a corpus binary
+//! (or a human watching `Wait` actually wait) expects.
 //!
 //! # `struct DateStamp` (`dos/dos.h`)
 //!
@@ -82,9 +94,20 @@ fn datestamp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
-/// Registers `DateStamp` onto [`DOS_LIBRARY_BASE`], looked up by name
-/// through [`DOS_LVOS`]. Called from [`crate::dispatch::Runtime::new`]
-/// alongside the other `dos.library` registrations.
+/// `Delay` (`D1` = ticks, 1/50s units). No return value. Blocks the
+/// host thread for the equivalent wall-clock duration -- see the
+/// module docs.
+fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ticks = ctx.cpu.data_register(DataRegister(1));
+    let millis = u64::from(ticks) * 1000 / u64::from(TICKS_PER_SECOND);
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+    Ok(())
+}
+
+/// Registers `DateStamp`/`Delay` onto [`DOS_LIBRARY_BASE`], looked up
+/// by name through [`DOS_LVOS`]. Called from
+/// [`crate::dispatch::Runtime::new`] alongside the other `dos.library`
+/// registrations.
 pub fn register_dosdate_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -99,6 +122,16 @@ pub fn register_dosdate_handlers<C: Cpu + 'static>(
             datestamp_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("DateStamp should be in DOS_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            DOS_LIBRARY_BASE,
+            DOS_LVOS,
+            "dos.library",
+            "Delay",
+            delay_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("Delay should be in DOS_LVOS: {e}"));
 }
 
 #[cfg(test)]
@@ -169,5 +202,48 @@ mod tests {
         assert!(days > 8_000);
         assert!((0..1440).contains(&minute));
         assert!((0..3000).contains(&tick));
+    }
+
+    #[test]
+    fn end_to_end_delay_blocks_for_roughly_the_requested_duration() {
+        // 2 ticks == 40ms -- small enough to keep the test suite fast,
+        // large enough to reliably distinguish "slept" from "didn't".
+        let ticks: u16 = 2;
+        let mut mem = FlatMemory::new(0x2_0000);
+        let words = [
+            0x223C, // move.l #imm32,D1
+            0,
+            ticks,
+            0x4EAE,           // jsr disp16(a6)
+            (-198i16) as u16, // Delay
+            0x7000,           // moveq #0,d0 (Delay doesn't touch D0 itself)
+            0x4E75,           // rts
+        ];
+        let mut offset = TRAP_TABLE_END;
+        for &w in &words {
+            mem.write_u16(offset, w);
+            offset += 2;
+        }
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let start = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let elapsed = start.elapsed();
+        assert_eq!(code, 0);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "Delay(2) should block for roughly 40ms, only blocked {elapsed:?}"
+        );
     }
 }
