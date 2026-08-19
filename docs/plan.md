@@ -3051,3 +3051,79 @@ Changes, all in `crates/volamos/src/main.rs`:
 - `cargo build --all`/`test --all`/`clippy --all-targets`/`fmt --all --
   check` all clean (new unit tests for `parse_byte_size` under both
   flag names and for `check_ram_fits`'s accept/reject/overflow cases).
+
+## Config file support (`~/.volamos` + local `.volamos` override) — 2026-08-19
+
+Implements GitHub issue #5. Simon's design: `~/.volamos` holds global
+defaults for the CLI's own scaffolding flags; a `.volamos` in the
+current directory overrides it for per-project settings; explicit CLI
+flags win over both. Clarified this session: plain `KEY=value` file
+format (no new dependency), local filename `.volamos` (same name as
+the global one), and — the one genuinely subtle design point — for
+repeatable settings (`-V`/`-a`) entries from every source all apply,
+but where the *same* `NAME:` appears in more than one source, the
+higher-precedence source's mapping wins for that name specifically
+(not "local file present at all means ignore global's entries").
+
+New `crates/volamos/src/config.rs`:
+
+- `Overrides` — every singular field `Option<T>` (`None` = "not set by
+  this source"), `volumes`/`assigns` plain `Vec`s. The shared currency
+  for "a partial settings layer," used for both a parsed config file
+  and (see below) the CLI's own raw arguments.
+- `parse(source: &str) -> Result<Overrides, String>` — pure, no I/O;
+  `KEY=VALUE` per line, `#` comments, blank lines ignored, errors name
+  the exact line number. Reuses `crate::parse_byte_size`/
+  `parse_cpu_type`/`split_name_value` (already private top-level items
+  in `main.rs`, visible to a submodule without needing `pub`) rather
+  than duplicating that parsing logic.
+- `merge(higher, lower) -> Overrides` — the key insight making the
+  merge-semantics decision fall out of *existing* code rather than
+  needing new logic: `volamos-core`'s `vfs.rs` `lookup_volume`/
+  `lookup_assign` already resolve a name via `.find()`, i.e.
+  first-match-in-the-Vec wins. So `merge` just concatenates
+  `higher.volumes ++ lower.volumes` (same for `assigns`) — a `NAME:`
+  present in both resolves to `higher`'s mapping automatically, a name
+  present in only one source comes through unaffected, with zero
+  changes needed in `volamos-core` itself.
+- `load_all()` — reads `~/.volamos` (from `$HOME`) and `./.volamos`
+  (from the process's own cwd), each optional (`Ok(None)` if missing,
+  not an error), merges local-over-global.
+
+`main.rs` changes: `parse_args` (the existing CLI parser, hardcoding
+built-in defaults inline) couldn't tell "explicitly set on the CLI"
+from "left at its default" -- exactly the distinction needed to know
+whether a config-file value should apply. Split into
+`parse_args_raw` (same flag-parsing loop, `Option`-seeded, returns a
+raw `config::Overrides` plus `program`/`guest_args` separately -- those
+two are never config-file-settable) and `resolve` (fills every unset
+field with the real built-in default, producing the `Options` `run`
+already consumed). `parse_args` itself becomes a thin
+`parse_args_raw` + `resolve` wrapper, marked `#[cfg(test)]` --
+preserved byte-for-byte so every one of the ~30 pre-existing
+`parse_args`-based tests needed zero changes. `main()` now: calls
+`parse_args_raw` (so `-h`/`--help` and any CLI parse error still
+short-circuit before config files are even touched), loads+merges
+config-file overrides via `config::load_all`, merges CLI-over-files via
+`config::merge`, then `resolve`s to the final `Options`.
+
+**Verification**: new `config.rs` unit tests (grammar for every key,
+comments/blanks, unknown key, every malformed-value case, repeated-
+singular-key-last-wins, `merge`'s precedence and concatenation order)
+-- deliberately no test mutates real `$HOME`/cwd or process-global env
+vars (parallel-test-safety; `std::env::set_var` is unsafe as of the
+current Rust edition). Manual end-to-end verification with real temp
+`$HOME`/cwd `.volamos` files, using `fixtures/filetest` (real file
+I/O) to prove: global-only config's `VOLUME=TEST:...` actually gets
+used; a local `.volamos`'s `TEST:` entry wins over a conflicting
+global one (checked by which host directory's `out.txt` actually got
+created, not just program output); an explicit `-V` on the CLI wins
+over both; a config-derived `STACK` value correctly flows into the
+`--ram`/`check_ram_fits` machinery from the previous entry; a
+malformed config file produces a clean `path:line: message` error
+rather than crashing. `cargo build --all`/`test --all` (76 volamos-
+crate tests, up from 59)/`clippy --all-targets -- -D warnings`/`fmt
+--all -- --check` all clean; `mkdocs build --strict` clean after new
+`userdocs/Configuration.md` (grammar/precedence/worked example) plus
+cross-links from `index.md`/`CLI-Reference.md`/`Getting-Started.md`/
+`Changelog.md`/README.md.

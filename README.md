@@ -133,8 +133,10 @@ Implemented so far:
   flags, multi-assign search order, Amiga `:`/`/` semantics), `.uaem`
   sidecar metadata for protection bits/comments, a guest heap with
   BPTR/BSTR helpers, and configurable guest stack size and total
-  address space (`--stack`/`--ram`, with overflow detection). Run
-  `cargo run -p volamos -- --help` for the full CLI surface.
+  address space (`--stack`/`--ram`, with overflow detection). A
+  `~/.volamos`/`.volamos` config file can supply default values for
+  any of the above, for repeated-use projects. Run `cargo run -p
+  volamos -- --help` for the full CLI surface.
 
 The three-oracle parity harness against `vamos`/real Kickstart is
 Phase 4+. See [`docs/plan.md`](docs/plan.md) for the full phase

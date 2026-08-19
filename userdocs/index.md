@@ -44,6 +44,8 @@ console-tool use case.
 - [Getting Started](Getting-Started.md) — running your first guest
   program, and mapping a real directory onto an Amiga volume.
 - [CLI Reference](CLI-Reference.md) — every flag.
+- [Configuration Files](Configuration.md) — `~/.volamos`/`.volamos` to
+  stop retyping the same flags for a repeated-use project.
 - [Volumes and Assigns](Volumes-and-Assigns.md) — how `-V`/`-a` map the
   host filesystem onto Amiga paths, including multi-assign search
   order.

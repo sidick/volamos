@@ -14,6 +14,10 @@ through verbatim as the *guest* program's own command-line arguments
 parses its own arguments (e.g. via `ReadArgs`) reads them from there,
 unaffected by anything volamos itself understood before `<program>`.
 
+Every flag below can also be given a default value in `~/.volamos`/
+`.volamos` instead of retyping it every run — see
+[Configuration Files](Configuration.md).
+
 ## Exit codes
 
 volamos propagates the **guest program's own exit code** on a normal

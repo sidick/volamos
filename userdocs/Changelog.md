@@ -11,9 +11,11 @@ will follow the version scheme in `Cargo.toml`.
   [`m68k`](https://crates.io/crates/m68k) crate, real guest heap and
   stack regions (with overflow detection), a configurable total guest
   address space (`--ram`, default 16 MiB) with a clean upfront error
-  if `--stack` doesn't leave it room, and a host-backed volume/assign
+  if `--stack` doesn't leave it room, a host-backed volume/assign
   filesystem (`-V`/`-a`/`--auto-assign`, multi-assign search order,
-  real Amiga path semantics including `/`-as-parent-dir).
+  real Amiga path semantics including `/`-as-parent-dir), and
+  [config files](Configuration.md) (`~/.volamos`/`.volamos`) supplying
+  default flag values for repeated-use projects.
 - **`dos.library`**: file I/O, locks and directory traversal, pattern
   matching (`ParsePattern`/`MatchFirst`/`MatchNext`), `ReadArgs`/
   `FreeArgs`, a real `ENV:` volume for environment variables, `LoadSeg`/

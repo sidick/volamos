@@ -56,6 +56,15 @@
 //! [`volamos_core::backend::M68kCpu::with_config`]. A nested `System()`/
 //! `Execute()` run (see [`run_nested_program`]) reuses the same CPU
 //! configuration as the top-level run, same as `--stack`.
+//!
+//! `~/.volamos` and a `.volamos` in the current directory supply
+//! default values for all of the above (except `<program>`/
+//! `[args...]` themselves) so a repeated-use project doesn't need to
+//! retype them -- explicit flags on the command line always win, then
+//! the local file, then the global one -- see [`config`]'s module doc
+//! for the exact grammar and merge semantics.
+
+mod config;
 
 use std::io;
 use std::path::PathBuf;
@@ -171,6 +180,12 @@ fn print_usage(program_name: &str) {
         "If none of -V/-a/--cwd/--auto-assign are given, no volume/assign filesystem is \
          installed at all: dos.library path-based calls (Open, Lock, Examine, ...) fail \
          cleanly with an IoErr; Input/Output/PutStr/IoErr/SetIoErr work either way."
+    );
+    eprintln!();
+    eprintln!(
+        "~/.volamos supplies default values for the flags above (KEY=value lines, e.g. \
+         STACK=256K); a .volamos in the current directory overrides it; explicit flags on \
+         this command line win over both. See the Configuration page in the docs."
     );
 }
 
@@ -323,19 +338,22 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 
 /// Hand-rolled argument parsing: this CLI's surface is small enough that
 /// pulling in an argument-parsing crate isn't worth the dependency.
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut verbose = false;
-    let mut snoop = false;
+///
+/// Returns the *raw* [`config::Overrides`] rather than a fully-resolved
+/// [`Options`] -- unlike a config file, `<program>`/`[args...]` aren't
+/// part of that shared vocabulary, so they're returned alongside it
+/// rather than folded in; and keeping built-in defaults out of this
+/// function is what lets `main` tell "explicitly set on the CLI" apart
+/// from "left at its default" when merging in `~/.volamos`/`.volamos`
+/// (see `crate::config`'s module doc). [`parse_args`] is the
+/// no-config-files convenience wrapper most callers (and every existing
+/// test) actually want.
+fn parse_args_raw(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(config::Overrides, String, Vec<String>), String> {
+    let mut overrides = config::Overrides::default();
     let mut program = None;
     let mut guest_args = Vec::new();
-    let mut volumes = Vec::new();
-    let mut assigns = Vec::new();
-    let mut cwd = None;
-    let mut auto_assign_root = None;
-    let mut stack_size = DEFAULT_STACK_SIZE;
-    let mut ram_size = DEFAULT_RAM_SIZE;
-    let mut cpu_type = CpuType::M68000;
-    let mut fpu = false;
 
     while let Some(arg) = args.next() {
         if program.is_some() {
@@ -343,15 +361,17 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
             continue;
         }
         match arg.as_str() {
-            "-v" | "--verbose" => verbose = true,
-            "-s" | "--snoop" => snoop = true,
+            "-v" | "--verbose" => overrides.verbose = Some(true),
+            "-s" | "--snoop" => overrides.snoop = Some(true),
             "-h" | "--help" => return Err(String::new()), // caller prints usage and exits 0
             "-V" | "--volume" => {
                 let value = args
                     .next()
                     .ok_or_else(|| format!("{arg} requires a NAME:hostdir argument"))?;
                 let (name, hostdir) = split_name_value(&arg, &value)?;
-                volumes.push((name.to_string(), PathBuf::from(hostdir)));
+                overrides
+                    .volumes
+                    .push((name.to_string(), PathBuf::from(hostdir)));
             }
             "-a" | "--assign" => {
                 let value = args
@@ -359,59 +379,78 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
                     .ok_or_else(|| format!("{arg} requires a NAME:target[+target...] argument"))?;
                 let (name, targets) = split_name_value(&arg, &value)?;
                 let targets: Vec<String> = targets.split('+').map(str::to_string).collect();
-                assigns.push((name.to_string(), targets));
+                overrides.assigns.push((name.to_string(), targets));
             }
             "--cwd" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--cwd requires an AMIGAPATH argument".to_string())?;
-                cwd = Some(value);
+                overrides.cwd = Some(value);
             }
             "--auto-assign" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--auto-assign requires a HOSTDIR argument".to_string())?;
-                auto_assign_root = Some(PathBuf::from(value));
+                overrides.auto_assign_root = Some(PathBuf::from(value));
             }
             "--stack" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--stack requires a SIZE argument".to_string())?;
-                stack_size = parse_byte_size("--stack", &value)?;
+                overrides.stack_size = Some(parse_byte_size("--stack", &value)?);
             }
             "--ram" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--ram requires a SIZE argument".to_string())?;
-                ram_size = parse_byte_size("--ram", &value)?;
+                overrides.ram_size = Some(parse_byte_size("--ram", &value)?);
             }
             "--cpu" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--cpu requires a MODEL argument".to_string())?;
-                cpu_type = parse_cpu_type(&value)?;
+                overrides.cpu_type = Some(parse_cpu_type(&value)?);
             }
-            "--fpu" => fpu = true,
-            "--no-fpu" => fpu = false,
+            "--fpu" => overrides.fpu = Some(true),
+            "--no-fpu" => overrides.fpu = Some(false),
             _ => program = Some(arg),
         }
     }
 
     let program = program.ok_or_else(|| "missing <program> argument".to_string())?;
-    Ok(Options {
-        verbose,
-        snoop,
+    Ok((overrides, program, guest_args))
+}
+
+/// Fills every unset field of `overrides` with its built-in default,
+/// producing the final [`Options`] `run` consumes. Used both by
+/// [`parse_args`] (CLI-only, no config files) and by `main` (after
+/// merging CLI overrides with `~/.volamos`/`.volamos`).
+fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String>) -> Options {
+    Options {
+        verbose: overrides.verbose.unwrap_or(false),
+        snoop: overrides.snoop.unwrap_or(false),
         program,
         guest_args,
-        volumes,
-        assigns,
-        cwd,
-        auto_assign_root,
-        stack_size,
-        ram_size,
-        cpu_type,
-        fpu,
-    })
+        volumes: overrides.volumes,
+        assigns: overrides.assigns,
+        cwd: overrides.cwd,
+        auto_assign_root: overrides.auto_assign_root,
+        stack_size: overrides.stack_size.unwrap_or(DEFAULT_STACK_SIZE),
+        ram_size: overrides.ram_size.unwrap_or(DEFAULT_RAM_SIZE),
+        cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
+        fpu: overrides.fpu.unwrap_or(false),
+    }
+}
+
+/// CLI-only argument parsing, ignoring `~/.volamos`/`.volamos` entirely.
+/// `main` doesn't use this directly (it needs [`parse_args_raw`]'s CLI
+/// overrides kept separate so it can merge in config-file values before
+/// resolving defaults) -- this is the convenience every test in this
+/// module wants instead.
+#[cfg(test)]
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
+    let (overrides, program, guest_args) = parse_args_raw(args)?;
+    Ok(resolve(overrides, program, guest_args))
 }
 
 /// Works out the initial guest current directory per the defaulting rule
@@ -648,8 +687,11 @@ fn main() -> ExitCode {
     let mut args = std::env::args();
     let program_name = args.next().unwrap_or_else(|| "volamos".to_string());
 
-    let opts = match parse_args(args) {
-        Ok(opts) => opts,
+    // -h/--help and any CLI parse error short-circuit here, before
+    // ~/.volamos/.volamos are even read -- neither is relevant to
+    // those paths (see parse_args_raw's doc).
+    let (cli_overrides, program, guest_args) = match parse_args_raw(args) {
+        Ok(v) => v,
         Err(msg) => {
             if !msg.is_empty() {
                 eprintln!("volamos: {msg}");
@@ -662,6 +704,20 @@ fn main() -> ExitCode {
             };
         }
     };
+
+    let file_overrides = match config::load_all() {
+        Ok(overrides) => overrides,
+        Err(msg) => {
+            eprintln!("volamos: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = resolve(
+        config::merge(cli_overrides, file_overrides),
+        program,
+        guest_args,
+    );
 
     match run(&opts) {
         Ok(code) => {

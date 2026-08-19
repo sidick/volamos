@@ -49,6 +49,7 @@ nav:
       - Getting Started: Getting-Started.md
   - Using volamos:
       - CLI Reference: CLI-Reference.md
+      - Configuration Files: Configuration.md
       - Volumes and Assigns: Volumes-and-Assigns.md
       - Supported Libraries: Supported-Libraries.md
       - Examples: Examples.md

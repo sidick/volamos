@@ -121,6 +121,8 @@ foo bar
   shell/CI pipeline.
 - [CLI Reference](CLI-Reference.md) for every flag, including `--cpu`/
   `--fpu` (to run 68020+/FPU-requiring binaries) and `--stack`/`--ram`.
+- [Configuration Files](Configuration.md) to stop retyping the same
+  `-V`/`-a`/etc. flags for a project you run often.
 - [Volumes and Assigns](Volumes-and-Assigns.md) for multi-assign search
   order, `--auto-assign`, and the exact Amiga path semantics volamos
   implements.
