@@ -1,25 +1,43 @@
 //! `dos.library` shell variables: `SetVar`/`GetVar`/`DeleteVar`.
 //!
-//! # Scope: local (`LV_VAR`) variables only
+//! # Scope: local (`LV_VAR`) variables, plus directory-backed global ones
 //!
 //! Real AmigaOS shell variables come in two flavors: *local* (per-
 //! process, kept in memory, linked off `pr_LocalVars`) and *global*
 //! (files under the `ENV:` assign, so they're visible to every process
 //! and can be made to survive a reboot via `GVF_SAVE_VAR`/`ENVARC:`).
-//! This module implements only local, `LV_VAR`-type variables (see
-//! [`DosState::local_vars`]) -- no `ENV:`-backed storage, and no
-//! `LV_ALIAS` support (`SetVar`'s `flags` low byte selecting `LV_ALIAS`
-//! is treated as an unsupported request, not a crash). `GVF_GLOBAL_ONLY`
-//! therefore always fails cleanly here (`ERROR_OBJECT_NOT_FOUND` on
-//! read/delete, `DOSFALSE` + the same code on write) rather than
-//! reading/writing real files -- most real `C:` commands that touch
-//! variables at all (like `Version`, whose own `SetVar` call is what
-//! motivated adding this module) use plain local variables, not global
-//! ones, so this covers the common case without needing a fake `ENV:`
-//! filesystem.
+//! Local, `LV_VAR`-type variables are kept purely in memory (see
+//! [`DosState::local_vars`]); global (`GVF_GLOBAL_ONLY`) ones are real
+//! files under whatever host directory the guest's `ENV:` assign points
+//! at (via [`DosState::vfs`], the same mechanism `Open`/`Lock` already
+//! use for every other path) -- one file per variable, named after the
+//! variable (case preserved on creation, matched case-insensitively on
+//! lookup, same as every other [`crate::vfs::Vfs`] path), containing its
+//! raw content. This mirrors real AmigaOS (`ENV:` is *always* just a
+//! directory, conventionally `RAM:env`) and vamos's own convention for
+//! the same thing. If no `ENV:` assign is configured (no [`Vfs`] at
+//! all, or one without an `ENV:` volume/assign registered), global
+//! reads/writes/deletes fail cleanly with `ERROR_OBJECT_NOT_FOUND` --
+//! the same "this variable doesn't exist" a well-behaved caller already
+//! has to handle, not a crash or a hang (there is no requester/GUI
+//! layer here to block on, unlike real AmigaOS's "please insert volume"
+//! prompt for a *literally unknown* device name).
+//!
+//! `GetVar` without `GVF_LOCAL_ONLY`/`GVF_GLOBAL_ONLY` searches local
+//! first, falling back to global if not found there, matching real
+//! `GetVar`'s documented search order. `SetVar`/`DeleteVar` don't
+//! search: `GVF_GLOBAL_ONLY` picks the global store, its absence picks
+//! local, same as real `SetVar`/`DeleteVar` (`DeleteVar` is implemented
+//! as `SetVar(name, NULL, 0, flags)`, matching the real one). No
+//! `GVF_SAVE_VAR`/`ENVARC:` mirroring (a `SetVar` requesting it just
+//! writes `ENV:` normally) and no `LV_ALIAS` support (`SetVar`'s
+//! `flags` low byte selecting `LV_ALIAS` is treated as an unsupported
+//! request, not a crash) -- neither has come up in the real binaries
+//! this runtime has been tested against yet.
 //!
 //! Variable names are matched case-insensitively (upper-cased before
-//! use as the [`DosState::local_vars`] key), matching the real
+//! use as the [`DosState::local_vars`] key, or resolved case-
+//! insensitively by [`Vfs`] for a global one), matching the real
 //! behavior. `SetVar`'s `size == -1` convention (buffer is a `NUL`-
 //! terminated string; the runtime measures it) is implemented; ordinary
 //! non-printable/binary variable content and `GetVar`'s `GVF_BINARY_VAR`/
@@ -30,22 +48,51 @@
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosargs::ERROR_BAD_NUMBER;
-use crate::dosfile::{DosState, ERROR_OBJECT_NOT_FOUND};
+use crate::dosfile::{DosState, ERROR_OBJECT_NOT_FOUND, map_io_error, map_vfs_error};
 use crate::guestmem::read_c_string;
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
+use crate::vfs::{ResolveMode, Vfs};
 
 const LV_ALIAS: u32 = 1;
 const GVF_GLOBAL_ONLY: u32 = 0x0100;
+const GVF_LOCAL_ONLY: u32 = 0x0200;
 const GVF_BINARY_VAR: u32 = 0x0400;
 const GVF_DONT_NULL_TERM: u32 = 0x0800;
 
+/// Reads global variable `name`'s content from `ENV:name` on `vfs`.
+fn global_get(vfs: Option<&Vfs>, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let vfs = vfs.ok_or(ERROR_OBJECT_NOT_FOUND)?;
+    let amiga_path = format!("ENV:{}", String::from_utf8_lossy(name));
+    let resolved = vfs
+        .resolve_with_amiga_path(&amiga_path, ResolveMode::MustExist)
+        .map_err(|e| map_vfs_error(&e))?;
+    std::fs::read(&resolved.host_path).map_err(|e| map_io_error(&e))
+}
+
+/// Writes global variable `name`'s content to `ENV:name` on `vfs`,
+/// creating or overwriting the file.
+fn global_set(vfs: Option<&Vfs>, name: &[u8], content: &[u8]) -> Result<(), i32> {
+    let vfs = vfs.ok_or(ERROR_OBJECT_NOT_FOUND)?;
+    let amiga_path = format!("ENV:{}", String::from_utf8_lossy(name));
+    let resolved = vfs
+        .resolve_with_amiga_path(&amiga_path, ResolveMode::ParentMustExist)
+        .map_err(|e| map_vfs_error(&e))?;
+    std::fs::write(&resolved.host_path, content).map_err(|e| map_io_error(&e))
+}
+
+/// Deletes global variable `name`'s `ENV:name` file on `vfs`.
+fn global_delete(vfs: Option<&Vfs>, name: &[u8]) -> Result<(), i32> {
+    let vfs = vfs.ok_or(ERROR_OBJECT_NOT_FOUND)?;
+    let amiga_path = format!("ENV:{}", String::from_utf8_lossy(name));
+    let resolved = vfs
+        .resolve_with_amiga_path(&amiga_path, ResolveMode::MustExist)
+        .map_err(|e| map_vfs_error(&e))?;
+    std::fs::remove_file(&resolved.host_path).map_err(|e| map_io_error(&e))
+}
+
 const DOSTRUE: u32 = 0xFFFF_FFFF;
 const DOSFALSE: u32 = 0;
-
-fn var_key(mem: &dyn AddressSpace, name_ptr: u32) -> String {
-    String::from_utf8_lossy(&read_c_string(mem, name_ptr)).to_ascii_uppercase()
-}
 
 /// `SetVar` (`D1` = name, `D2` = buffer (`0` deletes), `D3` = size
 /// (`-1` = buffer is a `NUL`-terminated string), `D4` = flags). `D0` =
@@ -79,29 +126,37 @@ fn set_var(
     if flags & 0xFF == LV_ALIAS {
         return Err(ERROR_OBJECT_NOT_FOUND);
     }
-    let key = var_key(mem, name_ptr);
+    let raw_name = read_c_string(mem, name_ptr);
+    let global = flags & GVF_GLOBAL_ONLY != 0;
 
     if buffer_ptr == 0 {
-        return if dos.local_vars.remove(&key).is_some() {
-            Ok(())
+        return if global {
+            global_delete(dos.vfs.as_ref(), &raw_name)
         } else {
-            Err(ERROR_OBJECT_NOT_FOUND)
+            let key = String::from_utf8_lossy(&raw_name).to_ascii_uppercase();
+            if dos.local_vars.remove(&key).is_some() {
+                Ok(())
+            } else {
+                Err(ERROR_OBJECT_NOT_FOUND)
+            }
         };
     }
 
-    if flags & GVF_GLOBAL_ONLY != 0 {
-        return Err(ERROR_OBJECT_NOT_FOUND);
-    }
-
-    let content = if size == -1 {
+    let content: Vec<u8> = if size == -1 {
         read_c_string(mem, buffer_ptr)
     } else {
         (0..size.max(0) as u32)
             .map(|i| mem.read_u8(buffer_ptr.wrapping_add(i)))
             .collect()
     };
-    dos.local_vars.insert(key, content);
-    Ok(())
+
+    if global {
+        global_set(dos.vfs.as_ref(), &raw_name, &content)
+    } else {
+        let key = String::from_utf8_lossy(&raw_name).to_ascii_uppercase();
+        dos.local_vars.insert(key, content);
+        Ok(())
+    }
 }
 
 /// `GetVar` (`D1` = name, `D2` = buffer, `D3` = buffer capacity in
@@ -134,18 +189,25 @@ fn get_var(
     if size <= 0 {
         return Err(ERROR_BAD_NUMBER);
     }
-    if flags & GVF_GLOBAL_ONLY != 0 {
-        // No ENV:-backed storage -- see the module docs.
-        return Err(ERROR_OBJECT_NOT_FOUND);
-    }
 
-    let key = var_key(mem, name_ptr);
-    let Some(value) = dos.local_vars.get(&key) else {
-        return Err(ERROR_OBJECT_NOT_FOUND);
+    let raw_name = read_c_string(mem, name_ptr);
+    let try_local = flags & GVF_GLOBAL_ONLY == 0;
+    let try_global = flags & GVF_LOCAL_ONLY == 0;
+
+    let local_hit = if try_local {
+        let key = String::from_utf8_lossy(&raw_name).to_ascii_uppercase();
+        dos.local_vars.get(&key).cloned()
+    } else {
+        None
+    };
+    let content: Vec<u8> = match local_hit {
+        Some(v) => v,
+        None if try_global => global_get(dos.vfs.as_ref(), &raw_name)?,
+        None => return Err(ERROR_OBJECT_NOT_FOUND),
     };
 
     let binary = flags & GVF_BINARY_VAR != 0;
-    let mut content: &[u8] = value;
+    let mut content: &[u8] = &content;
     if !binary {
         let cut = content
             .iter()
@@ -226,6 +288,35 @@ mod tests {
     use super::*;
     use crate::guestmem::write_c_string;
     use crate::memory::FlatMemory;
+    use crate::vfs::VfsConfig;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("volamos-dosvar-test-{tag}-{pid}-{n}"));
+            fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn setup() -> (FlatMemory, DosState) {
         (FlatMemory::new(0x1000), DosState::new(None))
@@ -300,13 +391,102 @@ mod tests {
     }
 
     #[test]
-    fn global_only_is_not_supported() {
+    fn global_only_without_a_vfs_fails_cleanly() {
+        // No Vfs configured at all: same "no ENV: assign to resolve
+        // against" reasoning as every other path-based call's
+        // established convention -- fails cleanly, not a crash or a
+        // hang (see this module's doc comment on why that's correct
+        // even though real hardware would show a requester here).
         let (mut mem, mut dos) = setup();
         write_c_string(&mut mem, 0x100, b"X");
         write_c_string(&mut mem, 0x200, b"y");
         let err = set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_GLOBAL_ONLY).unwrap_err();
         assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
         let err = get_var(&mut mem, &mut dos, 0x100, 0x300, 8, GVF_GLOBAL_ONLY).unwrap_err();
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    /// A `TempDir` + `Vfs` with `ENV:` assigned to a fresh subdirectory,
+    /// for the directory-backed global-variable tests below.
+    fn setup_with_env() -> (FlatMemory, DosState, TempDir) {
+        let tmp = TempDir::new("dosvar-env");
+        fs::create_dir(tmp.path().join("env")).unwrap();
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("ENV".to_string(), tmp.path().join("env"))],
+            assigns: vec![],
+            auto_assign_root: None,
+            cwd: "ENV:".to_string(),
+        })
+        .expect("build vfs");
+        (FlatMemory::new(0x1000), DosState::new(Some(vfs)), tmp)
+    }
+
+    #[test]
+    fn global_set_then_get_round_trips_through_a_real_file() {
+        let (mut mem, mut dos, tmp) = setup_with_env();
+        write_c_string(&mut mem, 0x100, b"GREETING");
+        write_c_string(&mut mem, 0x200, b"hello");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_GLOBAL_ONLY).expect("set should succeed");
+
+        assert_eq!(
+            fs::read(tmp.path().join("env").join("GREETING")).expect("file should exist"),
+            b"hello"
+        );
+
+        let len = get_var(&mut mem, &mut dos, 0x100, 0x300, 32, GVF_GLOBAL_ONLY)
+            .expect("get should succeed");
+        assert_eq!(len, 5);
+        assert_eq!(read_c_string(&mem, 0x300), b"hello");
+    }
+
+    #[test]
+    fn global_delete_removes_the_real_file() {
+        let (mut mem, mut dos, tmp) = setup_with_env();
+        write_c_string(&mut mem, 0x100, b"TEMP");
+        write_c_string(&mut mem, 0x200, b"x");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_GLOBAL_ONLY).expect("set should succeed");
+        set_var(&mem, &mut dos, 0x100, 0, 0, GVF_GLOBAL_ONLY).expect("delete should succeed");
+
+        assert!(!tmp.path().join("env").join("TEMP").exists());
+        let err = get_var(&mut mem, &mut dos, 0x100, 0x300, 8, GVF_GLOBAL_ONLY).unwrap_err();
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_var_falls_back_to_global_when_not_found_locally() {
+        // No flags: real GetVar checks local first, then global.
+        let (mut mem, mut dos, _tmp) = setup_with_env();
+        write_c_string(&mut mem, 0x100, b"ONLYGLOBAL");
+        write_c_string(&mut mem, 0x200, b"from-env");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_GLOBAL_ONLY).expect("set should succeed");
+
+        let len = get_var(&mut mem, &mut dos, 0x100, 0x300, 32, 0).expect("get should succeed");
+        assert_eq!(len, 8);
+        assert_eq!(read_c_string(&mem, 0x300), b"from-env");
+    }
+
+    #[test]
+    fn get_var_prefers_local_over_global_when_both_exist() {
+        let (mut mem, mut dos, _tmp) = setup_with_env();
+        write_c_string(&mut mem, 0x100, b"DUP");
+        write_c_string(&mut mem, 0x200, b"global-value");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_GLOBAL_ONLY).expect("set should succeed");
+        write_c_string(&mut mem, 0x400, b"local-value");
+        set_var(&mem, &mut dos, 0x100, 0x400, -1, 0).expect("set should succeed");
+
+        let len = get_var(&mut mem, &mut dos, 0x100, 0x300, 32, 0).expect("get should succeed");
+        assert_eq!(len, 11);
+        assert_eq!(read_c_string(&mem, 0x300), b"local-value");
+    }
+
+    #[test]
+    fn get_var_local_only_does_not_fall_back_to_global() {
+        let (mut mem, mut dos, _tmp) = setup_with_env();
+        write_c_string(&mut mem, 0x100, b"ONLYGLOBAL");
+        write_c_string(&mut mem, 0x200, b"from-env");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_GLOBAL_ONLY).expect("set should succeed");
+
+        let err = get_var(&mut mem, &mut dos, 0x100, 0x300, 8, GVF_LOCAL_ONLY).unwrap_err();
         assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
     }
 

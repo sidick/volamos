@@ -1974,6 +1974,77 @@ generated; `mathlibs.rs`: 3 FFP conversion tests -- round-trip over a
 representative value set, exact-zero, and one independently-derived
 bit-pattern check).
 
+**Real hardware ground-truth via Copperline, and `ENV:`-backed
+`GetVar`/`SetVar`/`DeleteVar` — 2026-08-19.** Simon: "Do it" (root-cause
+the still-open `PcOutOfBounds` crash via real hardware). Got a genuine
+ground-truth comparison working: Copperline (`copperline --run`, real
+Kickstart 3.1 r40.68) plus `m68k-amigaos-gdb`/the Copperline control
+protocol (CCP) for scripted register/memory inspection. Confirmed
+`ExecBase`, computed `PhxAss`'s real code addresses from its own hunk 0
+size (contiguous within one real allocation, so entry-relative offsets
+transfer directly -- volamos's loader lays hunks out contiguously too,
+`crates/volamos-core/src/loader.rs`'s `load` doc already says so), and
+set a real breakpoint at the exact real address matching volamos's
+crash site.
+
+**Result: `PhxAss` runs to completion cleanly on real hardware** --
+"Pass 1", "Pass 2", "00 No errors.", back at the CLI prompt, no
+crash at all. Confirms the bug is volamos-side, not a `PhxAss` bug or
+something needing unusual real-hardware setup.
+
+Getting there needed unwinding a real environmental obstacle first: the
+`--run` warp-boot path's minimal generated `Startup-Sequence` doesn't
+assign `ENV:`, and something in the booted system (Shell/CLI startup,
+before `PhxAss` itself even loads) blocks on a real "Please insert
+volume ENV: in any drive" Intuition requester -- reproducible, and
+confirmed via `capture.screenshot`, not a guess. Dismissing it
+interactively (mouse click-through via CCP's `input.mouse_to`/
+`input.mouse`) proved unreliable; the practical fix was mounting a
+host directory as the `ENV:` volume directly in Copperline's own config
+(`[[filesys]] volume = "ENV"`), which sidesteps the requester by making
+`ENV:` genuinely resolve.
+
+That environmental fix suggested a real, previously-undiscovered
+volamos gap: `dosvar.rs`'s `GetVar`/`SetVar`/`DeleteVar` explicitly
+never had any `ENV:`-backed storage at all (documented as an accepted
+simplification since T12/T17-era work -- "most real `C:` commands... use
+plain local variables, not global ones"). Simon: "we have a few
+options... simply map the ENV: volume to a directory... feels like the
+better choice" (matching vamos's own convention) -- implemented exactly
+that. `GVF_GLOBAL_ONLY` variables are now real files under whatever
+host directory the guest's `ENV:` assign points at (via the same `Vfs`
+mechanism `Open`/`Lock` already use), one file per variable, case
+preserved on creation and matched case-insensitively on lookup, same as
+every other `Vfs` path. `GetVar` without `GVF_LOCAL_ONLY`/
+`GVF_GLOBAL_ONLY` now correctly searches local first and falls back to
+global (added `GVF_LOCAL_ONLY`, previously missing entirely), matching
+real `GetVar`'s documented search order; `SetVar`/`DeleteVar` still pick
+one scope by `GVF_GLOBAL_ONLY` with no fallback, matching real
+semantics. No `ENV:` assign configured (no `Vfs`, or one without an
+`ENV:` volume) still fails cleanly with `ERROR_OBJECT_NOT_FOUND` --
+same as before, no regression, and exactly what a well-behaved caller
+already has to handle (Simon, correctly skeptical of the initial
+hypothesis: "normally if an env var isn't found programs continue on
+with their defaults").
+
+**That skepticism was right**: re-running `PhxAss` against volamos with
+a real (empty) `-V ENV:hostdir` still hits the identical crash at the
+identical spot. `GetVar` returning "not found" was never going to
+change `PhxAss`'s behavior whether it came from the old hardcoded path
+or a real, empty directory -- same outcome either way. So `ENV:`
+backing is a real, independently valuable, well-tested fix (matches
+real semantics, useful for any future corpus binary reading shell/global
+variables), but it does **not** explain the `PcOutOfBounds` crash.
+Decided (Simon): commit the `ENV:` work now; leave the crash itself
+open for a future session rather than continuing to chase it here.
+
+New tests: 6 (`dosvar.rs`: global set/get round-trip through a real
+file, global delete removes the real file, `GetVar` falls back to
+global when not found locally, `GetVar` prefers local over global when
+both exist, `GetVar` with `GVF_LOCAL_ONLY` does not fall back, and the
+existing no-`Vfs` "global still fails cleanly" case kept/renamed to
+clarify it's specifically the no-`Vfs` case).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
