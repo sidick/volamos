@@ -158,6 +158,20 @@ const FILE_HANDLE_SIZE: u32 = 44;
 /// docs' "Guest `FileHandle` layout" section for why this is written but
 /// not used as the lookup key.
 const FH_ARG1_OFFSET: u32 = 36;
+/// Byte offset of `fh_Port` within `struct FileHandle` (`dos/dosextens.h`).
+/// Despite the name/type, real AmigaOS treats it as a plain `LONG`, not a
+/// pointer: "If it is non-zero, the file is interactive" (RKRM
+/// `files.md`), consulted directly by `IsInteractive()`. Written non-zero
+/// only for the lazily-created `Input()`/`Output()` default handles
+/// (stdin/stdout are conceptually a console, always interactive); real
+/// host files opened via `Open()` leave it `0` (correctly
+/// non-interactive, matching "the FFS and the RAM-Handler are file
+/// systems and thus create non-interactive files").
+const FH_PORT_OFFSET: u32 = 4;
+/// The non-zero sentinel written to `fh_Port` for interactive handles --
+/// any non-zero value works, since callers only ever test it for
+/// zero-ness, never interpret it as a real pointer.
+const FH_PORT_INTERACTIVE: u32 = 1;
 
 /// Maps a [`std::io::Error`] to an AmigaOS `IoErr()` code. The one place
 /// this runtime translates host I/O errors; every handler that touches
@@ -582,6 +596,7 @@ impl DosState {
             None => {
                 let id = self.next_id();
                 let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+                mem.write_u32(addr.wrapping_add(FH_PORT_OFFSET), FH_PORT_INTERACTIVE);
                 self.handles.insert(addr, HostHandle::Stdin);
                 self.input_handle = Some(addr);
                 addr
@@ -606,6 +621,7 @@ impl DosState {
             None => {
                 let id = self.next_id();
                 let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+                mem.write_u32(addr.wrapping_add(FH_PORT_OFFSET), FH_PORT_INTERACTIVE);
                 self.handles.insert(addr, HostHandle::Stdout);
                 self.output_handle = Some(addr);
                 addr
@@ -806,6 +822,50 @@ fn output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     Ok(())
 }
 
+/// `IsInteractive` (`D1` = `BPTR`). `D0` = `DOSTRUE`/`DOSFALSE`. Reads
+/// `fh_Port` directly out of guest memory -- cannot fail, and doesn't
+/// touch `IoErr()`, matching the real function.
+fn is_interactive_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let addr = addr_from_bptr(bptr);
+    let fh_port = ctx.mem.read_u32(addr.wrapping_add(FH_PORT_OFFSET));
+    ctx.cpu.set_data_register(
+        DataRegister(0),
+        if fh_port != 0 { DOSTRUE } else { DOSFALSE },
+    );
+    Ok(())
+}
+
+/// `SetMode` (`D1` = `BPTR`, `D2` = mode). `D0` = `DOSTRUE`, always --
+/// this runtime has no real `CON:`/`RAW:`/`AUX:` console handler for
+/// the concept of a buffer mode to apply to (see [`crate::dosfile`]'s
+/// module docs: `Input()`/`Output()` are backed directly by host
+/// stdin/stdout, not a console handler process), so there is nothing to
+/// change and nothing that can fail. `IoErr()` is set to `0` on success
+/// (real `SetMode` sets it to `1` only "if the console is attached to a
+/// window of the Amiga graphical user interface" -- never true here).
+fn set_mode_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.dos.set_io_err(0);
+    ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
+    Ok(())
+}
+
+/// `WaitForChar` (`D1` = `BPTR`, `D2` = timeout in microseconds). `D0` =
+/// `DOSFALSE`, always -- this runtime has no way to non-blockingly peek
+/// at host stdin (and no real console handler to ask instead), so
+/// rather than actually block for up to `timeout` this always reports
+/// "nothing available yet" immediately. Real callers (e.g. `Dir`'s
+/// abort-on-keypress check during a long listing) treat that as "no key
+/// was pressed" and carry on, which is the correct behavior for this
+/// runtime's typical non-interactive/piped corpus-testing use. `IoErr()`
+/// is set to `0`, matching "no bytes became available and the handler
+/// was able to complete the function" (not an error).
+fn wait_for_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.dos.set_io_err(0);
+    ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+    Ok(())
+}
+
 /// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
 /// `BPTR`.
 fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -909,6 +969,9 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("Seek", seek_handler::<C>);
     reg!("Input", input_handler::<C>);
     reg!("Output", output_handler::<C>);
+    reg!("IsInteractive", is_interactive_handler::<C>);
+    reg!("SetMode", set_mode_handler::<C>);
+    reg!("WaitForChar", wait_for_char_handler::<C>);
     reg!("SelectInput", select_input_handler::<C>);
     reg!("SelectOutput", select_output_handler::<C>);
     reg!("IoErr", ioerr_handler::<C>);
@@ -1077,6 +1140,31 @@ mod tests {
         // Repeat calls return the same handle.
         assert_eq!(dos.input_addr(&mut heap, &mut mem).unwrap(), in_addr);
         assert_eq!(dos.output_addr(&mut heap, &mut mem).unwrap(), out_addr);
+    }
+
+    #[test]
+    fn input_and_output_default_handles_are_marked_interactive() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let in_addr = dos.input_addr(&mut heap, &mut mem).unwrap();
+        let out_addr = dos.output_addr(&mut heap, &mut mem).unwrap();
+        assert_ne!(mem.read_u32(in_addr + FH_PORT_OFFSET), 0);
+        assert_ne!(mem.read_u32(out_addr + FH_PORT_OFFSET), 0);
+    }
+
+    #[test]
+    fn a_real_opened_file_is_not_marked_interactive() {
+        let tmp = TempDir::new("not-interactive");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+        assert_eq!(mem.read_u32(addr + FH_PORT_OFFSET), 0);
     }
 
     #[test]
@@ -1441,6 +1529,74 @@ mod tests {
         let mut out2 = Vec::new();
         let code2 = rt2.run(&mut out2, None).expect("run should succeed");
         assert_ne!(code2, 0, "Output() should return a nonzero BPTR");
+    }
+
+    #[test]
+    fn end_to_end_is_interactive_true_for_output_false_for_a_real_file() {
+        let tmp = TempDir::new("e2e-isinteractive");
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        push_jsr(&mut words, 6, -60); // Output(a6): D0 = BPTR
+        words.push(move_d0_to_d(1)); // D1 = Output() handle
+        push_jsr(&mut words, 6, -216); // IsInteractive(a6): D0 = DOSTRUE
+        words.push(move_d0_to_d(2)); // D2 = save Output()'s result
+
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, MODE_NEWFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = BPTR
+        words.push(move_d0_to_d(1)); // D1 = the new file's handle
+        push_jsr(&mut words, 6, -216); // IsInteractive(a6): D0 = DOSFALSE
+        words.push(RTS); // exit code = the file's IsInteractive result
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "a real opened file should not be interactive");
+    }
+
+    #[test]
+    fn end_to_end_set_mode_always_succeeds() {
+        let words = [
+            move_imm_to_d(1),
+            0,
+            0, // D1 = 0 (bptr, unused)
+            move_imm_to_d(2),
+            0,
+            1, // D2 = 1 (raw mode)
+            jsr_disp16(6),
+            (-426i16) as u16, // SetMode(a6)
+            RTS,
+        ];
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+    }
+
+    #[test]
+    fn end_to_end_wait_for_char_reports_nothing_available() {
+        let words = [
+            move_imm_to_d(1),
+            0,
+            0, // D1 = 0 (bptr, unused)
+            move_imm_to_d(2),
+            0,
+            0, // D2 = 0 (timeout, unused)
+            jsr_disp16(6),
+            (-204i16) as u16, // WaitForChar(a6)
+            RTS,
+        ];
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSFALSE as i32);
     }
 
     #[test]

@@ -1210,6 +1210,46 @@ lock-and-wrap path, the missing-path failure, and the free/unlock
 effect), 5 (`doslock.rs`, for `DeleteFile`, including one end-to-end
 trap-dispatch test).
 
+**`Dir` gap chain — implemented 2026-08-19.** Moved to the next real
+corpus binary (`C:/Dir`) once `Delete` ran cleanly; found and fixed
+three small gaps, all in `crates/volamos-core/src/dosfile.rs`:
+
+- **`IsInteractive`**: reads `fh_Port` directly out of the guest
+  `struct FileHandle` (offset 4 -- confirmed against the real struct
+  layout already implicit in this runtime's existing
+  `FH_ARG1_OFFSET = 36`, since both fields are part of the same
+  11-`LONG` layout). `fh_Port` is now written non-zero only for the
+  lazily-created `Input()`/`Output()` default handles (conceptually a
+  console, always interactive); real host files opened via `Open()`
+  leave it `0`, correctly non-interactive.
+- **`SetMode`**: a no-op that always succeeds -- this runtime has no
+  real `CON:`/`RAW:`/`AUX:` console handler for a buffer mode to apply
+  to (`Input()`/`Output()` are backed directly by host stdin/stdout).
+- **`WaitForChar`**: always reports "nothing available yet" rather
+  than actually blocking (or attempting a non-blocking peek at host
+  stdin, which isn't portably possible without more infrastructure).
+  `Dir`'s own abort-on-keypress check during a long listing treats
+  that as "no key was pressed" and carries on -- the correct behavior
+  for this runtime's non-interactive/piped corpus-testing use.
+
+`Dir` now runs fully end-to-end against the real corpus binary,
+producing a columnar listing:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Dir WORK:
+     deep (dir)
+     destdir (dir)
+     ...
+  big.txt     copied.txt  empty.txt   hello.txt   hello2.txt  out.txt
+```
+(A leading `[0 q` in the captured output is `Dir`'s own ANSI/CSI
+console escape sequence, meant to be silently interpreted by a real
+terminal -- not a bug, just an artifact of capturing raw stdout instead
+of connecting to an ANSI-aware terminal.)
+
+New tests: 7, all in `dosfile.rs` (2 unit-level for the
+interactive/non-interactive `fh_Port` distinction, 3 end-to-end
+trap-dispatch for `IsInteractive`/`SetMode`/`WaitForChar`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this
