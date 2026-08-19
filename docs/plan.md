@@ -2959,6 +2959,15 @@ module's own docs.)
    Kickstart image sourcing for `REAL_ROM_B64` remains open — Simon
    holds that decision personally (Cloanto/Hyperion-copyrighted binary,
    never committed to this repo) and it isn't blocking today.
+
+   **Update, 2026-08-19: AmiBake has reached M8** — the OS 3.x-base
+   blocker named above is cleared. The real-Kickstart column of Phase
+   4's three-oracle harness is no longer blocked on external tooling;
+   the `REAL_ROM_B64` image-sourcing question above is still open and
+   still Simon's call, but that's the only remaining blocker. Phase 4
+   itself hasn't been picked up yet (this session only built the
+   `vamos`-only two-oracle subset, see its own dated entry) — noting
+   the status change here for whenever it is.
 3. **Empirical corpus — decided 2026-08-18, disk source refined
    2026-08-18.** Primary real-world test corpus: the **AmigaDOS `C:`
    Shell commands** from a genuine Workbench disk (`List`, `Copy`,
@@ -3187,3 +3196,76 @@ entry to confirm the FAIL path/diff output/exit code 1 also work
 before trusting the PASS path. No `volamos`/`volamos-core` source
 changes in this piece -- new script + CI job only, so `cargo build/
 test/clippy/fmt` are unaffected (still verified clean).
+
+## RunCommand: verbatim argptr/argsize passthrough (fixes issue #7) — 2026-08-19
+
+Root-caused the harness's `runcmdtest` divergence (see above): it
+turned out to be a real volamos bug, not a `vamos` quirk. The AmigaDOS
+Manual (RKRM) is explicit about `RunCommand(seglist, stacksize,
+argptr, argsize)`: "the CPU register a0 is loaded with argptr and
+register d0 is filled with argsize" -- the caller's exact argument
+buffer, passed through **verbatim**, no reformatting at all. volamos's
+`run_command_handler` (`crates/volamos-core/src/dosseg.rs`) was
+instead decoding the buffer as UTF-8, splitting it on whitespace, and
+running the result through the *ordinary* CLI-startup path
+(`Runtime::new`'s `args.join(" ")` + trailing `'\n'`) -- correct for
+`System()`/`Execute()` (which really do synthesize a normal command
+line from separate arguments) but wrong for `RunCommand`.
+
+Fix: new `StartConfig::raw_command_line: Option<Vec<u8>>`
+(`crates/volamos-core/src/dispatch.rs`) bypasses the args-joining
+entirely when set -- `Runtime::new` writes those exact bytes (still
+followed by the usual one defensive `NUL`, same as the args-based
+path). `SystemRequest` gained a matching `raw_args: Option<Vec<u8>>`
+field (`None` for `System()`/`Execute()`); `run_command_handler`/
+`DosState::run_command`/`resolve_and_run_command` now thread the raw
+`param_bytes` straight through instead of pre-splitting them into
+`Vec<String>` (a whitespace-split copy is still derived for
+`SystemRequest::args`/`command_line`, purely for a runner that wants
+to log/display them -- it no longer has any bearing on what the
+nested program actually receives). `crates/volamos/src/main.rs`'s
+`run_nested_program` gained a `raw_args: Option<&[u8]>` parameter,
+threaded from `req.raw_args`.
+
+Deliberately did **not** touch `fixtures/runcmdtest.s`'s param buffer
+(still the un-terminated 7-byte `"run cmd"`, no fixture regeneration
+needed) -- the point was to verify the fix against `vamos` directly:
+after the change, `tools/compare_vamos.py`'s `runcmdtest` entry went
+from a tracked `KNOWN` divergence straight to `PASS` (byte-identical
+output against `vamos` in `ghcr.io/sidick/amiga-dev:1`), which is
+strong empirical confirmation of RKRM-conformance without needing to
+change the fixture at all. Its `KNOWN_DIVERGENCES` entry removed;
+issue #7 closed with the root-cause writeup.
+
+**Scope note, filed as issue #8**: real `RunCommand` doesn't create a
+new process at all -- it overlays the *calling* process (same address
+space, stack swapped via `StackSwap`, `pr_Arguments`/`pr_CIS`
+temporarily installed, all reverted on return). volamos still routes
+`RunCommand` through the same brand-new-`Runtime` nested-execution
+path as `System()`/`Execute()` (`run_nested_program`), which is a
+reasonable approximation but not the real overlay semantics --
+researched but deliberately deferred: true overlay needs
+`Runtime::run`'s dispatch loop to support reentrantly invoking guest
+code and getting a return value back, which it can't do today (a
+genuine architectural extension, not a quick change), and nothing in
+the current corpus needs the deeper fidelity yet (shared file-handle
+identity across the overlay, `ReadArgs()` seeing `RunCommand`-supplied
+args specifically via `pr_Arguments`/`pr_CIS`).
+
+**Verification**: added `raw_command_line_bypasses_args_joining_and_newline_appending`
+(`dispatch.rs`) as a focused unit test; fixed the one existing e2e
+test (`runcmdtest_e2e.rs`) that had asserted the old (incorrect)
+`"run cmd\n"` output. Full `cargo build/test/clippy -D warnings/fmt
+--check` clean (537 volamos-core tests, up from 536). Re-ran
+`tools/compare_vamos.py` inside the Docker image after the fix --
+`runcmdtest` now `PASS`, only `exectest` (issue #6, still open,
+unrelated) remains `KNOWN`.
+
+**Also noted this session**: Simon's AmiBake has reached its M8
+(OS 3.x-base) milestone -- the blocker the "Phase 4 external tools"
+decision (above) named for the real-Kickstart column is now cleared.
+Phase 4's three-oracle harness (this session only built the
+`vamos`-only two-oracle subset) is worth revisiting properly now
+rather than staying deferred; not started as part of this entry --
+flagging the status change for the next time Phase 4 itself is picked
+up.

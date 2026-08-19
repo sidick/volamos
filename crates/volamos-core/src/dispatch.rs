@@ -1275,6 +1275,20 @@ pub struct StartConfig {
     /// buffer allocated on the guest heap, `A0` = pointer to it, `D0` =
     /// its length (see [`Runtime::new`]'s doc for the exact framing).
     pub args: Vec<String>,
+    /// Overrides [`Self::args`] entirely: the exact bytes to place in the
+    /// command-line buffer, with nothing joined/quoted/`'\n'`-appended --
+    /// used by `RunCommand`'s host-side runner, since the real
+    /// `RunCommand(seg, stack, argptr, argsize)` call (`dos.library`)
+    /// passes its caller's `argptr`/`argsize` straight through to `A0`/
+    /// `D0` verbatim (per the AmigaDOS Manual's own wording: "the CPU
+    /// register a0 is loaded with argptr and register d0 is filled with
+    /// argsize") -- unlike ordinary CLI/`System()`/`Execute()` startup,
+    /// which does synthesize a normal `'\n'`-terminated command line from
+    /// a list of separate arguments. `None` (the default) keeps today's
+    /// [`Self::args`]-based construction unchanged. [`Runtime::new`] still
+    /// appends one defensive `NUL` after either buffer, same as always --
+    /// see its own doc for why.
+    pub raw_command_line: Option<Vec<u8>>,
     /// Size in bytes of the guest stack region reserved at the top of
     /// guest memory (Phase 3 stage 6; threaded from the CLI's `--stack`
     /// flag). [`Runtime::new`] clamps this up to
@@ -1317,6 +1331,7 @@ impl Default for StartConfig {
             entry: 0,
             load_end: 0,
             args: Vec::new(),
+            raw_command_line: None,
             stack_size: DEFAULT_STACK_SIZE,
             attn_flags: 0,
             program_name: String::new(),
@@ -1761,9 +1776,19 @@ impl<C: Cpu + 'static> Runtime<C> {
         // unquoted tokens instead of the one argument it actually is.
         // Found via the real Workbench 3.1.4 Filenote binary silently
         // mis-parsing a multi-word comment.
-        let quoted_args: Vec<String> = config.args.iter().map(|a| quote_arg_if_needed(a)).collect();
-        let mut line = quoted_args.join(" ").into_bytes();
-        line.push(b'\n');
+        //
+        // `config.raw_command_line`, when set, bypasses all of the above
+        // entirely -- see its own doc for why (RunCommand's real, documented
+        // argptr/argsize-passthrough semantics).
+        let line = if let Some(raw) = &config.raw_command_line {
+            raw.clone()
+        } else {
+            let quoted_args: Vec<String> =
+                config.args.iter().map(|a| quote_arg_if_needed(a)).collect();
+            let mut line = quoted_args.join(" ").into_bytes();
+            line.push(b'\n');
+            line
+        };
         let line_len = line.len() as u32;
         let args_addr = heap
             .alloc(line_len + 1)
@@ -2844,6 +2869,39 @@ mod tests {
         let d0 = rt.cpu.data_register(DataRegister(0));
         assert_eq!(d0, 1);
         assert_eq!(rt.mem.read_u8(a0), b'\n');
+    }
+
+    #[test]
+    fn raw_command_line_bypasses_args_joining_and_newline_appending() {
+        // RunCommand's real, documented semantics (see StartConfig::
+        // raw_command_line's doc): argptr/argsize passed through
+        // verbatim, unlike ordinary args -- no space-joining, no
+        // trailing '\n'.
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[RTS]);
+        let load_end = entry + 0x100;
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: vec!["ignored".to_string()],
+                raw_command_line: Some(b"run cmd".to_vec()),
+                ..StartConfig::default()
+            },
+        );
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        let d0 = rt.cpu.data_register(DataRegister(0));
+        assert_eq!(
+            d0, 7,
+            "D0 should be the raw buffer's own length, not args-derived"
+        );
+        let bytes: Vec<u8> = (0..d0).map(|i| rt.mem.read_u8(a0 + i)).collect();
+        assert_eq!(bytes, b"run cmd");
+        // The usual defensive NUL still follows, same as the args-based path.
+        assert_eq!(rt.mem.read_u8(a0 + d0), 0);
     }
 
     #[test]

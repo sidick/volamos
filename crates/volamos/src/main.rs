@@ -560,9 +560,11 @@ fn check_ram_fits(load_end: u32, stack_size: u32, ram_size: u32) -> Result<(), S
     }
 }
 
+#[allow(clippy::too_many_arguments)] // internal helper; one param per thing a nested run inherits from its parent
 fn run_nested_program(
     host_path: &std::path::Path,
     args: &[String],
+    raw_args: Option<&[u8]>,
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
     ram_size: u32,
@@ -587,6 +589,7 @@ fn run_nested_program(
         entry: load_result.entry,
         load_end: load_result.end,
         args: args.to_vec(),
+        raw_command_line: raw_args.map(<[u8]>::to_vec),
         stack_size,
         attn_flags: attn_flags_for(cpu_type, fpu),
         program_name: program_name_from_path(host_path),
@@ -623,6 +626,7 @@ fn run(opts: &Options) -> Result<i32, String> {
         entry: load_result.entry,
         load_end: load_result.end,
         args: opts.guest_args.clone(),
+        raw_command_line: None,
         stack_size: opts.stack_size,
         attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
         program_name: program_name_from_path(std::path::Path::new(&opts.program)),
@@ -650,6 +654,7 @@ fn run(opts: &Options) -> Result<i32, String> {
         run_nested_program(
             &req.resolved_program_host_path,
             &req.args,
+            req.raw_args.as_deref(),
             vfs_config.clone(),
             req.stack_size_override.unwrap_or(nested_stack_size),
             nested_ram_size,

@@ -88,12 +88,14 @@ fn runcmdtest_loadseg_runcommand_propagates_output_and_control() {
     );
 
     let stdout = stdout_of(&output);
-    // Nested echoargs' own output ("run cmd\n" -- it PutStrs its command
-    // line verbatim) must appear, and it must appear *before*
-    // runcmdtest's own trailing message, proving the nested run actually
-    // completed (synchronously) before the parent continued.
+    // Nested echoargs' own output ("run cmd", no trailing newline --
+    // RunCommand's argptr/argsize is passed through verbatim, per the
+    // AmigaDOS Manual, unlike ordinary CLI startup which appends one)
+    // must appear, and it must appear *before* runcmdtest's own trailing
+    // message, proving the nested run actually completed (synchronously)
+    // before the parent continued.
     let nested_pos = stdout
-        .find("run cmd\n")
+        .find("run cmd")
         .expect("nested echoargs output should appear on stdout");
     let trailing_pos = stdout
         .find("after runcommand\n")

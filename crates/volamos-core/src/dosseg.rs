@@ -313,6 +313,15 @@ pub struct SystemRequest {
     /// splitting -- no quoting/escaping support, matching this module's
     /// documented scope cuts.
     pub args: Vec<String>,
+    /// The exact `argptr`/`argsize` bytes `RunCommand`'s caller supplied,
+    /// unmodified -- `Some` only for `RunCommand` (`None` for `System()`/
+    /// `Execute()`, which have no such buffer to preserve). A runner
+    /// should pass this straight through as the nested program's
+    /// command-line buffer (see [`crate::dispatch::StartConfig::
+    /// raw_command_line`]) rather than reconstructing one from
+    /// [`Self::args`] -- real `RunCommand` passes `argptr`/`argsize` to
+    /// `A0`/`D0` verbatim, per the AmigaDOS Manual.
+    pub raw_args: Option<Vec<u8>>,
     /// `RunCommand`'s explicit `stack` argument, threaded through so the
     /// nested run gets the *real* requested stack size instead of
     /// silently falling back to the parent's own `--stack`/default --
@@ -413,6 +422,7 @@ impl DosState {
             command_line: command_line.to_string(),
             resolved_program_host_path: host_path,
             args,
+            raw_args: None,
             stack_size_override: None,
         };
         Ok(runner(&request))
@@ -425,18 +435,22 @@ impl DosState {
     /// seglist_host_paths`]'s doc for why this re-runs from the
     /// remembered host path rather than executing the already-loaded
     /// seglist bytes in place, and the faithfulness trade-off that
-    /// implies. `paramptr`/`paramlen` (the raw command-tail buffer, not
-    /// necessarily NUL-terminated) is decoded as UTF-8 (lossily) and
-    /// split on whitespace into `args`, matching `System()`/`Execute()`'s
-    /// own documented no-quoting scope cut -- real `RunCommand` callers
-    /// pass exactly this kind of plain, space-separated argument buffer
-    /// in the overwhelming majority of real-world use. Returns the
-    /// invoked command's exit code, or `-1` with `IoErr()` set if it
-    /// couldn't be run at all (unknown `seg`, or no runner installed --
-    /// same [`ERROR_OBJECT_NOT_FOUND`] "couldn't run it" bucket
-    /// [`Self::resolve_and_run`] uses).
-    pub fn run_command(&mut self, seg: u32, args: Vec<String>, stack_size: u32) -> i32 {
-        match self.resolve_and_run_command(seg, args, stack_size) {
+    /// implies. `param_bytes` (the raw `argptr`/`argsize` buffer, not
+    /// necessarily NUL-terminated) is passed through **verbatim** as
+    /// [`SystemRequest::raw_args`] -- per the AmigaDOS Manual, real
+    /// `RunCommand` loads `A0`/`D0` with its caller's `argptr`/`argsize`
+    /// exactly as given, with no reformatting at all (unlike `System()`/
+    /// `Execute()`, which do synthesize a normal command line from
+    /// separate arguments). A whitespace-split `Vec<String>` is still
+    /// derived (lossily, as UTF-8) for [`SystemRequest::args`]/
+    /// `command_line`, purely for a runner that wants to log/display
+    /// them -- it plays no role in what the nested program actually
+    /// receives. Returns the invoked command's exit code, or `-1` with
+    /// `IoErr()` set if it couldn't be run at all (unknown `seg`, or no
+    /// runner installed -- same [`ERROR_OBJECT_NOT_FOUND`] "couldn't run
+    /// it" bucket [`Self::resolve_and_run`] uses).
+    pub fn run_command(&mut self, seg: u32, param_bytes: Vec<u8>, stack_size: u32) -> i32 {
+        match self.resolve_and_run_command(seg, param_bytes, stack_size) {
             Ok(code) => code,
             Err(io_err) => {
                 self.set_io_err(io_err);
@@ -448,7 +462,7 @@ impl DosState {
     fn resolve_and_run_command(
         &mut self,
         seg: u32,
-        args: Vec<String>,
+        param_bytes: Vec<u8>,
         stack_size: u32,
     ) -> Result<i32, i32> {
         let host_path = self
@@ -457,10 +471,13 @@ impl DosState {
             .cloned()
             .ok_or(ERROR_OBJECT_NOT_FOUND)?;
         let runner = self.system_runner.as_mut().ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        let param_str = String::from_utf8_lossy(&param_bytes);
+        let args: Vec<String> = param_str.split_whitespace().map(str::to_string).collect();
         let request = SystemRequest {
             command_line: args.join(" "),
             resolved_program_host_path: host_path,
             args,
+            raw_args: Some(param_bytes),
             stack_size_override: Some(stack_size),
         };
         Ok(runner(&request))
@@ -575,10 +592,8 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     for i in 0..param_len {
         param_bytes.push(ctx.mem.read_u8(param_ptr.wrapping_add(i)));
     }
-    let param_str = String::from_utf8_lossy(&param_bytes);
-    let args: Vec<String> = param_str.split_whitespace().map(str::to_string).collect();
 
-    let code = ctx.dos.run_command(seg, args, stack_size);
+    let code = ctx.dos.run_command(seg, param_bytes, stack_size);
     ctx.cpu.set_data_register(DataRegister(0), code as u32);
     Ok(())
 }

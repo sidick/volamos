@@ -86,10 +86,6 @@ KNOWN_DIVERGENCES = {
         "CheckSignal after SetSignal(1<<5,1<<5) doesn't match under vamos",
         "https://github.com/sidick/volamos/issues/6",
     ),
-    "runcmdtest": (
-        "missing newline between nested-run output and parent output under vamos",
-        "https://github.com/sidick/volamos/issues/7",
-    ),
 }
 
 
