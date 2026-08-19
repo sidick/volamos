@@ -8,14 +8,12 @@
 # workflow_dispatch exists for re-publishing a version after a docs-only
 # fix, or for a first publish ahead of the next release tag.
 #
-# volamos has no tagged releases yet, so this workflow won't have run by
-# the time it lands -- see README.md's "Documentation" section for why
-# there's no live Pages URL yet.
+# Live at https://sidick.github.io/volamos/ (first published via
+# workflow_dispatch ahead of volamos's first tagged release).
 #
-# One-time repo setup (not done yet -- do this before the first tag/
-# dispatch run): Settings -> Pages -> Source: "Deploy from a branch" /
-# gh-pages / root -- mike commits the built site to gh-pages itself, it
-# does not use the "GitHub Actions" Pages source.
+# One-time repo setup (done): Settings -> Pages -> Source: "Deploy from a
+# branch" / gh-pages / root -- mike commits the built site to gh-pages
+# itself, it does not use the "GitHub Actions" Pages source.
 
 name: Docs
 

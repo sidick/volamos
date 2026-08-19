@@ -12,11 +12,11 @@ command-line tools, not games or Workbench applications. It is a spiritual
 successor to [`vamos`](https://github.com/cnvogelg/amitools), the Python
 implementation of the same idea from the `amitools` package.
 
-**User documentation:** the [`userdocs/`](userdocs/) directory
+**User documentation:** [sidick.github.io/volamos](https://sidick.github.io/volamos/)
 (installation, CLI reference, volumes/assigns, supported libraries) is
 a full [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)
-site — no hosted build yet, so browse it directly on GitHub or run
-`mkdocs serve` locally (see
+site built from [`userdocs/`](userdocs/) — or run `mkdocs serve`
+locally (see
 [`userdocs/Building-from-Source.md`](userdocs/Building-from-Source.md)).
 This README stays a shorter overview.
 
