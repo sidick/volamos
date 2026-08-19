@@ -2212,6 +2212,55 @@ covering every `CpuType` and the FPU-model-specific bit choice
 (`AFF_68881`/`AFF_68882` vs. `AFF_FPU40` vs. no bit at all for
 `M68EC040`/`SCC68070`)).
 
+**`Sort`/`Search`/`Join` — memory pools and a real `MatchFirst`/
+`MatchNext` `IoErr()` bug — 2026-08-19.** Simon: "test sort, search and
+join next" -- three more real Workbench 3.1.4 `C:` binaries from the
+established empirical corpus. Two gaps found and fixed:
+
+- **`exec.library`'s `CreatePool`/`DeletePool`/`AllocPooled`/
+  `FreePooled`** (`crate::execmem`, LVOs -696/-702/-708/-714): `Sort`
+  opens one unconditionally at startup (a real, common AmigaOS memory-
+  management idiom -- allocate many same-lifetime items via a pool,
+  `DeletePool` once instead of freeing each individually). This
+  runtime's flat model has no puddle/threshold machinery to actually
+  need, so `AllocPooled` is just a direct [`GuestHeap`] allocation
+  (same size-rounding and `MEMF_CLEAR` handling as `AllocMem`, reading
+  `requirements` back out of a small pool-header block `CreatePool`
+  allocates, since `AllocPooled` itself takes no flags argument) and
+  `FreePooled` is `FreeMem`'s same loud-failure-on-size-mismatch check.
+  **Known, accepted simplification**: `DeletePool` only frees the
+  header, not any still-outstanding `AllocPooled` blocks (this runtime
+  doesn't track pool membership) -- a real leak within one process run,
+  but harmless for a single CLI invocation that exits right after.
+- **`MatchFirst`/`MatchNext` never set `IoErr()` on failure** -- only
+  `D0` (`crate::dosanchor`). Both real functions *also* leave the same
+  code in the global `IoErr()`, and `Sort`'s own source checks
+  `IoErr() != ERROR_NO_MORE_ENTRIES` after a failing `MatchNext` rather
+  than comparing `D0` directly -- a real, common AmigaDOS idiom (`D0`'s
+  raw return value and `IoErr()`'s code are conventionally
+  interchangeable for calls that document both). With `IoErr()` left
+  stale from an earlier, unrelated call, that check read the wrong
+  code and printed a bogus `PrintFault` ("Object is not of required
+  type") for what should have been silent, successful loop
+  termination -- `Sort` never actually wrote its output file as a
+  result. This is the *same* stale-`IoErr()` failure shape the
+  `Date`/`SetDate` investigation (see that entry above) first flagged
+  as a debugging trap -- except this time genuinely a volamos bug, not
+  a red herring, a useful reminder that the lesson cuts both ways.
+
+**Result**: `Sort` now sorts and writes real output (verified against
+its actual stdout, not just "didn't crash": `WORK:input.txt` ->
+alphabetized `WORK:output.txt`); `Search` finds and reports the correct
+line and number; `Join` concatenates files correctly. All three exit 0
+with no unhandled calls.
+
+New tests: 4 (`execmem.rs`: full `CreatePool`/`AllocPooled`/write/
+`FreePooled`/`DeletePool` round trip proving the block is real,
+writable guest memory; `AllocPooled(0)` returns `NULL`; `FreePooled`
+size mismatch is a loud error, same as `FreeMem`'s; `dosanchor.rs`: an
+end-to-end trap-dispatch test proving `IoErr()` after an exhausted
+`MatchNext` reports `ERROR_NO_MORE_ENTRIES`, matching `D0`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

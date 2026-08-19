@@ -605,7 +605,15 @@ fn match_end(heap: &mut GuestHeap, dos: &mut DosState, ap_addr: u32) {
 /// `MatchFirst` (`D1` = pattern `CString*`, `D2` = `AnchorPath*`,
 /// caller-allocated and initialized per the module docs). `D0` =
 /// `0` on success (an `IoErr()`-style error code otherwise -- `D0`
-/// itself carries the error, unlike most `dos.library` calls).
+/// itself carries the error, unlike most `dos.library` calls). Real
+/// `MatchFirst` *also* leaves the same code in `IoErr()` on failure --
+/// found missing while running the real `Sort` command (Workbench
+/// 3.1.4 `C:`), whose own source checks `IoErr() != ERROR_NO_MORE_ENTRIES`
+/// after a failing `MatchNext` rather than comparing `D0` directly (a
+/// real, common AmigaDOS idiom, not a quirk of this one program); with
+/// `IoErr()` left stale from an earlier, unrelated call, that comparison
+/// saw the wrong code and printed a bogus `PrintFault` for what should
+/// have been silent, successful loop termination.
 fn match_first_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let pat_ptr = ctx.cpu.data_register(DataRegister(1));
     let ap_addr = ctx.cpu.data_register(DataRegister(2));
@@ -615,14 +623,18 @@ fn match_first_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         DataRegister(0),
         match result {
             Ok(()) => 0,
-            Err(code) => code as u32,
+            Err(code) => {
+                ctx.dos.set_io_err(code);
+                code as u32
+            }
         },
     );
     Ok(())
 }
 
 /// `MatchNext` (`D1` = `AnchorPath*`). `D0` = `0` on success (error code
-/// otherwise), same convention as `MatchFirst`.
+/// otherwise), same convention -- including the `IoErr()` side effect on
+/// failure -- as [`match_first_handler`].
 fn match_next_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ap_addr = ctx.cpu.data_register(DataRegister(1));
     let result = match_next(ctx.heap, ctx.mem, ctx.dos, ap_addr);
@@ -630,7 +642,10 @@ fn match_next_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
         DataRegister(0),
         match result {
             Ok(()) => 0,
-            Err(code) => code as u32,
+            Err(code) => {
+                ctx.dos.set_io_err(code);
+                code as u32
+            }
         },
     );
     Ok(())
@@ -1062,6 +1077,61 @@ mod tests {
         assert_eq!(
             read_c_string(rt.memory(), ap_addr + AP_INFO_OFFSET + 8),
             b"hello.txt"
+        );
+    }
+
+    #[test]
+    fn end_to_end_match_next_exhaustion_also_sets_io_err() {
+        // Real MatchFirst/MatchNext leave the same code in IoErr() on
+        // failure, not just D0 -- found missing while running the real
+        // Sort command (Workbench 3.1.4 C:), which checks
+        // IoErr() != ERROR_NO_MORE_ENTRIES after a failing MatchNext
+        // rather than comparing D0 directly, a real, common AmigaDOS
+        // idiom. MatchFirst(non-wildcard file) then MatchNext (which
+        // exhausts immediately -- see match_first's non-wildcard
+        // branch) then IoErr(a6) should report ERROR_NO_MORE_ENTRIES.
+        let tmp = TempDir::new("e2e-ioerr");
+        fs::write(tmp.path().join("hello.txt"), b"hi").unwrap();
+
+        let mut words = Vec::new();
+        let pat_idx = push_move_imm_to_d(&mut words, 1, 0);
+        let ap_idx = push_move_imm_to_d(&mut words, 2, 0);
+        push_jsr(&mut words, 6, -822); // MatchFirst(a6)
+        let ap_idx2 = push_move_imm_to_d(&mut words, 1, 0);
+        push_jsr(&mut words, 6, -828); // MatchNext(a6) -- D1 = AnchorPath*
+        push_jsr(&mut words, 6, -132); // IoErr(a6) -- D0 = the exit code
+        words.push(RTS);
+
+        let pat = b"SYS:hello.txt";
+        let pat_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let ap_addr = (pat_addr + pat.len() as u32 + 1 + 3) & !3;
+        patch_imm32(&mut words, pat_idx, pat_addr);
+        patch_imm32(&mut words, ap_idx, ap_addr);
+        patch_imm32(&mut words, ap_idx2, ap_addr);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        write_c_string(&mut mem, pat_addr, pat);
+        for i in 0..AP_BUF_OFFSET {
+            mem.write_u8(ap_addr + i, 0);
+        }
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: ap_addr + AP_BUF_OFFSET,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs_over(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, ERROR_NO_MORE_ENTRIES,
+            "IoErr() should report the same code MatchNext returned in D0"
         );
     }
 }

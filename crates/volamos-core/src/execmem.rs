@@ -4,7 +4,10 @@
 //! small to earn its own module -- added here since it's still squarely
 //! an "exec.library memory-related call"), plus `CacheControl` (same
 //! reasoning: not an allocator, but a small, memory-system-adjacent
-//! call with no better home -- see [`cache_control_handler`]).
+//! call with no better home -- see [`cache_control_handler`]), plus
+//! `CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled` (a thin layer
+//! over the same flat [`GuestHeap`] the other allocators use -- see
+//! [`create_pool_handler`]).
 //!
 //! # Design: flat, no `MemHeader`/`MemChunk` emulation
 //!
@@ -349,6 +352,159 @@ fn free_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
         })
 }
 
+/// `CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`'s pool-header
+/// size: one `u32` holding the pool's `requirements` (`MEMF_*`, applied
+/// to every subsequent `AllocPooled` from it, since that call takes no
+/// flags of its own), rounded up to 8 bytes for the same alignment
+/// reasoning [`ALLOCVEC_HEADER_SIZE`] documents.
+const POOL_HEADER_SIZE: u32 = 8;
+
+/// `exec.library`'s `CreatePool` (LVO -696: `D0` = `requirements`
+/// (`MEMF_*`), `D1` = `puddleSize`, `D2` = `threshSize`). `D0` = an
+/// opaque pool handle, or `0` on failure.
+///
+/// Real `CreatePool` carves memory in `puddleSize`-sized chunks
+/// ("puddles"), sub-allocating individual `AllocPooled` requests from
+/// them (falling back to a direct allocation for anything bigger than
+/// `threshSize`) -- an optimization to avoid `GuestHeap`'s free-list
+/// overhead for many small, same-lifetime allocations. This runtime's
+/// flat model has no such overhead to avoid, so `puddleSize`/
+/// `threshSize` are accepted and ignored (same "flat memory makes the
+/// distinction moot" stance [`MEMF_CHIP`]/[`MEMF_FAST`] already take):
+/// every `AllocPooled` becomes its own direct [`GuestHeap`] allocation,
+/// same as [`alloc_mem_handler`]. The pool "handle" this returns is
+/// just a small header block recording `requirements` -- see
+/// [`POOL_HEADER_SIZE`].
+fn create_pool_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let requirements = ctx.cpu.data_register(DataRegister(0));
+    // D1 (puddleSize) and D2 (threshSize) are intentionally unused --
+    // see this handler's doc comment.
+
+    match ctx.heap.alloc(POOL_HEADER_SIZE) {
+        Ok(pool) => {
+            ctx.mem.write_u32(pool, requirements);
+            ctx.cpu.set_data_register(DataRegister(0), pool);
+        }
+        Err(_) => ctx.cpu.set_data_register(DataRegister(0), 0),
+    }
+    Ok(())
+}
+
+/// `exec.library`'s `DeletePool` (LVO -702: `A0` = pool handle). No
+/// return value.
+///
+/// **Known simplification**: real `DeletePool` frees every outstanding
+/// `AllocPooled` allocation from the pool along with the pool itself in
+/// one shot (a common, well-behaved idiom: allocate many same-lifetime
+/// items, then `DeletePool` once instead of `FreePooled`-ing each).
+/// Since this runtime doesn't track pool membership (each `AllocPooled`
+/// is an independent [`GuestHeap`] allocation, indistinguishable from
+/// any other once made), this only frees the header block -- any
+/// still-live `AllocPooled` blocks from it leak for the rest of this
+/// process's run. Harmless for a single CLI invocation (the guest never
+/// observes it, and the whole host process exits when the program
+/// does, reclaiming everything) but worth remembering if a future
+/// corpus binary's behavior ever depends on `GuestHeap` exhaustion.
+fn delete_pool_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let pool = ctx.cpu.address_register(AddressRegister(0));
+    if pool == 0 {
+        // Not documented either way; treated as a no-op defensively,
+        // matching every other *Free*/Delete* call's NULL tolerance in
+        // this module.
+        return Ok(());
+    }
+    // Best-effort: if the handle isn't actually live (e.g. a double
+    // DeletePool), there's nothing meaningful left to free -- silently
+    // succeed rather than erroring, since DeletePool has no failure
+    // return value to report through anyway.
+    let _ = ctx.heap.free(pool);
+    Ok(())
+}
+
+/// `exec.library`'s `AllocPooled` (LVO -708: `A0` = pool handle, `D0` =
+/// byte size). `D0` = the allocated block's address, or `0` on failure
+/// -- see [`create_pool_handler`] for why this is just a direct
+/// [`GuestHeap`] allocation, sized and `MEMF_CLEAR`-cleared exactly as
+/// [`alloc_mem_handler`] does (reading `requirements` back out of the
+/// pool header, since `AllocPooled` itself takes no flags argument).
+fn alloc_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let pool = ctx.cpu.address_register(AddressRegister(0));
+    let byte_size = ctx.cpu.data_register(DataRegister(0));
+
+    if byte_size == 0 {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+
+    let requirements = ctx.mem.read_u32(pool);
+    let rounded = round_up_8(byte_size);
+    match ctx.heap.alloc(rounded) {
+        Ok(addr) => {
+            if requirements & MEMF_CLEAR != 0 {
+                for i in 0..rounded {
+                    ctx.mem.write_u8(addr.wrapping_add(i), 0);
+                }
+            }
+            ctx.cpu.set_data_register(DataRegister(0), addr);
+        }
+        Err(_) => ctx.cpu.set_data_register(DataRegister(0), 0),
+    }
+    Ok(())
+}
+
+/// `exec.library`'s `FreePooled` (LVO -714: `A0` = pool handle, `A1` =
+/// memory block, `D0` = byte size). No return value. Same size-mismatch
+/// loud-failure contract as [`free_mem_handler`] (`A0`, the pool
+/// handle, isn't otherwise consulted -- this runtime's `AllocPooled`
+/// blocks aren't actually sub-allocated from any particular pool's own
+/// memory, so there's nothing pool-specific to validate beyond the
+/// block itself being a live allocation of the claimed size).
+fn free_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let addr = ctx.cpu.address_register(AddressRegister(1));
+    let byte_size = ctx.cpu.data_register(DataRegister(0));
+
+    if addr == 0 {
+        return Ok(());
+    }
+
+    let rounded = round_up_8(byte_size);
+    match ctx.heap.size_of_live_alloc(addr) {
+        Some(actual) if actual == rounded => {
+            ctx.heap
+                .free(addr)
+                .map_err(|e| DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo: -714,
+                    handler_name: "FreePooled".to_string(),
+                    message: format!(
+                        "GuestHeap::free unexpectedly failed for a block it just \
+                         confirmed as live at {addr:#010x}: {e}"
+                    ),
+                })
+        }
+        Some(actual) => Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -714,
+            handler_name: "FreePooled".to_string(),
+            message: format!(
+                "FreePooled size mismatch at {addr:#010x}: called with byteSize \
+                 {byte_size} (rounds to {rounded}), but the live allocation there \
+                 is {actual} bytes"
+            ),
+        }),
+        None => Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -714,
+            handler_name: "FreePooled".to_string(),
+            message: format!(
+                "FreePooled called on {addr:#010x}, which isn't a currently-live \
+                 allocation (never allocated, already freed, or not an \
+                 AllocPooled pointer at all)"
+            ),
+        }),
+    }
+}
+
 /// `CopyMem`/`CopyMemQuick` (LVOs -624/-630): `A0` = source, `A1` =
 /// dest, `D0` = size in bytes. No return value. Real `CopyMemQuick`
 /// additionally requires long-word alignment and a size that's a
@@ -433,6 +589,10 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
     reg!("CopyMem", copy_mem_handler::<C>);
     reg!("CopyMemQuick", copy_mem_handler::<C>);
     reg!("CacheControl", cache_control_handler::<C>);
+    reg!("CreatePool", create_pool_handler::<C>);
+    reg!("DeletePool", delete_pool_handler::<C>);
+    reg!("AllocPooled", alloc_pooled_handler::<C>);
+    reg!("FreePooled", free_pooled_handler::<C>);
 }
 
 #[cfg(test)]
@@ -906,5 +1066,128 @@ mod tests {
         let mut out2 = Vec::new();
         rt2.run(&mut out2, None).expect("run should succeed");
         assert_eq!(rt2.memory().read_u32(CACHE_BITS_ADDR), old);
+    }
+
+    // --- CreatePool/DeletePool/AllocPooled/FreePooled ---
+
+    #[test]
+    fn pool_alloc_write_free_delete_round_trip() {
+        // movea.l Dn,An -- every LVO's result arrives in D0, so this
+        // shuffles it into whichever address register the *next* call
+        // needs it in. The pool handle and block pointer are kept safe
+        // in D3/D4 (untouched by any LVO's own D0 return value) for the
+        // whole program, and copied into the needed address register
+        // fresh before each call.
+        fn movea_dn_to_an(src_d: u16, dst_a: u16) -> u16 {
+            0x2040 | (dst_a << 9) | src_d
+        }
+        fn move_d0_to_dn(dst_d: u16) -> u16 {
+            0x2000 | (dst_d << 9)
+        }
+
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(0)); // D0 = requirements = 0
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(1)); // D1 = puddleSize (ignored)
+        words.push(0);
+        words.push(0x1000);
+        words.push(move_imm_to_d(2)); // D2 = threshSize (ignored)
+        words.push(0);
+        words.push(0x800);
+        words.extend_from_slice(&jsr_disp16_a6(-696)); // CreatePool(a6) -> D0
+        words.push(move_d0_to_dn(3)); // D3 = pool handle (kept safe)
+
+        words.push(movea_dn_to_an(3, 0)); // A0 = pool handle
+        words.push(move_imm_to_d(0)); // D0 = size
+        words.push(0);
+        words.push(16);
+        words.extend_from_slice(&jsr_disp16_a6(-708)); // AllocPooled(a6) -> D0
+        words.push(move_d0_to_dn(4)); // D4 = allocated block (kept safe)
+
+        // Write a marker byte, so we can prove the block is real,
+        // writable guest memory, not just a bookkeeping fiction.
+        words.push(movea_dn_to_an(4, 2)); // A2 = block
+        words.push(0x1140); // move.b #0x42,(a2)
+        words.push(0x0042);
+
+        // FreePooled(A0=pool, A1=block, D0=size)
+        words.push(movea_dn_to_an(3, 0)); // A0 = pool handle
+        words.push(movea_dn_to_an(4, 1)); // A1 = block
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(16);
+        words.extend_from_slice(&jsr_disp16_a6(-714)); // FreePooled(a6)
+
+        words.push(movea_dn_to_an(3, 0)); // A0 = pool handle
+        words.extend_from_slice(&jsr_disp16_a6(-702)); // DeletePool(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None);
+        assert!(code.is_ok(), "run should succeed: {code:?}");
+    }
+
+    #[test]
+    fn alloc_pooled_zero_size_returns_null() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(0)); // D0 = requirements
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(1)); // D1 = puddleSize
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(2)); // D2 = threshSize
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-696)); // CreatePool(a6) -> D0
+        words.push(move_d0_to_a(0)); // A0 = pool handle
+        words.push(move_imm_to_d(0)); // D0 = 0
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-708)); // AllocPooled(a6) -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "AllocPooled(0) should return NULL");
+    }
+
+    #[test]
+    fn free_pooled_size_mismatch_is_a_loud_error() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(2));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-696)); // CreatePool(a6) -> D0
+        words.push(move_d0_to_a(0)); // A0 = pool handle
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(16);
+        words.extend_from_slice(&jsr_disp16_a6(-708)); // AllocPooled(a6, 16) -> D0
+        words.push(move_d0_to_a(1)); // A1 = block
+        // FreePooled with the WRONG size (8, not 16).
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(8);
+        words.extend_from_slice(&jsr_disp16_a6(-714)); // FreePooled(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("size mismatch"),
+            "unexpected message: {message}"
+        );
     }
 }
