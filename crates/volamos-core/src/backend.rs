@@ -60,8 +60,10 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// to fit three more real library bases (the standard Workbench math
 /// libraries -- see `crate::mathlibs`'s module docs) each needing their
 /// own negative-offset jump table plus positive-offset `struct Library`
-/// header room, same reasoning as the first grow.
-pub const TRAP_TABLE_SIZE: u32 = 0x1800;
+/// header room, then once more from `0x1800` for `timer.device`'s real
+/// device base (see `crate::dispatch::TIMER_DEVICE_BASE`) -- same
+/// reasoning each time.
+pub const TRAP_TABLE_SIZE: u32 = 0x1A00;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

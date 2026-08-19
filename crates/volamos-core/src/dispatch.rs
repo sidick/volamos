@@ -262,9 +262,31 @@ pub const MATHTRANS_LIBRARY_BASE: u32 = 0x13B0;
 pub const MATHIEEEDOUBBAS_LIBRARY_BASE: u32 = 0x15B0;
 
 /// Real `mathieeedoubtrans.library` base address -- same chunked layout
-/// as [`MATHTRANS_LIBRARY_BASE`], in the final `0x1600`..`0x1800` chunk.
+/// as [`MATHTRANS_LIBRARY_BASE`], in the `0x1600`..`0x1800` chunk.
 /// Deepest real LVO: `IEEEDPLog10` at `-138`.
 pub const MATHIEEEDOUBTRANS_LIBRARY_BASE: u32 = 0x17B0;
+
+/// Real `timer.device` base address -- same chunked layout as
+/// [`MATHTRANS_LIBRARY_BASE`], in the `0x1800`..`0x1A00` chunk.
+///
+/// A *device* base, not a library one, but timer.device famously
+/// doubles as a library: its time-arithmetic functions (`AddTime`/
+/// `SubTime`/`CmpTime`/`ReadEClock`/`GetSysTime`, LVOs `-42`..`-66`
+/// past the six standard device vectors) are called through LVOs off
+/// `io_Device`, which the RKRM itself documents fetching as
+/// `TimerBase = TimerIO->tr_node.io_Device`. `OpenDevice` writes this
+/// base into every successfully-opened timer request's `io_Device` so
+/// that idiom works for real -- found via the real `PhxAss` assembler,
+/// which computes its "N lines in X sec" stats line exactly that way
+/// (`jsr -48(A6)` = `SubTime` off `io_Device`) and previously jumped
+/// through the placeholder sentinel `1` this field used to hold. See
+/// `crate::exectask`'s timer handlers.
+pub const TIMER_DEVICE_BASE: u32 = 0x19B0;
+
+/// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
+/// (a device's base is `struct Device`, a `struct Library` whose
+/// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
+const NT_DEVICE: u8 = 3;
 
 /// Fake `version.library` base address. `version.library` is a small
 /// real AmigaOS library some `C:` commands (the real `Version` command
@@ -1473,6 +1495,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHTRANS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBBAS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBTRANS_LIBRARY_BASE);
+        write_library_node(&mut mem, TIMER_DEVICE_BASE);
+        // A device's node type is NT_DEVICE, not write_library_node's
+        // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
+        mem.write_u8(
+            TIMER_DEVICE_BASE.wrapping_add(LIB_NODE_TYPE_OFFSET),
+            NT_DEVICE,
+        );
 
         // Real struct ExecBase (NDK exec/execbase.h) extends well past
         // struct Library -- SoftVer, ChkBase, the Capture vectors,

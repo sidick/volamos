@@ -2045,6 +2045,63 @@ both exist, `GetVar` with `GVF_LOCAL_ONLY` does not fall back, and the
 existing no-`Vfs` "global still fails cleanly" case kept/renamed to
 clarify it's specifically the no-`Vfs` case).
 
+**`PcOutOfBounds` crash root-caused and fixed: `timer.device`'s
+library-style vectors — 2026-08-19.** A review of the accumulated
+evidence found the root cause without any further tracing -- the crash
+site's own field offset was the give-away, matching Simon's
+wrongly-initialized-field hypothesis exactly. The crashing instruction
+sequence (captured earlier) was:
+
+```
+0x305a  movea.l (0x15C,a5),a0   ; a0 = the timerequest (a global)
+0x305e  movea.l (0x14,a0),a6    ; a6 = io_Device (offset 20!)
+0x3068  jsr     (-48,a6)        ; SubTime(TimerBase)
+```
+
+Offset `0x14` = 20 = `struct IORequest.io_Device` -- the exact field
+`open_device_handler` filled with the placeholder
+`TIMER_DEVICE_SENTINEL: u32 = 1`. `PhxAss` was executing the
+RKRM-documented idiom, verbatim from the Devices book's Timer chapter
+(`TimerBase = (struct Library *)TimerIO->tr_node.io_Device;`):
+timer.device doubles as a *library*, its time-arithmetic functions
+(`AddTime -42`/`SubTime -48`/`CmpTime -54`/`ReadEClock -60`/
+`GetSysTime -66`, past the six standard device vectors; order confirmed
+against AROS's own `rom/timer/timer.conf`) called via LVOs off
+`io_Device`. `jsr -48(1)` = jump to `0xFFFFFFD1` -- the reported
+`PcOutOfBounds` address, matching to the byte. The purpose also
+matches: `PhxAss` diffs two `TR_GETSYSTIME` readings with `SubTime` for
+its "N lines in X sec" stats line -- the very line real hardware
+printed right after "Pass 2", exactly where volamos crashed instead.
+
+Fixed with the same real-base pattern as the math libraries: a new
+`TIMER_DEVICE_BASE` (`0x19B0`; `TRAP_TABLE_SIZE` grown `0x1800` ->
+`0x1A00` for its chunk), a real `struct Library` header with `ln_Type`
+= `NT_DEVICE` (not `NT_LIBRARY` -- a device base is a `struct Device`),
+all five vectors registered as real handlers (`AddTime`/`SubTime` with
+proper micro carry/borrow; `CmpTime`'s documented inverted-looking
+convention -- `-1` when the *first* operand is later -- confirmed
+against the RKRM chapter's own worked example; `GetSysTime` sharing the
+`TR_GETSYSTIME` clock via a new `host_time_secs_micro` helper;
+`ReadEClock` returning the PAL rate 709379 Hz in `D0` and a
+64-bit tick count derived from the same wall clock, which is correct
+for the only documented use -- differences between readings), and
+`OpenDevice` writing this real base into `io_Device` where the
+sentinel used to go.
+
+**Result: `PhxAss` now runs end-to-end under volamos** -- exit 0,
+output identical to the real-Kickstart-3.1 ground-truth run including
+the stats line, and the assembled output file is a valid hunk
+executable (`moveq #0,d0; rts`) that volamos itself then loads and runs
+cleanly. The full loop -- volamos runs a real assembler, which produces
+a real program, which volamos runs -- closes for the first time.
+
+New tests: 3 (`exectask.rs`: the full `OpenDevice` -> `movea.l
+(0x14,a0),a6` -> `jsr -48(a6)` TimerBase idiom, byte-for-byte the
+`PhxAss` shape, with `SubTime`'s borrow path and `CmpTime`'s `-1`
+convention asserted; `AddTime`'s micro-carry path; `GetSysTime`/
+`ReadEClock` plausibility including a 64-bit-truncation guard on
+`ev_hi`).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

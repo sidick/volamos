@@ -228,6 +228,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{
     DOS_LIBRARY_BASE, DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable,
+    TIMER_DEVICE_BASE,
 };
 use crate::execlist::{LN_NAME, LN_TYPE};
 use crate::guestmem::{GuestHeap, write_c_string};
@@ -730,13 +731,6 @@ const IO_ERROR_OFFSET: u32 = 31;
 const TR_TIME_SECS_OFFSET: u32 = 32;
 const TR_TIME_MICRO_OFFSET: u32 = 36;
 
-/// A fixed, non-`NULL`, non-dereferenced sentinel for `io_Device` --
-/// see [`open_device_handler`]'s doc comment for why `timer.device` is
-/// the one device this runtime backs for real, and
-/// [`do_io_handler`]/[`send_io_handler`] for where this is read back to
-/// recognize a timer request.
-const TIMER_DEVICE_SENTINEL: u32 = 1;
-
 /// `timer.device`'s three documented commands (`devices/timer.h`,
 /// numerically `CMD_NONSTD` (9) + 0/1/2 -- confirmed against the
 /// AmiBlitz3 `timer.ab3`/`io.ab3` includes, the RKRM Devices book's own
@@ -744,6 +738,12 @@ const TIMER_DEVICE_SENTINEL: u32 = 1;
 const TR_ADDREQUEST: u16 = 9;
 const TR_GETSYSTIME: u16 = 10;
 const TR_SETSYSTIME: u16 = 11;
+
+/// The E-Clock's count rate in ticks per second, as [`ReadEClock`]
+/// reports in `D0`: 709379 Hz on a PAL machine (the system master clock
+/// divided by 10), the rate every real PAL Amiga reports and the value
+/// this runtime's fixed PAL-like identity uses.
+const ECLOCK_PAL_HZ: u32 = 709_379;
 
 /// `exec.library`'s `OpenDevice` (LVO -444: `A0` = device name
 /// `CString*`, `D0` = unit, `A1` = `struct IORequest*`, `D1` = flags).
@@ -762,8 +762,10 @@ const TR_SETSYSTIME: u16 = 11;
 /// which would need real drivers this runtime doesn't have (same "no
 /// real handler processes" scope boundary `crate::dospkt`'s `DoPkt`
 /// and `crate::dosdevproc`'s `GetDeviceProc` establish for
-/// `dos.library` handlers) -- so `timer.device` succeeds, backed by
-/// [`TIMER_DEVICE_SENTINEL`], and everything else still fails with
+/// `dos.library` handlers) -- so `timer.device` succeeds, with
+/// `io_Device` set to the real [`TIMER_DEVICE_BASE`] (whose jump table
+/// backs the RKRM-documented `TimerBase = io_Device` library-call idiom
+/// -- see that constant's doc), and everything else still fails with
 /// `IOERR_OPENFAIL`, matching the real, documented "device/unit failed
 /// to open" convention for a device this runtime genuinely can't back.
 fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -773,7 +775,7 @@ fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 
     if name.eq_ignore_ascii_case(b"timer.device") {
         ctx.mem
-            .write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_SENTINEL);
+            .write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_BASE);
         ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
@@ -799,14 +801,14 @@ fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 }
 
 /// Core of `DoIO`/`SendIO` for a `timer.device` request (`io_Device` ==
-/// [`TIMER_DEVICE_SENTINEL`]): dispatches on `io_Command`, writes the
+/// [`TIMER_DEVICE_BASE`]): dispatches on `io_Command`, writes the
 /// result into the request, and returns the `io_Error` value. Any
 /// `io_Device` this runtime doesn't recognize (shouldn't happen for a
 /// well-behaved caller, since only `timer.device` ever opens
 /// successfully) fails with [`IOERR_NOCMD`] rather than panicking.
 fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
     let device = mem.read_u32(ioreq + IO_DEVICE_OFFSET);
-    if device != TIMER_DEVICE_SENTINEL {
+    if device != TIMER_DEVICE_BASE {
         return IOERR_NOCMD;
     }
 
@@ -814,14 +816,11 @@ fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
     match command {
         TR_GETSYSTIME => {
             // tv_secs/tv_micro are both since the AmigaOS epoch
-            // (1978-01-01), per the RKRM Devices book's "Timer Device"
-            // chapter ("By convention, it tells how many seconds have
-            // passed since midnight, January 1, 1978").
-            let (days, minute, tick) = crate::dosdate::now_as_datestamp();
-            let secs = (days as i64) * 86_400 + (minute as i64) * 60 + (tick as i64) / 50;
-            let micro = (tick as i64 % 50) * 20_000;
-            mem.write_u32(ioreq + TR_TIME_SECS_OFFSET, secs as u32);
-            mem.write_u32(ioreq + TR_TIME_MICRO_OFFSET, micro as u32);
+            // (1978-01-01) -- see host_time_secs_micro, shared with the
+            // library-call GetSysTime vector.
+            let (secs, micro) = host_time_secs_micro();
+            mem.write_u32(ioreq + TR_TIME_SECS_OFFSET, secs);
+            mem.write_u32(ioreq + TR_TIME_MICRO_OFFSET, micro);
             0
         }
         TR_SETSYSTIME => {
@@ -909,13 +908,137 @@ fn abort_io_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// The current wall-clock time as AmigaOS-epoch (1978-01-01) seconds
+/// plus microseconds -- the value `GetSysTime`/`TR_GETSYSTIME` report,
+/// per the RKRM Devices book's "Timer Device" chapter ("By convention,
+/// it tells how many seconds have passed since midnight, January 1,
+/// 1978"). Built on [`crate::dosdate::now_as_datestamp`], the same
+/// clock every other date-facing call here uses.
+fn host_time_secs_micro() -> (u32, u32) {
+    let (days, minute, tick) = crate::dosdate::now_as_datestamp();
+    let secs = (days as i64) * 86_400 + (minute as i64) * 60 + (tick as i64) / 50;
+    let micro = (tick as i64 % 50) * 20_000;
+    (secs as u32, micro as u32)
+}
+
+/// Reads a `struct timeval` (`tv_secs`/`tv_micro`, both `ULONG`) at
+/// `addr`.
+fn read_timeval(mem: &dyn AddressSpace, addr: u32) -> (u32, u32) {
+    (mem.read_u32(addr), mem.read_u32(addr.wrapping_add(4)))
+}
+
+/// Writes a `struct timeval` at `addr`.
+fn write_timeval(mem: &mut dyn AddressSpace, addr: u32, secs: u32, micro: u32) {
+    mem.write_u32(addr, secs);
+    mem.write_u32(addr.wrapping_add(4), micro);
+}
+
+/// `timer.device`'s `AddTime` (LVO -42: `A0` = destination `struct
+/// timeval*`, `A1` = source). `*A0 += *A1`, microseconds carrying into
+/// seconds, result stored back into `*A0` (no meaningful `D0`). One of
+/// the time-arithmetic functions the RKRM documents calling as library
+/// vectors off `TimerBase = io_Device` -- see
+/// [`crate::dispatch::TIMER_DEVICE_BASE`].
+fn add_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dest = ctx.cpu.address_register(AddressRegister(0));
+    let src = ctx.cpu.address_register(AddressRegister(1));
+    let (dsecs, dmicro) = read_timeval(ctx.mem, dest);
+    let (ssecs, smicro) = read_timeval(ctx.mem, src);
+    let mut micro = u64::from(dmicro) + u64::from(smicro);
+    let mut secs = dsecs.wrapping_add(ssecs);
+    if micro >= 1_000_000 {
+        micro -= 1_000_000;
+        secs = secs.wrapping_add(1);
+    }
+    write_timeval(ctx.mem, dest, secs, micro as u32);
+    Ok(())
+}
+
+/// `timer.device`'s `SubTime` (LVO -48: `A0` = destination, `A1` =
+/// source). `*A0 -= *A1`, borrowing from seconds, result stored back
+/// into `*A0`. This exact call (`jsr -48(A6)` with `A6` fetched from
+/// `io_Device`) is how the real `PhxAss` assembler computes its "N
+/// lines in X sec" stats line -- the previously-unimplemented vector
+/// behind the long-open `PcOutOfBounds`-after-Pass-2 crash.
+fn sub_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dest = ctx.cpu.address_register(AddressRegister(0));
+    let src = ctx.cpu.address_register(AddressRegister(1));
+    let (dsecs, dmicro) = read_timeval(ctx.mem, dest);
+    let (ssecs, smicro) = read_timeval(ctx.mem, src);
+    let mut secs = dsecs.wrapping_sub(ssecs);
+    let micro = if dmicro < smicro {
+        secs = secs.wrapping_sub(1);
+        dmicro + 1_000_000 - smicro
+    } else {
+        dmicro - smicro
+    };
+    write_timeval(ctx.mem, dest, secs, micro);
+    Ok(())
+}
+
+/// `timer.device`'s `CmpTime` (LVO -54: `A0` = `dest`, `A1` = `src`).
+/// `D0` = `0` if equal, `-1` if `*A0` is later than `*A1`, `+1` if
+/// `*A0` is earlier -- the documented (inverted-looking) convention,
+/// confirmed by the RKRM Devices chapter's own worked example ("-1 ...
+/// means the first parameter has greater time value than second").
+fn cmp_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dest = ctx.cpu.address_register(AddressRegister(0));
+    let src = ctx.cpu.address_register(AddressRegister(1));
+    let d = read_timeval(ctx.mem, dest);
+    let s = read_timeval(ctx.mem, src);
+    let result: i32 = match d.cmp(&s) {
+        std::cmp::Ordering::Greater => -1,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 0,
+    };
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
+/// `timer.device`'s `GetSysTime` (LVO -66: `A0` = destination `struct
+/// timeval*`). Fills `*A0` with the current system time -- the direct
+/// library-call form of `TR_GETSYSTIME` (V36+), same clock, same
+/// AmigaOS-epoch convention (see [`host_time_secs_micro`]).
+fn get_sys_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dest = ctx.cpu.address_register(AddressRegister(0));
+    let (secs, micro) = host_time_secs_micro();
+    write_timeval(ctx.mem, dest, secs, micro);
+    Ok(())
+}
+
+/// `timer.device`'s `ReadEClock` (LVO -60: `A0` = destination `struct
+/// EClockVal*`, `ev_hi`/`ev_lo` -- the upper and lower halves of the
+/// 64-bit E-Clock register). `D0` = the E-Clock's count rate in ticks
+/// per second ([`ECLOCK_PAL_HZ`]). The RKRM documents the register's
+/// absolute value as having "no direct relationship to actual time" --
+/// only *differences* between two readings, divided by the rate, are
+/// meaningful -- so deriving the tick count from the same wall clock as
+/// [`host_time_secs_micro`] (seconds-since-1978 at 709379 ticks/sec)
+/// gives correct interval arithmetic, which is the only documented use.
+fn read_eclock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let dest = ctx.cpu.address_register(AddressRegister(0));
+    let (secs, micro) = host_time_secs_micro();
+    let ticks = u64::from(secs) * u64::from(ECLOCK_PAL_HZ)
+        + u64::from(micro) * u64::from(ECLOCK_PAL_HZ) / 1_000_000;
+    ctx.mem.write_u32(dest, (ticks >> 32) as u32);
+    ctx.mem.write_u32(dest.wrapping_add(4), ticks as u32);
+    ctx.cpu.set_data_register(DataRegister(0), ECLOCK_PAL_HZ);
+    Ok(())
+}
+
 /// Registers every implemented task/signal handler: `exec.library`'s
 /// `FindTask`/`SetSignal`/`SetExcept`/`Wait`/`Signal`/`AllocSignal`/
 /// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`/`OpenDevice`/
 /// `CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/`CheckIO`/`AbortIO`, plus
 /// `dos.library`'s `CheckSignal` (registered from here rather than
 /// `dosfile.rs`, so that file needs no edits at all -- see the module
-/// docs). Called unconditionally from [`crate::dispatch::Runtime::new`].
+/// docs), plus `timer.device`'s library-style time functions
+/// (`AddTime`/`SubTime`/`CmpTime`/`ReadEClock`/`GetSysTime`, registered
+/// onto [`TIMER_DEVICE_BASE`] at their real device LVOs -- the six
+/// standard device vectors `-6`..`-36` come first, so the extended
+/// functions start at `-42`, order confirmed against AROS's own
+/// `rom/timer/timer.conf` functionlist). Called unconditionally from
+/// [`crate::dispatch::Runtime::new`].
 pub fn register_exectask_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -962,6 +1085,28 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
             check_signal_handler::<C>,
         )
         .expect("CheckSignal should be in DOS_LVOS");
+
+    // timer.device's library-style vectors, at their real device LVOs
+    // (see this function's doc comment). Registered directly by offset
+    // rather than through a generated LVO table -- five well-known,
+    // AROS-confirmed vectors don't warrant one.
+    macro_rules! reg_timer {
+        ($lvo:literal, $name:literal, $handler:expr) => {
+            table.register(
+                mem,
+                TIMER_DEVICE_BASE,
+                $lvo,
+                "timer.device",
+                $name,
+                $handler,
+            );
+        };
+    }
+    reg_timer!(-42, "AddTime", add_time_handler::<C>);
+    reg_timer!(-48, "SubTime", sub_time_handler::<C>);
+    reg_timer!(-54, "CmpTime", cmp_time_handler::<C>);
+    reg_timer!(-60, "ReadEClock", read_eclock_handler::<C>);
+    reg_timer!(-66, "GetSysTime", get_sys_time_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1932,7 +2077,7 @@ mod tests {
         assert_eq!(code, 0, "OpenDevice(timer.device) should succeed");
         assert_eq!(
             rt.memory().read_u32(ioreq_addr + IO_DEVICE_OFFSET),
-            TIMER_DEVICE_SENTINEL
+            TIMER_DEVICE_BASE
         );
         assert_eq!(rt.memory().read_u8(ioreq_addr + IO_ERROR_OFFSET), 0);
     }
@@ -1985,7 +2130,7 @@ mod tests {
     fn run_io_request_unit_level_get_systime() {
         let mut mem = FlatMemory::new(0x1000);
         let ioreq = 0x100u32;
-        mem.write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_SENTINEL);
+        mem.write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_BASE);
         mem.write_u16(ioreq + IO_COMMAND_OFFSET, TR_GETSYSTIME);
         assert_eq!(run_io_request(&mut mem, ioreq), 0);
         assert!(mem.read_u32(ioreq + TR_TIME_SECS_OFFSET) > 8_000 * 86_400);
@@ -1995,7 +2140,7 @@ mod tests {
     fn run_io_request_unrecognized_device_returns_nocmd() {
         let mut mem = FlatMemory::new(0x1000);
         let ioreq = 0x100u32;
-        mem.write_u32(ioreq + IO_DEVICE_OFFSET, 0xDEAD_0000); // not TIMER_DEVICE_SENTINEL
+        mem.write_u32(ioreq + IO_DEVICE_OFFSET, 0xDEAD_0000); // not TIMER_DEVICE_BASE
         mem.write_u16(ioreq + IO_COMMAND_OFFSET, TR_GETSYSTIME);
         assert_eq!(run_io_request(&mut mem, ioreq), IOERR_NOCMD);
     }
@@ -2076,6 +2221,220 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0, "WaitIO should report io_Error == 0");
+    }
+
+    // --- timer.device's library-style vectors (TimerBase idiom) ---
+
+    #[test]
+    fn timer_base_idiom_fetches_io_device_and_calls_sub_time() {
+        // The full RKRM-documented sequence, byte-for-byte the shape
+        // that crashed with the old sentinel io_Device: OpenDevice,
+        // then `movea.l (0x14,a0),a6` (A6 = io_Device = "TimerBase"),
+        // then `jsr -48(a6)` (SubTime) -- exactly what the real PhxAss
+        // assembler executes for its stats line. Uses a borrow-needing
+        // input pair so the micro-underflow path is covered too:
+        // (10s, 200000us) - (3s, 500000us) = (6s, 700000us).
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = name (patched)
+        let name_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched)
+        let ioreq_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+        words.push(move_imm_to_a(0)); // A0 = ioreq again (patched)
+        let ioreq_idx2 = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x2C68); // movea.l (0x14,a0),a6 -- A6 = io_Device
+        words.push(0x0014);
+        words.push(move_imm_to_a(0)); // A0 = dest timeval (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src timeval (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x4EAE); // jsr -48(a6) -- SubTime
+        words.push(0xFFD0);
+        words.push(0x4EAE); // jsr -54(a6) -- CmpTime(dest, src): dest is
+        words.push(0xFFCA); // now later than src, so D0 = -1
+        words.push(RTS);
+
+        let name_addr = entry + (movea_exec_base_to_a6().len() + words.len()) as u32 * 2;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        let dest_addr = ioreq_addr + 64;
+        let src_addr = dest_addr + 8;
+        for (idx, value) in [
+            (name_idx, name_addr),
+            (ioreq_idx, ioreq_addr),
+            (ioreq_idx2, ioreq_addr),
+            (dest_idx, dest_addr),
+            (src_idx, src_addr),
+        ] {
+            words[idx] = (value >> 16) as u16;
+            words[idx + 1] = value as u16;
+        }
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..40 {
+            mem.write_u8(ioreq_addr + i, 0);
+        }
+        mem.write_u32(dest_addr, 10);
+        mem.write_u32(dest_addr + 4, 200_000);
+        mem.write_u32(src_addr, 3);
+        mem.write_u32(src_addr + 4, 500_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -1, "CmpTime(later, earlier) should return -1");
+        assert_eq!(rt.memory().read_u32(dest_addr), 6, "SubTime tv_secs");
+        assert_eq!(
+            rt.memory().read_u32(dest_addr + 4),
+            700_000,
+            "SubTime tv_micro (borrow path)"
+        );
+    }
+
+    #[test]
+    fn add_time_carries_micro_overflow_into_seconds() {
+        // AddTime via its real LVO with A6 pointed straight at
+        // TIMER_DEVICE_BASE (skipping OpenDevice -- the vector table is
+        // populated unconditionally at Runtime::new time):
+        // (1s, 600000us) + (2s, 700000us) = (4s, 300000us).
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = dest (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = src (patched)
+        let src_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // AddTime
+        words.push(0x7000); // moveq #0,d0
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 4;
+        let src_addr = dest_addr + 8;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+        words[src_idx] = (src_addr >> 16) as u16;
+        words[src_idx + 1] = src_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(dest_addr, 1);
+        mem.write_u32(dest_addr + 4, 600_000);
+        mem.write_u32(src_addr, 2);
+        mem.write_u32(src_addr + 4, 700_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: src_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0);
+        assert_eq!(rt.memory().read_u32(dest_addr), 4, "AddTime tv_secs");
+        assert_eq!(
+            rt.memory().read_u32(dest_addr + 4),
+            300_000,
+            "AddTime tv_micro (carry path)"
+        );
+    }
+
+    #[test]
+    fn get_sys_time_and_read_eclock_vectors_report_plausible_values() {
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = timeval dest (patched)
+        let tv_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // GetSysTime
+        words.push(move_imm_to_a(0)); // A0 = EClockVal dest (patched)
+        let ev_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-60)); // ReadEClock -> D0 = rate
+        words.push(RTS);
+
+        let tv_addr = entry + (words.len() as u32) * 2 + 4;
+        let ev_addr = tv_addr + 8;
+        words[tv_idx] = (tv_addr >> 16) as u16;
+        words[tv_idx + 1] = tv_addr as u16;
+        words[ev_idx] = (ev_addr >> 16) as u16;
+        words[ev_idx + 1] = ev_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: ev_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32, ECLOCK_PAL_HZ,
+            "ReadEClock should return the PAL E-Clock rate in D0"
+        );
+        // Same "plausibly recent" bound as the TR_GETSYSTIME test.
+        assert!(rt.memory().read_u32(tv_addr) > 8_000 * 86_400);
+        // The E-Clock tick count for any recent time exceeds 32 bits
+        // (8000 days * 86400 * 709379 >> 2^32), so ev_hi must be
+        // non-zero -- catches an accidental 32-bit truncation.
+        assert!(
+            rt.memory().read_u32(ev_addr) > 0,
+            "ev_hi should be non-zero"
+        );
     }
 
     // --- CloseDevice ---
