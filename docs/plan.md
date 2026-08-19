@@ -2139,6 +2139,79 @@ cases above; `main.rs`: default is 68000/no-FPU, `--cpu` parses every
 documented model, unknown model is a clean error, missing value is a
 clean error, `--fpu` sets it, last-flag-wins for `--fpu`/`--no-fpu`).
 
+**First real `C:` command run against the new `--cpu`/`--fpu` flags:
+`AttnFlags`, `CacheControl`, `Supervisor` — 2026-08-19.** Simon: "that
+gives an obvious command to test next, the cpu command" -- the real
+Workbench 3.1.4 `C:CPU` (`~/amiga/wb314/full/C/CPU`, the same
+established empirical corpus disk), which reports/sets processor and
+cache state and is the most direct real-binary exercise of the CPU/FPU
+configurability just added. Three gaps found and fixed in the same
+"run -> gap -> implement -> verify" loop this project already follows,
+each confirmed against the real binary's actual printed output, not
+just "it doesn't crash":
+
+- **`ExecBase.AttnFlags`** (new `EXEC_BASE_ATTNFLAGS_OFFSET = 296`,
+  same field-by-field NDK derivation as `EXEC_BASE_LIBLIST_OFFSET`):
+  the real, documented way guest code detects the installed CPU/FPU
+  (`AFF_68010`/`AFF_68020`/`AFF_68030`/`AFF_68040`/`AFF_68881`/
+  `AFF_68882`/`AFF_FPU40`/`AFF_68060`, bit positions confirmed against
+  a primary NDK `execbase.h` source, not guessed) -- there's no
+  library call for this, `AttnFlags` itself *is* the interface. New
+  `StartConfig.attn_flags: u16` field (defaults to `0`, i.e. unchanged
+  behavior for every existing caller); the CLI's new `attn_flags_for`
+  computes it cumulatively from `--cpu`/`--fpu` (each model's bit is
+  documented as "also set for" every later model, e.g. a real 68040
+  reports `AFF_68010`/`AFF_68020`/`AFF_68030`/`AFF_68040` together).
+  Verified directly against the real command's own report format
+  (`"System: 68030 68882 ..."`, `"System: 68040 68040/060-FPU ..."`)
+  across every `--cpu` value -- exact match to the documented example
+  shape.
+- **`exec.library`'s `CacheControl`** (LVO -648, `crate::execmem`):
+  `D0`/`D1` = `cacheBits`/`cacheMask`, `D0` returns the *previous*
+  `CACRF_*` state; `cacheMask == 0` is a pure query. This runtime
+  doesn't model a real cache, so it's pure bookkeeping -- the bits
+  live in guest memory at a new `CACHE_BITS_ADDR = 0x00C0` (the first
+  4 bytes of the "unused headroom" the reserved-region memory map
+  already documented), single source of truth, no host-side mirror,
+  same convention `crate::exectask` established for task/signal state.
+  Seeded to an "everything enabled" default (`CACRF_EnableI`/`IBE`/
+  `EnableD`/`DBE`/`EnableE`/`CopyBack`/`WriteAllocate`, bit values also
+  confirmed against a primary source) at `Runtime::new` time.
+- **`exec.library`'s `Supervisor`** (LVO -30, `crate::execfmt`, next to
+  `RawDoFmt`'s existing "step the CPU mid-handler" `PutChProc`
+  machinery, for the same underlying reason): runs a guest routine
+  synchronously and returns its `D0`. This runtime has no user/
+  supervisor privilege distinction to elevate, so it reduces to "run
+  the routine for real" -- but the *first* implementation attempt
+  pushed a plain `RTS`-style return address, and the real `CPU`
+  command's own routine (which wraps its direct, privileged `CACR`
+  `movec` access in `Supervisor` even though `CacheControl` already
+  answers the query -- defensive real-world code) promptly executed a
+  bare `rte` against that, sending the program counter straight off
+  the end of guest memory (caught immediately and clearly by this
+  session's own `PcOutOfBounds` diagnostic, doing exactly the job it
+  was built for). Root cause: real `Supervisor`'s documented contract
+  is that the routine **must terminate with `RTE`, not `RTS`** --
+  fixed by pushing a real 6-byte exception-style stack frame (`SR`
+  then `PC` = `EXIT_STUB_ADDR`, matching every other real 68000
+  exception this runtime delivers) instead.
+
+**Result**: every `--cpu`/`--fpu` combination (68000 through 68060,
+with and without FPU) now runs the real `CPU` command to a clean exit
+0, each reporting the real, correctly-formatted "System: ..." line for
+that configuration -- the intended end-to-end validation of the
+CPU/FPU configurability work.
+
+New tests: 17 (`execmem.rs`: `CacheControl` query-only leaves state
+unchanged, only-masked-bits set, query-then-set round-trip;
+`execfmt.rs`: `Supervisor` runs the routine and returns `D0` via `RTE`,
+preserves registers the routine didn't touch, a routine that never
+`RTE`s is a clean error not a hang; `main.rs`: 11 `attn_flags_for`
+cases, independently computed against the verified bit positions,
+covering every `CpuType` and the FPU-model-specific bit choice
+(`AFF_68881`/`AFF_68882` vs. `AFF_FPU40` vs. no bit at all for
+`M68EC040`/`SCC68070`)).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

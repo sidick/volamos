@@ -187,6 +187,95 @@ fn parse_cpu_type(s: &str) -> Result<CpuType, String> {
     }
 }
 
+/// Computes `ExecBase.AttnFlags` (`exec/execbase.h`'s `AFF_68010`/
+/// `AFF_68020`/`AFF_68030`/`AFF_68040`/`AFF_68060`, plus `AFF_68881`/
+/// `AFF_68882` for a coprocessor FPU or `AFF_FPU40` for the 68040's
+/// on-die one) for `cpu_type`/`fpu`, matching what real Kickstart
+/// startup code fills in for the machine it's actually running on --
+/// see [`StartConfig::attn_flags`]'s doc for why the CLI computes this
+/// rather than `Runtime`/`StartConfig` knowing about [`CpuType`]
+/// directly. Each model's bit is documented as "also set for" every
+/// later model (a real 68040 reports `AFF_68010`/`AFF_68020`/
+/// `AFF_68030`/`AFF_68040` together, not just its own bit), so this
+/// builds the flags cumulatively. `SCC68070` (a system-on-chip, not a
+/// real desktop Amiga CPU) reports `0` -- no documented `AFF_*` bit
+/// exists for it.
+fn attn_flags_for(cpu_type: CpuType, fpu: bool) -> u16 {
+    const AFF_68010: u16 = 1 << 0;
+    const AFF_68020: u16 = 1 << 1;
+    const AFF_68030: u16 = 1 << 2;
+    const AFF_68040: u16 = 1 << 3;
+    const AFF_68881: u16 = 1 << 4;
+    const AFF_68882: u16 = 1 << 5;
+    const AFF_FPU40: u16 = 1 << 6;
+    const AFF_68060: u16 = 1 << 7;
+
+    let mut flags = 0u16;
+    if matches!(
+        cpu_type,
+        CpuType::M68010
+            | CpuType::M68EC020
+            | CpuType::M68020
+            | CpuType::M68EC030
+            | CpuType::M68030
+            | CpuType::M68EC040
+            | CpuType::M68LC040
+            | CpuType::M68040
+            | CpuType::M68060
+    ) {
+        flags |= AFF_68010;
+    }
+    if matches!(
+        cpu_type,
+        CpuType::M68EC020
+            | CpuType::M68020
+            | CpuType::M68EC030
+            | CpuType::M68030
+            | CpuType::M68EC040
+            | CpuType::M68LC040
+            | CpuType::M68040
+            | CpuType::M68060
+    ) {
+        flags |= AFF_68020;
+    }
+    if matches!(
+        cpu_type,
+        CpuType::M68EC030
+            | CpuType::M68030
+            | CpuType::M68EC040
+            | CpuType::M68LC040
+            | CpuType::M68040
+            | CpuType::M68060
+    ) {
+        flags |= AFF_68030;
+    }
+    if matches!(
+        cpu_type,
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060
+    ) {
+        flags |= AFF_68040;
+    }
+    if cpu_type == CpuType::M68060 {
+        flags |= AFF_68060;
+    }
+
+    if fpu {
+        match cpu_type {
+            // The 68040/68060's on-die FPU (M68EC040/M68LC040 have no
+            // FPU at all, so --fpu is a no-op there, matching real
+            // hardware -- there's no external-68881-socket option on
+            // those variants).
+            CpuType::M68040 | CpuType::M68060 => flags |= AFF_FPU40,
+            CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030 => {
+                flags |= AFF_68881 | AFF_68882;
+            }
+            _ => {}
+        }
+    }
+
+    flags
+}
+
 /// Splits `NAME:rest` on the *first* `:` -- a volume/assign name can't
 /// itself contain `:` (it's the Amiga path syntax's own separator), so
 /// this is unambiguous even though the `rest` (a host directory, or an
@@ -379,6 +468,7 @@ fn run_nested_program(
         load_end: load_result.end,
         args: args.to_vec(),
         stack_size,
+        attn_flags: attn_flags_for(cpu_type, fpu),
     };
     let mut runtime = Runtime::new(M68kCpu::with_config(cpu_type, fpu), mem, config);
 
@@ -412,6 +502,7 @@ fn run(opts: &Options) -> Result<i32, String> {
         load_end: load_result.end,
         args: opts.guest_args.clone(),
         stack_size: opts.stack_size,
+        attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
     };
     let mut runtime = Runtime::new(cpu, mem, config);
 
@@ -860,5 +951,94 @@ mod tests {
         // makes this the natural, unsurprising behavior either way).
         let opts = parse_args(args(&["--fpu", "--no-fpu", "prog"])).unwrap();
         assert!(!opts.fpu);
+    }
+
+    // --- attn_flags_for ---
+    //
+    // Independently-computed expected values (not just re-deriving the
+    // same OR chain the implementation uses), matching the real,
+    // verified exec/execbase.h bit positions: AFF_68010=1<<0,
+    // AFF_68020=1<<1, AFF_68030=1<<2, AFF_68040=1<<3, AFF_68881=1<<4,
+    // AFF_68882=1<<5, AFF_FPU40=1<<6, AFF_68060=1<<7.
+
+    #[test]
+    fn attn_flags_68000_is_zero() {
+        assert_eq!(attn_flags_for(CpuType::M68000, false), 0);
+        // --fpu on a 68000 is a no-op -- no coprocessor interface at
+        // all below 68020 (see M68kCpu::with_config's doc).
+        assert_eq!(attn_flags_for(CpuType::M68000, true), 0);
+    }
+
+    #[test]
+    fn attn_flags_68010_sets_only_its_own_bit() {
+        assert_eq!(attn_flags_for(CpuType::M68010, false), 0x1);
+    }
+
+    #[test]
+    fn attn_flags_68020_sets_68010_and_68020_bits() {
+        assert_eq!(attn_flags_for(CpuType::M68020, false), 0x1 | 0x2);
+        assert_eq!(attn_flags_for(CpuType::M68EC020, false), 0x1 | 0x2);
+    }
+
+    #[test]
+    fn attn_flags_68030_sets_68010_68020_68030_bits() {
+        assert_eq!(attn_flags_for(CpuType::M68030, false), 0x1 | 0x2 | 0x4);
+    }
+
+    #[test]
+    fn attn_flags_68040_sets_every_lower_cpu_bit() {
+        assert_eq!(
+            attn_flags_for(CpuType::M68040, false),
+            0x1 | 0x2 | 0x4 | 0x8
+        );
+    }
+
+    #[test]
+    fn attn_flags_68060_sets_every_lower_cpu_bit_plus_its_own() {
+        assert_eq!(
+            attn_flags_for(CpuType::M68060, false),
+            0x1 | 0x2 | 0x4 | 0x8 | 0x80
+        );
+    }
+
+    #[test]
+    fn attn_flags_68020_with_fpu_sets_68881_and_68882() {
+        assert_eq!(
+            attn_flags_for(CpuType::M68020, true),
+            0x1 | 0x2 | (1 << 4) | (1 << 5)
+        );
+    }
+
+    #[test]
+    fn attn_flags_68030_with_fpu_sets_68881_and_68882() {
+        assert_eq!(
+            attn_flags_for(CpuType::M68030, true),
+            0x1 | 0x2 | 0x4 | (1 << 4) | (1 << 5)
+        );
+    }
+
+    #[test]
+    fn attn_flags_68040_with_fpu_sets_fpu40_not_68881() {
+        assert_eq!(
+            attn_flags_for(CpuType::M68040, true),
+            0x1 | 0x2 | 0x4 | 0x8 | (1 << 6)
+        );
+    }
+
+    #[test]
+    fn attn_flags_68ec040_with_fpu_has_no_fpu_bit() {
+        // M68EC040 has no on-die FPU and no external-68881-socket
+        // option -- --fpu is a documented no-op there.
+        assert_eq!(
+            attn_flags_for(CpuType::M68EC040, true),
+            attn_flags_for(CpuType::M68EC040, false)
+        );
+    }
+
+    #[test]
+    fn attn_flags_scc68070_is_zero() {
+        // No documented AFF_* bit exists for this model.
+        assert_eq!(attn_flags_for(CpuType::SCC68070, false), 0);
+        assert_eq!(attn_flags_for(CpuType::SCC68070, true), 0);
     }
 }

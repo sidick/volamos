@@ -2,7 +2,9 @@
 //! `FreeVec`/`AvailMem` (T16, Phase 3 stage 2), plus `CopyMem`/
 //! `CopyMemQuick` (a raw memory-copy pair, not an allocator, but too
 //! small to earn its own module -- added here since it's still squarely
-//! an "exec.library memory-related call").
+//! an "exec.library memory-related call"), plus `CacheControl` (same
+//! reasoning: not an allocator, but a small, memory-system-adjacent
+//! call with no better home -- see [`cache_control_handler`]).
 //!
 //! # Design: flat, no `MemHeader`/`MemChunk` emulation
 //!
@@ -100,7 +102,9 @@
 //! single source of truth, exactly as it already is for `FreeMem` above.
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
-use crate::dispatch::{DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable};
+use crate::dispatch::{
+    CACHE_BITS_ADDR, DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable,
+};
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
 
@@ -370,6 +374,34 @@ fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     Ok(())
 }
 
+/// `exec.library`'s `CacheControl` (LVO -648: `D0` = `cacheBits`, `D1`
+/// = `cacheMask`). `D0` = the `CACRF_*` state *before* this call --
+/// bits named in `cacheMask` are set to the corresponding bit of
+/// `cacheBits`; every other bit is left alone. `cacheMask == 0` is
+/// therefore a pure query (real, documented behavior -- "if
+/// `cacheMask` is 0, the state is not changed").
+///
+/// This runtime doesn't model a real CPU cache (nothing here is ever
+/// actually cached or invalidated), so this is bookkeeping only: the
+/// bits themselves live in guest memory at [`CACHE_BITS_ADDR`] (single
+/// source of truth, no host-side mirror -- same convention
+/// `crate::exectask`'s module docs establish for task/signal state),
+/// seeded to [`crate::dispatch::Runtime::new`]'s "everything enabled"
+/// default. Found missing while running the real `CPU` command
+/// (Workbench 3.1.4 `C:`), which queries this to report the current
+/// cache/burst state.
+fn cache_control_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let cache_bits = ctx.cpu.data_register(DataRegister(0));
+    let cache_mask = ctx.cpu.data_register(DataRegister(1));
+
+    let old = ctx.mem.read_u32(CACHE_BITS_ADDR);
+    let new = (old & !cache_mask) | (cache_bits & cache_mask);
+    ctx.mem.write_u32(CACHE_BITS_ADDR, new);
+
+    ctx.cpu.set_data_register(DataRegister(0), old);
+    Ok(())
+}
+
 /// Registers every T16 `exec.library` memory-allocation handler onto
 /// [`EXEC_LIBRARY_BASE`], looked up by name through [`EXEC_LVOS`] (the T7
 /// table), following [`crate::dosfile::register_dos_handlers`]'s
@@ -400,6 +432,7 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
     reg!("FreeVec", free_vec_handler::<C>);
     reg!("CopyMem", copy_mem_handler::<C>);
     reg!("CopyMemQuick", copy_mem_handler::<C>);
+    reg!("CacheControl", cache_control_handler::<C>);
 }
 
 #[cfg(test)]
@@ -803,5 +836,75 @@ mod tests {
         for (i, &b) in source.iter().enumerate() {
             assert_eq!(rt.memory().read_u8(dest_addr + i as u32), b);
         }
+    }
+
+    // --- CacheControl ---
+
+    fn cache_control_program(cache_bits: u32, cache_mask: u32) -> Vec<u16> {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(0)); // D0 = cacheBits
+        words.push((cache_bits >> 16) as u16);
+        words.push(cache_bits as u16);
+        words.push(move_imm_to_d(1)); // D1 = cacheMask
+        words.push((cache_mask >> 16) as u16);
+        words.push(cache_mask as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-648)); // CacheControl(a6)
+        words.push(RTS);
+        words
+    }
+
+    #[test]
+    fn cache_control_query_with_zero_mask_reports_the_default_without_changing_it() {
+        let words = cache_control_program(0, 0);
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32,
+            crate::dispatch::CACHE_BITS_DEFAULT,
+            "D0 should report the pre-call state"
+        );
+        assert_eq!(
+            rt.memory().read_u32(CACHE_BITS_ADDR),
+            crate::dispatch::CACHE_BITS_DEFAULT,
+            "a zero mask must not change any bits"
+        );
+    }
+
+    #[test]
+    fn cache_control_sets_only_the_masked_bits() {
+        // Clear CACRF_EnableI (bit 0) and CACRF_EnableD (bit 8), leaving
+        // every other default bit untouched.
+        let mask = 0x101;
+        let words = cache_control_program(0, mask);
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32,
+            crate::dispatch::CACHE_BITS_DEFAULT,
+            "D0 should still report the pre-call (old) state"
+        );
+        assert_eq!(
+            rt.memory().read_u32(CACHE_BITS_ADDR),
+            crate::dispatch::CACHE_BITS_DEFAULT & !mask,
+            "only the masked bits should have cleared"
+        );
+    }
+
+    #[test]
+    fn cache_control_query_then_set_round_trips() {
+        let query = cache_control_program(0, 0);
+        let mut rt = runtime_with_program(&query);
+        let mut out = Vec::new();
+        let old = rt.run(&mut out, None).expect("run should succeed") as u32;
+
+        // Set every bit the query reported, via an all-ones mask -- the
+        // result should be unchanged from the default.
+        let set_same = cache_control_program(old, 0xFFFF_FFFF);
+        let mut rt2 = runtime_with_program(&set_same);
+        let mut out2 = Vec::new();
+        rt2.run(&mut out2, None).expect("run should succeed");
+        assert_eq!(rt2.memory().read_u32(CACHE_BITS_ADDR), old);
     }
 }

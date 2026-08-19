@@ -2,9 +2,12 @@
 //! AmigaOS C startup library builds its own `sprintf`/`Printf` on top
 //! of, per the NDK autodoc's own worked example. Real `RawDoFmt` calls
 //! back into a guest-supplied `PutChProc` once per output character
-//! (including a final `NUL`), so this handler is the one place in the
-//! runtime that steps the CPU itself mid-handler, rather than only
+//! (including a final `NUL`), so this handler is one of two in the
+//! runtime that step the CPU itself mid-handler, rather than only
 //! reading/writing registers and memory -- see [`call_put_ch_proc`].
+//! `Supervisor` (below) is the other, for the same underlying reason:
+//! both need to run a guest-supplied routine synchronously and get its
+//! result back before the enclosing library call can itself return.
 //!
 //! # Format string syntax
 //!
@@ -408,9 +411,115 @@ fn raw_do_fmt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
-/// Registers `RawDoFmt` onto [`EXEC_LIBRARY_BASE`], looked up by name
-/// through [`EXEC_LVOS`]. Called from [`crate::dispatch::Runtime::new`]
-/// alongside the other `exec.library` registrations.
+/// Hard cap on how many instructions one `Supervisor` callout may take
+/// -- see [`CALLOUT_STEP_BUDGET`]'s use for `PutChProc`.
+const SUPERVISOR_STEP_BUDGET: u32 = 100_000;
+
+/// `exec.library`'s `Supervisor` (LVO -30: `A5` = a routine to call in
+/// supervisor mode, `struct { LONG (*)() }`). `D0` = whatever the
+/// routine itself left in `D0`.
+///
+/// Real `Supervisor` elevates to supervisor mode, calls the routine
+/// (preserving every register the caller had set except `PC`/`SP`,
+/// which the call/return sequence naturally handles), and drops back to
+/// the caller's original privilege level on return -- the routine sees
+/// (and, other than `D0`, can freely leave changed in) the same
+/// registers the caller had, unlike [`call_put_ch_proc`]'s `RawDoFmt`
+/// callback, which restores everything but its own `A3` contract
+/// afterward.
+///
+/// **The routine must terminate with `RTE`, not `RTS`** -- the real,
+/// documented `Supervisor` contract (confirmed the hard way: an early
+/// implementation here pushed a plain `RTS`-style return address, and
+/// the real `CPU` command's routine promptly executed a bare `rte`
+/// with nothing valid on the stack, sending the program counter
+/// straight off the end of guest memory). This runtime has no user/
+/// supervisor privilege distinction at all (every guest instruction
+/// already executes as if privileged), so there's nothing to actually
+/// elevate: this pushes a real exception-style stack frame (`SR` then
+/// `PC`, 6 bytes, matching every other real 68000 exception this
+/// runtime delivers -- see [`crate::cpu::Cpu::take_hardware_exception`]'s
+/// doc) with `PC` = [`EXIT_STUB_ADDR`], sets `PC` to the routine, then
+/// steps until the routine's own `RTE` pops that frame back off, the
+/// same technique `call_put_ch_proc` uses for `RawDoFmt`'s `PutChProc`.
+/// Found missing while running the real `CPU` command (Workbench 3.1.4
+/// `C:`), which wraps its direct `CACR`-register access in `Supervisor`
+/// (a real, privileged `movec` instruction on 68020+) even though
+/// `CacheControl` already answers its query -- defensive real-world
+/// code, not a bug.
+fn supervisor_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let routine = ctx.cpu.address_register(AddressRegister(5));
+    let saved_sp = ctx.cpu.address_register(AddressRegister(7));
+    let saved_pc = ctx.cpu.pc();
+    let saved_sr = ctx.cpu.sr();
+
+    let sp = saved_sp.wrapping_sub(6);
+    ctx.mem.write_u16(sp, saved_sr);
+    ctx.mem.write_u32(sp.wrapping_add(2), EXIT_STUB_ADDR);
+    ctx.cpu.set_address_register(AddressRegister(7), sp);
+    ctx.cpu.set_pc(routine);
+
+    let mut steps = 0u32;
+    while ctx.cpu.pc() != EXIT_STUB_ADDR {
+        if steps >= SUPERVISOR_STEP_BUDGET {
+            return Err(DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -30,
+                handler_name: "Supervisor".to_string(),
+                message: format!(
+                    "routine at {routine:#010x} did not return within \
+                     {SUPERVISOR_STEP_BUDGET} steps -- possible infinite loop \
+                     or missing rts"
+                ),
+            });
+        }
+        match ctx.cpu.step(ctx.mem) {
+            StopReason::Step => {}
+            StopReason::Halted => {
+                return Err(DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo: -30,
+                    handler_name: "Supervisor".to_string(),
+                    message: format!("routine at {routine:#010x} halted the CPU"),
+                });
+            }
+            StopReason::Trap(info) => {
+                return Err(DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo: -30,
+                    handler_name: "Supervisor".to_string(),
+                    message: format!(
+                        "routine at {routine:#010x} trapped at {:#010x} ({:?}) \
+                         -- calling back into another library call from a \
+                         Supervisor routine isn't supported",
+                        info.pc, info.kind
+                    ),
+                });
+            }
+            StopReason::PcOutOfBounds { pc } => {
+                return Err(DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo: -30,
+                    handler_name: "Supervisor".to_string(),
+                    message: format!(
+                        "routine at {routine:#010x} ran the program counter \
+                         off the end of guest memory (reached {pc:#010x})"
+                    ),
+                });
+            }
+        }
+        steps += 1;
+    }
+
+    ctx.cpu.set_pc(saved_pc);
+    ctx.cpu.set_address_register(AddressRegister(7), saved_sp);
+    Ok(())
+}
+
+/// Registers `RawDoFmt`/`Supervisor` onto [`EXEC_LIBRARY_BASE`], looked
+/// up by name through [`EXEC_LVOS`]. Called from
+/// [`crate::dispatch::Runtime::new`] alongside the other `exec.library`
+/// registrations.
 pub fn register_execfmt_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -425,6 +534,16 @@ pub fn register_execfmt_handlers<C: Cpu + 'static>(
             raw_do_fmt_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("RawDoFmt should be in EXEC_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            EXEC_LIBRARY_BASE,
+            EXEC_LVOS,
+            "exec.library",
+            "Supervisor",
+            supervisor_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("Supervisor should be in EXEC_LVOS: {e}"));
 }
 
 #[cfg(test)]
@@ -438,6 +557,9 @@ mod tests {
     fn move_imm_to_a(n: u16) -> u16 {
         0x207C | (n << 9)
     }
+    fn move_imm_to_d(n: u16) -> u16 {
+        0x203C | (n << 9)
+    }
     fn movea_exec_base_to_a6() -> [u16; 3] {
         [
             move_imm_to_a(6),
@@ -450,6 +572,21 @@ mod tests {
     }
     const RTS: u16 = 0x4E75;
     const STUFF_CHAR: [u16; 2] = [0x16C0, 0x4E75]; // move.b d0,(a3)+ ; rts
+
+    fn runtime_with_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, words);
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + (words.len() as u32) * 2 + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
         let mut offset = addr;
@@ -530,5 +667,92 @@ mod tests {
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(read_c_string(rt.memory(), out_addr), b"Fish have 2 eyes.");
+    }
+
+    // --- Supervisor ---
+
+    #[test]
+    fn supervisor_runs_the_routine_and_returns_its_d0_via_rte() {
+        // The real, documented contract: the routine must end with RTE,
+        // not RTS (see supervisor_handler's doc comment for why -- an
+        // early implementation here got this wrong and the real CPU
+        // command's own Supervisor routine sent PC off the end of guest
+        // memory as a result).
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(RTS);
+
+        // moveq #42,d0 ; rte
+        const ROUTINE: [u16; 2] = [0x702A, 0x4E73];
+        let routine_idx_words = words.len();
+        words.extend_from_slice(&ROUTINE);
+        let routine_addr = TRAP_TABLE_END + (routine_idx_words as u32) * 2;
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn supervisor_preserves_registers_the_routine_did_not_touch() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(1)); // D1 = 0x1234 -- must survive
+        words.push(0);
+        words.push(0x1234);
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(0x2001); // move.l d1,d0 -- exit code proves D1 survived
+        words.push(RTS);
+
+        // A no-op routine that only RTEs straight back.
+        const ROUTINE: [u16; 1] = [0x4E73]; // rte
+        let routine_idx_words = words.len();
+        words.extend_from_slice(&ROUTINE);
+        let routine_addr = TRAP_TABLE_END + (routine_idx_words as u32) * 2;
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0x1234, "D1 set before Supervisor should survive it");
+    }
+
+    #[test]
+    fn supervisor_routine_that_never_returns_is_a_clean_error_not_a_hang() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(RTS);
+
+        // bra.s $ (an infinite self-loop, never RTEs).
+        const ROUTINE: [u16; 1] = [0x60FE];
+        let routine_idx_words = words.len();
+        words.extend_from_slice(&ROUTINE);
+        let routine_addr = TRAP_TABLE_END + (routine_idx_words as u32) * 2;
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("did not return"),
+            "unexpected message: {message}"
+        );
     }
 }

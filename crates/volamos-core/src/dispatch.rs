@@ -187,7 +187,15 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     `TRAP #15` at vector 47 = `0xBC`) while staying
 ///                     comfortably clear of `dos.library`'s own LVO
 ///                     region starting at `0x02CC` below.
-/// 0x00C0 .. 0x02CC   unused headroom
+/// 0x00C0 .. 0x00C4   CACHE_BITS_ADDR: a plain guest-memory `u32` cell
+///                     holding the current `CACRF_*` cache-control
+///                     bits (`crate::execmem`'s `CacheControl` handler
+///                     reads/writes it directly) -- guest memory is the
+///                     single source of truth for this, same
+///                     "no separate host-side mirror" convention
+///                     `crate::exectask`'s module docs establish for
+///                     task/signal state.
+/// 0x00C4 .. 0x02CC   unused headroom
 /// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
@@ -391,6 +399,41 @@ const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 /// the second -- an real-world quirk worth remembering if any other
 /// corpus binary reports an unexpected "revision"-looking number.
 const EXEC_BASE_SOFTVER_OFFSET: u32 = 34;
+
+/// Byte offset of `ExecBase.AttnFlags` from [`EXEC_LIBRARY_BASE`]: a
+/// `UWORD` at `LibNode` (34) + `SoftVer`/`LowMemChkSum` (4) +
+/// `ChkBase` (4) + `ColdCapture`/`CoolCapture`/`WarmCapture` (12) +
+/// `SysStkUpper`/`SysStkLower` (8) + `MaxLocMem` (4) + `DebugEntry`/
+/// `DebugData`/`AlertData`/`MaxExtMem` (16) + `ChkSum` (2) +
+/// `IntVects[16]` (192) + `ThisTask` (4) + `IdleCount`/`DispCount` (8) +
+/// `Quantum`/`Elapsed`/`SysFlags` (6) + `IDNestCnt`/`TDNestCnt` (2) =
+/// 296 -- same field-by-field derivation as
+/// [`EXEC_BASE_LIBLIST_OFFSET`]'s doc, just stopping four fields
+/// earlier (`AttnFlags` immediately precedes `AttnResched`). Real
+/// guest code reads this directly to detect the installed CPU/FPU
+/// (`AFF_68010`/`AFF_68020`/.../`AFF_68881`/`AFF_FPU40`/`AFF_68060`,
+/// `exec/execbase.h`) -- there's no library call for it, `AttnFlags`
+/// itself *is* the documented interface. Found missing while running
+/// the real `CPU` command (Workbench 3.1.4 `C:`), which reports
+/// "System: <model> <fpu> ..." based on it.
+const EXEC_BASE_ATTNFLAGS_OFFSET: u32 = 296;
+
+/// Guest address of the `u32` cell holding the current `CACRF_*` cache-
+/// control bits -- see [`EXEC_LIBRARY_BASE`]'s "Reserved-region memory
+/// map" doc.
+pub const CACHE_BITS_ADDR: u32 = 0x00C0;
+
+/// [`CACHE_BITS_ADDR`]'s value at `Runtime::new` time: every
+/// documented "enable"/"burst" bit set (`CACRF_EnableI`/`IBE`/
+/// `EnableD`/`DBE`/`EnableE`/`CopyBack`/`WriteAllocate`), no
+/// freeze/clear bits -- a plausible "everything cached" boot default
+/// (real Kickstart enables the caches it has by default), not a
+/// bit-exact match for any one real machine's actual boot-time CACR
+/// value (this runtime doesn't model per-model cache availability, so
+/// e.g. a `--cpu 68000` run still reports 68030-only bits like
+/// `EnableD` as set -- harmless, since a well-behaved caller only
+/// checks bits its own `AttnFlags`-detected CPU actually has).
+pub(crate) const CACHE_BITS_DEFAULT: u32 = 0xC000_3111;
 
 /// Byte length of each library's `ln_Name` string, including its `NUL`
 /// terminator, as laid out by [`write_library_list_nodes`] in the
@@ -1178,6 +1221,17 @@ pub struct StartConfig {
     /// `args` can add `..StartConfig::default()` (or `..Default::default()`)
     /// to their struct literal instead of naming this field explicitly.
     pub stack_size: u32,
+    /// Value to write into `ExecBase.AttnFlags` ([`EXEC_BASE_ATTNFLAGS_OFFSET`]):
+    /// the real, documented way guest code detects which CPU/FPU is
+    /// installed (`AFF_68010`/`AFF_68020`/.../`AFF_68881`/`AFF_FPU40`/
+    /// `AFF_68060`, `exec/execbase.h`). The caller (the CLI's `--cpu`/
+    /// `--fpu` flags) computes this from whatever [`crate::backend::
+    /// M68kCpu`](crate::backend::M68kCpu) it built -- `Runtime`/
+    /// `StartConfig` don't otherwise know or care which concrete
+    /// [`Cpu`] backend/model is in use. Defaults to `0` (a plain
+    /// M68000, no FPU -- `M68kCpu::new`'s own default), matching every
+    /// AttnFlags-unaware call site's existing behavior unchanged.
+    pub attn_flags: u16,
 }
 
 impl Default for StartConfig {
@@ -1187,6 +1241,7 @@ impl Default for StartConfig {
             load_end: 0,
             args: Vec::new(),
             stack_size: DEFAULT_STACK_SIZE,
+            attn_flags: 0,
         }
     }
 }
@@ -1524,6 +1579,11 @@ impl<C: Cpu + 'static> Runtime<C> {
             EXEC_LIBRARY_BASE + EXEC_BASE_SOFTVER_OFFSET,
             LIBRARY_REVISION,
         );
+        mem.write_u16(
+            EXEC_LIBRARY_BASE + EXEC_BASE_ATTNFLAGS_OFFSET,
+            config.attn_flags,
+        );
+        mem.write_u32(CACHE_BITS_ADDR, CACHE_BITS_DEFAULT);
         write_library_list_nodes(&mut mem);
 
         let mut registry = LibraryRegistry::new();
@@ -1994,6 +2054,7 @@ mod tests {
                 load_end: entry + 0x100,
                 args: Vec::new(),
                 stack_size: 1, // far below MIN_STACK_SIZE
+                attn_flags: 0,
             },
         );
         let task = rt.current_task();
@@ -2126,6 +2187,7 @@ mod tests {
                 load_end,
                 args: Vec::new(),
                 stack_size: MIN_STACK_SIZE,
+                attn_flags: 0,
             },
         );
 
