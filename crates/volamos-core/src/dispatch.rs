@@ -1168,6 +1168,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // module docs for why these need no real internal buffer.
         crate::dosbuf::register_dosbuf_handlers(&mut table, &mut mem);
 
+        // dos.library Fault/PrintFault (secondary-error-code -> message
+        // text, and printing it) -- see crate::dosfault's module docs.
+        crate::dosfault::register_dosfault_handlers(&mut table, &mut mem);
+
         // dos.library StrToLong (decimal string -> LONG) -- see
         // crate::dosstr's module docs.
         crate::dosstr::register_dosstr_handlers(&mut table, &mut mem);

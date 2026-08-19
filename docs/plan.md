@@ -1002,11 +1002,36 @@ Hello from volamos!
 This is a test file.
 Line three here.
 ```
-5 new tests: 2 unit-level (`select_output`/`select_input` redirect and
+3 new tests: 2 unit-level (`select_output`/`select_input` redirect and
 report the previous handle, `is_output_default` unaffected by
 selection), 1 end-to-end trap-dispatch test (`Open` → `SelectOutput` →
 `PutStr`, asserting both the file contents and that `ctx.out` stays
 empty).
+
+**`Fault`/`PrintFault` — implemented 2026-08-19**
+(`crates/volamos-core/src/dosfault.rs`), found next by running the real
+`Type` against a directory argument: after printing its own `"TYPE
+can't open %s"`, `Type` calls `PrintFault(IoErr(), "Type")` as its
+final command-level error report -- the same pattern the Shell itself
+uses (`PrintFault(cli_Result2, cmd)`, per `shell.md`) to surface a
+command's overall result. Real `dos.library` keeps this message table
+as localized resource strings (`dl_Errors`); this runtime hardcodes the
+standard English text for the codes this runtime can actually produce
+(plus the wider well-known `dos/dos.h` `ERROR_*` set, for future
+corpus binaries), falling back to a generic `"Error N"` for anything
+unrecognized -- matching `Fault()`'s own documented fallback. No
+separate `pr_CES` error stream exists in this runtime, so both always
+write to the current `Output()` selection (matching real pre-V45
+AmigaDOS's own fallback when no error stream is configured). Confirmed
+against the real binary -- no crash, and a plausible two-line report:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Type WORK:subdir
+TYPE can't open subdir
+Object not found
+```
+5 new tests in `dosfault.rs` (message-table lookup for a known and an
+unknown code, `PrintFault` end-to-end with a header and with a
+zero/no-op code, `Fault`'s buffer-fill-and-truncate behavior).
 
 ## Phase 4 — parity pass (three-oracle harness)
 
