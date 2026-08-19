@@ -2850,12 +2850,77 @@ wrong LVO, caught immediately by the test itself rather than shipped
 silently). Full `cargo test --all` (530 passed), `cargo clippy
 --all-targets`, `cargo fmt --all` clean.
 
+## `intuition.library` stub (vamos gap audit, Tier 3 complete) -- 2026-08-19
+
+Second and last item of Tier 3: a thin stub matching vamos's own scope
+exactly -- `DisplayAlert`, `AutoRequest`, `EasyRequestArgs`,
+`CurrentTime`, nothing else. This runtime has no display/windowing
+model at all, so `AutoRequest`/`EasyRequestArgs` (which report *which
+button a real user pressed*) return a fixed default (`TRUE`/`0`
+respectively) rather than trying to guess -- an inherent, documented
+limitation of a headless stub. `DisplayAlert` mirrors
+`exec.library`'s own `Alert` handler exactly (same `AT_DeadEnd`
+semantics, same unconditional stderr logging, same fail-loud-on-
+dead-end behavior) since it's Intuition's own presentation layer for
+the identical underlying alert. `CurrentTime` is the one genuinely
+real function here -- honest host wall-clock time, reusing
+`crate::exectask::host_time_secs_micro` (now `pub(crate)`), the same
+source `timer.device`'s `GetSysTime` already uses.
+
+**LVO table provenance, another real gotcha caught by verification,
+not assumed**: unlike `locale.library`'s single mid-table insertion,
+intuition.library's LVO table needed two independent fixes. First,
+AROS's `intuition.conf` contains an unsupported `.inlineguard`
+directive `tools/gen_lvos.py` can't parse, positioned safely past
+every function this runtime implements -- worked around by feeding
+the tool a locally truncated copy of the source ending right after
+`SysReqHandler` (one entry past `EasyRequestArgs`), documented here
+rather than silently. Second, and more importantly: a first
+generation attempt (default `--start-bias`, i.e. `0`) produced offsets
+exactly `24` off from the real, NDK-cross-checked values for all four
+target functions (`CurrentTime`/`DisplayAlert`/`AutoRequest`/
+`EasyRequestArgs`) -- caught immediately by checking the `--sanity`
+flags' *effect*, not just their presence, after learning (by reading
+`tools/gen_lvos.py`'s own source) that `--sanity` only embeds a Rust
+test assertion at generation time, it does **not** validate anything
+until that test actually runs. Fixed with `--start-bias 24` (the
+standard 4-slot library preamble locale.library's own `.fd`
+uniquely lacked, but intuition.library's does have, unlike locale's
+extra reserved slot).
+
+**Base address, one more real deviation from the established chunked
+layout**: `intuition.library`'s deepest implemented LVO
+(`EasyRequestArgs` at `-588`) doesn't fit the usual 512-byte
+per-library trap-table chunk's `432`-byte negative-offset headroom --
+`INTUITION_LIBRARY_BASE` gets a double-size, 1024-byte chunk instead,
+`TRAP_TABLE_SIZE` grown by `0x400` (not the usual `0x200`) to match.
+
+`intuition.library` joins `STANDARD_WORKBENCH_LIBRARIES` (always
+present), same confirmed design decision as `locale.library`. Also
+fixed 3 pre-existing `backend.rs` unit tests whose hardcoded `0x2000`-
+byte test memory no longer had room for the grown `TRAP_TABLE_END`
+(bumped to `0x3000`) -- caught immediately by the full test-suite run
+this session's own standing verification discipline requires before
+any commit, not shipped broken.
+
+Verified: 6 new tests (including both `DisplayAlert` branches).
+Full `cargo test --all` (536 passed), `cargo clippy --all-targets`,
+`cargo fmt --all` clean. **This closes out the entire vamos coverage
+gap audit** -- every tier (cheap `AllocateTagItems`/`FreeTagItems`/
+`mathffp.library`, moderate semaphore-list-family/`RunCommand`, bigger
+`locale.library`/`intuition.library`) from the original plan is now
+implemented, tested, and documented.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
-.app bundle generation. Also fixed non-goals: no GUI/Intuition, no
-custom-chip access, no cross-process IPC/message-port bridging —
-console tools only.
+.app bundle generation. Also fixed non-goals: real windowing/GUI (no
+`Screen`/`Window`/`Gadget` model, no display), no custom-chip access,
+no cross-process IPC/message-port bridging — console tools only.
+(Amended 2026-08-19: `crate::intuition` is a real but deliberately
+thin exception — four headless-safe stub calls, matching vamos's own
+same-scoped coverage, not a real GUI implementation; see that
+module's own docs.)
 
 ## CLARIFYING QUESTIONS (open as of start of Phase 2)
 

@@ -42,6 +42,7 @@ pub mod execmem;
 pub mod execsem;
 pub mod exectask;
 pub mod guestmem;
+pub mod intuition;
 pub mod loader;
 pub mod locale;
 pub mod lvos;

@@ -139,6 +139,7 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "mathieeedoubtrans.library",
     "mathffp.library",
     "locale.library",
+    "intuition.library",
 ];
 
 /// Guest address of the exit sentinel: the last word inside the reserved
@@ -308,6 +309,21 @@ pub const MATHFFP_LIBRARY_BASE: u32 = 0x1BB0;
 /// `crate::locale`'s LVO table only names them so unknown-call
 /// diagnostics can print a real function name).
 pub const LOCALE_LIBRARY_BASE: u32 = 0x1DB0;
+
+/// Real `intuition.library` base address -- same chunked layout idea as
+/// [`MATHTRANS_LIBRARY_BASE`], but a *double*-size chunk
+/// (`0x1E00`..`0x2200`, 1024 bytes instead of the usual 512): deepest
+/// real (implemented) LVO here is `EasyRequestArgs` at `-588`, deeper
+/// than the standard 512-byte chunk's usual `0x1B0` (432 byte)
+/// headroom can cover (the full `intuition.library` interface goes
+/// much deeper still -- `crate::intuition`'s LVO table only names
+/// entries up through `SysReqHandler`, see that module's own
+/// provenance doc, since nothing past `EasyRequestArgs` is in this
+/// runtime's implemented scope). Base sits at offset `0x260` (608)
+/// into the chunk: comfortably past `-588`'s magnitude, with `0x1A0`
+/// (416) bytes of positive-offset room left after it for
+/// [`write_library_node`]'s `struct Library` header.
+pub const INTUITION_LIBRARY_BASE: u32 = 0x2060;
 
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
@@ -1590,6 +1606,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // its `locale` argument (no real locale/catalog system).
         crate::locale::register_locale_handlers(&mut table, &mut mem);
 
+        // intuition.library: a thin stub (DisplayAlert/AutoRequest/
+        // EasyRequestArgs/CurrentTime only, no real windowing) -- see
+        // crate::intuition's module docs.
+        crate::intuition::register_intuition_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -1632,6 +1653,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHIEEEDOUBTRANS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHFFP_LIBRARY_BASE);
         write_library_node(&mut mem, LOCALE_LIBRARY_BASE);
+        write_library_node(&mut mem, INTUITION_LIBRARY_BASE);
         write_library_node(&mut mem, TIMER_DEVICE_BASE);
         // A device's node type is NT_DEVICE, not write_library_node's
         // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
@@ -1684,6 +1706,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("mathieeedoubtrans.library", MATHIEEEDOUBTRANS_LIBRARY_BASE);
         registry.register_real("mathffp.library", MATHFFP_LIBRARY_BASE);
         registry.register_real("locale.library", LOCALE_LIBRARY_BASE);
+        registry.register_real("intuition.library", INTUITION_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using

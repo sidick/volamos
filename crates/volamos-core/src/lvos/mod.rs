@@ -20,6 +20,7 @@ use crate::cpu::{AddressRegister, DataRegister};
 
 pub mod dos;
 pub mod exec;
+pub mod intuition;
 pub mod locale;
 pub mod mathffp;
 pub mod mathieeedoubbas;

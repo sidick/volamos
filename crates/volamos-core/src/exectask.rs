@@ -1079,8 +1079,10 @@ fn abort_io_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// per the RKRM Devices book's "Timer Device" chapter ("By convention,
 /// it tells how many seconds have passed since midnight, January 1,
 /// 1978"). Built on [`crate::dosdate::now_as_datestamp`], the same
-/// clock every other date-facing call here uses.
-fn host_time_secs_micro() -> (u32, u32) {
+/// clock every other date-facing call here uses. Also reused by
+/// `crate::intuition`'s `CurrentTime`, which is documented to report
+/// exactly this same epoch/units.
+pub(crate) fn host_time_secs_micro() -> (u32, u32) {
     let (days, minute, tick) = crate::dosdate::now_as_datestamp();
     let secs = (days as i64) * 86_400 + (minute as i64) * 60 + (tick as i64) / 50;
     let micro = (tick as i64 % 50) * 20_000;

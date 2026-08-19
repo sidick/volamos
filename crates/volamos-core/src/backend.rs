@@ -70,8 +70,12 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// more from `0x1A00` for `mathffp.library`'s real base (see
 /// `crate::dispatch::MATHFFP_LIBRARY_BASE`), then once more from
 /// `0x1C00` for `locale.library`'s real base (see
-/// `crate::dispatch::LOCALE_LIBRARY_BASE`) -- same reasoning each time.
-pub const TRAP_TABLE_SIZE: u32 = 0x1E00;
+/// `crate::dispatch::LOCALE_LIBRARY_BASE`), then once more (this time
+/// a *double*-size, `0x400` chunk -- see
+/// `crate::dispatch::INTUITION_LIBRARY_BASE`'s doc for why) from
+/// `0x1E00` for `intuition.library`'s real base -- same reasoning each
+/// time.
+pub const TRAP_TABLE_SIZE: u32 = 0x2200;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this
@@ -296,7 +300,7 @@ mod tests {
 
     #[test]
     fn moveq_sets_data_register_and_advances_pc() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
         let start = cpu.pc();
         // 0x7005: MOVEQ.L #5, D0
         load_words(&mut mem, start, &[0x7005]);
@@ -310,7 +314,7 @@ mod tests {
 
     #[test]
     fn nop_advances_pc_without_changing_registers() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
         let start = cpu.pc();
         // 0x4E71: NOP
         load_words(&mut mem, start, &[0x4E71]);
@@ -325,7 +329,7 @@ mod tests {
 
     #[test]
     fn trap_instruction_surfaces_as_stop_reason_trap() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
         let start = cpu.pc();
         // 0x4E40: TRAP #0
         load_words(&mut mem, start, &[0x4E40]);
@@ -353,7 +357,7 @@ mod tests {
         // M68kCpu::with_config's doc comment.
         let mut cpu = M68kCpu::with_config(CpuType::M68000, true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x2000);
+        let mut mem = FlatMemory::new(0x3000);
         load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
 
         let reason = cpu.step(&mut mem);
@@ -374,7 +378,7 @@ mod tests {
     fn with_config_68020_with_no_fpu_traps_fline() {
         let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x2000);
+        let mut mem = FlatMemory::new(0x3000);
         load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
 
         let reason = cpu.step(&mut mem);
@@ -395,7 +399,7 @@ mod tests {
     fn with_config_68020_with_fpu_does_not_trap_fline() {
         let mut cpu = M68kCpu::with_config(CpuType::M68020, true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x2000);
+        let mut mem = FlatMemory::new(0x3000);
         load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
 
         let reason = cpu.step(&mut mem);
@@ -414,7 +418,7 @@ mod tests {
 
     #[test]
     fn aline_opcode_surfaces_as_stop_reason_trap_with_pc_of_trapping_instruction() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
         // 0x7007: MOVEQ.L #7, D0 (step 1, just to move PC off the reset value)
         // 0xA000: A-line trap opcode (library jump-table style vector)
         let start = cpu.pc();
@@ -438,14 +442,14 @@ mod tests {
 
     #[test]
     fn address_register_roundtrip() {
-        let (mut cpu, _mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, _mem) = new_cpu_with_memory(0x3000);
         cpu.set_address_register(AddressRegister(3), 0xDEAD_BEEF);
         assert_eq!(cpu.address_register(AddressRegister(3)), 0xDEAD_BEEF);
     }
 
     #[test]
     fn status_register_roundtrip() {
-        let (mut cpu, _mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, _mem) = new_cpu_with_memory(0x3000);
         cpu.set_sr(0x2700);
         assert_eq!(cpu.sr(), 0x2700);
     }
@@ -462,7 +466,7 @@ mod tests {
         // only stop if it happened to wrap back around onto something
         // that traps -- reporting a misleading address far from the real
         // bug. `Cpu::run` must catch this immediately instead.
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x2000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
         cpu.set_pc(0xFFFF_FFD1);
 
         let reason = cpu.run(&mut mem);
