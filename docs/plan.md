@@ -2406,6 +2406,42 @@ test flipped to `end_to_end_cli_returns_non_null` since the old
 The opcode-`0xa000` gap is a distinct, unrelated investigation, not
 yet started.
 
+## `AmiSnap` continued: `exec.library`'s `Alert` — 2026-08-19
+
+Follow-on to the `ThisTask`/`pr_CLI` fix above. The opcode-`0xa000`
+gap's "candidates" diagnostic listed several plausible-looking guesses
+(math libraries, `AmiSSL`'s master library) -- **Simon corrected this:
+`amisslmaster.library` is opened conditionally and volamos never even
+attempts it, so it can't be the cause.** The real answer was in the
+same candidate list: `PC - EXEC_LIBRARY_BASE == -108` exactly matches
+`exec.library`'s `Alert` LVO, confirming the guest genuinely called
+`Alert()` (not a math/SSL call at all -- the diagnostic just lists
+every registered base's offset from `PC`, most of which are noise).
+
+Implemented `Alert` (`crates/volamos-core/src/exectask.rs`,
+`alert_handler`): `D7` = `alertNum` (per the existing, already-
+verified `EXEC_LVOS` entry). `AT_DeadEnd` (bit 31, `0x80000000`,
+verified against a primary NDK `exec/alerts.h`) decides the behavior:
+clear (recoverable) logs via the normal `--verbose` `CallInfo`
+mechanism and returns to the caller, matching real `Alert()`'s
+documented "flashes and returns" case (this runtime has no Guru
+Meditation display to show); set (dead-end) fails loudly with
+`DispatchError::HandlerFailed` instead of pretending execution can
+safely continue, since the guest itself declared system integrity
+can't be guaranteed.
+
+Verified: `AmiSnap` run with no arguments now runs to completion (exit
+code 20, a real recoverable alert logged along the way) instead of
+crashing -- no more "unhandled library call" at all for this binary.
+Full `cargo test --all` (487 passed), `cargo clippy --all-targets`,
+`cargo fmt --all` clean. New tests: a recoverable alert returns to the
+caller (proven by a following instruction actually executing); a
+dead-end alert fails with the expected `HandlerFailed` details.
+
+Follow-on gap noticed while re-testing: `AmiSnap --help` exits 0 but
+prints no output at all -- likely a `libnix` buffered-stdio flush gap
+(`Flush`/`SetVBuf`-adjacent), not yet investigated.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

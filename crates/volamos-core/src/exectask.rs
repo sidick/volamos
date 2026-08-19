@@ -516,6 +516,48 @@ fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// `AT_DeadEnd` (bit 31, `0x80000000`), per `<exec/alerts.h>` -- set in
+/// `alertNum` when the condition is fatal (system integrity can no
+/// longer be guaranteed; a real kernel typically reboots or hangs
+/// rather than returning to the caller). Clear means "recoverable":
+/// real `Alert()` flashes the power light / shows a requester and
+/// returns to the caller so execution continues.
+const AT_DEAD_END: u32 = 0x8000_0000;
+
+/// `Alert` (LVO -108): `D7` = `alertNum` (per [`crate::lvos::exec::EXEC_LVOS`],
+/// already verified against a primary source). This runtime has no
+/// Guru Meditation display to show, so both cases are handled as
+/// honestly as a headless runtime can: a recoverable alert
+/// ([`AT_DEAD_END`] clear) is impossible to usefully act on either, so
+/// it's simply logged (via the handler's own `CallInfo` -- see
+/// `--verbose`) and returned from, matching real `Alert()`'s documented
+/// "flashes and returns" behavior for this case. A dead-end alert
+/// ([`AT_DEAD_END`] set) means the guest itself has declared system
+/// integrity can no longer be guaranteed, so this fails loudly instead
+/// of pretending to continue past it -- the real machine wouldn't
+/// either. Found needed while running the real `AmiSnap` binary
+/// (`~/src/amisnap`): `PC - EXEC_LIBRARY_BASE == -108` exactly matched
+/// this LVO in the `UnknownCall` diagnostic's candidate list, i.e. the
+/// guest really was calling `Alert()`, not some math/AmiSSL library (a
+/// wrong initial guess -- `amisslmaster.library` is opened
+/// conditionally and this runtime never even attempts it).
+fn alert_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let alert_num = ctx.cpu.data_register(DataRegister(7));
+    if alert_num & AT_DEAD_END != 0 {
+        return Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -108,
+            handler_name: "Alert".to_string(),
+            message: format!(
+                "Alert({alert_num:#010x}): AT_DeadEnd set -- the guest has declared system \
+                 integrity can no longer be guaranteed; a real machine would reboot or hang \
+                 here rather than return to the caller"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// `SetSignal` (LVO -306): `D0` = new signal bits, `D1` = mask of which
 /// bits to change. Returns the *old* `tc_SigRecvd` in `D0`, then applies
 /// `(tc_SigRecvd & !mask) | (newSignals & mask)` -- the standard
@@ -1125,6 +1167,7 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
         };
     }
     reg_exec!("FindTask", find_task_handler::<C>);
+    reg_exec!("Alert", alert_handler::<C>);
     reg_exec!("SetSignal", set_signal_handler::<C>);
     reg_exec!("SetExcept", set_except_handler::<C>);
     reg_exec!("Wait", wait_handler::<C>);
@@ -1403,6 +1446,55 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0, "FindTask of a name should always return NULL");
+    }
+
+    // --- Alert ---
+
+    #[test]
+    fn alert_recoverable_returns_and_execution_continues() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(7)); // D7 = 0x01234567 (AT_DeadEnd clear)
+        words.push(0x0123);
+        words.push(0x4567);
+        words.extend_from_slice(&jsr_disp16_a6(-108)); // Alert(a6)
+        words.push(move_imm_to_d(0)); // D0 = 99, proving control returned here
+        words.push(0);
+        words.push(99);
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 99, "a recoverable alert should return to the caller");
+    }
+
+    #[test]
+    fn alert_dead_end_fails_loudly_instead_of_pretending_to_continue() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(7)); // D7 = 0x80000001 (AT_DeadEnd set)
+        words.push(0x8000);
+        words.push(0x0001);
+        words.extend_from_slice(&jsr_disp16_a6(-108)); // Alert(a6)
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let err = rt
+            .run(&mut out, None)
+            .expect_err("dead-end alert should fail");
+        match err {
+            crate::dispatch::RuntimeError::Dispatch(DispatchError::HandlerFailed {
+                library,
+                lvo,
+                handler_name,
+                ..
+            }) => {
+                assert_eq!(library, "exec.library");
+                assert_eq!(lvo, -108);
+                assert_eq!(handler_name, "Alert");
+            }
+            other => panic!("expected HandlerFailed, got {other:?}"),
+        }
     }
 
     // --- SetSignal ---
