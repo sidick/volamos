@@ -216,6 +216,7 @@ fn alloc_achain(heap: &mut GuestHeap, mem: &mut dyn AddressSpace) -> Result<u32,
 /// full path, if `ap_Strlen` is non-zero. Returns
 /// [`ERROR_BUFFER_OVERFLOW`] (still having filled everything else) if
 /// the path didn't fit.
+#[allow(clippy::too_many_arguments)] // internal helper; one param per real FIB/AnchorPath field it fills
 fn write_match_result(
     mem: &mut dyn AddressSpace,
     ap_addr: u32,
@@ -224,9 +225,17 @@ fn write_match_result(
     is_dir: bool,
     size: u32,
     full_amiga_path: &str,
+    host_path: &Path,
 ) -> Result<(), i32> {
-    fill_fib(mem, ap_addr + AP_INFO_OFFSET, name, is_dir, size);
-    fill_fib(mem, achain_addr + AN_INFO_OFFSET, name, is_dir, size);
+    fill_fib(mem, ap_addr + AP_INFO_OFFSET, name, is_dir, size, host_path);
+    fill_fib(
+        mem,
+        achain_addr + AN_INFO_OFFSET,
+        name,
+        is_dir,
+        size,
+        host_path,
+    );
 
     let strlen = mem.read_u16(ap_addr + AP_STRLEN_OFFSET) as usize;
     if strlen == 0 {
@@ -254,7 +263,9 @@ fn list_and_filter(host_dir: &Path, pattern: &Node) -> Result<Vec<(String, bool)
     for dirent in std::fs::read_dir(host_dir).map_err(|e| map_io_error(&e))? {
         let dirent = dirent.map_err(|e| map_io_error(&e))?;
         let name = dirent.file_name().to_string_lossy().into_owned();
-        if dospattern::full_match(pattern, name.as_bytes(), true) {
+        if !crate::dosmeta::is_sidecar_name(&name)
+            && dospattern::full_match(pattern, name.as_bytes(), true)
+        {
             let is_dir = dirent.file_type().map(|t| t.is_dir()).unwrap_or(false);
             out.push((name, is_dir));
         }
@@ -329,6 +340,7 @@ fn match_first(
             is_dir,
             size,
             &entry.amiga_path,
+            &entry.host_path,
         )?;
         mem.write_u32(ap_addr + AP_BASE_OFFSET, achain_addr);
         mem.write_u32(ap_addr + AP_LAST_OFFSET, achain_addr);
@@ -391,10 +403,11 @@ fn match_first(
     mem.write_u32(achain_addr + AN_LOCK_OFFSET, bptr);
     let (name0, is_dir0) = entries[0].clone();
     let full_path0 = join_amiga(&dir_part, &name0);
+    let host_path0 = host_path.join(&name0);
     let size0 = if is_dir0 {
         0
     } else {
-        std::fs::metadata(host_path.join(&name0))
+        std::fs::metadata(&host_path0)
             .map(|m| m.len() as u32)
             .unwrap_or(0)
     };
@@ -406,6 +419,7 @@ fn match_first(
         is_dir0,
         size0,
         &full_path0,
+        &host_path0,
     )?;
     mem.write_u32(ap_addr + AP_BASE_OFFSET, achain_addr);
     mem.write_u32(ap_addr + AP_LAST_OFFSET, achain_addr);
@@ -520,7 +534,16 @@ fn match_next_inner(
                 .map(|m| m.len() as u32)
                 .unwrap_or(0)
         };
-        write_match_result(mem, ap_addr, achain_addr, &name, is_dir, size, &full_path)?;
+        write_match_result(
+            mem,
+            ap_addr,
+            achain_addr,
+            &name,
+            is_dir,
+            size,
+            &full_path,
+            &host_path,
+        )?;
         // Same directory as the previous iteration -- per the RKRM,
         // `APF_DirChanged` "is also cleared if the directory is the
         // same as in the previous iteration" (it isn't self-clearing
@@ -561,6 +584,7 @@ fn match_next_inner(
         true,
         0,
         &full_path,
+        &finished.dir_host_path,
     )?;
     set_flag_bit(mem, ap_addr, APF_DIDDIR, true);
     // Leaving a directory is a directory change too (see the doc note
@@ -772,6 +796,29 @@ mod tests {
 
         match_end(&mut heap, &mut dos, ap);
         assert!(dos.locks.is_empty());
+    }
+
+    #[test]
+    fn wildcard_match_hides_uaem_sidecar_files() {
+        let tmp = TempDir::new("wildcard-uaem");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        fs::write(tmp.path().join("work/a.txt"), b"a").unwrap();
+        fs::write(
+            tmp.path().join("work/a.txt.uaem"),
+            b"----rwed 1978-01-01 00:00:00.00\n",
+        )
+        .unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        let ap = alloc_ap(&mut heap, &mut mem, 0);
+
+        match_first(&mut heap, &mut mem, &mut dos, b"SYS:work/#?", ap).expect("match");
+        assert_eq!(fib_name(&mem, ap), b"a.txt");
+
+        let err = match_next(&mut heap, &mut mem, &mut dos, ap).unwrap_err();
+        assert_eq!(
+            err, ERROR_NO_MORE_ENTRIES,
+            "the .uaem sidecar should never appear"
+        );
     }
 
     #[test]

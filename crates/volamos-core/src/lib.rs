@@ -22,6 +22,8 @@ pub mod dosfault;
 pub mod dosfile;
 pub mod dosfs;
 pub mod doslock;
+pub mod dosmeta;
+pub mod dosnote;
 pub mod dospath;
 pub mod dospattern;
 pub mod dosprintf;

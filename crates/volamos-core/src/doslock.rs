@@ -68,20 +68,25 @@
 //! [`crate::dosfile::ERROR_OBJECT_WRONG_TYPE`] -- there's nothing to
 //! enumerate.
 //!
-//! `fib_Date` is filled with a fixed `DateStamp` (`ds_Days`/`ds_Minute`/
-//! `ds_Tick` all `0`, i.e. the AmigaOS epoch) rather than any host mtime.
-//! Phase 4's parity harness freezes/normalizes virtual time entirely
-//! (see `docs/plan.md`), so real timestamps would just be a source of
-//! non-determinism between runs and runners this side of that harness;
-//! a fixed epoch is the simplest thing that's already parity-ready.
+//! `fib_Date`/`fib_Protection`/`fib_Comment` come from the target's
+//! `.uaem` sidecar file if one exists (see [`crate::dosmeta`]), or this
+//! runtime's original defaults otherwise: a fixed `DateStamp`
+//! (`ds_Days`/`ds_Minute`/`ds_Tick` all `0`, i.e. the AmigaOS epoch)
+//! rather than any host mtime, `fib_Protection == 0`, and an empty
+//! comment. Phase 4's parity harness freezes/normalizes virtual time
+//! entirely (see `docs/plan.md`), so a *live* host mtime would just be a
+//! source of non-determinism between runs and runners this side of that
+//! harness; a fixed epoch (or a sidecar's own explicit, checked-in date)
+//! is parity-ready either way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::{
     DosState, ERROR_INVALID_LOCK, ERROR_OBJECT_WRONG_TYPE, map_io_error, map_vfs_error,
 };
+use crate::dosmeta;
 use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr, read_c_string, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
@@ -505,13 +510,16 @@ impl DosState {
         let meta = std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
         let is_dir = meta.is_dir();
         let size = if is_dir { 0 } else { meta.len() as u32 };
-        fill_fib(mem, fib_addr, &display_name, is_dir, size);
+        fill_fib(mem, fib_addr, &display_name, is_dir, size, &host_path);
 
         if is_dir {
             let mut names = Vec::new();
             for dirent in std::fs::read_dir(&host_path).map_err(|e| map_io_error(&e))? {
                 let dirent = dirent.map_err(|e| map_io_error(&e))?;
-                names.push(dirent.file_name().to_string_lossy().into_owned());
+                let name = dirent.file_name().to_string_lossy().into_owned();
+                if !dosmeta::is_sidecar_name(&name) {
+                    names.push(name);
+                }
             }
             names.sort();
             self.exnext.insert(
@@ -558,7 +566,7 @@ impl DosState {
         let meta = std::fs::metadata(&entry_path).map_err(|e| map_io_error(&e))?;
         let is_dir = meta.is_dir();
         let size = if is_dir { 0 } else { meta.len() as u32 };
-        fill_fib(mem, fib_addr, &name, is_dir, size);
+        fill_fib(mem, fib_addr, &name, is_dir, size, &entry_path);
         Ok(())
     }
 }
@@ -592,16 +600,19 @@ fn alloc_lock_struct(
 }
 
 /// Fills a guest `struct FileInfoBlock` at `fib_addr` for an entry named
-/// `name` (a file if `is_dir` is false, in which case `size` is its byte
-/// length; `size` is ignored -- written as `0` -- for a directory). See
-/// the module docs for the field-by-field layout and the fixed
-/// `DateStamp`/empty-comment choices.
+/// `name` at `host_path` (a file if `is_dir` is false, in which case
+/// `size` is its byte length; `size` is ignored -- written as `0` --
+/// for a directory). `fib_Protection`/`fib_Date`/`fib_Comment` come from
+/// `host_path`'s `.uaem` sidecar if one exists ([`crate::dosmeta`]),
+/// else this runtime's original defaults (`0`, the AmigaOS epoch, no
+/// comment) -- see the module docs for the field-by-field layout.
 pub(crate) fn fill_fib(
     mem: &mut dyn AddressSpace,
     fib_addr: u32,
     name: &str,
     is_dir: bool,
     size: u32,
+    host_path: &Path,
 ) {
     let entry_type = if is_dir {
         ENTRY_TYPE_DIR
@@ -609,6 +620,7 @@ pub(crate) fn fill_fib(
         ENTRY_TYPE_FILE
     };
     let num_blocks = size.div_ceil(BLOCK_SIZE);
+    let meta = dosmeta::read_sidecar(host_path).unwrap_or_default();
 
     mem.write_u32(fib_addr + FIB_DISKKEY_OFFSET, 0);
     mem.write_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET, entry_type as u32);
@@ -626,18 +638,25 @@ pub(crate) fn fill_fib(
         truncated_name.as_bytes(),
     );
 
-    mem.write_u32(fib_addr + FIB_PROTECTION_OFFSET, 0);
+    mem.write_u32(fib_addr + FIB_PROTECTION_OFFSET, meta.prot);
     mem.write_u32(fib_addr + FIB_ENTRYTYPE_OFFSET, entry_type as u32);
     mem.write_u32(fib_addr + FIB_SIZE_OFFSET, size);
     mem.write_u32(fib_addr + FIB_NUMBLOCKS_OFFSET, num_blocks);
-    // fib_Date: fixed DateStamp (ds_Days, ds_Minute, ds_Tick), all 0 --
-    // see the module docs' "Examine/ExNext" section.
-    mem.write_u32(fib_addr + FIB_DATE_OFFSET, 0);
-    mem.write_u32(fib_addr + FIB_DATE_OFFSET + 4, 0);
-    mem.write_u32(fib_addr + FIB_DATE_OFFSET + 8, 0);
-    // fib_Comment: empty NUL-terminated string (TEXT fib_Comment[80],
-    // NDK dos/dos.h -- not a BSTR, same fix as fib_FileName above).
-    write_c_string(mem, fib_addr + FIB_COMMENT_OFFSET, b"");
+    // fib_Date: from the sidecar if present, else the fixed AmigaOS
+    // epoch -- see the module docs' "Examine/ExNext" section and
+    // crate::dosmeta's own docs on why this doesn't reintroduce
+    // host-mtime non-determinism.
+    mem.write_u32(fib_addr + FIB_DATE_OFFSET, meta.date.0 as u32);
+    mem.write_u32(fib_addr + FIB_DATE_OFFSET + 4, meta.date.1 as u32);
+    mem.write_u32(fib_addr + FIB_DATE_OFFSET + 8, meta.date.2 as u32);
+    // fib_Comment: from the sidecar if present, else empty (TEXT
+    // fib_Comment[80], NDK dos/dos.h -- not a BSTR, same fix as
+    // fib_FileName above).
+    write_c_string(
+        mem,
+        fib_addr + FIB_COMMENT_OFFSET,
+        meta.comment.as_deref().unwrap_or(b""),
+    );
 }
 
 // --- LVO handlers ---
@@ -1259,6 +1278,72 @@ mod tests {
 
         let err = dos.ex_next(&mut mem, addr, fib_addr).unwrap_err();
         assert_eq!(err, ERROR_NO_MORE_ENTRIES);
+    }
+
+    #[test]
+    fn ex_next_hides_uaem_sidecar_files() {
+        let tmp = TempDir::new("examinedir-uaem");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        fs::write(tmp.path().join("work/a.txt"), b"a").unwrap();
+        fs::write(
+            tmp.path().join("work/a.txt.uaem"),
+            b"----rwed 1978-01-01 00:00:00.00\n",
+        )
+        .unwrap();
+
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:work", SHARED_LOCK)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        let fib_addr = 0x4000;
+        dos.examine(&mut mem, addr, fib_addr).expect("examine dir");
+        dos.ex_next(&mut mem, addr, fib_addr)
+            .expect("only real entry");
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+            b"a.txt"
+        );
+
+        let err = dos.ex_next(&mut mem, addr, fib_addr).unwrap_err();
+        assert_eq!(
+            err, ERROR_NO_MORE_ENTRIES,
+            "the .uaem sidecar should never appear"
+        );
+    }
+
+    #[test]
+    fn examine_reads_protection_and_comment_from_a_uaem_sidecar() {
+        let tmp = TempDir::new("examine-uaem-meta");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        crate::dosmeta::write_sidecar(
+            &tmp.path().join("f.txt"),
+            &crate::dosmeta::Meta {
+                prot: 0x11,
+                date: (0, 0, 0),
+                comment: Some(b"a note".to_vec()),
+            },
+        )
+        .unwrap();
+
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        let fib_addr = 0x2000;
+        dos.examine(&mut mem, addr, fib_addr).expect("examine file");
+        assert_eq!(mem.read_u32(fib_addr + FIB_PROTECTION_OFFSET), 0x11);
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_COMMENT_OFFSET),
+            b"a note"
+        );
     }
 
     #[test]

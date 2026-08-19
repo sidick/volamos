@@ -1350,6 +1350,93 @@ New tests: 4 (`dosfile.rs`, for `Cli`/`GetFileSysTask`/
 end-to-end for `VFWritef` reached under its own LVO name rather than
 via `VFPrintf`).
 
+**`.uaem` metadata sidecars + `SetComment`/`Filenote` — 2026-08-19.**
+Simon requested this directly, referencing the FS-UAE/Amiberry/
+Copperline `.uaem` sidecar convention this project's own `~/src/
+amisnap` tool already implements and interoperates with. Implemented
+`crates/volamos-core/src/dosmeta.rs` (`read_sidecar`/`write_sidecar`,
+the one-line `HSPARWED YYYY-MM-DD HH:MM:SS.CC comment` format) with the
+byte-for-byte encoding taken directly from `~/src/amisnap/src/amiga/
+applyuaem.c`/`tools/amisnap_reader.py` -- an independently-built
+reference already checked against real captured Copperline output --
+rather than re-derived from scratch, so sidecars this runtime writes
+interoperate with those tools' own readers and vice versa. Unlike
+`crate::dospattern`'s tokenized encoding (a genuinely private format
+nothing outside this runtime ever reads), byte-compatibility here was
+the entire point.
+
+Wired into the existing pipeline:
+- `crate::doslock`'s `fill_fib` now reads a target's `.uaem` sidecar
+  (if any) for `fib_Protection`/`fib_Date`/`fib_Comment`, falling back
+  to this runtime's original defaults (`0`, the AmigaOS epoch, no
+  comment) when none exists -- required threading a new `host_path`
+  parameter through `fill_fib` and `crate::dosanchor`'s
+  `write_match_result` (4 call sites total across both modules).
+  Confirmed this doesn't reintroduce the host-mtime non-determinism
+  `crate::doslock`'s module docs deliberately avoid: a sidecar's date
+  is explicit, checked-in data, not a live filesystem timestamp.
+- `crate::dosprotect`'s `SetProtection` now also writes the *full*
+  8-bit mask to the sidecar (merged onto whatever was already recorded
+  there, so a prior comment survives), in addition to its existing
+  real-`chmod`-on-`FIBB_WRITE` effect -- closing the "one-way, doesn't
+  round-trip" gap that module's own docs flagged when first
+  implemented for `Copy`.
+- **`SetComment`** (new, `crates/volamos-core/src/dosnote.rs`, found
+  missing running the real `C:/Filenote` binary): writes a comment to
+  the sidecar, merged the same way.
+- **Sidecar files are hidden from every directory-listing site**
+  (`crate::doslock`'s `Examine`/`ExNext`, `crate::dosanchor`'s
+  `MatchFirst`/`MatchNext`) via a new `dosmeta::is_sidecar_name`
+  filter -- matching real FS-UAE/Amiberry behavior (a `.uaem` is a
+  host-side implementation detail of the mount, not a real Amiga
+  file); caught by Simon's own follow-up request to check `List`
+  against a directory containing a commented file, which surfaced the
+  sidecar showing up as a spurious extra directory entry.
+
+**A second, independent bug found via the same `Filenote` run**: its
+multi-word `COMMENT "test comment from Filenote"` argument arrived at
+`SetComment` as the single word `"Filenote"` -- garbage, not a crash.
+Root-caused to `crate::dispatch::Runtime::new`'s command-line
+construction (`config.args.join(" ")`): this runtime's own CLI splits
+host argv into separate elements *before* this join, so an argv
+element that itself contains spaces (the host shell's quoting already
+resolved) loses that boundary once rejoined with plain spaces --
+`ReadArgs`, which parses this buffer as raw AmigaDOS-syntax command-
+line text exactly like a real Shell prompt, then sees several separate
+unquoted tokens instead of the one argument it actually is. Fixed with
+a new `quote_arg_if_needed` (`dispatch.rs`) that re-wraps any argv
+element containing whitespace/`;`/`=`/`"`/`*` (or that's empty) in
+AmigaDOS double-quotes, escaping embedded `"`/`*`/newline exactly per
+`crate::dosargs`'s own quoted-item decoder (`*"`/`**`/`*n`) -- the
+overwhelming majority of ordinary single-word arguments are left
+completely unaffected.
+
+`Filenote` now runs fully end-to-end against the real corpus binary,
+and `List`/`Dir` correctly display comments while hiding the sidecar
+files themselves:
+```
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/Filenote WORK:hello.txt COMMENT "test comment from Filenote"
+$ volamos -V WORK:<vol> ~/amiga/wb314/full/C/List WORK:
+...
+hello.txt                     58 ----rwed 01-Jan-78 00:00:00
+: test comment from Filenote
+...
+```
+Also fixed a now-stale pre-existing test
+(`dispatch::tests::unknown_call_diagnostic_names_the_function_when_table_is_known`)
+that had hardcoded `SetComment` (-180) as an example of a permanently
+unregistered LVO -- switched to `SetOwner` (-996), still unimplemented
+(no host concept of an Amiga uid/gid to map it onto).
+
+New tests: 9 (`dosmeta.rs`, including one parsing a real captured
+`~/src/amisnap` fixture line verbatim), 2 (`dosprotect.rs`, sidecar
+write + comment-preserving merge), 3 (`dosnote.rs`, including a
+comment-preserving-protection merge test), 4 (`doslock.rs`, sidecar
+metadata round-trip through `Examine` + sidecar-hiding), 1
+(`dosanchor.rs`, sidecar-hiding through `MatchFirst`), 5 (`dispatch.rs`,
+`quote_arg_if_needed` unit tests plus an end-to-end command-line
+re-quoting test).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

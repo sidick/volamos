@@ -1089,6 +1089,36 @@ pub struct Runtime<C: Cpu> {
 /// so a CLI's `--verbose` flag can log it.
 pub type TraceEvent = CallInfo;
 
+/// Wraps `arg` in AmigaDOS `ReadArgs`-syntax double quotes (escaping `"`
+/// as `*"`, `*` as `**`, and a literal newline as `*n`, matching
+/// `crate::dosargs`'s own quoted-item decoder exactly) if it contains
+/// any character that would otherwise split it into multiple tokens or
+/// be misread (whitespace, `;`, `=`, `"`, `*`) or if it's empty (an
+/// empty *unquoted* item isn't a token at all). Left completely
+/// unchanged otherwise, so the overwhelming majority of ordinary,
+/// single-word arguments are unaffected.
+fn quote_arg_if_needed(arg: &str) -> String {
+    let needs_quoting = arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| matches!(c, ' ' | '\t' | '\n' | ';' | '=' | '"' | '*'));
+    if !needs_quoting {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for c in arg.chars() {
+        match c {
+            '"' => out.push_str("*\""),
+            '*' => out.push_str("**"),
+            '\n' => out.push_str("*n"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl<C: Cpu + 'static> Runtime<C> {
     /// Builds a runtime around an already-constructed CPU and loaded
     /// guest memory, per `config` (see [`StartConfig`]).
@@ -1194,6 +1224,9 @@ impl<C: Cpu + 'static> Runtime<C> {
         // dos.library SetProtection -- see crate::dosprotect's module
         // docs.
         crate::dosprotect::register_dosprotect_handlers(&mut table, &mut mem);
+
+        // dos.library SetComment -- see crate::dosnote's module docs.
+        crate::dosnote::register_dosnote_handlers(&mut table, &mut mem);
 
         // dos.library StrToLong (decimal string -> LONG) -- see
         // crate::dosstr's module docs.
@@ -1361,7 +1394,20 @@ impl<C: Cpu + 'static> Runtime<C> {
         // (the length reported in D0 includes this '\n'), plus one extra
         // NUL byte as a defensive terminator for code that scans instead
         // of trusting D0. Allocated on the heap built just above.
-        let mut line = config.args.join(" ").into_bytes();
+        //
+        // Each `config.args` element is re-quoted with `quote_arg_if_needed`
+        // before joining -- the host shell has already split argv into
+        // separate elements and stripped ITS OWN quoting, so an element
+        // containing whitespace (e.g. a multi-word `Filenote ... COMMENT
+        // "a whole sentence"` argument) needs AmigaDOS-style quotes
+        // reintroduced here, or the guest's own `ReadArgs` -- which parses
+        // this buffer as raw, ReadArgs-syntax command-line text, exactly
+        // like a real Shell prompt -- would see it as several separate
+        // unquoted tokens instead of the one argument it actually is.
+        // Found via the real Workbench 3.1.4 Filenote binary silently
+        // mis-parsing a multi-word comment.
+        let quoted_args: Vec<String> = config.args.iter().map(|a| quote_arg_if_needed(a)).collect();
+        let mut line = quoted_args.join(" ").into_bytes();
         line.push(b'\n');
         let line_len = line.len() as u32;
         let args_addr = heap
@@ -1890,10 +1936,10 @@ mod tests {
         use crate::lvos::dos::DOS_LVOS;
 
         // Register PutStr by name (populates the base -> table map), then
-        // jsr an unrelated, unregistered LVO on the same base: -180 is
-        // SetComment's real offset, but no handler is registered for it.
+        // jsr an unrelated, unregistered LVO on the same base: -996 is
+        // SetOwner's real offset, but no handler is registered for it.
         let entry = TRAP_TABLE_END;
-        let words = [0x4EAE, (-180i16) as u16, 0x4E75]; // jsr -180(a6) ; rts
+        let words = [0x4EAE, (-996i16) as u16, 0x4E75]; // jsr -996(a6) ; rts
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
         let mut rt = Runtime::new(
@@ -1924,8 +1970,8 @@ mod tests {
                 assert!(
                     candidates
                         .iter()
-                        .any(|(lib, offset)| lib == "dos.library/SetComment" && *offset == -180),
-                    "expected a dos.library/SetComment (-180) candidate, got {candidates:?}"
+                        .any(|(lib, offset)| lib == "dos.library/SetOwner" && *offset == -996),
+                    "expected a dos.library/SetOwner (-996) candidate, got {candidates:?}"
                 );
             }
             other => panic!("expected UnknownCall, got {other:?}"),
@@ -2122,6 +2168,46 @@ mod tests {
         assert_eq!(bytes, b"foo bar\n");
         // A defensive NUL immediately follows, not counted in D0.
         assert_eq!(rt.mem.read_u8(a0 + d0), 0);
+    }
+
+    #[test]
+    fn quote_arg_if_needed_leaves_plain_words_untouched() {
+        assert_eq!(quote_arg_if_needed("WORK:hello.txt"), "WORK:hello.txt");
+        assert_eq!(quote_arg_if_needed("COMMENT"), "COMMENT");
+    }
+
+    #[test]
+    fn quote_arg_if_needed_quotes_a_multi_word_argument() {
+        assert_eq!(
+            quote_arg_if_needed("test comment from Filenote"),
+            "\"test comment from Filenote\""
+        );
+    }
+
+    #[test]
+    fn quote_arg_if_needed_escapes_embedded_quotes_and_asterisks() {
+        assert_eq!(quote_arg_if_needed(r#"say "hi""#), r#""say *"hi*"""#);
+        assert_eq!(quote_arg_if_needed("a*b c"), "\"a**b c\"");
+    }
+
+    #[test]
+    fn quote_arg_if_needed_quotes_an_empty_argument() {
+        assert_eq!(quote_arg_if_needed(""), "\"\"");
+    }
+
+    #[test]
+    fn a0_d0_command_line_re_quotes_a_multi_word_argument_so_readargs_sees_one_token() {
+        // Found via the real Workbench 3.1.4 Filenote binary: without
+        // re-quoting, a multi-word host argv element (e.g. a comment
+        // string) silently became several separate ReadArgs tokens.
+        let rt = runtime_with_program_and_args(
+            &[RTS],
+            vec!["COMMENT".to_string(), "a whole sentence".to_string()],
+        );
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        let d0 = rt.cpu.data_register(DataRegister(0));
+        let bytes: Vec<u8> = (0..d0).map(|i| rt.mem.read_u8(a0 + i)).collect();
+        assert_eq!(bytes, b"COMMENT \"a whole sentence\"\n");
     }
 
     #[test]

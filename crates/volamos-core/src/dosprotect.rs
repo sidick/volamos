@@ -5,7 +5,8 @@
 //! binary: it calls this after copying a file, to replicate the
 //! source's protection bits onto the new copy.
 //!
-//! # Scope: only `FIBB_WRITE`, and one-way
+//! # Two effects: real host writability, plus the full mask via a
+//! `.uaem` sidecar
 //!
 //! `mask` (per `dos/dos.h`) is an 8-bit field: `FIBB_DELETE`(0)/
 //! `FIBB_EXECUTE`(1)/`FIBB_WRITE`(2)/`FIBB_READ`(3)/`FIBB_ARCHIVE`(4)/
@@ -14,18 +15,21 @@
 //! `FIBB_WRITE` maps onto anything the host file system actually
 //! enforces (`std::fs::Permissions::set_readonly`) -- `DELETE`/
 //! `EXECUTE`/`READ` and the rest have no meaningful host-level
-//! equivalent this runtime can act on. This is a real, narrower-than-
-//! real-AmigaDOS scope: [`crate::doslock`]'s `fill_fib` still always
-//! reports `fib_Protection == 0` (all bits clear), so a `SetProtection`
-//! call's effect on the *write* bit isn't reflected back through a
-//! later `Examine`/`ExNext` -- only the host file's actual writability
-//! changes. Revisit (threading real permissions back through
-//! `fill_fib`) if a future corpus binary depends on reading back what
-//! it just set.
+//! equivalent this runtime can act on, so that's the only bit this
+//! handler ever changes the host file's *real* permissions for. The
+//! *full* mask, though, is also written to the target's `.uaem` sidecar
+//! ([`crate::dosmeta`]), merged onto whatever was already recorded there
+//! (so a prior `SetComment`'s comment survives) -- `crate::doslock`'s
+//! `fill_fib` reads that back for `fib_Protection` on a later
+//! `Examine`/`ExNext`, so (unlike this module's own earlier scope note)
+//! `SetProtection` *does* now round-trip fully, just via the sidecar
+//! rather than a real host filesystem attribute for the seven bits the
+//! host can't represent.
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::map_io_error;
+use crate::dosmeta;
 use crate::guestmem::read_c_string;
 use crate::lvos::dos::DOS_LVOS;
 use crate::vfs::ResolveMode;
@@ -58,7 +62,15 @@ fn set_protection_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
             .map_err(|e| map_io_error(&e))?
             .permissions();
         perms.set_readonly(mask & FIBF_WRITE != 0);
-        fs::set_permissions(&host_path, perms).map_err(|e| map_io_error(&e))
+        fs::set_permissions(&host_path, perms).map_err(|e| map_io_error(&e))?;
+
+        let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
+        sidecar_meta.prot = mask;
+        // Best-effort: a sidecar write failure shouldn't fail the whole
+        // call when the real host permission change (the primary,
+        // always-real effect) already succeeded above.
+        let _ = dosmeta::write_sidecar(&host_path, &sidecar_meta);
+        Ok(())
     })();
 
     match result {
@@ -241,6 +253,44 @@ mod tests {
 
         let meta = fs::metadata(&path).unwrap();
         assert!(!meta.permissions().readonly());
+    }
+
+    #[test]
+    fn set_protection_writes_the_full_mask_to_a_uaem_sidecar() {
+        let tmp = TempDir::new("sidecar");
+        let path = tmp.path().join("f.txt");
+        fs::write(&path, b"hi").unwrap();
+
+        // 0x11 = FIBB_ARCHIVE | FIBB_DELETE, per crate::dosmeta's own
+        // real-captured-example test.
+        let code = run_set_protection(b"SYS:f.txt\0", 0x11, tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+
+        let meta = crate::dosmeta::read_sidecar(&path).expect("sidecar should exist");
+        assert_eq!(meta.prot, 0x11);
+    }
+
+    #[test]
+    fn set_protection_preserves_an_existing_sidecar_comment() {
+        let tmp = TempDir::new("sidecar-merge");
+        let path = tmp.path().join("f.txt");
+        fs::write(&path, b"hi").unwrap();
+        crate::dosmeta::write_sidecar(
+            &path,
+            &crate::dosmeta::Meta {
+                prot: 0,
+                date: (0, 0, 0),
+                comment: Some(b"existing comment".to_vec()),
+            },
+        )
+        .unwrap();
+
+        let code = run_set_protection(b"SYS:f.txt\0", FIBF_WRITE, tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+
+        let meta = crate::dosmeta::read_sidecar(&path).expect("sidecar should exist");
+        assert_eq!(meta.prot, FIBF_WRITE);
+        assert_eq!(meta.comment.as_deref(), Some(&b"existing comment"[..]));
     }
 
     #[test]

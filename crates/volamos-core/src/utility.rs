@@ -415,7 +415,8 @@ pub(crate) fn days_to_ymd(days: u32) -> (u32, u32, u32) {
 /// [`EPOCH_YEAR`]-01-01. Does not validate the inputs -- callers that need
 /// validation (`CheckDate`) do it separately; this matches real
 /// `Date2Amiga`'s own documented "does no sanity checking" behavior.
-fn ymd_to_days(year: u32, month: u32, mday: u32) -> u32 {
+/// Shared with [`crate::dosmeta`]'s `.uaem` sidecar timestamp parsing.
+pub(crate) fn ymd_to_days(year: u32, month: u32, mday: u32) -> u32 {
     let mut days = 0u32;
     for y in EPOCH_YEAR..year {
         days += if is_leap_year(y) { 366 } else { 365 };
