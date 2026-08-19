@@ -42,6 +42,7 @@ pub mod exectask;
 pub mod guestmem;
 pub mod loader;
 pub mod lvos;
+pub mod mathlibs;
 pub mod memory;
 pub mod utility;
 pub mod vfs;

@@ -20,6 +20,9 @@ use crate::cpu::{AddressRegister, DataRegister};
 
 pub mod dos;
 pub mod exec;
+pub mod mathieeedoubbas;
+pub mod mathieeedoubtrans;
+pub mod mathtrans;
 pub mod utility;
 
 /// One argument register in a library call's calling convention: either a

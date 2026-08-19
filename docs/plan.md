@@ -1886,6 +1886,94 @@ with no handler installed, standard-Workbench-library
 `OpenLibrary`-always-succeeds-with-real-header; `backend.rs`:
 `PcOutOfBounds` reporting).
 
+**Real `mathtrans.library`/`mathieeedoubbas.library`/
+`mathieeedoubtrans.library` implementations — 2026-08-19.** Simon: "it
+sounds like the maths libraries could be worth implementing soon."
+Replaced the fake-trap stand-ins for these three libraries (still opened
+via the `STANDARD_WORKBENCH_LIBRARIES` allowlist above for
+`mathieeesingbas.library`/`mathieeesingtrans.library`, not yet given
+real implementations) with genuine, real library bases backed by actual
+math semantics, following the same `register_real`/`write_library_node`
+pattern `dos.library`/`exec.library`/`utility.library` already use.
+
+- **LVO tables**: extracted from AROS's own `workbench/libs/{mathtrans,
+  mathieeedoubbas,mathieeedoubtrans}/*.conf` via `tools/gen_lvos.py`
+  (same uncopyrightable-facts-only extraction as the existing
+  `dos.rs`/`exec.rs`/`utility.rs` tables — see the "fd/SFD metadata
+  decision" section). Required two small `gen_lvos.py` fixes: these
+  `.conf` files omit the `OpenLib`/`CloseLib`/`.skip 2` preamble
+  `dos.conf`/`exec.conf` spell out explicitly (needed `--start-bias
+  24`, already documented in the script's own module doc), and their
+  register lists include `double`-sized arguments spanning two
+  registers (`D0/D1`), written `/`-joined in the source — the script's
+  register parser only understood a flat comma-separated list, so it
+  gained support for flattening `/`-joined groups in call order,
+  plus an import-pruning fix (don't emit `use ...AddressRegister`
+  for a table that never uses one, to keep `cargo clippy` clean).
+  Every table's LVOs were cross-checked against independently published
+  values (<https://anadoxin.org/blog/amigaos-stdlib-vector-tables.html/>)
+  before trusting `--start-bias 24`: `SPAtan`/`IEEEDPFlt`/`IEEEDPFieee`/
+  `SPFieee` all matched exactly. (First attempt at the `--sanity` flags
+  for two of the three tables used guessed-not-verified LVO values for
+  entries the independent source didn't cover, causing the generated
+  tests to fail immediately — a useful, cheap catch of the mistake
+  before it could reach a committed file; corrected against the
+  tool's own (by-then-validated) derivation instead of guessing again.)
+- **`crates/volamos-core/src/mathlibs.rs`** (new module): `double`
+  arguments/results pack into a register pair per each library's real
+  `.conf` (`D0`/`D1` for the first, `D2`/`D3` for a second); implemented
+  `IEEEDPFix`/`Flt`/`Cmp`/`Tst`/`Abs`/`Neg`/`Add`/`Sub`/`Mul`/`Div`/
+  `Floor`/`Ceil` (mathieeedoubbas) and `Atan`/`Sin`/`Cos`/`Tan`/
+  `Sincos`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Pow`/`Sqrt`/`Tieee`/
+  `Fieee`/`Asin`/`Acos`/`Log10` (mathieeedoubtrans) directly on Rust
+  `f64`, no format-conversion risk. `mathtrans.library` predates IEEE
+  double support and operates on AmigaOS's own 32-bit FFP (Fast
+  Floating Point) encoding instead: 1 sign bit, 7-bit excess-64
+  exponent, 24-bit normalized `[0.5,1)` mantissa fraction (confirmed via
+  <https://wiki.amigaos.net/wiki/Math_Libraries>). `ffp_to_f32`/
+  `f32_to_ffp` convert by re-deriving the shared bit pattern from IEEE
+  single precision's own `1.mantissa * 2^exp` layout (IEEE's 24-bit
+  significand -- implicit leading 1 plus 23 explicit mantissa bits --
+  turns out to be *exactly* FFP's 24-bit mantissa field, just
+  interpreted as a different fixed-point format, so the exponent
+  translation is a plain additive bias, `stored_field = raw_exp - 62`)
+  rather than a `log2`/`powi` round trip, avoiding float-precision edge
+  cases at power-of-two boundaries; unit-tested both by round-trip and
+  against one independently hand-derived encoding (`1.0`). FFP's 7-bit
+  exponent field has real, documented less range than IEEE single's
+  8-bit one -- out-of-range results saturate rather than panic/wrap.
+  Every `SP*` transcendental reduces to "convert FFP in, call the `f32`
+  method, convert back" once that conversion is right.
+- **New base addresses**: `MATHTRANS_LIBRARY_BASE`/
+  `MATHIEEEDOUBBAS_LIBRARY_BASE`/`MATHIEEEDOUBTRANS_LIBRARY_BASE`
+  needed real jump-table + `struct Library` header room the original
+  `[0x0000,0x1200)` reserved region didn't have spare (the existing
+  four real bases already use most of the gaps between each other).
+  Grew `crate::backend::TRAP_TABLE_SIZE` from `0x1200` to `0x1800`
+  (three new `0x200`-byte chunks, same "prefilled with the unknown-call
+  sentinel until a real header/handler overwrites its own portion"
+  treatment as the rest of the region) rather than trying to
+  shoehorn them into the existing gaps.
+- **Verified against the real `PhxAss` run**: `OpenLibrary` for all
+  three now reports `(real)` instead of `(fake, unimplemented)`, with
+  real, distinct base addresses. Not a fix for the still-open
+  `PcOutOfBounds` crash from the previous entry, though -- that crash
+  happens before any actual math LVO is ever called (confirmed: no
+  math-library call appears in the trace before it), so it's
+  independent of this work, exactly as the previous entry's "root cause
+  ... needs real disassembly or ground-truth comparison" already
+  anticipated. Real math semantics for these libraries stands on its
+  own merits (any future corpus binary doing real floating-point work
+  now gets correct answers instead of an "unimplemented" trap) and was
+  explicitly requested regardless of whether it moved this specific
+  crash.
+
+New tests: 15 (`lvos/mathtrans.rs`/`mathieeedoubbas.rs`/
+`mathieeedoubtrans.rs`: one `known_lvos_match_amigaos` sanity test each,
+generated; `mathlibs.rs`: 3 FFP conversion tests -- round-trip over a
+representative value set, exact-zero, and one independently-derived
+bit-pattern check).
+
 ## Phase 4 — parity pass (three-oracle harness)
 
 Scope: a test harness running the same fixture corpus against (1) this

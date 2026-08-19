@@ -24,7 +24,10 @@ argument-register calling convention, using its own directive spellings:
     starts at 6 and increases by 6 for every slot consumed (a real
     function *or* a skipped one), so `LVO = -bias`. `REGLIST` is a
     comma-separated list of `Dn`/`An` register names in call order (or
-    empty for a no-argument call).
+    empty for a no-argument call); a single logical argument spanning
+    two registers (e.g. a `double` passed as `D0/D1`, seen in the math
+    libraries' `.conf` files) is written `/`-joined and flattened into
+    the same in-order list.
   - `.private` -- applies to the immediately preceding function; marks it
     as an internal vector not meant for guest code to call directly
     (AROS uses this for `OpenLib`/`CloseLib`, which real guest code never
@@ -160,7 +163,17 @@ def parse_functionlist(text: str, *, source_label: str, start_bias: int = 0) -> 
         decl = m.group("decl").strip()
         name = decl.split()[-1].lstrip("*")
         regs_str = m.group("regs").strip()
-        regs = [r.strip() for r in regs_str.split(",")] if regs_str else []
+        # A single argument can span two registers (e.g. a `double`
+        # passed as a `D0/D1` pair, seen in the math libraries' .conf
+        # files) -- flatten "/"-joined groups in call order, same as a
+        # plain comma-separated list, since LvoEntry only records which
+        # physical registers carry the call's data in order, not how
+        # they're grouped into logical arguments.
+        regs = (
+            [r.strip() for part in regs_str.split(",") for r in part.split("/")]
+            if regs_str
+            else []
+        )
         for r in regs:
             if not REG_RE.match(r):
                 raise SystemExit(
@@ -215,7 +228,15 @@ def render(
     lines.append("//!")
     lines.append("//! DO NOT EDIT BY HAND. Regenerate with `tools/gen_lvos.py`.")
     lines.append("")
-    lines.append("use crate::cpu::{AddressRegister, DataRegister};")
+    uses_a_reg = any(r.startswith("A") for e in entries for r in e.regs)
+    uses_d_reg = any(r.startswith("D") for e in entries for r in e.regs)
+    cpu_imports = ", ".join(
+        name
+        for used, name in ((uses_a_reg, "AddressRegister"), (uses_d_reg, "DataRegister"))
+        if used
+    )
+    if cpu_imports:
+        lines.append(f"use crate::cpu::{{{cpu_imports}}};")
     lines.append("use crate::lvos::{ArgReg, LvoEntry};")
     lines.append("")
     lines.append(f"/// The full `{library_doc}` LVO table (all known functions, not just the")

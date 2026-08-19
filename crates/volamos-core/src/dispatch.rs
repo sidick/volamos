@@ -245,6 +245,27 @@ pub const EXEC_LIBRARY_BASE: u32 = 0x0F00;
 /// both neighbors as currently registered.
 pub const UTILITY_LIBRARY_BASE: u32 = 0x0C00;
 
+/// Real `mathtrans.library` base address (see `crate::mathlibs`'s module
+/// docs). Placed in the space [`crate::backend::TRAP_TABLE_SIZE`] was
+/// grown to fit, past the original region's `0x1200` end: `0x1200`..
+/// `0x1400` is this library's own chunk, base near its end
+/// (`0x13B0`) leaves `0x1B0` (432) bytes of negative-offset headroom --
+/// far more than its deepest real LVO (`SPLog10` at `-126`) -- and `0x50`
+/// (80) bytes of positive-offset room for [`write_library_node`]'s
+/// `struct Library` header (34 bytes needed) before the next chunk
+/// starts, with margin to spare.
+pub const MATHTRANS_LIBRARY_BASE: u32 = 0x13B0;
+
+/// Real `mathieeedoubbas.library` base address -- same chunked layout as
+/// [`MATHTRANS_LIBRARY_BASE`], in the next `0x1400`..`0x1600` chunk.
+/// Deepest real LVO: `IEEEDPCeil` at `-96`.
+pub const MATHIEEEDOUBBAS_LIBRARY_BASE: u32 = 0x15B0;
+
+/// Real `mathieeedoubtrans.library` base address -- same chunked layout
+/// as [`MATHTRANS_LIBRARY_BASE`], in the final `0x1600`..`0x1800` chunk.
+/// Deepest real LVO: `IEEEDPLog10` at `-138`.
+pub const MATHIEEEDOUBTRANS_LIBRARY_BASE: u32 = 0x17B0;
+
 /// Fake `version.library` base address. `version.library` is a small
 /// real AmigaOS library some `C:` commands (the real `Version` command
 /// itself, confirmed empirically -- see `docs/plan.md`'s empirical-
@@ -1407,6 +1428,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // see crate::utility's module docs.
         crate::utility::register_utility_handlers(&mut table, &mut mem);
 
+        // mathtrans.library/mathieeedoubbas.library/mathieeedoubtrans.
+        // library: real math library implementations, not just fake
+        // traps -- see crate::mathlibs's module docs.
+        crate::mathlibs::register_mathlibs_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -1444,6 +1470,9 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, EXEC_LIBRARY_BASE);
         write_library_node(&mut mem, UTILITY_LIBRARY_BASE);
         write_library_node(&mut mem, VERSION_LIBRARY_BASE);
+        write_library_node(&mut mem, MATHTRANS_LIBRARY_BASE);
+        write_library_node(&mut mem, MATHIEEEDOUBBAS_LIBRARY_BASE);
+        write_library_node(&mut mem, MATHIEEEDOUBTRANS_LIBRARY_BASE);
 
         // Real struct ExecBase (NDK exec/execbase.h) extends well past
         // struct Library -- SoftVer, ChkBase, the Capture vectors,
@@ -1473,6 +1502,9 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("exec.library", EXEC_LIBRARY_BASE);
         registry.register_real("utility.library", UTILITY_LIBRARY_BASE);
         registry.register_real("version.library", VERSION_LIBRARY_BASE);
+        registry.register_real("mathtrans.library", MATHTRANS_LIBRARY_BASE);
+        registry.register_real("mathieeedoubbas.library", MATHIEEEDOUBBAS_LIBRARY_BASE);
+        registry.register_real("mathieeedoubtrans.library", MATHIEEEDOUBTRANS_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using
