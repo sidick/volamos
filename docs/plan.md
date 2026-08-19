@@ -2536,6 +2536,42 @@ is that trip. Needs a design decision before implementing (a real,
 walkable `MemHeader`/`MemChunk` chain vs. some other faithful-enough
 approximation), not just a mechanical LVO fill-in like the two above.
 
+## `AmiSnap` continued: `exec.library`'s `Allocate`/`Deallocate` -- 2026-08-19
+
+Resolved the design question flagged above without reopening
+`execmem.rs`'s flat-`AllocMem` decision at all: `Allocate`'s own
+NDK/AROS-documented `EXAMPLE` shows the intended usage is a
+caller-built **private** pool (`AllocMem` one big block, then
+hand-initialize a `MemHeader` pointing at one `MemChunk` spanning it,
+suballocate with `Allocate`/`Deallocate` directly) -- neither function
+ever needs to touch this runtime's own `GuestHeap` at all, they just
+operate on whatever chunk chain already exists at the guest
+`MemHeader*` address in `A0`. New module
+`crates/volamos-core/src/execchunk.rs`, fully independent of
+`execmem.rs`.
+
+Algorithm (NDK headers document the struct layout, not the algorithm
+-- traced against general Amiga systems-programming references and
+AROS's `Allocate()` doc/`EXAMPLE`): `mh_First` chains address-ordered
+`MemChunk`s; `Allocate` walks first-fit, taking bytes off the *front*
+of the first chunk big enough (shrink in place, or unlink entirely on
+an exact fit); `Deallocate` finds the address-ordered insertion point
+and coalesces with an adjacent predecessor and/or successor chunk,
+covering the classic "free the middle of three, then free both
+neighbors" triple-merge case.
+
+Verified: **`AmiSnap` printed real guest output for the first time**
+(its own `$VER:` banner, `AmiSnap 0.1 (12.08.2026)`) before hitting a
+new gap. Full `cargo test --all` (500 passed), `cargo clippy
+--all-targets`, `cargo fmt --all` clean.
+
+**Next gap, not yet implemented**: `dos.library`'s `AllocDosObject`
+(LVO -228) -- this is the exact call the earlier `?`/`RDA_ExtHelp`
+investigation already found in AmiSnap's own source
+(`AllocDosObject(DOS_RDARGS, NULL)`, building the `struct RDArgs` its
+`ReadArgs()` call needs), so implementing it should unblock argument
+parsing and get much closer to `AmiSnap` actually running its verbs.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

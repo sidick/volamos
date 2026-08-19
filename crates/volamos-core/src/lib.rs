@@ -35,6 +35,7 @@ pub mod dosseg;
 pub mod dossetfiledate;
 pub mod dosstr;
 pub mod dosvar;
+pub mod execchunk;
 pub mod execfmt;
 pub mod execlist;
 pub mod execmem;

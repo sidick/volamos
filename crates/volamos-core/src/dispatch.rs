@@ -1527,6 +1527,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         // runtime never needs the real waiter-queue machinery.
         crate::execsem::register_execsem_handlers(&mut table, &mut mem);
 
+        // exec.library's raw Allocate/Deallocate (a real, coalescing
+        // MemHeader/MemChunk free-list allocator, deliberately separate
+        // from execmem.rs's flat AllocMem/FreeMem model) -- see
+        // crate::execchunk's module docs.
+        crate::execchunk::register_execchunk_handlers(&mut table, &mut mem);
+
         // exec.library RawDoFmt (the printf-like formatter every AmigaOS
         // C startup library's own sprintf/Printf builds on) -- see
         // crate::execfmt's module docs, including how it steps the CPU
