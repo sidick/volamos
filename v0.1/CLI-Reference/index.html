@@ -1,0 +1,1257 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A Rust-native, Wine-style runtime for classic AmigaOS m68k CLI binaries">
+      
+      
+      
+        <link rel="canonical" href="https://sidick.github.io/volamos/v0.1/CLI-Reference/">
+      
+      
+        <link rel="prev" href="../Getting-Started/">
+      
+      
+        <link rel="next" href="../Volumes-and-Assigns/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>CLI Reference - volamos</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#cli-reference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="volamos" class="md-header__button md-logo" aria-label="volamos" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            volamos
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              CLI Reference
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/sidick/volamos" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    sidick/volamos
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="volamos" class="md-nav__button md-logo" aria-label="volamos" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    volamos
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/sidick/volamos" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    sidick/volamos
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting going
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting going
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Getting-Started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using volamos
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Using volamos
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#exit-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exit codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-verbose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -v, --verbose
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-s-snoop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -s, --snoop
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-volume-namehostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -V, --volume NAME:hostdir
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-a-assign-nametargettarget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -a, --assign NAME:target[+target...]
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cwd-amigapath" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cwd AMIGAPATH
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-auto-assign-hostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --auto-assign HOSTDIR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-stack-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --stack SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-ram-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --ram SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cpu-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cpu MODEL
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-fpu-no-fpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --fpu, --no-fpu
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#no-flags-at-all" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        No flags at all
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Volumes-and-Assigns/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Volumes and Assigns
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Supported-Libraries/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Supported Libraries
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Help
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Help
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Building-from-Source/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Building from Source
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#exit-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exit codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-verbose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -v, --verbose
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-s-snoop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -s, --snoop
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-volume-namehostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -V, --volume NAME:hostdir
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-a-assign-nametargettarget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -a, --assign NAME:target[+target...]
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cwd-amigapath" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cwd AMIGAPATH
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-auto-assign-hostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --auto-assign HOSTDIR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-stack-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --stack SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-ram-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --ram SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cpu-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cpu MODEL
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-fpu-no-fpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --fpu, --no-fpu
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#no-flags-at-all" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        No flags at all
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://github.com/sidick/volamos/edit/main/userdocs/CLI-Reference.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="cli-reference">CLI Reference<a class="headerlink" href="#cli-reference" title="Permanent link">&para;</a></h1>
+<div class="highlight"><pre><span></span><code>volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
+        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
+        [--cpu MODEL] [--fpu|--no-fpu] &lt;program&gt; [args...]
+</code></pre></div>
+<p><code>volamos --help</code> prints this same reference from the binary itself.
+Everything before <code>&lt;program&gt;</code> is a volamos flag; <code>&lt;program&gt;</code> is a host
+path to an AmigaOS hunk executable; everything after it is passed
+through verbatim as the <em>guest</em> program's own command-line arguments
+(<code>A0</code>/<code>D0</code>, the real AmigaOS startup convention) — a guest program that
+parses its own arguments (e.g. via <code>ReadArgs</code>) reads them from there,
+unaffected by anything volamos itself understood before <code>&lt;program&gt;</code>.</p>
+<h2 id="exit-codes">Exit codes<a class="headerlink" href="#exit-codes" title="Permanent link">&para;</a></h2>
+<p>volamos propagates the <strong>guest program's own exit code</strong> on a normal
+run — whatever it returned in <code>D0</code> at <code>rts</code>, same as running it on a
+real Amiga would produce as its process return code. There is no
+volamos-specific exit code convention layered on top of that.</p>
+<p>volamos only ever produces its own exit code (<code>1</code>) when the guest never
+got to run at all — the program path couldn't be read, didn't parse as
+a valid hunk executable, a <code>-V</code>/<code>-a</code> argument was malformed, or the
+guest genuinely crashed the runtime (an unimplemented library call, a
+stack overflow, an invalid instruction). In every one of those cases
+volamos prints a diagnostic to stderr naming exactly what went wrong
+before exiting.</p>
+<h2 id="-v-verbose"><code>-v</code>, <code>--verbose</code><a class="headerlink" href="#-v-verbose" title="Permanent link">&para;</a></h2>
+<p>Logs every emulated library call to stderr as it happens — library
+name, LVO (library vector offset), and which handler serviced it:</p>
+<div class="highlight"><pre><span></span><code>volamos: dos.library(-948) -&gt; PutStr
+</code></pre></div>
+<p>The most detailed of the two logging flags; useful for understanding
+exactly what a guest program is doing, or diagnosing an unimplemented-
+call failure by seeing the last few calls that succeeded first.</p>
+<h2 id="-s-snoop"><code>-s</code>, <code>--snoop</code><a class="headerlink" href="#-s-snoop" title="Permanent link">&para;</a></h2>
+<p>A lighter-weight, <code>SnoopDos</code>-style alternative: logs only <em>resource-
+opening</em> calls (<code>OpenLibrary</code>/<code>OldOpenLibrary</code>, <code>Open</code>) — what was
+requested, and whether it resolved to a real/unimplemented library or
+succeeded/failed for a file:</p>
+<div class="highlight"><pre><span></span><code>snoop: library "dos.library" -&gt; base 0x00000800 (real)
+</code></pre></div>
+<p>Useful for quickly seeing which libraries and files a real, unfamiliar
+binary actually touches, without the full per-call firehose <code>-v</code>
+produces. If both <code>-v</code> and <code>-s</code> are given, <code>-v</code> wins — its own per-call
+output already includes the same detail inline.</p>
+<h2 id="-v-volume-namehostdir"><code>-V</code>, <code>--volume NAME:hostdir</code><a class="headerlink" href="#-v-volume-namehostdir" title="Permanent link">&para;</a></h2>
+<p>Maps an Amiga volume <code>NAME:</code> onto a real host directory. Repeatable —
+give it multiple times to map several volumes at once. See
+<a href="../Volumes-and-Assigns/">Volumes and Assigns</a> for the full path-
+resolution model.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>-V<span class="w"> </span>SRC:/home/me/project<span class="w"> </span>-V<span class="w"> </span>DEST:/tmp/out<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-a-assign-nametargettarget"><code>-a</code>, <code>--assign NAME:target[+target...]</code><a class="headerlink" href="#-a-assign-nametargettarget" title="Permanent link">&para;</a></h2>
+<p>Assigns a logical Amiga name <code>NAME:</code> to one or more existing Amiga path
+targets (each itself an already-mapped volume, or another assign),
+joined with <code>+</code> for a multi-assign search order — the real AmigaDOS
+<code>ASSIGN NAME: target1 ADD target2 ...</code> idiom. Repeatable. See
+<a href="../Volumes-and-Assigns/">Volumes and Assigns</a> for the exact search-
+order and recursive-assign semantics, with worked examples.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>-V<span class="w"> </span>SYS:/home/me/amiga<span class="w"> </span>-a<span class="w"> </span>LIBS:SYS:libsA+SYS:libsB<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-cwd-amigapath"><code>--cwd AMIGAPATH</code><a class="headerlink" href="#-cwd-amigapath" title="Permanent link">&para;</a></h2>
+<p>Sets the guest's initial current directory. Default: the first <code>-V</code>
+volume's root if any <code>-V</code> was given, else the first <code>-a</code> assign's
+root, else <code>root:</code> (relying on <code>--auto-assign</code> to resolve it — see
+below).</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>-V<span class="w"> </span>SRC:/home/me/project<span class="w"> </span>--cwd<span class="w"> </span>SRC:subdir<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-auto-assign-hostdir"><code>--auto-assign HOSTDIR</code><a class="headerlink" href="#-auto-assign-hostdir" title="Permanent link">&para;</a></h2>
+<p>A fallback for any volume/assign name volamos doesn't otherwise know
+about: <code>NAME:</code> resolves to <code>&lt;HOSTDIR&gt;/NAME</code> automatically, without
+needing an explicit <code>-V</code>/<code>-a</code> for every name a guest program might
+reference. See <a href="../Volumes-and-Assigns/">Volumes and Assigns</a>.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--auto-assign<span class="w"> </span>/home/me/amiga-volumes<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-stack-size"><code>--stack SIZE</code><a class="headerlink" href="#-stack-size" title="Permanent link">&para;</a></h2>
+<p>Overrides the guest stack region's size — default 64 KiB (65536
+bytes). <code>SIZE</code> is a plain byte count, optionally suffixed <code>K</code>/<code>k</code>
+(KiB) or <code>M</code>/<code>m</code> (MiB):</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--stack<span class="w"> </span>256K<span class="w"> </span>fixtures/hello
+volamos<span class="w"> </span>--stack<span class="w"> </span><span class="m">524288</span><span class="w"> </span>fixtures/hello<span class="w">   </span><span class="c1"># equivalent to --stack 512K</span>
+</code></pre></div>
+<p>A value below the runtime's own minimum is silently clamped up to it,
+mirroring real AmigaOS's own stack-size clamp behavior rather than
+erroring. See <a href="../Getting-Started/#4-see-a-runtime-safety-check-in-action">Getting Started</a>
+for what happens when a guest program actually overflows its stack.</p>
+<p>If <code>--stack</code> is close to or exceeds <code>--ram</code> (below), leaving no room
+for the loaded program and the runtime's own guest heap, volamos fails
+with a clear error rather than running at all:</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>volamos<span class="w"> </span>--ram<span class="w"> </span>8K<span class="w"> </span>--stack<span class="w"> </span>8K<span class="w"> </span>fixtures/hello
+volamos:<span class="w"> </span>--stack<span class="w"> </span><span class="m">8192</span><span class="w"> </span>is<span class="w"> </span>too<span class="w"> </span>large<span class="w"> </span><span class="k">for</span><span class="w"> </span>--ram<span class="w"> </span><span class="m">8192</span>:<span class="w"> </span>the<span class="w"> </span>loaded<span class="w"> </span>program<span class="w"> </span>ends
+at<span class="w"> </span>0x2224,<span class="w"> </span>and<span class="w"> </span>there<span class="w"> </span>must<span class="w"> </span>be<span class="w"> </span>room<span class="w"> </span><span class="k">for</span><span class="w"> </span>the<span class="w"> </span>stack<span class="w"> </span>plus<span class="w"> </span>at<span class="w"> </span>least<span class="w"> </span><span class="m">4096</span><span class="w"> </span>bytes
+of<span class="w"> </span>guest<span class="w"> </span>heap<span class="w"> </span>after<span class="w"> </span>that<span class="w"> </span>--<span class="w"> </span>increase<span class="w"> </span>--ram<span class="w"> </span>or<span class="w"> </span>decrease<span class="w"> </span>--stack
+</code></pre></div>
+<h2 id="-ram-size"><code>--ram SIZE</code><a class="headerlink" href="#-ram-size" title="Permanent link">&para;</a></h2>
+<p>Overrides the total guest address space — default 16 MiB (16777216
+bytes). Same <code>SIZE</code> syntax as <code>--stack</code>: a plain byte count, optionally
+suffixed <code>K</code>/<code>k</code> (KiB) or <code>M</code>/<code>m</code> (MiB):</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--ram<span class="w"> </span>4M<span class="w"> </span>fixtures/hello
+volamos<span class="w"> </span>--ram<span class="w"> </span>64M<span class="w"> </span>--stack<span class="w"> </span>1M<span class="w"> </span>fixtures/hello<span class="w">   </span><span class="c1"># room for a much larger stack</span>
+</code></pre></div>
+<p>The default comfortably covers the tiny CLI binaries volamos currently
+targets, with plenty of headroom for a larger-than-default <code>--stack</code>.
+Raise it if a guest program needs more address space than that (e.g. a
+larger <code>--stack</code>, or a program that allocates a lot via <code>AllocMem</code>).</p>
+<h2 id="-cpu-model"><code>--cpu MODEL</code><a class="headerlink" href="#-cpu-model" title="Permanent link">&para;</a></h2>
+<p>Picks the emulated CPU model. Default <code>68000</code> — the lowest common
+denominator every Kickstart 3.1 machine shares. One of: <code>68000</code>,
+<code>68010</code>, <code>68020</code>, <code>68ec020</code>, <code>68030</code>, <code>68ec030</code>, <code>68040</code>, <code>68ec040</code>,
+<code>68lc040</code>, <code>68060</code>, <code>scc68070</code>.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>fixtures/hello
+</code></pre></div>
+<p>A binary compiled for a CPU floor higher than the emulated model (e.g.
+<code>m68k-amigaos-gcc -m68020</code>, run under the default <code>--cpu 68000</code>) will
+typically fail its own startup-time CPU check rather than running with
+subtly wrong behavior — real toolchain startup code (<code>libnix</code> and
+similar) checks <code>ExecBase.AttnFlags</code> and calls <code>Alert()</code> if the
+running CPU doesn't meet what the binary was compiled for, and volamos
+implements that check faithfully. If a real binary you're running
+fails immediately with an <code>Alert</code> diagnostic, check what CPU floor it
+was actually compiled for.</p>
+<h2 id="-fpu-no-fpu"><code>--fpu</code>, <code>--no-fpu</code><a class="headerlink" href="#-fpu-no-fpu" title="Permanent link">&para;</a></h2>
+<p>Whether a coprocessor FPU is fitted. Default: no FPU. Only meaningful
+for <code>--cpu 68020</code> and later — earlier models have no coprocessor
+interface at all, so F-line (FPU) instructions always trap on them
+regardless of this flag.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>--fpu<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="no-flags-at-all">No flags at all<a class="headerlink" href="#no-flags-at-all" title="Permanent link">&para;</a></h2>
+<p>If none of <code>-V</code>/<code>-a</code>/<code>--cwd</code>/<code>--auto-assign</code> are given, no volume/assign
+filesystem is installed at all: <code>dos.library</code> path-based calls
+(<code>Open</code>, <code>Lock</code>, <code>Examine</code>, ...) fail cleanly with an <code>IoErr()</code>, but
+<code>Input</code>/<code>Output</code>/<code>PutStr</code>/<code>IoErr</code>/<code>SetIoErr</code> (and anything that doesn't
+touch a path) still work — exactly what <a href="../Getting-Started/">Getting Started</a>'s
+first two examples rely on.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../Getting-Started/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Getting Started">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Getting Started
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../Volumes-and-Assigns/" class="md-footer__link md-footer__link--next" aria-label="Next: Volumes and Assigns">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Volumes and Assigns
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      volamos — a Rust-native runtime for classic AmigaOS m68k CLI binaries. MIT OR Apache-2.0.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.footer", "content.action.edit", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
