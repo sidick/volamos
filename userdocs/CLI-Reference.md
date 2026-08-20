@@ -183,6 +183,25 @@ regardless of this flag.
 volamos --cpu 68020 --fpu fixtures/hello
 ```
 
+!!! note "Performance: software math libraries are faster than a real FPU"
+    Programs that do floating-point math through `mathffp.library`/
+    `mathtrans.library`/`mathieeedoubbas.library` (the common path for
+    code that doesn't require a real 68881/882 — e.g. most `--cpu 68000`
+    binaries) run at full host CPU speed under volamos, since those
+    libraries are implemented as genuine host `f64`/`f32` arithmetic,
+    not emulated 1980s FPU hardware. Programs that instead execute real
+    F-line FPU instructions (needing `--cpu 68020`+ and `--fpu`) go
+    through the `m68k` crate's *interpreted* FPU emulation instead,
+    which is considerably slower — confirmed with a real BYTEmark 2.2
+    Fourier run: `--cpu 68000` (library math) scored an index of 1.46
+    (faster than a 233 MHz AMD K6 reference machine); the same binary's
+    real-FPU path under `--cpu 68020 --fpu` scored 0.09, in line with
+    the rest of the suite's plain-interpreted-CPU results. `--fpu`
+    doesn't force a program to use one path or the other — that's
+    determined by how the program itself was written/compiled — it
+    just decides whether real F-line instructions execute instead of
+    trapping.
+
 ## No flags at all
 
 If none of `-V`/`-a`/`--cwd`/`--auto-assign` are given, no volume/assign
