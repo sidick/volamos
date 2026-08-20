@@ -3547,3 +3547,54 @@ tests, unchanged pass count -- no source changes needed at all), and
 the full CI run for the merge commit (both `test` matrix legs, the
 `compare` two-oracle harness, `docs-build`) also green. No API break
 surfaced for anything this runtime actually uses from the crate.
+
+## Issue #6 resolved: fixtures/exectest had a real calling-convention bug — 2026-08-20
+
+Root-caused, not just re-labeled. Bisected `exectest.s` against real
+Kickstart 3.1 (Copperline) by truncating it section by section, real-
+vasm-reassembling, and retesting after each cut (`vasmm68k_mot` is at
+`/opt/amiga/bin/vasmm68k_mot`, not on `$PATH` by default) --
+narrowed a genuine illegal-instruction crash (`ACPU_InstErr`,
+`0x80000004`, per `/opt/amiga/m68k-amigaos/ndk-include/exec/alerts.h`)
+down to the `GetTagData` call specifically. Root cause: the fixture
+left `A6 = ExecBase` throughout and called `dos.library`/
+`utility.library` functions with their base in `A3`/`A4` directly,
+relying on volamos's trap dispatcher resolving purely from where a
+`jsr` physically lands rather than any "current A6" notion (a real,
+documented volamos simplification) -- but real `utility.library`'s
+`GetTagData` internally depends on `A6` holding its own base for a
+nested call of its own. Confirmed by saving/restoring `A6` around just
+that one call in a scratch copy: fixed it on real hardware immediately.
+
+This means the *original* #6 finding (volamos "exec ok" vs. vamos
+"ERR"/exit 9 on `CheckSignal`) was comparing two implementations both
+running technically-invalid guest code -- real hardware would have
+crashed before ever reaching that check, so neither answer was
+meaningful. Fixed `fixtures/exectest.s` (and the authoritative
+`fixtures/gen_exectest.py` generator, which needed a new
+`CodeBuilder.move_l_a_to_a` opcode helper in `fixtures/amiga_asm.py`
+for `move.l A,A`) to always swap `A6` to the real target library base
+immediately before every `jsr`, matching every other fixture's own
+convention.
+
+**With that fixed, re-ran the real three-way comparison**: real
+Kickstart now runs `exectest` clean ("exec ok", exit 0) -- matching
+volamos exactly. `vamos` *still* reports `ERR`/exit 9 on the corrected
+fixture. So the real, now-confirmed conclusion is the opposite of what
+#6 originally seemed to suggest: **volamos's `CheckSignal`/`SetSignal`
+already matches real hardware; `vamos` is the one that diverges from
+real AmigaOS here.** Nothing to fix in volamos itself. Updated
+`tools/compare_vamos.py`'s `KNOWN_DIVERGENCES` entry to record this
+confirmed diagnosis (still tracked, since `vamos` still disagrees, but
+now correctly attributed) rather than leaving it as an open question.
+
+**Verification**: `fixtures/exectest` regenerated via
+`gen_exectest.py`, confirmed byte-different but behaviorally identical
+to a fresh real-`vasm` build of the corrected `exectest.s` (both:
+"exec ok"/exit 0 under volamos, under real Kickstart via Copperline,
+and -- separately -- still `ERR`/exit 9 under `vamos`, confirming the
+`vamos` divergence is real and unrelated to the calling-convention
+fix). Full `cargo build/test (540)/clippy -D warnings/fmt --check`
+clean; re-ran `compare_vamos.py` inside `ghcr.io/sidick/amiga-dev:1`
+to confirm the harness still correctly reports `exectest` as `KNOWN`
+(not a regression to `FAIL`) with the updated reason text.

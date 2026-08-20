@@ -279,12 +279,23 @@ stack-overflow guard (also `exectask.rs`).
 Source: `exectest.s`; generator: `gen_exectest.py`.
 
 1. Real startup: `AbsExecBase` -> `OpenLibrary("dos.library", 0)`
-   (unchecked, matching every earlier fixture) -> `A3` (kept in `A3`
-   rather than `A6`, since this fixture keeps making further
-   *exec.library* calls afterward and needs `A6` free for those -- the
-   trap dispatcher resolves purely from where a `jsr` physically lands,
-   not from any "current A6" the runtime tracks, so any address register
-   can hold any library base at any time).
+   (unchecked, matching every earlier fixture) -> `A3`, kept as
+   *storage* only (not left as the active library base for calls --
+   this fixture interleaves `exec.library` calls, needing `A6` =
+   `EXEC_LIBRARY_BASE`, with `dos.library`/`utility.library` calls,
+   needing `A6` = that library's own base; `A6` is swapped to the
+   right base immediately before every `jsr`). **Found the hard way
+   (2026-08-20, issue #6)**: an earlier revision left `A6` = `ExecBase`
+   throughout and called `dos.library`/`utility.library` functions with
+   their base in `A3`/`A4` directly, relying on volamos's trap
+   dispatcher resolving purely from where a `jsr` physically lands
+   rather than any "current A6" notion -- that worked under volamos,
+   but crashed on real Kickstart: real `utility.library`'s
+   `GetTagData` (confirmed via Copperline against a real ROM)
+   internally depends on `A6` holding its own base for a nested call
+   of its own. Always swapping `A6` to the real target base before
+   every library call, like every other fixture already does, is the
+   real-hardware-correct convention.
 2. `AllocMem(64, MEMF_CLEAR)` via `A6` = `EXEC_LIBRARY_BASE`: checks
    non-NULL (exit 1 on failure) and that the first byte reads `0` (exit
    2 on failure), writes a byte pattern past it, then `FreeMem`s the
@@ -293,17 +304,20 @@ Source: `exectest.s`; generator: `gen_exectest.py`.
 3. `OpenLibrary("utility.library", 0)` via `A6` (exit 4 if NULL; this
    runtime always resolves that name to the fixed `UTILITY_LIBRARY_BASE`
    -- it's registered as a real library at `Runtime::new` time, never
-   the auto-created-fake-library path) -> `A4`. `Stricmp("AMIGA",
-   "amiga")` via `A4` (exit 5 if nonzero). `GetTagData` on a tag list
-   built directly in the DATA hunk (`{TAG_VAL, 7}, {TAG_DONE, 0}`, via
-   `amiga_asm.py`'s `DataBuilder.u32s`, expects `7` back, exit 6
-   otherwise). `Strnicmp("HELLO1", "HELLO2", 6)` (expects nonzero --
-   exit 7 if it wrongly reports equal).
+   the auto-created-fake-library path) -> `A4`, then `A6` = `A4` for
+   the calls below. `Stricmp("AMIGA", "amiga")` via `A6` (exit 5 if
+   nonzero). `GetTagData` on a tag list built directly in the DATA hunk
+   (`{TAG_VAL, 7}, {TAG_DONE, 0}`, via `amiga_asm.py`'s
+   `DataBuilder.u32s`, expects `7` back, exit 6 otherwise).
+   `Strnicmp("HELLO1", "HELLO2", 6)` (expects nonzero -- exit 7 if it
+   wrongly reports equal). `A6` is then restored to `ExecBase` before
+   step 4.
 4. `FindTask(NULL)` via `A6` (exit 8 if NULL). `SetSignal(0, 0)`
    (unchecked read), then `SetSignal(1<<5, 1<<5)` to set bit 5, then
-   `dos.library`'s `CheckSignal(1<<5)` via `A3` (expects exactly `1<<5`
-   back -- exit 9 otherwise).
-5. On full success: `PutStr("exec ok\n")` via `A3` and exit `0`.
+   `A6` = `A3` (dos.library's base) for `CheckSignal(1<<5)` (expects
+   exactly `1<<5` back -- exit 9 otherwise).
+5. On full success: `PutStr("exec ok\n")` via `A6` (still dos.library's
+   base from the `CheckSignal` swap) and exit `0`.
 
 Every failure path `PutStr`s a single fixed `"ERR\n"` marker (the
 `filetest.s` convention) with a distinct nonzero exit code (1-9) per

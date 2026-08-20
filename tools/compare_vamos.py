@@ -83,7 +83,9 @@ CORPUS = [
 # just because it's this project's own implementation.
 KNOWN_DIVERGENCES = {
     "exectest": (
-        "CheckSignal after SetSignal(1<<5,1<<5) doesn't match under vamos",
+        "CheckSignal after SetSignal(1<<5,1<<5) doesn't match under vamos -- "
+        "confirmed via real Kickstart (Copperline) that volamos matches real "
+        "hardware here; this is vamos's own divergence, not a volamos bug",
         "https://github.com/sidick/volamos/issues/6",
     ),
 }

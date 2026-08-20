@@ -163,6 +163,14 @@ class CodeBuilder:
         base."""
         self.word(0x2000 | (dst_an << 9) | 0x40 | src_dn)
 
+    def move_l_a_to_a(self, dst_an: int, src_an: int) -> None:
+        """`move.l Asrc,Adst` (MOVEA) -- both source and dest addressing
+        mode 001 (An direct), e.g. `move.l a4,a6` to swap in a saved
+        library base as the target of the next `jsr disp16(a6)`, matching
+        real AmigaOS's calling convention (a library function may itself
+        depend on A6 holding its own base for an internal call)."""
+        self.word(0x2000 | (dst_an << 9) | 0x48 | src_an)
+
     def move_l_abs4_to_a(self, an: int) -> None:
         """`move.l 4.w,An` -- reads `AbsExecBase` (guest address 4;
         absolute-short addressing mode 111/000)."""

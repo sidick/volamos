@@ -15,18 +15,33 @@
 ;   move.l  #dosname,a1
 ;   moveq   #0,d0
 ;   jsr     -552(a6)                ; exec.library/OpenLibrary
-;   move.l  d0,a3                   ; A3 = dos.library base -- NOT a6:
-;                                    ; unlike the earlier fixtures, this one
-;                                    ; keeps making further exec.library
-;                                    ; calls afterward and needs a6 free for
-;                                    ; those. The trap dispatcher resolves
-;                                    ; purely from where a jsr physically
-;                                    ; lands, not from any "current a6"
-;                                    ; notion the runtime tracks -- any
-;                                    ; address register can hold any
-;                                    ; library base at any time (see
-;                                    ; crates/volamos-core/src/dispatch.rs's
-;                                    ; module docs).
+;   move.l  d0,a3                   ; A3 = dos.library base, kept as *storage*
+;                                    ; only -- unlike the earlier fixtures,
+;                                    ; this one interleaves exec.library
+;                                    ; calls (needing A6 = ExecBase) with
+;                                    ; dos.library/utility.library calls
+;                                    ; (needing A6 = that library's own
+;                                    ; base). A6 is swapped to the right
+;                                    ; base immediately before every jsr,
+;                                    ; from A3/A4 (dos/utility, saved
+;                                    ; there after their own OpenLibrary)
+;                                    ; or by re-reading absolute address 4
+;                                    ; for ExecBase -- never left pointing
+;                                    ; at the wrong library across a call.
+;
+; Found the hard way (2026-08-20, GitHub issue #6): earlier revisions of
+; this fixture called dos.library/utility.library functions with their
+; base in A3/A4 directly (A6 left at ExecBase throughout) rather than
+; swapping A6 -- volamos's trap dispatcher resolves purely from where a
+; `jsr` physically lands, not from any "current A6" notion, so that
+; worked under volamos. It does *not* work on real Kickstart: real
+; `utility.library`'s `GetTagData` (confirmed via Copperline against a
+; real ROM) internally depends on A6 holding its own library base for a
+; nested call of its own, and jumped into unrelated exec.library code
+; when it didn't, crashing with an illegal-instruction Guru. Always
+; swapping A6 to the real target base before every library call --
+; exactly like every other fixture already does -- is both the
+; real-hardware-correct convention and what this fixture was missing.
 ;
 ; a4 later holds utility.library's base, obtained the same way via a real
 ; OpenLibrary("utility.library", 0) call through a6 = EXEC_LIBRARY_BASE
@@ -61,9 +76,11 @@ start:
         move.l  #dosname,a1
         moveq   #0,d0
         jsr     -552(a6)                ; OpenLibrary("dos.library",0) -- unchecked
-        move.l  d0,a3                    ; A3 = dos.library base
+        move.l  d0,a3                    ; A3 = dos.library base (storage only)
 
 ; --- (a) exec.library: AllocMem/FreeMem, AllocVec/FreeVec ---
+; A6 is still ExecBase from start: -- every call in this block is a
+; plain exec.library call, no swap needed.
         moveq   #64,d0
         move.l  #MEMF_CLEAR,d1
         jsr     -198(a6)                ; AllocMem(64, MEMF_CLEAR) -> D0
@@ -96,18 +113,19 @@ start:
         jsr     -552(a6)                 ; OpenLibrary("utility.library",0) -> D0
         tst.l   d0
         beq     err4                     ; NULL -> exit 4
-        move.l  d0,a4                    ; A4 = utility.library base
+        move.l  d0,a4                    ; A4 = utility.library base (storage only)
 
+        move.l  a4,a6                    ; A6 = utility.library base for these calls
         move.l  #str_upper,a0
         move.l  #str_lower,a1
-        jsr     -162(a4)                 ; Stricmp("AMIGA","amiga") -> D0 (expect 0)
+        jsr     -162(a6)                 ; Stricmp("AMIGA","amiga") -> D0 (expect 0)
         tst.l   d0
         bne     err5                     ; nonzero -> exit 5
 
         move.l  #taglist,a0
         moveq   #TAG_VAL,d0
         move.l  #$DEAD,d1                ; default -- shouldn't be returned
-        jsr     -36(a4)                  ; GetTagData -> D0 (expect 7)
+        jsr     -36(a6)                  ; GetTagData -> D0 (expect 7)
         subq.l  #TAG_PLANTED,d0
         tst.l   d0
         bne     err6                     ; wrong value -> exit 6
@@ -115,9 +133,11 @@ start:
         move.l  #str_a,a0
         move.l  #str_b,a1
         moveq   #6,d0
-        jsr     -168(a4)                 ; Strnicmp("HELLO1","HELLO2",6) -> D0 (expect != 0)
+        jsr     -168(a6)                 ; Strnicmp("HELLO1","HELLO2",6) -> D0 (expect != 0)
         tst.l   d0
         beq     err7                     ; (wrongly) equal -> exit 7
+
+        move.l  4,a6                     ; A6 = ExecBase again for step (c)
 
 ; --- (c) exec.library task/signal + dos.library CheckSignal ---
         move.l  #0,a1
@@ -133,8 +153,9 @@ start:
         moveq   #32,d1
         jsr     -306(a6)                 ; SetSignal(1<<5,1<<5) -- sets bit 5
 
+        move.l  a3,a6                    ; A6 = dos.library base for CheckSignal
         moveq   #32,d1
-        jsr     -792(a3)                 ; dos CheckSignal(1<<5) -> D0
+        jsr     -792(a6)                 ; dos CheckSignal(1<<5) -> D0
         move.l  d0,d2
         moveq   #32,d1
         sub.l   d1,d2                    ; D2 = D0 - 32
@@ -142,54 +163,67 @@ start:
         bne     err9                     ; wrong bit -> exit 9
 
 ; --- (d) success ---
+; A6 is already dos.library's base from the CheckSignal swap above.
         move.l  #okmsg,d1
-        jsr     -948(a3)                 ; PutStr("exec ok\n") via dos.library
+        jsr     -948(a6)                 ; PutStr("exec ok\n") via dos.library
         moveq   #0,d0
         rts
 
+; Every error exit below can be reached with A6 holding ExecBase,
+; utility.library's base, or dos.library's base, depending which check
+; failed -- always swap to dos.library's base (A3) before PutStr.
 err1:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #1,d0
         rts
 err2:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #2,d0
         rts
 err3:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #3,d0
         rts
 err4:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #4,d0
         rts
 err5:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #5,d0
         rts
 err6:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #6,d0
         rts
 err7:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #7,d0
         rts
 err8:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #8,d0
         rts
 err9:
+        move.l  a3,a6
         move.l  #errmsg,d1
-        jsr     -948(a3)
+        jsr     -948(a6)
         moveq   #9,d0
         rts
 

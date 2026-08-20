@@ -18,13 +18,21 @@ OpenLibrary("dos.library") sequence):
 
 1. A6 = *4 (AbsExecBase = EXEC_LIBRARY_BASE); OpenLibrary("dos.library",
    0) via -552(a6) (unchecked, matching every earlier fixture's own
-   convention); A3 = the returned dos.library base -- kept in A3 rather
-   than clobbering A6, since this fixture, unlike the earlier ones, keeps
-   making *exec.library* calls afterward and needs A6 free for those (the
-   trap dispatcher resolves purely from where a `jsr` physically lands,
-   not from any "current A6" notion the runtime tracks -- any address
-   register can hold any library base at any time; see
-   crates/volamos-core/src/dispatch.rs's module docs).
+   convention); A3 = the returned dos.library base -- kept in A3 as
+   *storage* only, since this fixture, unlike the earlier ones,
+   interleaves exec.library calls (needing A6 = ExecBase) with
+   dos.library/utility.library calls (needing A6 = that library's own
+   base). A6 is swapped to the right base immediately before every
+   `jsr`, via `move_l_a_to_a` from A3/A4 or by re-reading absolute
+   address 4 for ExecBase -- never left pointing at the wrong library
+   across a call. Found the hard way (2026-08-20, issue #6): an earlier
+   revision left A6 = ExecBase throughout and called dos.library/
+   utility.library functions with their base in A3/A4 directly, relying
+   on volamos's trap dispatcher resolving purely from where a `jsr`
+   physically lands rather than any "current A6" notion -- that worked
+   under volamos, but crashed on real Kickstart: real utility.library's
+   GetTagData (confirmed via Copperline against a real ROM) internally
+   depends on A6 holding its own base for a nested call of its own.
 
 2. (a) exec.library via A6 = EXEC_LIBRARY_BASE:
    - AllocMem(64, MEMF_CLEAR) -> D0; fail (exit 1) if NULL. Read the
@@ -162,16 +170,17 @@ def build_program() -> bytes:
     code.branch(CodeBuilder.BEQ, "err4")
     code.move_l_d_to_a(A4, D0)  # A4 = utility.library base
 
+    code.move_l_a_to_a(A6, A4)  # A6 = utility.library base for these calls
     code.move_l_label_to_a(A0, "str_upper")
     code.move_l_label_to_a(A1, "str_lower")
-    code.jsr_disp16_a(A4, LVO_STRICMP)  # Stricmp("AMIGA","amiga") -> D0 (expect 0)
+    code.jsr_disp16_a(A6, LVO_STRICMP)  # Stricmp("AMIGA","amiga") -> D0 (expect 0)
     code.tst_l_d(D0)
     code.branch(CodeBuilder.BNE, "err5")
 
     code.move_l_label_to_a(A0, "taglist")
     code.moveq(D0, TAG_VAL)
     code.move_l_imm_to_d(D1, 0xDEAD)  # default -- shouldn't be returned
-    code.jsr_disp16_a(A4, LVO_GETTAGDATA)  # GetTagData -> D0 (expect 7)
+    code.jsr_disp16_a(A6, LVO_GETTAGDATA)  # GetTagData -> D0 (expect 7)
     code.subq_l_imm_d(D0, TAG_PLANTED_VALUE)
     code.tst_l_d(D0)
     code.branch(CodeBuilder.BNE, "err6")
@@ -179,9 +188,11 @@ def build_program() -> bytes:
     code.move_l_label_to_a(A0, "str_a")
     code.move_l_label_to_a(A1, "str_b")
     code.moveq(D0, 6)
-    code.jsr_disp16_a(A4, LVO_STRNICMP)  # Strnicmp("HELLO1","HELLO2",6) -> D0 (expect != 0)
+    code.jsr_disp16_a(A6, LVO_STRNICMP)  # Strnicmp("HELLO1","HELLO2",6) -> D0 (expect != 0)
     code.tst_l_d(D0)
     code.branch(CodeBuilder.BEQ, "err7")
+
+    code.move_l_abs4_to_a(A6)  # A6 = ExecBase again for step (c)
 
     # --- (c) exec.library task/signal + dos.library CheckSignal ---
     code.move_l_imm_to_a(A1, 0)
@@ -197,8 +208,9 @@ def build_program() -> bytes:
     code.moveq(D1, 32)
     code.jsr_disp16_a(A6, LVO_SETSIGNAL)  # SetSignal(1<<5,1<<5) -- sets bit 5
 
+    code.move_l_a_to_a(A6, A3)  # A6 = dos.library base for CheckSignal
     code.moveq(D1, 32)
-    code.jsr_disp16_a(A3, LVO_CHECKSIGNAL)  # dos CheckSignal(1<<5) -> D0
+    code.jsr_disp16_a(A6, LVO_CHECKSIGNAL)  # dos CheckSignal(1<<5) -> D0
     code.move_l_d_to_d(D2, D0)
     code.moveq(D1, 32)
     code.sub_l_d_from_d(D2, D1)  # D2 = D0 - 32
@@ -206,15 +218,21 @@ def build_program() -> bytes:
     code.branch(CodeBuilder.BNE, "err9")
 
     # --- (d) success ---
+    # A6 is already dos.library's base from the CheckSignal swap above.
     code.move_l_label_to_d(D1, "okmsg")
-    code.jsr_disp16_a(A3, LVO_PUTSTR)  # PutStr("exec ok\n") via dos.library
+    code.jsr_disp16_a(A6, LVO_PUTSTR)  # PutStr("exec ok\n") via dos.library
     code.moveq(D0, 0)
     code.rts()
 
+    # Every error exit below can be reached with A6 holding ExecBase,
+    # utility.library's base, or dos.library's base, depending which
+    # check failed -- always swap to dos.library's base (A3) before
+    # PutStr, matching real AmigaOS's calling convention.
     for exit_code in range(1, 10):
         code.label(f"err{exit_code}")
+        code.move_l_a_to_a(A6, A3)
         code.move_l_label_to_d(D1, "errmsg")
-        code.jsr_disp16_a(A3, LVO_PUTSTR)  # PutStr("ERR\n")
+        code.jsr_disp16_a(A6, LVO_PUTSTR)  # PutStr("ERR\n")
         code.moveq(D0, exit_code)
         code.rts()
 
