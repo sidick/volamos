@@ -25,7 +25,11 @@ This README stays a shorter overview.
 volamos targets macOS and Linux equally. Headless and CI use (e.g. running
 an original Amiga toolchain as part of a build) is a first-class use case,
 not an afterthought — there's no dependency on a display, windowing
-system, or any Amiga hardware.
+system, or any Amiga hardware. A Windows build compiles cleanly too
+(cross-compile confirmed to `x86_64-pc-windows-gnu`, see
+[`userdocs/Building-from-Source.md`](userdocs/Building-from-Source.md#cross-platform-notes)),
+though it isn't CI-tested and running it under Windows/Wine hasn't been
+verified.
 
 ## Building
 

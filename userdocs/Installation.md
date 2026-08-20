@@ -2,12 +2,13 @@
 
 ## Requirements
 
-- **macOS or Linux.** These are the two officially supported host
-  platforms — see [the index page](index.md). volamos is pure Rust with
-  no platform-specific dependencies beyond a `SIGINT`/`SIGTERM` handler
-  that's already conditionally compiled out on non-Unix targets, so a
-  Windows build is likely to work too, but it hasn't been tried or
-  tested.
+- **macOS or Linux.** These are the two officially supported and
+  CI-tested host platforms — see [the index page](index.md). A Windows
+  build is possible too — `cargo build --release` cross-compiles
+  cleanly to a real Windows executable (see
+  [Building from Source](Building-from-Source.md#cross-platform-notes))
+  — but running it under Windows/Wine hasn't been verified, so treat
+  it as untested at runtime even though the build itself works.
 - **A recent stable Rust toolchain** (edition 2024 support) to build
   it — see [Building from Source](Building-from-Source.md). volamos
   has not yet had a tagged release, so building from source is

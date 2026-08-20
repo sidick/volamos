@@ -62,9 +62,42 @@ mkdocs serve
 volamos is pure Rust with no platform-specific dependencies beyond a
 `SIGINT`/`SIGTERM` -> guest-signal handler that's already conditionally
 compiled out on non-Unix targets (`#[cfg(unix)]`, with a documented
-no-op fallback elsewhere) — a Windows build is likely to compile and
-run, but it hasn't been tried or tested; macOS and Linux are the two
-officially supported and CI-tested platforms.
+no-op fallback elsewhere). macOS and Linux are the two officially
+supported and CI-tested platforms; Windows isn't CI-tested, but the
+build itself is confirmed real — `cargo build --release` cross-compiled
+cleanly to `x86_64-pc-windows-gnu` and produced a genuine Windows PE32+
+executable. Running it under Windows/Wine hasn't been verified, so
+treat a Windows build as untested at runtime even though it compiles.
+
+### Building on Windows directly
+
+```sh
+cargo build --release
+```
+
+produces `target\release\volamos.exe`, same as any other platform —
+no Windows-specific setup beyond a working Rust toolchain (MSVC or GNU)
+via [rustup](https://rustup.rs).
+
+### Cross-compiling for Windows from macOS or Linux
+
+Without a Windows machine, the GNU target cross-compiles cleanly using
+[mingw-w64](https://www.mingw-w64.org/) as the linker (the MSVC target,
+`x86_64-pc-windows-msvc`, needs the real MSVC linker and can't be
+cross-compiled from macOS/Linux):
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+
+# macOS (Homebrew):
+brew install mingw-w64
+# Debian/Ubuntu:
+sudo apt install mingw-w64
+
+cargo build --release --target x86_64-pc-windows-gnu -p volamos
+```
+
+produces `target/x86_64-pc-windows-gnu/release/volamos.exe`.
 
 ## Project structure
 

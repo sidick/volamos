@@ -3517,3 +3517,21 @@ survive) -- now `PASS`es across all three engines. Re-ran
 didn't regress anything else -- still clean (only issue #6's own
 tracked `exectest` divergence remains). Full `cargo build/test (540,
 up from 537)/clippy -D warnings/fmt --check` clean.
+
+## Windows build confirmed (docs only, not a code change) — 2026-08-20
+
+Simon asked for Windows build docs; rather than repeat the earlier
+"likely works, never tried" hedge, actually tried it. `rustup target
+add x86_64-pc-windows-gnu` + `brew install mingw-w64` (the MSVC target
+needs the real MSVC linker and can't cross-compile from macOS/Linux;
+the GNU target's linker is just `mingw-w64`) + `cargo build --release
+--target x86_64-pc-windows-gnu -p volamos` compiled cleanly and
+produced a genuine `PE32+ executable (console) x86-64 ... for MS
+Windows` (`file` confirms). Did **not** verify runtime behavior --
+declined to install Wine for this (Simon's call, respected) -- so a
+Windows build is now confirmed real at compile time, still unverified
+at runtime. Documented honestly as such (not overclaiming "it works")
+in `userdocs/Building-from-Source.md`'s "Cross-platform notes" (now
+with real, copy-pasteable native-Windows and cross-compile recipes),
+`userdocs/Installation.md`, and `README.md`'s "Platform support".
+`mkdocs build --strict` re-verified clean.
