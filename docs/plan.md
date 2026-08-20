@@ -3535,3 +3535,15 @@ in `userdocs/Building-from-Source.md`'s "Cross-platform notes" (now
 with real, copy-pasteable native-Windows and cross-compile recipes),
 `userdocs/Installation.md`, and `README.md`'s "Platform support".
 `mkdocs build --strict` re-verified clean.
+
+## `m68k` crate bumped to `=0.11.0` (renovate) — 2026-08-20
+
+The pre-1.0-churn risk the earlier dated notes above flagged finally
+materialized: `renovate[bot]` opened and merged #11 bumping the exact
+pin from `=0.10.14` to `=0.11.0` (a pre-1.0 minor bump, conventionally
+treated as potentially breaking). Verified rather than trusted blindly:
+`cargo build/test/clippy -D warnings/fmt --check` all clean locally (540
+tests, unchanged pass count -- no source changes needed at all), and
+the full CI run for the merge commit (both `test` matrix legs, the
+`compare` two-oracle harness, `docs-build`) also green. No API break
+surfaced for anything this runtime actually uses from the crate.
