@@ -771,6 +771,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Cross-platform notes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#building-on-windows-directly" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building on Windows directly
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cross-compiling-for-windows-from-macos-or-linux" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-compiling for Windows from macOS or Linux
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -907,6 +935,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Cross-platform notes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#building-on-windows-directly" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building on Windows directly
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cross-compiling-for-windows-from-macos-or-linux" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-compiling for Windows from macOS or Linux
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -985,9 +1041,33 @@ mkdocs<span class="w"> </span>serve
 <p>volamos is pure Rust with no platform-specific dependencies beyond a
 <code>SIGINT</code>/<code>SIGTERM</code> -&gt; guest-signal handler that's already conditionally
 compiled out on non-Unix targets (<code>#[cfg(unix)]</code>, with a documented
-no-op fallback elsewhere) — a Windows build is likely to compile and
-run, but it hasn't been tried or tested; macOS and Linux are the two
-officially supported and CI-tested platforms.</p>
+no-op fallback elsewhere). macOS and Linux are the two officially
+supported and CI-tested platforms; Windows isn't CI-tested, but the
+build itself is confirmed real — <code>cargo build --release</code> cross-compiled
+cleanly to <code>x86_64-pc-windows-gnu</code> and produced a genuine Windows PE32+
+executable. Running it under Windows/Wine hasn't been verified, so
+treat a Windows build as untested at runtime even though it compiles.</p>
+<h3 id="building-on-windows-directly">Building on Windows directly<a class="headerlink" href="#building-on-windows-directly" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>cargo<span class="w"> </span>build<span class="w"> </span>--release
+</code></pre></div>
+<p>produces <code>target\release\volamos.exe</code>, same as any other platform —
+no Windows-specific setup beyond a working Rust toolchain (MSVC or GNU)
+via <a href="https://rustup.rs">rustup</a>.</p>
+<h3 id="cross-compiling-for-windows-from-macos-or-linux">Cross-compiling for Windows from macOS or Linux<a class="headerlink" href="#cross-compiling-for-windows-from-macos-or-linux" title="Permanent link">&para;</a></h3>
+<p>Without a Windows machine, the GNU target cross-compiles cleanly using
+<a href="https://www.mingw-w64.org/">mingw-w64</a> as the linker (the MSVC target,
+<code>x86_64-pc-windows-msvc</code>, needs the real MSVC linker and can't be
+cross-compiled from macOS/Linux):</p>
+<div class="highlight"><pre><span></span><code>rustup<span class="w"> </span>target<span class="w"> </span>add<span class="w"> </span>x86_64-pc-windows-gnu
+
+<span class="c1"># macOS (Homebrew):</span>
+brew<span class="w"> </span>install<span class="w"> </span>mingw-w64
+<span class="c1"># Debian/Ubuntu:</span>
+sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>mingw-w64
+
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--target<span class="w"> </span>x86_64-pc-windows-gnu<span class="w"> </span>-p<span class="w"> </span>volamos
+</code></pre></div>
+<p>produces <code>target/x86_64-pc-windows-gnu/release/volamos.exe</code>.</p>
 <h2 id="project-structure">Project structure<a class="headerlink" href="#project-structure" title="Permanent link">&para;</a></h2>
 <ul>
 <li><code>crates/volamos-core</code> — library crate: the CPU/memory abstractions
