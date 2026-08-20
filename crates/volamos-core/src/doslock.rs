@@ -479,9 +479,16 @@ impl DosState {
     /// path (`lock == 0` restores the initial current directory -- see
     /// the module docs), returning the *previous* current-dir lock's
     /// `BPTR` (`0` if there wasn't one yet). Fails with
-    /// [`ERROR_INVALID_LOCK`] if `addr != 0` isn't a currently-open lock,
-    /// or if it's a lock on a file rather than a directory
-    /// ([`ERROR_OBJECT_WRONG_TYPE`]).
+    /// [`ERROR_INVALID_LOCK`] if `addr != 0` isn't a currently-open
+    /// lock. Real AmigaDOS accepts a lock on a *file*, not just a
+    /// directory, here -- confirmed via the AmigaDOS Manual's own
+    /// `CurrentDir(lock); Open("", MODE_OLDFILE)` idiom, which it
+    /// documents as relying on this exact case ("the empty string
+    /// describing the object locked by the current directory ..., even
+    /// if this locked object turns out to be a file"). See
+    /// [`crate::vfs::Vfs::resolve_with_amiga_path`]'s matching special
+    /// case for how a subsequent relative lookup against such a cwd
+    /// resolves back to that same file.
     pub fn current_dir(&mut self, addr: u32) -> Result<u32, i32> {
         if self.vfs.is_none() {
             return Err(crate::dosfile::ERROR_OBJECT_NOT_FOUND);
@@ -494,9 +501,6 @@ impl DosState {
             self.initial_cwd.clone().expect("just set above")
         } else {
             let entry = self.locks.get(&addr).ok_or(ERROR_INVALID_LOCK)?;
-            if !entry.host_path.is_dir() {
-                return Err(ERROR_OBJECT_WRONG_TYPE);
-            }
             entry.amiga_path.clone()
         };
 
@@ -1531,6 +1535,37 @@ mod tests {
             dos.lock(&mut heap, &mut mem, "inner.txt", SHARED_LOCK)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn current_dir_accepts_a_file_lock_and_relative_open_resolves_to_it() {
+        // Real AmigaDOS's own documented idiom (CurrentDir(lock);
+        // Open("", MODE_OLDFILE)) explicitly relies on CurrentDir
+        // accepting a lock on a plain file, not just a directory --
+        // confirmed against real Kickstart 3.1 for the exact real-world
+        // trigger this test mirrors: MatchFirst locks a non-wildcard
+        // target directly (the file itself), CurrentDir's into it, then
+        // a real C: command (Type) opens the bare matched name relative
+        // to that. See docs/plan.md's issue #10 writeup.
+        let tmp = TempDir::new("currentdirfile");
+        fs::create_dir(tmp.path().join("C")).unwrap();
+        fs::write(tmp.path().join("C/Assign"), b"binary content").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let file_bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:C/Assign", SHARED_LOCK)
+            .expect("lock the file directly, matching MatchFirst's non-wildcard case");
+        let file_addr = addr_from_bptr(file_bptr);
+
+        dos.current_dir(file_addr)
+            .expect("CurrentDir must accept a lock on a file, not just a directory");
+
+        let relative_bptr = dos
+            .lock(&mut heap, &mut mem, "Assign", SHARED_LOCK)
+            .expect("relative lookup against a file cwd should resolve to that same file");
+        assert_ne!(relative_bptr, 0);
     }
 
     // --- End-to-end tests through Runtime, mirroring dosfile.rs's style ---

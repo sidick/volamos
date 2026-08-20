@@ -3458,3 +3458,62 @@ substitutes `Today`, and the entry now genuinely `PASS`es
 (byte-identical) instead of needing `KNOWN_DIVERGENCES` tracking.
 `KNOWN_DIVERGENCES` is empty again. Issue #9 closed with the full
 writeup rather than left open as a real bug.
+
+## Issue #10 fixed: CurrentDir must accept a lock on a file — 2026-08-20
+
+Learned #9's lesson first: before assuming this was a real volamos
+bug, checked it against real Kickstart 3.1 (40.68) via Copperline.
+`Type SYS:C/Assign` succeeds there -- confirming this genuinely is a
+volamos gap, not another misdiagnosis.
+
+Root cause, two related pieces:
+
+1. `crates/volamos-core/src/dosanchor.rs`'s `MatchFirst` non-wildcard
+   case locks the matched object *itself* directly (`dos.lock(heap,
+   mem, &pat_str, SHARED_LOCK)`) -- for `"SYS:C/Assign"`, a lock on the
+   *file*, not its parent directory. Already correct, documented real
+   `MatchFirst` behavior -- not what needed fixing.
+2. `crates/volamos-core/src/doslock.rs`'s `current_dir()` rejected any
+   non-directory lock with `ERROR_OBJECT_WRONG_TYPE`. But the AmigaDOS
+   Manual explicitly documents `CurrentDir(lock)` accepting a lock on a
+   plain *file* -- the idiom `CurrentDir(lock); Open("",
+   MODE_OLDFILE)`, which it says "depends on the empty string
+   describing the object locked by the current directory ..., even if
+   this locked object turns out to be a file. This is a feature every
+   AmigaDOS file system supports." Real `Type` goes one step further
+   and passes the matched object's own bare name (not `""`) rather than
+   empty string -- works for the same underlying reason: a plain file
+   has nothing to search "inside" it, so a real filesystem's
+   relative-lookup packet just returns the locked object itself
+   regardless of what relative name was actually asked for.
+
+Fix, two parts:
+- `doslock.rs`'s `current_dir()` no longer rejects a file lock (removed
+  the `is_dir()` check entirely).
+- `vfs.rs`'s `resolve_with_amiga_path` gained the matching special
+  case: for a truly relative path (`parsed.volume.is_none()` -- a bare
+  `:` is deliberately excluded, since that always means "root of the
+  current volume" regardless of cwd's directory-ness) whose cwd doesn't
+  currently resolve to a directory, resolution short-circuits straight
+  to the cwd's own resolution rather than trying to append the relative
+  name onto a non-directory base (which could only ever fail -- there's
+  nothing to descend into).
+
+**Verification**: new unit tests --
+`relative_lookup_against_a_file_cwd_resolves_to_that_same_file` and
+`relative_lookup_against_a_bare_colon_ignores_a_file_cwd` (`vfs.rs`),
+`current_dir_accepts_a_file_lock_and_relative_open_resolves_to_it`
+(`doslock.rs`, exercising the exact real-world lock→CurrentDir→relative-
+Open sequence). Verified against real Kickstart via Copperline: `Type
+SYS:C/Assign`'s output is now **byte-for-byte identical** to real
+hardware (confirmed via a direct diff, not just "both succeeded").
+Added `type-s-shell-startup` to `tools/compare_three_way.py`'s corpus
+as a permanent regression guard (a real text file, not the binary
+`Assign` -- the harness's own Copperline output capture reads the
+result as text, which a binary executable's raw bytes wouldn't
+survive) -- now `PASS`es across all three engines. Re-ran
+`compare_vamos.py` against the full existing fixture corpus (inside
+`ghcr.io/sidick/amiga-dev:1`) to confirm this core `vfs.rs` change
+didn't regress anything else -- still clean (only issue #6's own
+tracked `exectest` divergence remains). Full `cargo build/test (540,
+up from 537)/clippy -D warnings/fmt --check` clean.

@@ -136,6 +136,16 @@ ALL_ENGINES = frozenset({"volamos", "vamos", "copperline"})
 # corpus followed.
 CORPUS = [
     ("list-c", "List SYS:C", normalize_list, frozenset({"volamos", "copperline"})),
+    # Regression guard for issue #10 (MatchFirst+CurrentDir+relative-Open
+    # composition): Type of a nested-path file -- a real text file
+    # (S/Shell-Startup), deliberately not a binary one, since this
+    # script's Copperline output capture reads the result file as text
+    # (Path.read_text(), strict UTF-8) for its line-based RC/completion-
+    # marker stripping, which a binary executable's raw bytes wouldn't
+    # survive. Content is unaffected by the .uaem/date issues that scope
+    # other entries down to volamos-vs-copperline -- all three engines
+    # are meaningful here.
+    ("type-s-shell-startup", "Type SYS:S/Shell-Startup", lambda s: s, ALL_ENGINES),
 ]
 
 

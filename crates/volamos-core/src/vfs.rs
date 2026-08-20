@@ -368,6 +368,37 @@ impl Vfs {
         mode: ResolveMode,
     ) -> Result<Resolved, VfsError> {
         let parsed = parse_path(amiga_path)?;
+
+        // Real AmigaDOS: `CurrentDir()` accepts a lock on a plain file,
+        // not just a directory (the AmigaDOS Manual's own worked
+        // example: `CurrentDir(lock); Open("", MODE_OLDFILE)` "depends
+        // on the empty string describing the object locked by the
+        // current directory of the calling process, even if this
+        // locked object turns out to be a file" -- a feature every
+        // AmigaDOS filesystem supports). Real `C:` commands (e.g.
+        // `Type`) go further and pass the matched object's own bare
+        // name rather than `""`, which still works for the same reason:
+        // a plain file has nothing to search "inside" it, so a real
+        // filesystem's relative-lookup packet just returns the
+        // locked/current-dir object itself regardless of what relative
+        // name was asked for. `amiga_path` here has no volume prefix at
+        // all (`parsed.volume.is_none()` -- a bare `:` is excluded,
+        // since that always means "root of the current volume",
+        // unaffected by the cwd's own directory-ness) -- if the cwd
+        // itself doesn't currently resolve to a directory, short-circuit
+        // straight to it rather than trying to append `amiga_path`'s
+        // own components onto a non-directory base, which can only ever
+        // fail. `MustExist` only: `ParentMustExist` (creating a new file
+        // "inside" a file-cwd) isn't a real scenario this needs to
+        // support yet.
+        if parsed.volume.is_none() && mode == ResolveMode::MustExist {
+            let cwd_resolved =
+                self.resolve_with_amiga_path(&self.config.cwd, ResolveMode::MustExist)?;
+            if !cwd_resolved.host_path.is_dir() {
+                return Ok(cwd_resolved);
+            }
+        }
+
         let vol_name = self.leading_name(&parsed, amiga_path)?;
         let components = self.effective_components(&parsed)?;
         let targets = self.assign_targets(&vol_name, 0)?;
@@ -827,6 +858,44 @@ mod tests {
             .resolve("SYS:work/foo.txt", ResolveMode::MustExist)
             .unwrap();
         assert_eq!(resolved, tmp.path().join("work/foo.txt"));
+    }
+
+    #[test]
+    fn relative_lookup_against_a_file_cwd_resolves_to_that_same_file() {
+        // Real AmigaDOS: CurrentDir() accepts a lock on a plain file
+        // (crate::doslock's current_dir doc), and a subsequent relative
+        // lookup -- for *any* relative name, not just "" -- resolves
+        // back to that same file (there's nothing to search "inside"
+        // it). Confirmed against real Kickstart 3.1 (Type of a
+        // nested-path file), see docs/plan.md's issue #10 writeup.
+        let tmp = TempDir::new("filecwd");
+        tmp.mkdir("C");
+        tmp.touch("C/Assign");
+        let mut vfs = simple_vfs(tmp.path());
+        vfs.set_cwd("SYS:C/Assign").unwrap();
+
+        let resolved = vfs.resolve("Assign", ResolveMode::MustExist).unwrap();
+        assert_eq!(resolved, tmp.path().join("C/Assign"));
+
+        // Any relative name works, not just a match on the file's own
+        // name -- the filesystem-level rule doesn't inspect it at all.
+        let resolved = vfs.resolve("WhateverName", ResolveMode::MustExist).unwrap();
+        assert_eq!(resolved, tmp.path().join("C/Assign"));
+    }
+
+    #[test]
+    fn relative_lookup_against_a_bare_colon_ignores_a_file_cwd() {
+        // A bare leading ':' always means "root of the current volume",
+        // regardless of the cwd's own directory-ness -- the file-cwd
+        // special case must not swallow this.
+        let tmp = TempDir::new("filecwdcolon");
+        tmp.mkdir("C");
+        tmp.touch("C/Assign");
+        let mut vfs = simple_vfs(tmp.path());
+        vfs.set_cwd("SYS:C/Assign").unwrap();
+
+        let resolved = vfs.resolve(":C/Assign", ResolveMode::MustExist).unwrap();
+        assert_eq!(resolved, tmp.path().join("C/Assign"));
     }
 
     #[test]
