@@ -82,14 +82,26 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Seeds Copperline's battery clock (--rtc-time; "implies fitting one" per
+# its own --help) to a fixed, deterministic date far from the AmigaOS
+# epoch (1-Jan-78) -- see issue #9's writeup (closed as not-a-bug): with
+# no RTC fitted, Copperline's guest clock defaults to the same 1-Jan-78
+# epoch this corpus's own .uaem sidecars are dated, so real AmigaDOS
+# commands that substitute "Today"/"Yesterday" for a matching date (e.g.
+# List) do so correctly -- while volamos's DateStamp() always uses the
+# real host clock (crates/volamos-core/src/dosdate.rs, no override
+# exists), which is essentially never 1-Jan-78. Neither side had a real
+# bug; they just disagreed about "now". Seeding Copperline's RTC to any
+# fixed date that isn't 1-Jan-78 makes both sides' "now" differ from the
+# corpus's stored date, so neither substitutes "Today" -- resolving the
+# divergence at the source rather than tracking it as KNOWN forever. The
+# exact seed value doesn't matter (any non-1978, non-today date works
+# just as well); this one has no other significance.
+RTC_SEED = "2025-01-01 00:00:00"
+
 # fixture (corpus-entry) name -> (reason, issue URL) -- same convention
 # as compare_vamos.py's KNOWN_DIVERGENCES.
-KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
-    "list-c": (
-        "List doesn't do AmigaDOS's Today/Yesterday relative-date substitution",
-        "https://github.com/sidick/volamos/issues/9",
-    ),
-}
+KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {}
 
 
 def normalize_list(stdout: str) -> str:
@@ -195,6 +207,8 @@ def run_copperline(
                 ":0",
                 "--control-info",
                 str(info_path),
+                "--rtc-time",
+                RTC_SEED,
                 "--noaudio",
                 "--windowed",
             ],

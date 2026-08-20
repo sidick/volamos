@@ -3426,3 +3426,35 @@ Copperline processes after a run (the `finally: proc.kill()` cleanup
 path). Corpus intentionally stays at one entry for now -- `Type`'s
 addition is blocked on #10, and `Version`/`Avail`/`Date` need their
 own configuration-alignment work first (noted inline in the script).
+
+## Issue #9 closed: not a bug, a "now" mismatch — 2026-08-20
+
+Investigated properly rather than implementing a fix for what turned
+out not to be a defect. `List` isn't something volamos implements (the
+real Hyperion binary's own machine code), and its `Today`/`Yesterday`
+logic already works correctly everywhere it runs. Confirmed by direct
+test (a file created seconds earlier still reports `01-Jan-78` under
+volamos, exactly as `doslock.rs`'s `fill_fib` documents -- sidecar date
+if present, else a fixed AmigaOS-epoch default, deliberately not host
+mtime, per `dosmeta.rs`'s own non-determinism reasoning):
+`crates/volamos-core/src/dosdate.rs`'s `DateStamp()` always uses the
+real host clock (no override exists), while Copperline with no RTC
+fitted (the default) boots at the same `01-Jan-78` epoch this corpus's
+`.uaem` sidecars happen to be dated -- so each side's "now" genuinely
+differs, and each side's `Today`/literal-date choice is correct
+relative to its own clock.
+
+Real fix was in the *harness*, not volamos: Copperline's `--rtc-time`
+(confirmed via its docs -- "implies fitting" the battery clock, Unix
+seconds or `"YYYY-MM-DD HH:MM[:SS]"`, deterministic/seeded rather than
+host-mirroring, exactly the "freeze/fix virtual time" idea Phase 4's
+own design notes already anticipated wanting) seeds the guest clock to
+a fixed date far from 1978. `tools/compare_three_way.py`'s
+`run_copperline` now always passes `--rtc-time` (a new `RTC_SEED`
+module constant, `"2025-01-01 00:00:00"`, arbitrary beyond "not
+1978"). With that, `list-c`'s divergence disappears at the source --
+neither side's "now" matches the corpus's stored date, so neither
+substitutes `Today`, and the entry now genuinely `PASS`es
+(byte-identical) instead of needing `KNOWN_DIVERGENCES` tracking.
+`KNOWN_DIVERGENCES` is empty again. Issue #9 closed with the full
+writeup rather than left open as a real bug.
