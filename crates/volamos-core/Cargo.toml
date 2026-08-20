@@ -8,4 +8,4 @@ authors.workspace = true
 description = "Core library for volamos: CPU/memory abstractions and AmigaOS library emulation"
 
 [dependencies]
-m68k = "=0.10.14"
+m68k = "=0.11.0"
