@@ -32,7 +32,18 @@
 ;   OpenFunc     -- increments lib_OpenCnt (a real library's own job, not
 ;                    volamos's -- library-device-loading-plan.md §2.4) and
 ;                    returns A6 (the base) in D0.
-;   CloseFunc/ExpungeFunc/ReservedFunc -- trivial, return 0.
+;   CloseFunc    -- the real delayed-expunge idiom (RKRM ch. 18 / plan
+;                    §2.4, phase L4): decrements lib_OpenCnt; if still
+;                    non-zero, returns 0 (still resident -- other opens
+;                    remain); if it just hit zero, returns the segList
+;                    BPTR InitFunc stored at SEGLIST_MARKER_OFFSET, the
+;                    documented signal that tells exec's CloseLibrary to
+;                    unload this library now. Exercises execlib.rs's
+;                    finish_close end to end.
+;   ExpungeFunc/ReservedFunc -- trivial, return 0 (never called by
+;                    anything this fixture's tests do -- CloseFunc handles
+;                    the expunge signalling itself, real exec never calls
+;                    EXPUNGE on this path).
 ;   UserFunc     -- the first user vector (LVO -30): `moveq #42,d0 ; rts`,
 ;                    executed *natively* by the CPU backend once called --
 ;                    no host dispatch at all, the whole architectural
@@ -112,6 +123,23 @@ OpenFunc:
         rts
 
 CloseFunc:
+        subq.w  #1,LIB_OPENCNT_OFFSET(a6)
+        bne.w   CloseStillOpen           ; .w forces vasm's long (16-bit
+                                          ; displacement) branch encoding --
+                                          ; matches gen_testlib.py's
+                                          ; CodeBuilder.branch(), which
+                                          ; always emits that form (see
+                                          ; amiga_asm.py's own comment on
+                                          ; the word-form branch opcode
+                                          ; bases); without the suffix vasm
+                                          ; auto-shortens this particular
+                                          ; branch to its 1-word short form
+                                          ; since the displacement fits,
+                                          ; which would desync the two
+                                          ; builds' byte layout.
+        move.l  SEGLIST_MARKER_OFFSET(a6),d0   ; last close: hand back the
+        rts                                     ; segList InitFunc stored
+CloseStillOpen:
         moveq   #0,d0
         rts
 

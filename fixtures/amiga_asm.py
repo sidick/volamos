@@ -348,12 +348,34 @@ class CodeBuilder:
         self.word(0x3028 | (dn << 9) | an)
         self.word(disp & 0xFFFF)
 
+    def move_l_disp_a_to_d(self, an: int, disp: int, dn: int) -> None:
+        """`move.l <disp16>(An),Dn` -- src=d16(An), dest=Dn direct; same
+        shape as [`move_w_disp_a_to_d`] with the long-size base (`0x2000`,
+        matching every other long MOVE helper above) instead of the
+        word-size base (`0x3000`). Added for `fixtures/testlib.s`'s real
+        `CloseFunc` (phase L4): loading the stored segList BPTR
+        (`SEGLIST_MARKER_OFFSET(a6)`) into D0 on the last close."""
+        self.word(0x2028 | (dn << 9) | an)
+        self.word(disp & 0xFFFF)
+
     def addq_w_disp_a(self, an: int, disp: int, imm: int) -> None:
         """`addq.w #imm,<disp16>(An)` (`1 <= imm <= 8`, encoded as `imm %
         8`; dest addressing mode d16(An) = 101)."""
         assert 1 <= imm <= 8
         q = imm % 8
         self.word(0x5068 | (q << 9) | an)  # size=word(01)<<6=0x40, mode=d16(An)(101)<<3=0x28
+        self.word(disp & 0xFFFF)
+
+    def subq_w_disp_a(self, an: int, disp: int, imm: int) -> None:
+        """`subq.w #imm,<disp16>(An)` (`1 <= imm <= 8`, encoded as `imm %
+        8`) -- same ADDQ/SUBQ family as [`addq_w_disp_a`], just with the
+        S bit (bit 8) set to select SUBQ instead of ADDQ (M68000 PRM,
+        ADDQ/SUBQ): `0x5068 | 0x0100 == 0x5168`. Added for
+        `fixtures/testlib.s`'s real `CloseFunc` (phase L4), which
+        decrements `lib_OpenCnt` in place before checking it."""
+        assert 1 <= imm <= 8
+        q = imm % 8
+        self.word(0x5168 | (q << 9) | an)
         self.word(disp & 0xFFFF)
 
     def cmpi_b_imm_to_d(self, dn: int, imm: int) -> None:

@@ -114,7 +114,9 @@ def build_program() -> bytes:
     code.move_l_label_to_d(D1, "cntoktxt")
     code.jsr_disp16_a(A6, LVO_PUTSTR)
 
-    # close both opens (forward-compatible no-op today, see libcall.s)
+    # close both opens -- now (phase L4) genuinely runs test.library's own
+    # Close vector twice, the second one triggering a real delayed
+    # expunge; see libcall.s's header comment
     code.move_l_a_to_a(A6, A5)
     code.move_l_a_to_a(A1, A3)
     code.jsr_disp16_a(A6, LVO_CLOSELIBRARY)

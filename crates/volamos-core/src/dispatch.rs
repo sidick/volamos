@@ -1123,6 +1123,38 @@ impl LibraryRegistry {
         self.loaded.get(name)
     }
 
+    /// Reverse lookup of a [`LibraryKind::Loaded`] library's name by its
+    /// base address (`library-device-loading-plan.md` §2.4, L4):
+    /// `CloseLibrary`'s only argument is a base (`A1`), not a name, so
+    /// [`crate::dispatch::close_library_handler`] needs this to decide
+    /// whether a given base belongs to a genuinely loaded library at all
+    /// (as opposed to a [`LibraryKind::Real`]/[`LibraryKind::Faked`] base,
+    /// which stays a no-op) before handing off to
+    /// [`crate::execlib::begin_close`]. A plain linear scan over `loaded`
+    /// -- kept minimal per the plan's brief, since this map holds at most
+    /// a handful of entries (the libraries a given run has actually
+    /// disk-loaded), not a hot path worth indexing by base.
+    pub fn loaded_library_by_base(&self, base: u32) -> Option<&str> {
+        self.loaded
+            .iter()
+            .find(|(_, l)| l.base == base)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Removes a [`LibraryKind::Loaded`] library's registry entries
+    /// entirely -- both `known` (so a later `OpenLibrary` of the same name
+    /// finds nothing and triggers a completely fresh disk load, rather
+    /// than resolving to a stale cached base) and `loaded` (its
+    /// bookkeeping is meaningless once the library is expunged). Called
+    /// from [`crate::execlib`]'s `CloseLibrary` delayed-expunge path
+    /// (`library-device-loading-plan.md` §2.4) once the library's own
+    /// Close vector has signalled (by returning a non-`NULL` segList) that
+    /// this was the last close.
+    pub fn unregister_loaded(&mut self, name: &str) {
+        self.known.remove(name);
+        self.loaded.remove(name);
+    }
+
     /// Given the guest address a trapped call landed at, finds the fake
     /// library (if any) whose jump-table block contains it, returning
     /// its name and the LVO offset (`pc - base`, always `<= 0`) within
@@ -1481,12 +1513,33 @@ fn open_library_common<C: Cpu>(
 }
 
 /// `exec.library`'s `CloseLibrary` handler (LVO -414): `A1` = library
-/// base. A no-op -- this runtime doesn't refcount library opens/closes,
-/// and real `CloseLibrary` only returns a meaningful (non-`NULL`) `D0`
-/// (a `BPTR` segList) when the close actually expunges the library from
-/// memory, which never applies to anything faked or fixed-address here.
-fn close_library_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    Ok(())
+/// base. Real `CloseLibrary` tolerates a `NULL` base (`exec.doc`'s
+/// `CloseLibrary` autodoc doesn't special-case it, but every real caller
+/// does -- and RKRM's own sample idiom is `if (lib) CloseLibrary(lib)`,
+/// so a stray unconditional call is common enough to be worth not
+/// crashing on) -- stays a no-op for that case, same as before this
+/// phase.
+///
+/// For anything else: [`LibraryKind::Real`]/[`LibraryKind::Faked`] bases
+/// (this runtime's own emulated libraries, and vamos-style auto-created
+/// stubs) also stay a no-op -- neither is backed by a real Close vector,
+/// and this runtime doesn't refcount their opens. Only a
+/// [`LibraryKind::Loaded`] base (found via
+/// [`LibraryRegistry::loaded_library_by_base`]) gets the real protocol
+/// (`library-device-loading-plan.md` §2.4): [`crate::execlib::
+/// begin_close`] trampolines into the library's own Close vector and
+/// interprets its result (stay resident, or a delayed-expunge segList to
+/// unload).
+fn close_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let base = ctx.cpu.address_register(AddressRegister(1));
+    if base == 0 {
+        return Ok(());
+    }
+    let Some(name) = ctx.registry.loaded_library_by_base(base) else {
+        return Ok(());
+    };
+    let name = name.to_string();
+    crate::execlib::begin_close(ctx, &name, base)
 }
 
 /// The shared handler bound to [`FAKE_LIB_SLOT`]: every vector of every
@@ -3209,6 +3262,84 @@ mod tests {
             .run(&mut out, None)
             .expect("CloseLibrary should be a no-op, not error");
         assert_eq!(code, 0);
+    }
+
+    /// L4: `CloseLibrary(NULL)` must stay a safe no-op -- real
+    /// `CloseLibrary` tolerates a `NULL` base (see
+    /// `close_library_handler`'s doc), and [`LibraryRegistry::
+    /// loaded_library_by_base`] would never find a `Loaded` library at
+    /// address 0 anyway, but this asserts the explicit early-return, not
+    /// just the registry miss.
+    #[test]
+    fn close_library_of_null_is_a_no_op() {
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 = NULL
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -414); // CloseLibrary(NULL)
+        words.push(MOVEQ_D0_0);
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("CloseLibrary(NULL) should be a no-op, not error");
+        assert_eq!(code, 0);
+    }
+
+    /// L4: `CloseLibrary` of a [`LibraryKind::Faked`] base (an
+    /// auto-created vamos-style stub) must also stay a no-op --
+    /// [`LibraryRegistry::loaded_library_by_base`] only ever matches a
+    /// genuinely [`LibraryKind::Loaded`] base, so a faked one falls
+    /// through to the same early return as `Real`. The name must be one
+    /// that *actually* produces a fake base with no `Vfs` configured:
+    /// only [`STANDARD_WORKBENCH_LIBRARIES`] names fake-succeed then (an
+    /// arbitrary unknown name would just return `NULL`, silently turning
+    /// this into a second copy of the `NULL` test above), and
+    /// `mathieeesingbas.library` is on that list without being backed by
+    /// a `Real` registered base.
+    #[test]
+    fn close_library_of_a_faked_base_is_a_no_op() {
+        let entry = TRAP_TABLE_END;
+        let name = b"mathieeesingbas.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary -> D0 = fake base
+        words.push(movea_dn(1, 0)); // A1 = D0 (the fake base -- CloseLibrary's argument)
+        words.push(0x2400); // move.l d0,d2 -- keep the base for the exit code
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -414); // CloseLibrary(fake base)
+        words.push(0x2002); // move.l d2,d0 -- exit code = the base
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("CloseLibrary of a faked base should be a no-op, not error");
+        // The exit code is the fake base itself: non-zero proves the open
+        // really did fake-succeed (the guard this test's doc comment
+        // explains -- an unknown name with no Vfs would return NULL and
+        // quietly test nothing new).
+        assert_ne!(code, 0, "the open should have produced a fake base");
     }
 
     #[test]

@@ -43,10 +43,19 @@
 ;      library-device-loading-plan.md's Test 3). A3 = the (same) returned
 ;      base. Read lib_OpenCnt (word, base+32): expect 2, else "bad\n"/
 ;      exit 20. Else PutStr("cnt ok\n").
-;   8. CloseLibrary both opens (A1=A3, A6=A5, LVO -414), once per open.
-;      Currently a no-op for a Loaded library (L4 wires the real Close
-;      vector) -- calling it here now is deliberate forward-compatibility,
-;      not a functional requirement of this fixture's own assertions.
+;   8. CloseLibrary both opens (A1=A3, A6=A5, LVO -414), once per open --
+;      now (phase L4) genuinely runs test.library's own Close vector each
+;      time: the first close decrements lib_OpenCnt from 2 to 1 and
+;      returns 0 (still resident), the second decrements it to 0 and
+;      returns its stored segList, triggering a real delayed expunge
+;      (LibList unlink, UnLoadSeg, base freed) -- see execlib.rs's
+;      finish_close and testlib.s's CloseFunc. This fixture doesn't
+;      assert on the expunge directly (that's execlib.rs's
+;      loaded_library_e2e module's job, with heap-accounting visibility
+;      this CLI-level test doesn't have); it just proves the real Close
+;      vector runs twice without corrupting anything downstream of it
+;      (nothing else touches test.library afterward, so a broken close
+;      wouldn't otherwise be observable here).
 ;   9. Exit 0.
 ;
 ; Regenerating: `vasmm68k_mot -Fhunkexe -nosym -o fixtures/libcall fixtures/libcall.s`

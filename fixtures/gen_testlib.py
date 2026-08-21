@@ -98,6 +98,13 @@ def build_program() -> bytes:
     code.rts()
 
     code.label("CloseFunc")
+    # Real delayed-expunge idiom (RKRM ch. 18 / plan §2.4, phase L4): see
+    # testlib.s's CloseFunc comment for the full rationale.
+    code.subq_w_disp_a(A6, LIB_OPENCNT_OFFSET, 1)
+    code.branch(code.BNE, "CloseStillOpen")
+    code.move_l_disp_a_to_d(A6, SEGLIST_MARKER_OFFSET, D0)
+    code.rts()
+    code.label("CloseStillOpen")
     code.moveq(D0, 0)
     code.rts()
 

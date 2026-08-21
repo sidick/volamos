@@ -830,6 +830,161 @@ pub fn reopen<C: Cpu>(
     Ok(())
 }
 
+// --- L4: CloseLibrary via the Close vector ---
+
+/// `CloseLibrary` for a [`crate::dispatch::LibraryKind::Loaded`] base
+/// (`library-device-loading-plan.md` §2.4): trampolines into the
+/// library's own Close vector (`base - 12`, LVO -12 per plan §1.4 -- `A6`
+/// = libBase is the *only* input register the Close vector's calling
+/// convention documents, unlike Open's `D0` = version). Called by
+/// [`crate::dispatch::close_library_handler`], which has already
+/// established (via [`crate::dispatch::LibraryRegistry::
+/// loaded_library_by_base`]) that `base` really is a loaded library's base
+/// and `name` its registered name.
+///
+/// Refcounting is the library's own job (its Open/Close vectors maintain
+/// `lib_OpenCnt` themselves, same as [`reopen`]'s doc explains) -- this
+/// function doesn't track opens/closes at all, it just runs the real
+/// vector and, in [`finish_close`], acts on whatever `D0` it returns.
+pub fn begin_close<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+    base: u32,
+) -> Result<(), DispatchError> {
+    let caller_a6 = ctx.cpu.address_register(AddressRegister(6));
+    // Captured now (rather than re-looked-up in finish_close) because
+    // once the Close vector actually runs it may, on the last-close path,
+    // be about to have its own registry entry removed -- simpler to carry
+    // the one field finish_close needs than to re-derive it from a
+    // registry that's mid-transition. The `expect` documents an invariant
+    // close_library_handler already established: it only calls this
+    // function for a `name` it just found via `loaded_library_by_base`,
+    // so a `loaded_library` miss here would mean the registry changed
+    // out from under us within a single handler dispatch -- a bug, not a
+    // reachable runtime condition.
+    let alloc_addr = ctx
+        .registry
+        .loaded_library(name)
+        .expect("begin_close is only called for a name just found in the registry")
+        .alloc_addr;
+
+    let name = name.to_string();
+    ctx.cpu.set_address_register(AddressRegister(6), base);
+    ctx.continuations
+        .trampoline(ctx.cpu, ctx.mem, base.wrapping_sub(12), move |ctx| {
+            finish_close(ctx, &name, base, alloc_addr, caller_a6)
+        });
+    Ok(())
+}
+
+/// Runs once the library's own Close vector has returned. `D0` is its
+/// result, per the CLOSE vector's documented contract (`exec/libraries.i`
+/// / RKRM ch. 18 "Exec Libraries", plan §1.4): `0` means the library
+/// stays resident (there are still other opens, or it simply never
+/// expunges on close) -- nothing further to do beyond restoring the
+/// caller's `A6`. Non-zero is a `SegList` `BPTR`: the delayed-expunge
+/// convention, where a library's Close vector itself decides "this was
+/// the last open" (by checking its own decremented `lib_OpenCnt`) and
+/// hands the seglist it stored at init time back to us instead of calling
+/// `Expunge`/`RemLibrary` itself (`fixtures/testlib.s`'s `CloseFunc` is
+/// exactly this idiom -- see that file's header comment).
+///
+/// On the delayed-expunge path, mirrors what real exec's own
+/// `CloseLibrary` code does after a non-zero Close result (this is
+/// documented exec behavior, not `RemLibrary`-specific -- RKRM ch. 18):
+/// unlink the base's `struct Node` from `ExecBase.LibList`
+/// ([`crate::execlist::remove_impl`] -- the `AddLibrary`-equivalent
+/// counterpart to [`after_init`]'s `add_tail_impl`), drop both registry
+/// entries via [`crate::dispatch::LibraryRegistry::unregister_loaded`] (a
+/// later `OpenLibrary` of the same name must load fresh from disk, not
+/// resolve to this now-dead base), `UnLoadSeg` the returned segList, then
+/// free the [`make_library`] base allocation.
+///
+/// # Why the base allocation is freed *here*, not by the library
+///
+/// The `structure`/`initFunc` `MakeLibrary` autodoc (plan §1.3 item 4)
+/// makes an *initFunc* that returns `NULL` responsible for freeing the
+/// base itself (see [`after_init`]'s doc) -- but that's a completely
+/// different moment in the library's lifecycle (a refused *open*, before
+/// the library was ever added to `LibList`). Once a library is resident,
+/// the conventional AUTOINIT contract is the reverse: `RemLibrary`
+/// (RKRM ch. 18) is the one that frees `lib_NegSize + lib_PosSize` bytes
+/// around the base *after* `Expunge` returns -- a library's own
+/// Close/Expunge code frees nothing of its own base, only whatever it
+/// separately allocated (here, nothing) plus the seglist. `CloseLibrary`'s
+/// delayed-expunge path is exec performing exactly that `RemLibrary`-style
+/// cleanup itself, immediately, since nothing else will.
+///
+/// # Loud, not best-effort, unlike [`after_init`]'s `NULL`-init cleanup
+///
+/// [`after_init`]'s unwind on a refused open is deliberately best-effort
+/// because a *contract-compliant* library may have already freed its own
+/// base, making a second `free` here an expected double-free to tolerate.
+/// No such ambiguity exists on this path: a library's Close vector
+/// returning a segList is an unambiguous "please unload me" instruction,
+/// with no contract under which the library itself also frees the
+/// seglist or the base -- so an `UnLoadSeg`/`free` failure here really is
+/// the library handing back garbage (an unknown `BPTR`, or -- impossible
+/// under this runtime's own bookkeeping, but not under a hypothetical
+/// corrupted one -- an already-freed base), and per this codebase's usual
+/// posture (`crate::dosseg`'s own "loud failure on an unknown seglist"
+/// stance) that's a bug worth surfacing loudly, not swallowing.
+///
+/// Real `CloseLibrary` itself returns nothing (`exec.doc`: "RESULT: none"
+/// -- unlike `Open`/`Close`, which are `RESULT: base`/`RESULT: 0 or
+/// seglist`, `CloseLibrary` is documented void). This leaves `D0` exactly
+/// as the Close vector left it rather than zeroing it -- matching real
+/// exec, which doesn't clear it either, and nothing in this codebase
+/// reads `CloseLibrary`'s own `D0` afterward.
+fn finish_close<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+    base: u32,
+    alloc_addr: u32,
+    caller_a6: u32,
+) -> Result<(), DispatchError> {
+    let close_result = ctx.cpu.data_register(DataRegister(0));
+    ctx.cpu.set_address_register(AddressRegister(6), caller_a6);
+
+    if close_result == 0 {
+        *ctx.call_detail = Some(format!("library {name:?} closed (still resident)"));
+        return Ok(());
+    }
+
+    let seglist_bptr = close_result;
+
+    crate::execlist::remove_impl(ctx.mem, base);
+    ctx.registry.unregister_loaded(name);
+
+    ctx.dos
+        .unload_seg(ctx.heap, seglist_bptr)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: name.to_string(),
+            lvo: -12,
+            handler_name: "CloseLibrary".to_string(),
+            message: format!(
+                "Close vector returned segList {seglist_bptr:#010x} on the delayed-expunge \
+                 path, but UnLoadSeg rejected it: {e}"
+            ),
+        })?;
+
+    ctx.heap
+        .free(alloc_addr)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: name.to_string(),
+            lvo: -12,
+            handler_name: "CloseLibrary".to_string(),
+            message: format!(
+                "freeing library base allocation {alloc_addr:#010x} after expunge: {e}"
+            ),
+        })?;
+
+    *ctx.call_detail = Some(format!(
+        "library {name:?} closed and expunged (base {base:#010x} freed)"
+    ));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,6 +1512,93 @@ mod tests {
             "OpenLibrary(\"scspill.library\", 0) should return a non-NULL base"
         );
     }
+
+    /// L4 extension of the test above: after a real, successful
+    /// `OpenLibrary("scspill.library", 0)`, also `CloseLibrary` it --
+    /// running scspill's own real Close (and, on this single-open
+    /// program, Expunge-equivalent) code natively, not a synthesized
+    /// fixture's -- and assert the whole run still exits cleanly. Same
+    /// skip-if-absent posture as the test above.
+    #[test]
+    fn real_scspill_library_closes_cleanly_after_a_real_open() {
+        let libs_dir = "/Users/simond/amiga/sasc/libs";
+        if !std::path::Path::new(libs_dir)
+            .join("scspill.library")
+            .exists()
+        {
+            eprintln!(
+                "skipping real_scspill_library_closes_cleanly_after_a_real_open: \
+                 {libs_dir}/scspill.library not present"
+            );
+            return;
+        }
+
+        use super::loaded_library_e2e::{jsr, load_words, move_an_dn, movea_dn, movea_imm, moveq};
+        use crate::backend::{M68kCpu, TRAP_TABLE_END};
+        use crate::dispatch::{EXEC_LIBRARY_BASE, Runtime, StartConfig};
+        use crate::memory::FlatMemory;
+        use crate::vfs::{Vfs, VfsConfig};
+
+        const RTS: u16 = 0x4E75;
+        let entry = TRAP_TABLE_END;
+        let name = b"scspill.library\0";
+
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0)); // D0 = requested version 0
+        jsr(&mut words, 6, -552); // OpenLibrary("scspill.library", 0) -> D0 = base
+        words.push(movea_dn(3, 0)); // A3 = base (callee-saved, kept across the close)
+        words.push(movea_dn(1, 0)); // A1 = base -- CloseLibrary's own argument
+        // A6 is still EXEC_LIBRARY_BASE here: OpenLibrary is a "Real"
+        // (ROM-resident) library call itself, dispatched via A6 =
+        // EXEC_LIBRARY_BASE, and it only ever writes D0 -- the caller's
+        // A6 is untouched, so no re-load is needed before this jsr.
+        jsr(&mut words, 6, -414); // CloseLibrary(base)
+        words.push(move_an_dn(3, 0)); // D0 = A3 (the base) -- final exit code,
+        // independent of whatever scspill's own Close vector happened to
+        // leave in D0 (real CloseLibrary is documented void -- see
+        // execlib.rs's finish_close doc -- so this test doesn't assert
+        // on D0's post-Close value at all).
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(
+            Vfs::new(VfsConfig {
+                volumes: vec![("LIBS".to_string(), std::path::PathBuf::from(libs_dir))],
+                assigns: vec![],
+                auto_assign_root: None,
+                cwd: "LIBS:".to_string(),
+            })
+            .expect("build vfs"),
+        );
+
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("run should succeed -- scspill's own Close/Expunge code must not fault");
+        assert_ne!(
+            code, 0,
+            "the exit code (the base, moved back into D0 after the close) should still be \
+             the non-NULL base OpenLibrary returned"
+        );
+    }
 }
 
 /// Phase L3 end-to-end tests: drive a real [`crate::dispatch::Runtime`]
@@ -1390,6 +1632,13 @@ mod loaded_library_e2e {
     const SEGLIST_MARKER_OFFSET: u32 = 36;
     const ALLOCMEM_MARKER_OFFSET: u32 = 40;
     const INIT_MARKER: u16 = 0x2A2A;
+    /// The heap cost of `InitFunc`'s own `AllocMem(4, MEMF_ANY)` call
+    /// (`testlib.s`'s header comment) that's never freed -- real
+    /// `AllocMem` rounds every request up to `execmem.rs`'s
+    /// `MEMBLOCKSIZE` (8) block granularity, so a 4-byte request costs 8.
+    /// See `last_close_expunge_leaks_nothing_beyond_initfuncs_own_deliberate_allocmem_block`'s
+    /// doc for why this is expected, not a `CloseLibrary` leak.
+    const INIT_ALLOCMEM_LEAK_BYTES: u32 = 8;
 
     struct TempDir {
         path: PathBuf,
@@ -1459,8 +1708,19 @@ mod loaded_library_e2e {
     }
 
     /// `move.l An,Dn`.
-    fn move_an_dn(an: u16, dn: u16) -> u16 {
+    pub(super) fn move_an_dn(an: u16, dn: u16) -> u16 {
         0x2000 | (dn << 9) | 0x008 | an
+    }
+
+    /// `movea.l Asrc,Adst` -- both source and dest addressing mode 001
+    /// (An direct); unlike [`movea_dn`], which can only move a *data*
+    /// register into an address register. Needed wherever a test keeps a
+    /// value in a callee-saved address register (e.g. `A2`) across a
+    /// library call and then needs it in a different address register
+    /// (e.g. `A1`, for `CloseLibrary`'s own argument) without a data
+    /// register roundtrip.
+    pub(super) fn movea_an(dst_an: u16, src_an: u16) -> u16 {
+        0x2000 | (dst_an << 9) | 0x48 | src_an
     }
 
     /// `jsr <disp16>(An)` (2 words: opcode + displacement).
@@ -1899,6 +2159,333 @@ mod loaded_library_e2e {
             found,
             "ExecBase.LibList should contain a node named \"test.library\" after a \
              successful load"
+        );
+    }
+
+    // --- L4: CloseLibrary end-to-end tests ---
+    //
+    // `library-device-loading-plan.md` §2.4 / phase L4's own brief: these
+    // drive `fixtures/testlib`'s real `CloseFunc` (see testlib.s's header
+    // comment for what it does -- decrement lib_OpenCnt, return the
+    // stored segList exactly on the last close) through the same real
+    // trap-dispatch path as the L3 tests above, now exercising
+    // execlib.rs's begin_close/finish_close.
+
+    /// Close with one of two opens outstanding must leave the library
+    /// resident and fully callable: `lib_OpenCnt` lands on 1 (not 0), and
+    /// a native call through its own jump table (LVO -30) still works --
+    /// if the close had incorrectly unlinked/freed the library despite
+    /// the remaining open, this call would be against no-longer-valid
+    /// state (even though this runtime's `FlatMemory` wouldn't
+    /// necessarily fault on it, `begin_close`'s heap `free`/`UnLoadSeg`
+    /// wrongly firing here is exactly the bug this test exists to catch
+    /// indirectly, via the final OpenCnt read landing on garbage instead
+    /// of 1).
+    #[test]
+    fn close_with_one_of_two_opens_leaves_library_resident_and_functional() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0); // placeholder #1, patched below
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open #1 -> D0 = base
+        words.push(movea_dn(2, 0)); // A2 = base (kept)
+
+        let second_placeholder_idx = words.len();
+        movea_imm(&mut words, 1, 0); // placeholder #2 (same string, patched below)
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open #2 -> D0 = base (same base, real reopen)
+
+        // Close once: two opens are outstanding, so testlib's CloseFunc
+        // decrements lib_OpenCnt to 1 (non-zero) and returns 0 -- the
+        // library must stay resident.
+        words.push(movea_an(1, 2)); // A1 = A2 (base)
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -414); // CloseLibrary
+
+        // Call the first user vector natively -- proves the library is
+        // still genuinely callable post-close (discarded result; a crash
+        // here would fail the whole `run`).
+        words.push(movea_an(6, 2)); // A6 = A2 (base)
+        jsr(&mut words, 6, -30); // UserFunc -> D0 = 42 (discarded below)
+
+        words.push(moveq(0, 0)); // clear D0's upper word before the .w load
+        move_w_disp(&mut words, 2, 32, 0); // D0 = lib_OpenCnt
+        words.push(RTS);
+
+        // Two placeholders -> patch both explicitly, same pattern as
+        // open_cnt_is_two_after_opening_twice.
+        let entry = TRAP_TABLE_END;
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+        words[second_placeholder_idx + 1] = (str_addr >> 16) as u16;
+        words[second_placeholder_idx + 2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let name = b"test.library\0";
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+        let (_tmp, vfs) = vfs_with_libs_file("close-one-of-two", "test.library", TESTLIB);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect(
+            "run should succeed -- including the native post-close user-vector call, which \
+             would be against corrupted state if the close had wrongly expunged the library",
+        );
+        assert_eq!(
+            code, 1,
+            "lib_OpenCnt should be 1 (still resident) after closing one of two opens"
+        );
+    }
+
+    /// The last close (only one open outstanding) must genuinely expunge
+    /// the library: `ExecBase.LibList` no longer contains its node
+    /// afterward -- the [`crate::execlist::remove_impl`] half of
+    /// [`finish_close`]'s delayed-expunge path, proven the same way
+    /// [`liblist_contains_the_loaded_library_by_name`] proves the
+    /// opposite (`add_tail_impl`, on open).
+    #[test]
+    fn last_close_removes_the_liblist_node() {
+        use crate::dispatch::EXEC_BASE_LIBLIST_OFFSET;
+        use crate::execlist::{LH_HEAD, LN_NAME, LN_SUCC};
+        use crate::guestmem::read_c_string;
+
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open -> D0 = base
+        words.push(movea_dn(1, 0)); // A1 = base
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -414); // CloseLibrary -- last close, expunges
+        words.push(RTS);
+
+        let (result, rt) = run_against_library(
+            "expunge-liblist",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        result.expect("run should succeed");
+
+        let mem = rt.memory();
+        let list_addr = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
+        let mut node = mem.read_u32(list_addr + LH_HEAD);
+        let mut found = false;
+        while mem.read_u32(node + LN_SUCC) != 0 {
+            let name_ptr = mem.read_u32(node + LN_NAME);
+            if read_c_string(mem, name_ptr) == b"test.library" {
+                found = true;
+                break;
+            }
+            node = mem.read_u32(node + LN_SUCC);
+        }
+        assert!(
+            !found,
+            "ExecBase.LibList should no longer contain test.library after the last close \
+             expunged it"
+        );
+    }
+
+    /// Builds and runs a program that either (a) opens `test.library`
+    /// once and closes it once (the last close, triggering a real
+    /// expunge), or (b) does neither -- just an immediate `rts` -- then
+    /// returns the resulting [`Runtime`]'s guest heap's free-byte count.
+    /// `load_end` is a fixed constant, independent of which branch runs,
+    /// so the heap's own starting address (and hence this count) is
+    /// directly comparable across both: identical free-byte counts after
+    /// (a) and (b) is a strong end-to-end proof that a full open+close
+    /// cycle -- both the seglist ([`crate::dosseg::DosState::unload_seg`])
+    /// and the [`make_library`] base allocation ([`GuestHeap::free`]) --
+    /// leaves absolutely nothing behind, matching
+    /// `init_func_returning_null_fails_the_open_and_does_not_leak`'s own
+    /// technique for the open-side failure path.
+    fn free_bytes_after_full_open_close_cycle(open_and_close: bool) -> u32 {
+        let entry = TRAP_TABLE_END;
+        let fixed_load_end = entry + 0x400;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let vfs_tag = if open_and_close {
+            "expunge-noleak-opened"
+        } else {
+            "expunge-noleak-baseline"
+        };
+        let (_tmp, vfs) = vfs_with_libs_file(vfs_tag, "test.library", TESTLIB);
+
+        let mut rt = if open_and_close {
+            let mut words = Vec::new();
+            movea_imm(&mut words, 1, 0); // placeholder, patched below
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            words.push(moveq(0, 0));
+            jsr(&mut words, 6, -552); // open -> D0 = base
+            words.push(movea_dn(1, 0)); // A1 = base
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            jsr(&mut words, 6, -414); // CloseLibrary -- last close, expunges
+            words.push(RTS);
+
+            let str_addr = entry + (words.len() as u32) * 2;
+            words[1] = (str_addr >> 16) as u16;
+            words[2] = str_addr as u16;
+            let name = b"test.library\0";
+            assert!(
+                str_addr + name.len() as u32 + 4 <= fixed_load_end,
+                "fixed_load_end must stay generous enough for this program"
+            );
+
+            load_words(&mut mem, entry, &words);
+            crate::guestmem::write_c_string(&mut mem, str_addr, name);
+            Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: fixed_load_end,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            )
+        } else {
+            load_words(&mut mem, entry, &[RTS]);
+            Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: fixed_load_end,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            )
+        };
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        rt.heap_mut().free_bytes()
+    }
+
+    /// Test (plan §2.4 / L4 brief): a full open+close cycle of a library
+    /// whose last close expunges it returns the heap to (almost) exactly
+    /// as much free space as never having opened it at all -- see
+    /// [`free_bytes_after_full_open_close_cycle`]'s doc for why this is a
+    /// strong no-leak proof covering both the seglist and the
+    /// [`make_library`] base allocation.
+    ///
+    /// "Almost": the two counts differ by exactly
+    /// [`INIT_ALLOCMEM_LEAK_BYTES`] -- not a bug in `CloseLibrary`, but a
+    /// deliberate, permanent feature of *this fixture*. `testlib.s`'s
+    /// `InitFunc` calls `AllocMem(4, MEMF_ANY)` mid-init purely to prove
+    /// the L2 trampoline supports a *nested* library call (see that
+    /// file's header comment and `ALLOCMEM_MARKER_OFFSET`'s doc above);
+    /// it stores the result as a marker and never frees it, and nothing
+    /// in `CloseFunc` frees it either -- there's no reason it should
+    /// (it's not part of the library's own `MakeLibrary`-allocated base
+    /// or its seglist, just an ordinary allocation the library's `Open`
+    /// contract never promises to release on `Close`). Real `AllocMem`
+    /// also rounds every request up to an 8-byte block granularity
+    /// (`execmem.rs`'s `MEMBLOCKSIZE`), so the 4-byte request costs 8.
+    /// Found the hard way: this test originally asserted plain equality
+    /// and failed with a genuine, reproducible 8-byte gap, which a
+    /// `finish_close` debug trace traced to *outside* both the seglist's
+    /// and the base's freed ranges entirely -- i.e. real, if
+    /// fixture-specific, not a `CloseLibrary` bug.
+    #[test]
+    fn last_close_expunge_leaks_nothing_beyond_initfuncs_own_deliberate_allocmem_block() {
+        let never_opened = free_bytes_after_full_open_close_cycle(false);
+        let opened_then_closed = free_bytes_after_full_open_close_cycle(true);
+        assert_eq!(
+            never_opened - INIT_ALLOCMEM_LEAK_BYTES,
+            opened_then_closed,
+            "heap free space after a full open+close cycle should be exactly \
+             INIT_ALLOCMEM_LEAK_BYTES less than never having opened test.library at all -- any \
+             other difference means the expunge path leaked the seglist or the make_library \
+             base allocation (the two things CloseLibrary's delayed-expunge path actually owns)"
+        );
+    }
+
+    /// Reload after expunge: opening the same name again after its last
+    /// close expunged it must be a genuinely fresh disk load -- not a
+    /// stale cached base (that base is gone -- see
+    /// [`last_close_removes_the_liblist_node`]) and not a
+    /// [`crate::execlib::reopen`] (that path requires a still-registered
+    /// [`crate::dispatch::LibraryKind::Loaded`] entry, which
+    /// [`crate::dispatch::LibraryRegistry::unregister_loaded`] just
+    /// removed). Proven exactly like the L3 init test
+    /// (`open_calls_user_vector_natively_and_init_really_ran`): the
+    /// reload's own `initFunc` must have run again (the `lib_Revision`
+    /// marker is freshly written), and its own `Open` vector must have
+    /// run too (`lib_OpenCnt` reads a fresh 1, not a continuation of the
+    /// pre-expunge count).
+    #[test]
+    fn open_after_expunge_reloads_fresh_from_disk() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0); // placeholder #1, patched below
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open #1 -> D0 = base1
+        words.push(movea_dn(1, 0)); // A1 = base1
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -414); // CloseLibrary -- last close, expunges base1
+
+        let second_placeholder_idx = words.len();
+        movea_imm(&mut words, 1, 0); // placeholder #2 (same string, patched below)
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open #2 -> D0 = base2, a fresh load
+        words.push(RTS); // exit code = base2
+
+        let entry = TRAP_TABLE_END;
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+        words[second_placeholder_idx + 1] = (str_addr >> 16) as u16;
+        words[second_placeholder_idx + 2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let name = b"test.library\0";
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+        let (_tmp, vfs) = vfs_with_libs_file("reload-after-expunge", "test.library", TESTLIB);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        let base2 = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(
+            base2, 0,
+            "the second open, after the first's expunge, should succeed as a fresh load"
+        );
+
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u16(base2 + LIB_REVISION_OFFSET),
+            INIT_MARKER,
+            "initFunc should have run again on the fresh reload, rewriting its marker"
+        );
+        assert_eq!(
+            mem.read_u16(base2 + 32), // LIB_OPENCNT_OFFSET
+            1,
+            "lib_OpenCnt should be a fresh 1 after the reload's own Open vector ran, not a \
+             continuation of the pre-expunge count"
         );
     }
 }
