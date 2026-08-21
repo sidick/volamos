@@ -105,6 +105,16 @@ const EXCEPTION_VECTOR_TABLE_SIZE: u32 = 0xC0;
 /// available to [`LibraryTable::register`].
 const FAKE_LIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 2;
 
+/// The slot index reserved for the trampoline primitive's continuation
+/// stub (see [`ContinuationStack`] and [`CONTINUATION_STUB_ADDR`]). Like
+/// [`FAKE_LIB_SLOT`], bound once via `register_fixed_slot` rather than
+/// handed out by [`LibraryTable::register`]'s counter -- there is only
+/// ever one continuation-stub address, so only one opcode word is ever
+/// written for it (at [`Runtime::new`] time), unlike `FAKE_LIB_SLOT`
+/// which gets rewritten across many fake libraries' jump-table blocks.
+/// Not available to [`LibraryTable::register`].
+const CONTINUATION_SLOT: u16 = MAX_LIBRARY_SLOTS - 3;
+
 /// Size in bytes of the jump-table block [`open_library_handler`] carves
 /// out of the guest heap for each newly auto-created fake library.
 /// Generous (matches [`crate::backend::TRAP_TABLE_SIZE`]) so any
@@ -198,7 +208,12 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     "no separate host-side mirror" convention
 ///                     `crate::exectask`'s module docs establish for
 ///                     task/signal state.
-/// 0x00C4 .. 0x02CC   unused headroom
+/// 0x00C4 .. 0x00C6   CONTINUATION_STUB_ADDR: a single A-line opcode
+///                     word bound to CONTINUATION_SLOT -- the trampoline
+///                     primitive's fixed "resume here after a
+///                     trampolined guest subroutine's rts" address. See
+///                     ContinuationStack's docs for the full mechanism.
+/// 0x00C6 .. 0x02CC   unused headroom
 /// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
@@ -502,6 +517,13 @@ pub const CACHE_BITS_ADDR: u32 = 0x00C0;
 /// checks bits its own `AttnFlags`-detected CPU actually has).
 pub(crate) const CACHE_BITS_DEFAULT: u32 = 0xC000_3111;
 
+/// Guest address of the trampoline primitive's continuation stub -- see
+/// [`ContinuationStack`]'s docs and [`EXEC_LIBRARY_BASE`]'s "Reserved-
+/// region memory map" doc. Sits in the headroom immediately after
+/// [`CACHE_BITS_ADDR`]'s cell, well clear of `dos.library`'s registered
+/// LVOs starting at `0x02CC`.
+pub const CONTINUATION_STUB_ADDR: u32 = 0x00C4;
+
 /// Byte length of each library's `ln_Name` string, including its `NUL`
 /// terminator, as laid out by [`write_library_list_nodes`] in the
 /// headroom above `ExecBase.LibList` -- see the "Reserved-region memory
@@ -579,6 +601,15 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// examples. Reset to `None` before every dispatched call; almost
     /// every handler leaves it alone.
     pub call_detail: &'a mut Option<String>,
+    /// Host-side pending stack for the trampoline primitive -- see
+    /// [`ContinuationStack`]'s docs. Any handler can call
+    /// [`ContinuationStack::trampoline`] on this to run a guest
+    /// subroutine (which may itself make ordinary library calls) and
+    /// resume, host-side, once it returns -- the mechanism that lets a
+    /// multi-phase operation like a disk library's `initFunction`/`Open`
+    /// sequence (see the library/device-loading plan's L3) run as
+    /// ordinary guest code instead of needing CPU-reentrancy machinery.
+    pub continuations: &'a mut ContinuationStack<C>,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -690,6 +721,15 @@ pub enum DispatchError {
     /// [`crate::exectask::fold_pending_host_break`]) -- see
     /// [`Runtime::run`]'s doc for the granularity caveat.
     StackOverflow { a7: u32, lower: u32, upper: u32 },
+    /// The guest reached [`CONTINUATION_STUB_ADDR`] with nothing on
+    /// [`ContinuationStack`]'s pending list to run -- see
+    /// [`continuation_stub_handler`]. Always a bug (either this
+    /// runtime's own trampoline bookkeeping is out of sync, or a guest
+    /// program somehow jumped straight to the internal stub address
+    /// without going through [`ContinuationStack::trampoline`]), never a
+    /// legitimate guest program state -- reported loudly rather than
+    /// treated as a silently-swallowed `rts`.
+    EmptyContinuationStack { pc: u32 },
 }
 
 impl fmt::Display for DispatchError {
@@ -730,6 +770,12 @@ impl fmt::Display for DispatchError {
                 f,
                 "stack overflow: A7 {a7:#010x} is outside the current task's stack bounds \
                  [{lower:#010x}, {upper:#010x}] -- try running with a larger --stack"
+            ),
+            DispatchError::EmptyContinuationStack { pc } => write!(
+                f,
+                "continuation stub trapped at {pc:#010x} with no pending continuation \
+                 (guest jumped to the trampoline stub directly, or ContinuationStack \
+                 bookkeeping is out of sync)"
             ),
         }
     }
@@ -1028,6 +1074,188 @@ impl LibraryRegistry {
             .find(|f| pc >= f.base.wrapping_sub(f.size) && pc < f.base)
             .map(|f| (f.name.as_str(), pc as i64 as i32 - f.base as i32))
     }
+}
+
+/// One pending host continuation, boxed so [`ContinuationStack`] can hold
+/// a heterogeneous stack of them. `FnOnce` (not `FnMut`/`Fn`) is
+/// deliberate: [`ContinuationStack::trampoline`] arranges for a
+/// continuation to run exactly once -- when its paired guest
+/// subroutine's `rts` traps back to [`CONTINUATION_STUB_ADDR`] -- and
+/// popping the `Box` out of the pending stack to call it already
+/// consumes it; there's no scenario where it needs to run again.
+type Continuation<C> = Box<dyn FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError>>;
+
+/// The trampoline primitive (library/device-loading plan §2.1, phase
+/// "L2"): lets a [`LibraryHandler`] run an arbitrary guest subroutine --
+/// one that may itself make ordinary library calls, which is the whole
+/// point, see below -- and get control back, host-side, once that
+/// subroutine returns.
+///
+/// # Why this exists
+///
+/// [`Runtime::run`]'s dispatch loop performs the `rts` for every
+/// dispatched handler *itself*, in host code (module docs, "Jump-table
+/// mechanics" step 4): after a handler returns, the loop pops whatever
+/// is on top of the guest stack into `PC`. That means a handler that
+/// pushes a chosen address onto the guest stack before returning
+/// controls where execution resumes next -- and if that address is the
+/// entry point of a real guest subroutine, the *ordinary* main loop runs
+/// it natively, dispatching any library calls it makes exactly like any
+/// other guest code. No new stepping/reentrancy machinery is needed for
+/// that part; it falls out of the loop's existing behavior for free.
+///
+/// This is the fix for a real, already-documented limitation:
+/// `execfmt.rs`'s `RawDoFmt` `PutChProc` callout and `Supervisor`
+/// handler both step the CPU themselves, in a private loop, to call back
+/// into guest code synchronously -- and both explicitly do *not* support
+/// the stepped routine making further library calls (see
+/// `call_put_ch_proc`'s doc comment: "calling back into another library
+/// call from a RawDoFmt PutChProc isn't supported"), because a nested
+/// `Cpu::step` loop has no way to route a trap through
+/// [`LibraryTable::dispatch`] without reentering [`Runtime::run`] itself.
+/// The trampoline sidesteps the problem entirely by not stepping at all:
+/// it lets the *existing* dispatch loop do the work, split across two
+/// (or more) handler invocations instead of one.
+///
+/// # Mechanism
+///
+/// [`ContinuationStack::trampoline`], called from inside a handler:
+///
+/// 1. Pushes [`CONTINUATION_STUB_ADDR`] onto the guest stack.
+/// 2. Pushes `subroutine_entry` onto the guest stack, on top of that.
+/// 3. Pushes `continuation` onto this (host-side) stack.
+///
+/// The handler then simply returns `Ok(())`. [`Runtime::run`]'s generic
+/// post-dispatch `rts` pops `subroutine_entry` into `PC`, and the guest
+/// subroutine runs natively through the ordinary main loop. Its own
+/// final `rts` pops `CONTINUATION_STUB_ADDR` into `PC`, which traps
+/// ([`continuation_stub_handler`], bound to [`CONTINUATION_SLOT`] via
+/// `register_fixed_slot` exactly like [`FAKE_LIB_SLOT`]/[`EXIT_SLOT`]):
+/// the stub pops the most recently pushed continuation off this stack
+/// and runs it with the live `HandlerContext`, free to read the
+/// subroutine's `D0`, push another trampoline for a further phase, or
+/// set final result registers. After the continuation returns, the
+/// *same* generic post-dispatch `rts` fires again and pops whatever is
+/// now on top of the guest stack -- either the original caller's return
+/// address (untouched beneath everything, if this was the final phase)
+/// or a fresh entry address the continuation itself just pushed (if it
+/// chained another trampoline). One stub address and one slot therefore
+/// serve arbitrarily many phases and arbitrary nesting; the phases
+/// themselves live entirely host-side, as closures on this stack.
+///
+/// # Register discipline is the caller's job
+///
+/// This primitive only manipulates the guest stack and this host-side
+/// pending list. It never touches `D0`/`D1`/`A0`/`A1`/`A6`/etc. -- the
+/// handler calling [`ContinuationStack::trampoline`] is responsible for
+/// setting whatever input registers the trampolined subroutine expects,
+/// either before or after the `trampoline` call (both work equally well,
+/// since `trampoline` doesn't read or write any register itself). Per
+/// the plan's §2.1 register-preservation note, the only register this
+/// runtime is ever on the hook to *restore* across a trampolined call is
+/// `A6` (the ABI makes `D0`/`D1`/`A0`/`A1` scratch, and a well-behaved
+/// callee preserves `D2`-`D7`/`A2`-`A5` itself) -- and doing that is a
+/// specific state machine's business (e.g. an L3 `OpenLibrary`
+/// continuation saving and restoring its caller's `A6` around the Open
+/// vector call), not something this generic primitive tracks for every
+/// use.
+///
+/// # Why not on [`LibraryRegistry`]
+///
+/// The plan's §2.1 sketch initially suggested this pending state could
+/// live on [`LibraryRegistry`] alongside the fake-library bookkeeping.
+/// It can't: a continuation closure is generic over `C: Cpu` (it takes a
+/// `&mut HandlerContext<'_, C>`), but `LibraryRegistry` is deliberately
+/// *not* generic (its own doc comment explains why: it's held
+/// independently of `LibraryTable<C>` on `Runtime<C>` to sidestep a
+/// mutable-borrow aliasing conflict) and derives `Clone`/`Debug`, neither
+/// of which a boxed `dyn FnOnce` can support. So this pending list lives
+/// in its own small type instead, held as its own field on `Runtime<C>`
+/// (alongside `registry`, not inside it) and threaded into
+/// [`HandlerContext`] as a new field, the same way `call_detail` already
+/// is. This is a mechanical necessity forced by the closure's generic
+/// type, not a reconsideration of the plan's design.
+///
+/// # Failure hygiene
+///
+/// No unwind or cleanup machinery backs this stack. A [`DispatchError`]/
+/// [`RuntimeError`] raised while a continuation is pending (by the
+/// trampolined subroutine, by the continuation itself, or by anything
+/// else in the run) is already fatal to the whole [`Runtime::run`] call
+/// -- the run stops and the error propagates out, discarding this
+/// `Runtime` (and its half-unwound pending stack) entirely. There is
+/// deliberately nothing here that tries to run "cleanup" continuations
+/// on the error path; per the plan's §5.5, that would only matter for a
+/// scenario (recovering a *live* `Runtime` after a failed trampoline and
+/// continuing to run it) this codebase has never needed. Symmetrically,
+/// if the guest program reaches [`EXIT_STUB_ADDR`] while continuations
+/// are still pending here (a guest that exits mid-trampoline, bypassing
+/// the stub entirely), [`Runtime::run`] just returns the exit code as
+/// usual -- the run is over either way, so an unpopped continuation or
+/// two is inert, not a leak worth detecting.
+pub struct ContinuationStack<C: Cpu> {
+    pending: Vec<Continuation<C>>,
+}
+
+impl<C: Cpu> Default for ContinuationStack<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: Cpu> ContinuationStack<C> {
+    /// Creates an empty stack (no continuations pending).
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Arranges for `subroutine_entry` to run next -- via
+    /// [`Runtime::run`]'s generic post-dispatch `rts`, see this type's
+    /// docs -- and for `continuation` to run, host-side, once that
+    /// subroutine's own `rts` returns. Call this from inside a
+    /// [`LibraryHandler`] and then return `Ok(())`; do not call it more
+    /// than once per handler invocation (each call pushes one more layer
+    /// of "resume here" onto the guest stack, which is only correct if
+    /// exactly one is unwound per handler dispatch).
+    pub fn trampoline<F>(
+        &mut self,
+        cpu: &mut C,
+        mem: &mut C::Memory,
+        subroutine_entry: u32,
+        continuation: F,
+    ) where
+        F: FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError> + 'static,
+    {
+        let sp = cpu.address_register(AddressRegister(7));
+        // Push CONTINUATION_STUB_ADDR first (deeper on the stack) so it's
+        // what the subroutine's own `rts` pops once it has consumed its
+        // own local pushes -- see this type's "Mechanism" doc.
+        let sp = sp.wrapping_sub(4);
+        mem.write_u32(sp, CONTINUATION_STUB_ADDR);
+        // Then push subroutine_entry on top: the very next thing
+        // Runtime::run's post-dispatch rts (for *this* handler) pops.
+        let sp = sp.wrapping_sub(4);
+        mem.write_u32(sp, subroutine_entry);
+        cpu.set_address_register(AddressRegister(7), sp);
+
+        self.pending.push(Box::new(continuation));
+    }
+}
+
+/// The stub handler bound to [`CONTINUATION_SLOT`] at
+/// [`CONTINUATION_STUB_ADDR`] -- see [`ContinuationStack`]'s docs for the
+/// full trampoline mechanism this completes. Pops the most recently
+/// pushed continuation off [`HandlerContext::continuations`] and runs it
+/// with the current context. An empty pending stack here is always a
+/// bug (see [`DispatchError::EmptyContinuationStack`]'s doc), not a
+/// state a correctly-behaving trampoline user can reach.
+fn continuation_stub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let Some(continuation) = ctx.continuations.pending.pop() else {
+        return Err(DispatchError::EmptyContinuationStack { pc: ctx.pc });
+    };
+    continuation(ctx)
 }
 
 /// `exec.library`'s `OpenLibrary` handler (LVO -552): `A1` = pointer to
@@ -1381,6 +1609,11 @@ pub struct Runtime<C: Cpu> {
     /// Guest address of the fake "current task" struct -- see
     /// [`HandlerContext::current_task`] and [`crate::exectask`].
     task: u32,
+    /// The trampoline primitive's host-side pending-continuation stack
+    /// -- see [`ContinuationStack`]'s docs. Held as its own field
+    /// (rather than inside `registry`) for the aliasing/generics reasons
+    /// documented there.
+    continuations: ContinuationStack<C>,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -1656,6 +1889,15 @@ impl<C: Cpu + 'static> Runtime<C> {
         // open_library_handler writes them, per fake library, on demand.
         table.register_fixed_slot(FAKE_LIB_SLOT, fake_lib_vector_handler::<C>);
 
+        // The trampoline primitive's continuation stub (L2): bound once,
+        // to CONTINUATION_STUB_ADDR -- see ContinuationStack's module
+        // docs for the full mechanism. Unlike FAKE_LIB_SLOT above, there
+        // is only ever one such address (not one per fake library), so
+        // its opcode word is written directly here rather than by
+        // another handler on demand.
+        table.register_fixed_slot(CONTINUATION_SLOT, continuation_stub_handler::<C>);
+        mem.write_u16(CONTINUATION_STUB_ADDR, 0xA000 | CONTINUATION_SLOT);
+
         // AbsExecBase: guest address 4 holds EXEC_LIBRARY_BASE, the
         // pointer real startup code reads via `move.l 4,a6`. Written
         // after the sentinel prefill above so it isn't overwritten by
@@ -1850,6 +2092,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             registry,
             dos,
             task,
+            continuations: ContinuationStack::new(),
         }
     }
 
@@ -2001,6 +2244,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         dos: &mut self.dos,
                         current_task: self.task,
                         call_detail: &mut call_detail,
+                        continuations: &mut self.continuations,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
@@ -3016,5 +3260,376 @@ mod tests {
             a0 > load_end,
             "A0 (command-line buffer) should sit after the task struct + name string"
         );
+    }
+
+    // --- ContinuationStack / trampoline primitive (L2) ---
+    //
+    // These tests build small hand-assembled "guest subroutines" and
+    // exercise ContinuationStack::trampoline directly from custom
+    // LibraryHandlers, the same way a future L3 OpenLibrary state
+    // machine will. The headline case (test 1) is exactly what
+    // execfmt.rs's RawDoFmt PutChProc/Supervisor stepping loops cannot
+    // do: a trampolined guest subroutine that itself makes an ordinary
+    // library call mid-flight.
+    mod trampoline {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        /// A fresh library base for these tests, far from every real/
+        /// fake base this runtime otherwise registers, so hand-picked
+        /// LVOs here can never collide with a real dos/exec/utility.
+        /// library registration.
+        const TEST_LIB_BASE: u32 = 0x1_8000;
+        const LVO_OUTER: i32 = -4;
+        const LVO_INNER: i32 = -8;
+
+        fn moveq_d0(imm: u8) -> u16 {
+            MOVEQ_D0_0 | u16::from(imm)
+        }
+
+        /// `movea.l #TEST_LIB_BASE,a6` -- same encoding `execfmt.rs`'s
+        /// tests use for `#EXEC_LIBRARY_BASE`.
+        fn movea_test_lib_to_a6() -> [u16; 3] {
+            [
+                0x207C | (6 << 9),
+                (TEST_LIB_BASE >> 16) as u16,
+                TEST_LIB_BASE as u16,
+            ]
+        }
+
+        fn jsr_disp16_a6(disp: i32) -> [u16; 2] {
+            [0x4EAE, disp as u16]
+        }
+
+        /// Builds a runtime whose program is `main_words`, followed
+        /// immediately (word-aligned) by `sub_words` -- returning the
+        /// runtime plus the guest address `sub_words` was loaded at, so
+        /// callers can hand that address to `ContinuationStack::
+        /// trampoline` as `subroutine_entry`.
+        fn runtime_with_main_and_subroutine(
+            main_words: &[u16],
+            sub_words: &[u16],
+        ) -> (Runtime<M68kCpu>, u32) {
+            let entry = TRAP_TABLE_END;
+            let sub_addr = entry + (main_words.len() as u32) * 2;
+            let mut all = main_words.to_vec();
+            all.extend_from_slice(sub_words);
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &all);
+            let load_end = sub_addr + (sub_words.len() as u32) * 2 + 64;
+            let rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+            (rt, sub_addr)
+        }
+
+        #[test]
+        fn trampolined_subroutine_can_itself_make_a_library_call() {
+            // main:      movea.l #TEST_LIB_BASE,a6 ; jsr LVO_OUTER(a6) ; rts
+            // subroutine: jsr LVO_INNER(a6) ; moveq #0x7E,d0 ; rts
+            //
+            // TestOuter's handler trampolines into `subroutine` instead
+            // of doing any work itself; `subroutine` calls TestInner (an
+            // ordinary registered library handler -- dispatched by the
+            // *same* main loop, zero new machinery) before overwriting
+            // D0 with a value only reachable if it ran to completion.
+            // The continuation reads that value, records it, and writes
+            // the run's actual exit code -- proving control flow really
+            // went main -> OUTER (host) -> subroutine (guest) -> INNER
+            // (host) -> back into subroutine (guest) -> continuation
+            // (host) -> back to main's own `rts`.
+            let mut main_words = movea_test_lib_to_a6().to_vec();
+            main_words.extend_from_slice(&jsr_disp16_a6(LVO_OUTER));
+            main_words.push(RTS);
+
+            let mut sub_words = jsr_disp16_a6(LVO_INNER).to_vec();
+            sub_words.push(moveq_d0(0x7E));
+            sub_words.push(RTS);
+
+            let (mut rt, sub_addr) = runtime_with_main_and_subroutine(&main_words, &sub_words);
+
+            let inner_called = Rc::new(Cell::new(false));
+            let continuation_saw_d0 = Rc::new(Cell::new(None::<u32>));
+
+            {
+                let inner_called = inner_called.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_INNER,
+                    "testlib",
+                    "TestInner",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        inner_called.set(true);
+                        ctx.cpu.set_data_register(DataRegister(0), 0x55);
+                        Ok(())
+                    },
+                );
+            }
+            {
+                let continuation_saw_d0 = continuation_saw_d0.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_OUTER,
+                    "testlib",
+                    "TestOuter",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let continuation_saw_d0 = continuation_saw_d0.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                let d0 = ctx.cpu.data_register(DataRegister(0));
+                                continuation_saw_d0.set(Some(d0));
+                                ctx.cpu.set_data_register(DataRegister(0), 0xAB);
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+
+            assert!(inner_called.get(), "TestInner should have been dispatched");
+            assert_eq!(
+                continuation_saw_d0.get(),
+                Some(0x7E),
+                "continuation should observe the subroutine's own D0, set after \
+                 its library call returned"
+            );
+            assert_eq!(
+                code, 0xAB,
+                "the run's final exit code should be the continuation's value, \
+                 reached via main's own untouched rts"
+            );
+        }
+
+        #[test]
+        fn chained_phases_run_in_order_and_return_to_original_caller() {
+            // A continuation that itself trampolines into a second guest
+            // subroutine with a second continuation. Both must run, in
+            // order, before control returns to main's own `rts`.
+            let mut main_words = movea_test_lib_to_a6().to_vec();
+            main_words.extend_from_slice(&jsr_disp16_a6(LVO_OUTER));
+            main_words.push(RTS);
+
+            // subroutine1: moveq #0x11,d0 ; rts
+            let sub1_words = vec![moveq_d0(0x11), RTS];
+            // subroutine2: moveq #0x22,d0 ; rts
+            let sub2_words = vec![moveq_d0(0x22), RTS];
+
+            let entry = TRAP_TABLE_END;
+            let sub1_addr = entry + (main_words.len() as u32) * 2;
+            let sub2_addr = sub1_addr + (sub1_words.len() as u32) * 2;
+            let mut all = main_words.clone();
+            all.extend_from_slice(&sub1_words);
+            all.extend_from_slice(&sub2_words);
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &all);
+            let mut rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: sub2_addr + (sub2_words.len() as u32) * 2 + 64,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+
+            let order = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+
+            {
+                let order = order.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_OUTER,
+                    "testlib",
+                    "TestOuter",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let order = order.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub1_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                assert_eq!(ctx.cpu.data_register(DataRegister(0)), 0x11);
+                                order.borrow_mut().push("phase1");
+                                let order = order.clone();
+                                ctx.continuations.trampoline(
+                                    ctx.cpu,
+                                    ctx.mem,
+                                    sub2_addr,
+                                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                        assert_eq!(ctx.cpu.data_register(DataRegister(0)), 0x22);
+                                        order.borrow_mut().push("phase2");
+                                        ctx.cpu.set_data_register(DataRegister(0), 0x99);
+                                        Ok(())
+                                    },
+                                );
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+
+            assert_eq!(*order.borrow(), vec!["phase1", "phase2"]);
+            assert_eq!(code, 0x99);
+        }
+
+        #[test]
+        fn nested_trampoline_from_within_a_trampolined_library_call() {
+            // subroutine1 (reached via TestOuter's trampoline) calls
+            // TestInner, which -- instead of returning synchronously --
+            // starts its *own* trampoline into subroutine3 before
+            // returning. This exercises the pending stack's LIFO
+            // discipline for real: subroutine1's own "resume here" entry
+            // (pushed by its `jsr LVO_INNER(a6)`) sits *beneath*
+            // TestInner's freshly pushed stub+entry, and TestInner's
+            // continuation (continuation3) must run and be popped before
+            // subroutine1 itself ever resumes. Deliberately not folded
+            // into the "chained phases" test above: that one nests two
+            // trampolines pushed by the *same* continuation, back to
+            // back; this one nests a trampoline started from *inside*
+            // another trampolined subroutine's own library call --
+            // different stack shape, worth covering directly.
+            let mut main_words = movea_test_lib_to_a6().to_vec();
+            main_words.extend_from_slice(&jsr_disp16_a6(LVO_OUTER));
+            main_words.push(RTS);
+
+            // subroutine1: jsr LVO_INNER(a6) ; moveq #0x7E,d0 ; rts
+            let mut sub1_words = jsr_disp16_a6(LVO_INNER).to_vec();
+            sub1_words.push(moveq_d0(0x7E));
+            sub1_words.push(RTS);
+            // subroutine3: moveq #0x19,d0 ; rts (moveq sign-extends its
+            // 8-bit immediate, so this stays clear of 0x80.. values,
+            // unlike the 0x99 used elsewhere in this test via a direct
+            // set_data_register write).
+            let sub3_words = vec![moveq_d0(0x19), RTS];
+
+            let entry = TRAP_TABLE_END;
+            let sub1_addr = entry + (main_words.len() as u32) * 2;
+            let sub3_addr = sub1_addr + (sub1_words.len() as u32) * 2;
+            let mut all = main_words.clone();
+            all.extend_from_slice(&sub1_words);
+            all.extend_from_slice(&sub3_words);
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &all);
+            let mut rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: sub3_addr + (sub3_words.len() as u32) * 2 + 64,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+
+            let order = Rc::new(RefCell::new(Vec::<(&'static str, u32)>::new()));
+
+            {
+                let order = order.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_INNER,
+                    "testlib",
+                    "TestInner",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let order = order.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub3_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                let d0 = ctx.cpu.data_register(DataRegister(0));
+                                order.borrow_mut().push(("continuation3", d0));
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+            {
+                let order = order.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_OUTER,
+                    "testlib",
+                    "TestOuter",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let order = order.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub1_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                let d0 = ctx.cpu.data_register(DataRegister(0));
+                                order.borrow_mut().push(("outer_continuation", d0));
+                                ctx.cpu.set_data_register(DataRegister(0), 0xAB);
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+
+            assert_eq!(
+                *order.borrow(),
+                vec![("continuation3", 0x19), ("outer_continuation", 0x7E)],
+                "the inner trampoline's continuation must run (and be popped) \
+                 before subroutine1 resumes and eventually reaches the outer \
+                 continuation"
+            );
+            assert_eq!(code, 0xAB);
+        }
+
+        #[test]
+        fn jumping_straight_to_the_stub_with_no_pending_continuation_is_a_loud_error() {
+            // jmp CONTINUATION_STUB_ADDR.abs.l -- a guest that somehow
+            // discovers and jumps to the internal stub address directly,
+            // never having gone through ContinuationStack::trampoline.
+            let words = [
+                0x4EF9, // jmp abs.l
+                (CONTINUATION_STUB_ADDR >> 16) as u16,
+                CONTINUATION_STUB_ADDR as u16,
+            ];
+            let mut rt = runtime_with_program(&words);
+
+            let mut out = Vec::new();
+            let err = rt.run(&mut out, None).unwrap_err();
+            match err {
+                RuntimeError::Dispatch(DispatchError::EmptyContinuationStack { pc }) => {
+                    assert_eq!(pc, CONTINUATION_STUB_ADDR);
+                }
+                other => panic!("expected EmptyContinuationStack, got {other:?}"),
+            }
+        }
     }
 }
