@@ -409,17 +409,35 @@ fn find_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 
 /// `PutMsg` (LVO -366): queues `message` onto `port`'s `mp_MsgList` (an
 /// ordinary `AddTail`) and sets its `ln_Type` to `ln_type`. Shared by
-/// [`put_msg_handler`] (`ln_type` = [`NT_MESSAGE`]) and
+/// [`put_msg_handler`] (`ln_type` = [`NT_MESSAGE`]),
 /// [`reply_msg_handler`]'s non-`NULL`-reply-port path (`ln_type` =
-/// [`NT_REPLYMSG`]).
-fn put_msg_impl<M: AddressSpace>(mem: &mut M, port: u32, message: u32, ln_type: u8) {
+/// [`NT_REPLYMSG`]), and [`crate::dospkt::handle_fs_packet`]'s
+/// `ReplyPkt`-equivalent reply.
+pub(crate) fn put_msg_impl<M: AddressSpace + ?Sized>(
+    mem: &mut M,
+    port: u32,
+    message: u32,
+    ln_type: u8,
+) {
     add_tail_impl(mem, port + MP_MSGLIST, message);
     mem.write_u8(message + LN_TYPE, ln_type);
 }
 
+/// `PutMsg`'s handler, with one interception: a message sent to the
+/// filesystem handler port (the port every non-`NIL:` `FileHandle`'s
+/// `fh_Type` names -- see `dosfile.rs`'s `FH_TYPE_OFFSET` doc) is a
+/// `DosPacket` for a handler process this runtime doesn't have, so it's
+/// serviced synchronously host-side instead of queued: by the time this
+/// `PutMsg` returns, the packet's reply is already waiting on its
+/// `dp_Port`, which is exactly what makes a packet-level client's
+/// `GetMsg`-then-`WaitPort` loop terminate without anything ever
+/// needing to block (see [`crate::dospkt::handle_fs_packet`]).
 fn put_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let port = ctx.cpu.address_register(AddressRegister(0));
     let message = ctx.cpu.address_register(AddressRegister(1));
+    if ctx.dos.is_fs_handler_port(port) {
+        return crate::dospkt::handle_fs_packet(ctx, message);
+    }
     put_msg_impl(ctx.mem, port, message, NT_MESSAGE);
     Ok(())
 }

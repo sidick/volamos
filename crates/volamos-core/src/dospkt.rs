@@ -70,6 +70,28 @@ const ACTION_DISK_INFO: u32 = 25;
 const ACTION_INFO: u32 = 26;
 const ACTION_IS_FILESYSTEM: u32 = 1027;
 
+// The file-I/O packet types [`handle_fs_packet`] answers -- the four
+// that implement `Read`/`Write`/`Seek`/`Close` at the packet level, per
+// the RKRM's `packet-documentation.md` (each cited at its match arm).
+const ACTION_READ: u32 = 82;
+const ACTION_WRITE: u32 = 87;
+const ACTION_END: u32 = 1007;
+const ACTION_SEEK: u32 = 1008;
+
+// --- struct DosPacket field offsets (dos/dosextens.h) -- all LONGs. ---
+
+/// `dp_Port`: the `MsgPort` the handler sends the packet back to once
+/// done -- per the RKRM's `direct-packet-communication.md`, "the reply
+/// port of the message in `mn_ReplyPort` is *not* used; instead, the
+/// message carrying the packet is sent back to `dp_Port`".
+const DP_PORT: u32 = 4;
+const DP_TYPE: u32 = 8;
+const DP_RES1: u32 = 12;
+const DP_RES2: u32 = 16;
+const DP_ARG1: u32 = 20;
+const DP_ARG2: u32 = 24;
+const DP_ARG3: u32 = 28;
+
 const ID_VALIDATED: u32 = 82;
 const ID_DOS_DISK: u32 = 0x444F_5300;
 
@@ -90,6 +112,12 @@ const BYTES_PER_BLOCK: u32 = 512;
 
 const DOSTRUE: u32 = 0xFFFF_FFFF;
 const DOSFALSE: u32 = 0;
+/// The `-1` a packet's `dp_Res1` reports for a failed
+/// `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK` -- numerically the same
+/// word as [`DOSTRUE`], named separately because the packet contract's
+/// "-1 = error" and the boolean contract's "-1 = success" mean opposite
+/// things.
+const RESULT_ERROR: u32 = 0xFFFF_FFFF;
 
 fn fill_info_data(mem: &mut dyn AddressSpace, addr: u32) {
     mem.write_u32(addr + ID_NUMSOFTERRORS_OFFSET, 0);
@@ -133,6 +161,126 @@ fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 
     ctx.dos.set_io_err(res2 as i32);
     ctx.cpu.set_data_register(DataRegister(0), res1);
+    Ok(())
+}
+
+/// Services one guest-sent file-I/O `DosPacket` and replies to it --
+/// the host-side stand-in for a real filesystem handler process's
+/// packet loop, called from [`crate::execlist`]'s `PutMsg` handler
+/// whenever the destination port is [`crate::dosfile::DosState`]'s
+/// filesystem handler port (the port every non-`NIL:` `FileHandle`'s
+/// `fh_Type` points at).
+///
+/// # Why `PutMsg`, not just `DoPkt`
+///
+/// Real programs bypass `Read()`/`Write()` (and `DoPkt`/`SendPkt`)
+/// entirely and speak the packet protocol by hand: build a
+/// `StandardPacket`, `PutMsg` its message to `fh_Type`, then
+/// `WaitPort`/`GetMsg` the reply port. Found via the real SAS/C `sc`
+/// compiler (issue #24): `sc1.library` does all of its source-file
+/// reading and object-file writing this way -- with no host-side
+/// handler behind `fh_Type`, its first read deadlocked waiting for a
+/// reply that could never come. Servicing the packet *synchronously
+/// inside `PutMsg`* -- reply already queued by the time `PutMsg`
+/// returns -- makes the client's subsequent `GetMsg` succeed
+/// immediately, so its `WaitPort` fallback path never needs to block
+/// (`vamos` structures its own equivalent the same way, and the real
+/// `sc` compiles successfully against it).
+///
+/// # Packet anatomy (RKRM `direct-packet-communication.md`)
+///
+/// "`mn_Node.ln_Name` of the exec message is (mis-)used to point to
+/// the `DosPacket` and its `dp_Link` element points back to the
+/// message"; the reply goes to `dp_Port`, and `mn_ReplyPort` is
+/// explicitly not part of the protocol. The reply itself mirrors real
+/// `ReplyPkt()`: fill `dp_Res1`/`dp_Res2`, send the message to
+/// `dp_Port` (`ln_Type` set to `NT_REPLYMSG`, matching what an exec
+/// message that has been replied looks like).
+///
+/// # Actions
+///
+/// `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK`/`ACTION_END` -- the four
+/// packet-level faces of `Read`/`Write`/`Seek`/`Close`, each routed to
+/// the same [`crate::dosfile::DosState`] backing the wrapper LVOs use
+/// (`dp_Arg1` echoes `fh_Arg1`, which this runtime sets to the handle
+/// struct's own guest address -- see `dosfile.rs`'s `FH_ARG1_OFFSET`
+/// doc -- so the lookup is direct). A write to the `Output()` default
+/// handle goes through [`HandlerContext::out`], same special case as
+/// the `Write` LVO handler. Anything else gets `dp_Res1 = -1` /
+/// `dp_Res2 = ERROR_ACTION_NOT_KNOWN`, the real, documented "handler
+/// doesn't implement this packet" convention (RKRM
+/// `packet-documentation.md`'s own `ACTION_SEEK` note: "set `dp_Res1`
+/// to -1 -- *and not 0* -- and `dp_Res2` to `ERROR_ACTION_NOT_KNOWN`").
+pub fn handle_fs_packet<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    msg: u32,
+) -> Result<(), DispatchError> {
+    let pkt = ctx.mem.read_u32(msg + crate::execlist::LN_NAME);
+    let action = ctx.mem.read_u32(pkt + DP_TYPE);
+    let arg1 = ctx.mem.read_u32(pkt + DP_ARG1);
+    let arg2 = ctx.mem.read_u32(pkt + DP_ARG2);
+    let arg3 = ctx.mem.read_u32(pkt + DP_ARG3);
+
+    let (res1, res2) = match action {
+        // RKRM packet-documentation.md, ACTION_READ (82): Arg1 =
+        // fh_Arg1, Arg2 = buffer (APTR), Arg3 = length; Res1 = bytes
+        // read (0 legal at EOF) or -1 + Res2 on error.
+        ACTION_READ => match ctx.dos.read(arg1, arg3 as usize) {
+            Ok(data) => {
+                for (i, b) in data.iter().enumerate() {
+                    ctx.mem.write_u8(arg2.wrapping_add(i as u32), *b);
+                }
+                (data.len() as u32, 0)
+            }
+            Err(code) => (RESULT_ERROR, code as u32),
+        },
+        // ACTION_WRITE (87): same shape; Res1 = bytes written or -1.
+        // The Output() default handle write goes through ctx.out, same
+        // as the Write LVO handler (see HostHandle::Stdout's doc).
+        ACTION_WRITE => {
+            let mut buf = vec![0u8; arg3 as usize];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ctx.mem.read_u8(arg2.wrapping_add(i as u32));
+            }
+            if ctx.dos.is_output_default(arg1) {
+                match ctx.out.write_all(&buf) {
+                    Ok(()) => (arg3, 0),
+                    Err(e) => (RESULT_ERROR, crate::dosfile::map_io_error(&e) as u32),
+                }
+            } else {
+                match ctx.dos.write(arg1, &buf) {
+                    Ok(n) => (n as u32, 0),
+                    Err(code) => (RESULT_ERROR, code as u32),
+                }
+            }
+        }
+        // ACTION_SEEK (1008): Arg2 = offset, Arg3 = mode; Res1 =
+        // previous position or -1.
+        ACTION_SEEK => match ctx.dos.seek(arg1, arg2 as i32, arg3 as i32) {
+            Ok(old) => (old as u32, 0),
+            Err(code) => (RESULT_ERROR, code as u32),
+        },
+        // ACTION_END (1007): Res1 = boolean. Close of the
+        // Input()/Output() defaults is the same documented no-op
+        // success as the Close LVO's.
+        ACTION_END => {
+            if ctx.dos.close(ctx.heap, arg1) {
+                (DOSTRUE, 0)
+            } else {
+                (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32)
+            }
+        }
+        _ => (RESULT_ERROR, ERROR_ACTION_NOT_KNOWN as u32),
+    };
+
+    ctx.mem.write_u32(pkt + DP_RES1, res1);
+    ctx.mem.write_u32(pkt + DP_RES2, res2);
+    *ctx.call_detail = Some(format!(
+        "DosPacket action {action} (fh_Arg1 {arg1:#x}) -> Res1 {res1:#x}"
+    ));
+
+    let reply_port = ctx.mem.read_u32(pkt + DP_PORT);
+    crate::execlist::put_msg_impl(ctx.mem, reply_port, msg, crate::execlist::NT_REPLYMSG);
     Ok(())
 }
 
@@ -328,5 +476,159 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, DOSFALSE as i32);
+    }
+
+    // --- Packet-level file I/O via raw PutMsg (handle_fs_packet) ---
+
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("volamos-dospkt-test-{tag}-{pid}-{n}"));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Builds and runs the raw packet-I/O guest program `sc1.library`'s
+    /// own idiom distills to (issue #24): `Open` a file, read `fh_Type`
+    /// and `fh_Arg1` straight off the returned `FileHandle`, finish a
+    /// pre-built `DosPacket` with them, `PutMsg` its message to
+    /// `fh_Type`, then `GetMsg` the packet's reply port. Returns
+    /// `(exit_code, mem, pkt, msg, buf)` for the caller to assert on --
+    /// the packet's static fields (`dp_Type`/`dp_Arg2`/`dp_Arg3`) come
+    /// from `action`/`arg3`, so each test drives a different action
+    /// through the identical guest code path.
+    fn run_packet_program(
+        dir: &TempDir,
+        action: u32,
+        arg3: u32,
+    ) -> (i32, Runtime<M68kCpu>, u32, u32, u32) {
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = name (patched)
+        push_move_imm_to_d(&mut words, 2, 1005); // D2 = MODE_OLDFILE
+        push_jsr(&mut words, 6, -30); // Open(a6) -> D0 = BPTR
+        words.push(0xE580); // ASL.L #2,D0 (BPTR -> address)
+        words.push(0x2640); // MOVEA.L D0,A3 (handle addr)
+        let arg1_idx = words.len();
+        words.push(0x23EB); // MOVE.L (36,A3),(xxx).L -- dp_Arg1 = fh_Arg1
+        words.push(36);
+        words.push(0); // dest hi (patched)
+        words.push(0); // dest lo (patched)
+        words.push(0x206B); // MOVEA.L (8,A3),A0 -- A0 = fh_Type
+        words.push(8);
+        let msg_idx = words.len();
+        words.push(0x227C); // MOVEA.L #MSG,A1 (patched)
+        words.push(0);
+        words.push(0);
+        words.push(0x2C7C); // MOVEA.L #EXEC_LIBRARY_BASE,A6
+        words.push((crate::dispatch::EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(crate::dispatch::EXEC_LIBRARY_BASE as u16);
+        push_jsr(&mut words, 6, -366); // PutMsg(a6)
+        let rport_idx = words.len();
+        words.push(0x207C); // MOVEA.L #RPORT,A0 (patched)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -372); // GetMsg(a6) -> D0 = reply msg or 0
+        words.push(RTS);
+
+        let data = (TRAP_TABLE_END + (words.len() as u32) * 2 + 3) & !3;
+        let (name, pkt, msg, rport, buf) = (data, data + 12, data + 44, data + 60, data + 96);
+        words[name_idx + 1] = (name >> 16) as u16;
+        words[name_idx + 2] = name as u16;
+        words[arg1_idx + 2] = ((pkt + DP_ARG1) >> 16) as u16;
+        words[arg1_idx + 3] = (pkt + DP_ARG1) as u16;
+        words[msg_idx + 1] = (msg >> 16) as u16;
+        words[msg_idx + 2] = msg as u16;
+        words[rport_idx + 1] = (rport >> 16) as u16;
+        words[rport_idx + 2] = rport as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        crate::guestmem::write_c_string(&mut mem, name, b"SYS:f.txt");
+        // The pre-built StandardPacket, minus the run-time dp_Arg1 the
+        // guest code fills in: message.ln_Name -> packet (the packet/
+        // message linkage the RKRM documents), dp_Port -> the reply
+        // port, whose mp_MsgList the client initializes itself.
+        mem.write_u32(msg + crate::execlist::LN_NAME, pkt);
+        mem.write_u32(pkt + DP_PORT, rport);
+        mem.write_u32(pkt + DP_TYPE, action);
+        mem.write_u32(pkt + DP_ARG2, buf);
+        mem.write_u32(pkt + DP_ARG3, arg3);
+        crate::execlist::init_list_header(&mut mem, rport + crate::execlist::MP_MSGLIST);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: data + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), dir.path.clone())],
+            assigns: vec![],
+            auto_assign_root: None,
+            cwd: "SYS:".to_string(),
+        })
+        .expect("build vfs");
+        rt.set_vfs(vfs);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        (code, rt, pkt, msg, buf)
+    }
+
+    #[test]
+    fn end_to_end_action_read_packet_via_raw_putmsg() {
+        let dir = TempDir::new("pkt-read");
+        std::fs::write(dir.path.join("f.txt"), b"packet payload").unwrap();
+        let (code, rt, pkt, msg, buf) = run_packet_program(&dir, ACTION_READ, 64);
+        let mem = rt.memory();
+
+        assert_eq!(
+            code as u32, msg,
+            "GetMsg must find the reply already queued -- the whole point \
+             of servicing the packet synchronously inside PutMsg"
+        );
+        assert_eq!(mem.read_u32(pkt + DP_RES1), 14, "dp_Res1 = bytes read");
+        assert_eq!(mem.read_u32(pkt + DP_RES2), 0);
+        assert_eq!(
+            mem.read_u8(msg + crate::execlist::LN_TYPE),
+            crate::execlist::NT_REPLYMSG,
+            "the replied message must look replied"
+        );
+        let got: Vec<u8> = (0..14).map(|i| mem.read_u8(buf + i)).collect();
+        assert_eq!(got, b"packet payload");
+    }
+
+    #[test]
+    fn end_to_end_unknown_action_packet_replies_action_not_known() {
+        let dir = TempDir::new("pkt-unknown");
+        std::fs::write(dir.path.join("f.txt"), b"x").unwrap();
+        let (code, rt, pkt, msg, _) = run_packet_program(&dir, 4242, 0);
+        let mem = rt.memory();
+
+        assert_eq!(
+            code as u32, msg,
+            "even an unknown action must be replied, not swallowed -- a \
+             client blocked on the reply port would otherwise hang"
+        );
+        assert_eq!(mem.read_u32(pkt + DP_RES1), RESULT_ERROR, "-1, not 0");
+        assert_eq!(mem.read_u32(pkt + DP_RES2), ERROR_ACTION_NOT_KNOWN as u32);
     }
 }

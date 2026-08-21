@@ -3474,11 +3474,14 @@ mod tests {
         // from the heap *before* the command-line buffer, so A0 (the
         // command-line buffer's address) no longer equals load_end
         // directly. And since the cli_StandardInput fix (issue #13),
-        // the eagerly-allocated Input() file handle is now the very
-        // first thing Runtime::new allocates from the heap, so the
-        // task struct sits right after it rather than at load_end
+        // the eagerly-allocated Input() file handle is the first heap
+        // use -- which itself first lazily creates the filesystem
+        // handler MsgPort its fh_Type points at (issue #24) -- so the
+        // task struct sits after both of those rather than at load_end
         // itself.
-        assert_eq!(rt.task, load_end + 44); // 44 = dosfile::FILE_HANDLE_SIZE
+        // 36 = execlist::MSGPORT_SIZE (34) rounded to the heap's 4-byte
+        // granularity; 44 = dosfile::FILE_HANDLE_SIZE.
+        assert_eq!(rt.task, load_end + 36 + 44);
         let a0 = rt.cpu.address_register(AddressRegister(0));
         assert!(
             a0 > load_end,

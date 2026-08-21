@@ -154,10 +154,32 @@ const RESULT_ERROR: u32 = 0xFFFF_FFFF;
 /// `Input()`/`Output()` default-handle constructors) allocate exactly
 /// this much, zeroed, on the guest heap per opened file.
 const FILE_HANDLE_SIZE: u32 = 44;
-/// Byte offset of `fh_Arg1` within `struct FileHandle` -- see the module
-/// docs' "Guest `FileHandle` layout" section for why this is written but
-/// not used as the lookup key.
+/// Byte offset of `fh_Arg1` within `struct FileHandle` -- holds the
+/// handle struct's own guest address. Real handlers store their private
+/// per-file identifier here, and packet-level clients echo it back as
+/// `dp_Arg1` in `ACTION_READ`/`ACTION_WRITE`/... packets (RKRM
+/// `packet-documentation.md`: "`Arg1`: `fh_Arg1` of the file handle"),
+/// so storing the handle's own address makes [`crate::dospkt`]'s packet
+/// dispatch a direct `handles` lookup with no separate id map. (An
+/// earlier version stored a monotonic debug counter here instead;
+/// nothing ever read it back.)
 const FH_ARG1_OFFSET: u32 = 36;
+/// Byte offset of `fh_Type` within `struct FileHandle`
+/// (`dos/dosextens.h`): the `MsgPort` of the *handler process* backing
+/// this file -- the port packet-level file I/O sends `DosPacket`s to.
+/// Real `Open()` always fills this in (it's how `SendPkt`-style clients
+/// find the file system), and real programs genuinely bypass
+/// `Read()`/`Write()` and talk packets straight to it: found via the
+/// real SAS/C `sc` compiler, whose `sc1.library` reads `fh_Type` off the
+/// source-file handle, `PutMsg`s `ACTION_READ`/`ACTION_WRITE` packets to
+/// it, and `WaitPort`/`GetMsg`s the reply (issue #24 -- with this left
+/// `0`, the packet went to a NULL port and the reply-wait deadlocked).
+/// Every handle except `NIL:`'s points at [`DosState::fs_port_addr`]'s
+/// host-serviced port; `NIL:` keeps `fh_Type = 0`, matching real
+/// AmigaOS, where the NIL: pseudo-handler has no process (RKRM
+/// `handlers-filesystems.md`: "If the path is relative to `NIL:`, no
+/// handler exists and `NULL` is returned").
+const FH_TYPE_OFFSET: u32 = 8;
 /// Byte offset of `fh_Port` within `struct FileHandle` (`dos/dosextens.h`).
 /// Despite the name/type, real AmigaOS treats it as a plain `LONG`, not a
 /// pointer: "If it is non-zero, the file is interactive" (RKRM
@@ -292,10 +314,11 @@ pub struct DosState {
     /// [`get_file_sys_task_handler`]'s doc comment for why a fixed
     /// sentinel (never a real, dereferenceable `MsgPort`) is sufficient.
     current_file_sys_task: u32,
-    /// Monotonic counter used only to give each opened handle a distinct
-    /// debug id written into `fh_Arg1` (see the module docs) -- not used
-    /// for lookups.
-    next_debug_id: u32,
+    /// Guest address of the lazily-created filesystem handler `MsgPort`
+    /// every non-`NIL:` `FileHandle`'s `fh_Type` points at -- see
+    /// [`FH_TYPE_OFFSET`]'s doc and [`Self::fs_port_addr`]. `None` until
+    /// the first handle is allocated.
+    fs_port: Option<u32>,
 
     // --- T11: locks / Examine-ExNext state. Methods and handlers for
     // these fields live in `crate::doslock`, not here (see that module's
@@ -317,9 +340,9 @@ pub struct DosState {
     /// time `CurrentDir` runs, before it's ever changed -- `CurrentDir(0)`
     /// restores this. `None` until the first `CurrentDir` call.
     pub(crate) initial_cwd: Option<String>,
-    /// Monotonic counter for `fl_Key` debug values, independent of
-    /// `next_debug_id` (which is for `FileHandle`s) so the two id spaces
-    /// don't visually collide when debugging.
+    /// Monotonic counter for `fl_Key` debug values (`FileHandle`s carry
+    /// their own guest address in `fh_Arg1` instead of a counter id --
+    /// see [`FH_ARG1_OFFSET`]'s doc).
     pub(crate) next_lock_id: u32,
 
     // --- Phase 3 stage 7: LoadSeg/UnLoadSeg + System()/Execute state.
@@ -442,7 +465,7 @@ impl DosState {
             current_input: None,
             current_output: None,
             current_file_sys_task: DEFAULT_FILE_SYS_TASK,
-            next_debug_id: 0,
+            fs_port: None,
             locks: HashMap::new(),
             exnext: HashMap::new(),
             current_dir_lock: None,
@@ -474,9 +497,66 @@ impl DosState {
         std::mem::replace(&mut self.io_err, value)
     }
 
-    fn next_id(&mut self) -> u32 {
-        self.next_debug_id = self.next_debug_id.wrapping_add(1);
-        self.next_debug_id
+    /// The guest address of the filesystem handler `MsgPort` (lazily
+    /// created on first use): a real, minimally-initialized `struct
+    /// MsgPort` in guest memory whose only job is to be a valid,
+    /// non-`NULL` `fh_Type` target -- `PutMsg` to it is intercepted
+    /// host-side ([`crate::execlist`]'s `PutMsg` handler routes it to
+    /// [`crate::dospkt::handle_fs_packet`]), so nothing ever genuinely
+    /// waits on its `mp_MsgList`; the list header is still initialized
+    /// so a guest that inspects (or, defensively, `GetMsg`s) the port
+    /// sees a coherent empty port rather than zeroed garbage.
+    pub(crate) fn fs_port_addr(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+    ) -> Result<u32, i32> {
+        if let Some(addr) = self.fs_port {
+            return Ok(addr);
+        }
+        let addr = heap
+            .alloc(crate::execlist::MSGPORT_SIZE)
+            .map_err(|_| ERROR_NO_FREE_STORE)?;
+        for i in 0..crate::execlist::MSGPORT_SIZE {
+            mem.write_u8(addr.wrapping_add(i), 0);
+        }
+        crate::execlist::init_list_header(mem, addr + crate::execlist::MP_MSGLIST);
+        self.fs_port = Some(addr);
+        Ok(addr)
+    }
+
+    /// Whether `port` is the filesystem handler port -- the `PutMsg`
+    /// handler's test for routing a guest-sent `DosPacket` to
+    /// [`crate::dospkt::handle_fs_packet`] instead of queueing it.
+    pub fn is_fs_handler_port(&self, port: u32) -> bool {
+        self.fs_port == Some(port)
+    }
+
+    /// Allocates and initializes one guest `struct FileHandle`:
+    /// zeroed, `fh_Arg1` = its own address (see [`FH_ARG1_OFFSET`]'s
+    /// doc), and -- unless `nil` -- `fh_Type` = the filesystem handler
+    /// port (see [`FH_TYPE_OFFSET`]'s doc; `NIL:` handles keep the real
+    /// AmigaOS `fh_Type = 0`, "no handler process").
+    fn alloc_file_handle(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        nil: bool,
+    ) -> Result<u32, i32> {
+        let fh_type = if nil {
+            0
+        } else {
+            self.fs_port_addr(heap, mem)?
+        };
+        let addr = heap
+            .alloc(FILE_HANDLE_SIZE)
+            .map_err(|_| ERROR_NO_FREE_STORE)?;
+        for i in 0..FILE_HANDLE_SIZE {
+            mem.write_u8(addr.wrapping_add(i), 0);
+        }
+        mem.write_u32(addr.wrapping_add(FH_ARG1_OFFSET), addr);
+        mem.write_u32(addr.wrapping_add(FH_TYPE_OFFSET), fh_type);
+        Ok(addr)
     }
 
     /// Whether `addr` (a guest `FileHandle` struct address, *not* a
@@ -531,8 +611,7 @@ impl DosState {
             return self.output_addr(heap, mem).map(bptr_from_addr);
         }
         if name.eq_ignore_ascii_case("NIL:") {
-            let id = self.next_id();
-            let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+            let addr = self.alloc_file_handle(heap, mem, true)?;
             self.handles.insert(addr, HostHandle::Null);
             return Ok(bptr_from_addr(addr));
         }
@@ -576,8 +655,7 @@ impl DosState {
                 .map_err(|e| map_io_error(&e))?
         };
 
-        let id = self.next_id();
-        let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+        let addr = self.alloc_file_handle(heap, mem, false)?;
         self.handles
             .insert(addr, HostHandle::HostFile(file, resolved.amiga_path));
         Ok(bptr_from_addr(addr))
@@ -700,8 +778,7 @@ impl DosState {
         let addr = match self.input_handle {
             Some(addr) => addr,
             None => {
-                let id = self.next_id();
-                let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+                let addr = self.alloc_file_handle(heap, mem, false)?;
                 mem.write_u32(addr.wrapping_add(FH_PORT_OFFSET), FH_PORT_INTERACTIVE);
                 self.handles.insert(addr, HostHandle::Stdin);
                 self.input_handle = Some(addr);
@@ -725,8 +802,7 @@ impl DosState {
         let addr = match self.output_handle {
             Some(addr) => addr,
             None => {
-                let id = self.next_id();
-                let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+                let addr = self.alloc_file_handle(heap, mem, false)?;
                 mem.write_u32(addr.wrapping_add(FH_PORT_OFFSET), FH_PORT_INTERACTIVE);
                 self.handles.insert(addr, HostHandle::Stdout);
                 self.output_handle = Some(addr);
@@ -764,21 +840,6 @@ impl DosState {
         self.current_output = Some(new_addr);
         Ok(old)
     }
-}
-
-/// Allocates a zeroed `sizeof(struct FileHandle)`-byte block on `heap`
-/// and writes `debug_id` into `fh_Arg1` (see the module docs).
-fn alloc_file_handle(
-    heap: &mut GuestHeap,
-    mem: &mut dyn AddressSpace,
-    debug_id: u32,
-) -> Result<u32, crate::guestmem::GuestHeapError> {
-    let addr = heap.alloc(FILE_HANDLE_SIZE)?;
-    for i in 0..FILE_HANDLE_SIZE {
-        mem.write_u8(addr.wrapping_add(i), 0);
-    }
-    mem.write_u32(addr.wrapping_add(FH_ARG1_OFFSET), debug_id);
-    Ok(addr)
 }
 
 // --- LVO handlers ---
@@ -1475,6 +1536,44 @@ mod tests {
     }
 
     #[test]
+    fn open_sets_fh_type_to_the_fs_port_and_fh_arg1_to_the_handles_own_address() {
+        let tmp = TempDir::new("fhtype");
+        fs::write(tmp.path().join("f.txt"), b"x").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+        let fs_port = dos.fs_port_addr(&mut heap, &mut mem).unwrap();
+        assert_eq!(
+            mem.read_u32(addr + FH_TYPE_OFFSET),
+            fs_port,
+            "fh_Type must name the filesystem handler port -- packet-level \
+             clients (real sc1.library, issue #24) PutMsg straight to it"
+        );
+        assert_eq!(
+            mem.read_u32(addr + FH_ARG1_OFFSET),
+            addr,
+            "fh_Arg1 must round-trip as the packet dispatch lookup key"
+        );
+        assert!(dos.is_fs_handler_port(fs_port));
+        assert!(!dos.is_fs_handler_port(addr));
+    }
+
+    #[test]
+    fn nil_handle_keeps_fh_type_zero() {
+        // Real AmigaOS: the NIL: pseudo-handler has no process, so its
+        // handles carry fh_Type = 0 -- see FH_TYPE_OFFSET's doc.
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let bptr = dos.open(&mut heap, &mut mem, "NIL:", MODE_OLDFILE).unwrap();
+        assert_eq!(mem.read_u32(addr_from_bptr(bptr) + FH_TYPE_OFFSET), 0);
+    }
+
+    #[test]
     fn open_nil_reads_as_immediate_eof_and_discards_writes() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
         let mut mem = FlatMemory::new(0x2000);
@@ -1722,9 +1821,14 @@ mod tests {
         let tmp = TempDir::new("closefree");
         fs::write(tmp.path().join("f.txt"), b"x").unwrap();
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let free_before = heap.free_bytes();
         let mut mem = FlatMemory::new(0x2000);
         let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        // Force the singleton filesystem handler port into existence
+        // first -- it deliberately persists for the process lifetime
+        // (every later handle's fh_Type names it), so it must not count
+        // against the open/close round-trip measured below.
+        dos.fs_port_addr(&mut heap, &mut mem).unwrap();
+        let free_before = heap.free_bytes();
         let bptr = dos
             .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
             .unwrap();

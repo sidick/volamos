@@ -3822,3 +3822,66 @@ under the real SAS/C install, chasing whatever gap chain
 corpus entry for `testlib`/`libcall` under real Kickstart via
 Copperline (the fixtures are real-hardware-ABI-clean specifically to
 enable this), and L6's broader real-library corpus pass.
+
+## Issue #24 fixed: packet-level file I/O -- the real SAS/C compiler now compiles C under volamos — 2026-08-21
+
+The L5 milestone, reached: `sc hello.c` under the `~/amiga/sasc`
+config now compiles to completion (exit 0) and the produced `hello.o`
+is **byte-identical to the one real Kickstart 3.1 produces** for the
+same source (compared against a kept Copperline-run output --
+deterministic object bytes being a far stronger signal than matching
+stdout).
+
+**The investigation** (recorded in full on issue #24, methodology
+worth reusing): the `WaitPort` deadlock went through three wrong
+hypotheses -- "needs real multi-tasking" (disproven: no
+`CreateTask`/`CreateProc` anywhere in any engine's trace),
+"`AllocSignal` returns a different bit" (disproven: `vamos`'s own
+`AllocSignal` turned out to be an unimplemented return-0 stub, ruling
+it out as an oracle; and real Kickstart, whose `AllocSignal` is
+genuinely correct like volamos's, also avoids the deadlock -- proven
+by standing up a full multi-volume SAS/C environment under Copperline
+and watching real hardware compile successfully), and "a flag byte in
+`sc1.library` gates the `WaitPort` path" (half-right: interactive
+Copperline tracing -- `run_until {pc}` at computed addresses, locating
+`sc1.library`'s unlabeled runtime hunk base by catching its one
+`PutMsg` call site's return address on the stack -- showed the gate
+byte identical between volamos and real hardware). The actual smoking
+gun came from one-shot volamos-side instrumentation: **`sc1`'s
+`PutMsg` was targeting port `0x0`**, traced to `fh_Type` (offset 8 of
+`struct FileHandle`) -- confirmed by matching the traced structure
+address exactly against `Open("hello.c")`'s returned handle.
+
+**Root cause**: real programs genuinely bypass `Read()`/`Write()` and
+speak the DOS packet protocol by hand -- read `fh_Type` (the handler
+process's `MsgPort`, which real `Open()` always populates), build a
+`StandardPacket`, `PutMsg` it, `WaitPort`/`GetMsg` the reply.
+volamos's `FileHandle`s left `fh_Type` zeroed, so `sc1.library`'s
+first source-file read sent its packet to a NULL port and waited
+forever for a reply that couldn't come.
+
+**The fix** (`dosfile.rs`/`dospkt.rs`/`execlist.rs`): a lazily-created
+host-serviced filesystem handler `MsgPort` that every non-`NIL:`
+handle's `fh_Type` now names (`NIL:` keeps `fh_Type = 0`, the real
+"no handler process" convention); `fh_Arg1` now holds the handle's own
+guest address (the real "handler's private identifier, echoed back as
+`dp_Arg1`" convention -- previously an unused debug counter); and
+`PutMsg` to that port routes to `dospkt::handle_fs_packet`, which
+services `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK`/`ACTION_END`
+against the same `DosState` backing the wrapper LVOs use, then replies
+`ReplyPkt`-style (fill `dp_Res1`/`dp_Res2`, send the message to
+`dp_Port` -- per the RKRM, `mn_ReplyPort` is explicitly not part of
+the packet protocol). Servicing synchronously inside `PutMsg` means
+the reply is already queued when the client's `GetMsg` runs, so its
+`WaitPort` fallback never needs to block -- the same structure
+`vamos`'s working implementation uses (verified against its
+`FileManager.fs_put_msg` source). Unknown actions reply `dp_Res1 = -1`
+/ `ERROR_ACTION_NOT_KNOWN` per the documented handler convention
+("-1 -- *and not 0*", RKRM `packet-documentation.md`).
+
+**Verification**: two new e2e tests drive the exact `sc1` idiom (raw
+`PutMsg`/`GetMsg` of a hand-built packet from guest code) plus unit
+tests for the new handle fields; 591 tests, clippy `-D warnings`, fmt
+all clean; all 11 `compare_three_way.py` corpus entries still pass;
+and the headline check above -- `hello.o` byte-identical to real
+hardware's.
