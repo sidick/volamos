@@ -210,6 +210,27 @@ CORPUS = [
         ALL_ENGINES,
         "renamed.txt",
     ),
+    # Was issue #14 (AnchorPath's ap_Buf wrongly included the
+    # device-name prefix, e.g. printing "SYS:SYS:S/Shell-Startup"
+    # instead of "SYS:S/Shell-Startup"), fixed 2026-08-21. Verifies via
+    # `output_file` pointed at the now-deleted original path --
+    # `read_output_file` returns the same "<... was never written>"
+    # placeholder text on all three engines once the file is gone,
+    # which doubles as a "the delete actually happened" check.
+    (
+        "delete-shell-startup",
+        "Delete SYS:S/Shell-Startup",
+        lambda s: s,
+        ALL_ENGINES,
+        "S/Shell-Startup",
+    ),
+    # Deterministic, silent on success (no stdout either way) --
+    # confirms exit code and lack-of-crash agree across all three
+    # engines. Doesn't verify the directory actually exists afterward
+    # (`output_file` only reads files as text, not directory presence)
+    # -- manually confirmed by hand across all three engines before
+    # wiring this in.
+    ("makedir-newdir", "MakeDir SYS:newdir", lambda s: s, ALL_ENGINES, None),
 ]
 
 

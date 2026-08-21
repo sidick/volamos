@@ -3681,3 +3681,33 @@ for the earlier Copy gap chain and the dospattern encoding rewrite
 (real `Rename` reuses `ParsePattern`'s output buffer as a plain
 `STRPTR`, per that entry). Corpus is now 9 entries; all passing
 locally.
+
+## Issue #14 fixed: `AnchorPath`'s `ap_Buf` wrongly included the device-name prefix; two more corpus entries — 2026-08-21
+
+Manually verifying `Delete` before adding it to the corpus (same
+discipline as every prior addition) found a real, new bug: `Delete
+SYS:S/Shell-Startup` printed `SYS:SYS:S/Shell-Startup  Deleted` under
+volamos vs. real Kickstart's `SYS:S/Shell-Startup  Deleted` (`vamos`
+disagrees too, but with its own unrelated lowercase-folding quirk).
+Disassembling the real `Delete` binary found the cause: it builds its
+own device-name prefix by scanning the *original pattern text*, and
+prints that separately, concatenated with `MatchNext`'s `ap_Buf`.
+`ap_Buf` itself -- per the RKRM's own wording, "its complete
+(**relative**) path" -- is supposed to hold the volume-*relative* path,
+not the fully device-qualified one; volamos's `dosanchor.rs` was
+writing the fully `VFS`-qualified path (device name included) into
+`ap_Buf`, so any real caller building its own prefix separately (like
+`Delete`) doubled it. Fixed with a new `strip_device_prefix` helper
+applied in `write_match_result`; updated the one existing test that
+had (wrongly) codified the old behavior as correct. Verified against
+real Kickstart 3.1 via Copperline: byte-identical output after the
+fix. Full `cargo build/test (541)/clippy -D warnings/fmt --check`
+clean.
+
+Added `delete-shell-startup` (verifies via `output_file` pointed at
+the now-deleted path -- all three engines return the same "was never
+written" placeholder once it's gone, doubling as a "deletion actually
+happened" check) and `makedir-newdir` (silent on success either way;
+manually confirmed the directory is actually created across all three
+engines by hand, since `output_file` can't check directory presence).
+Corpus is now 11 entries; all passing locally.

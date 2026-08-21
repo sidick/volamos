@@ -192,6 +192,22 @@ fn join_amiga(dir: &str, name: &str) -> String {
     }
 }
 
+/// Strips a leading `volume:`/`assign:` device-name prefix, if any --
+/// what `ap_Buf` actually holds on real hardware isn't the fully
+/// `VFS`-qualified path this module otherwise works with internally,
+/// but a path *relative to the volume* (the RKRM's own wording: "its
+/// complete (*relative*) path"). Found via disassembling the real
+/// `C:Delete` binary (issue #14): it builds its own device-name prefix
+/// separately (by scanning the *pattern text itself* for a leading
+/// `:`, not from `ap_Buf`) and concatenates that with `ap_Buf`'s own
+/// content when printing a match -- so a caller-supplied device name
+/// stayed *in* `ap_Buf` too, real output would double it (exactly
+/// volamos's old, wrong behavior: `SYS:SYS:S/Shell-Startup`, vs. real
+/// hardware's `SYS:S/Shell-Startup`).
+fn strip_device_prefix(path: &str) -> &str {
+    path.split_once(':').map_or(path, |(_, rest)| rest)
+}
+
 fn set_flag_bit(mem: &mut dyn AddressSpace, ap_addr: u32, bit: u8, set: bool) {
     let flags = mem.read_u8(ap_addr + AP_FLAGS_OFFSET);
     mem.write_u8(
@@ -241,7 +257,7 @@ fn write_match_result(
     if strlen == 0 {
         return Ok(());
     }
-    let bytes = full_amiga_path.as_bytes();
+    let bytes = strip_device_prefix(full_amiga_path).as_bytes();
     let overflowed = bytes.len() + 1 > strlen;
     let n = bytes.len().min(strlen.saturating_sub(1));
     let buf_addr = ap_addr + AP_BUF_OFFSET;
@@ -858,7 +874,10 @@ mod tests {
 
         match_first(&mut heap, &mut mem, &mut dos, b"SYS:hello.txt", ap).expect("match");
         let path = read_c_string(&mem, ap + AP_BUF_OFFSET);
-        assert_eq!(path, b"SYS:hello.txt");
+        // Not "SYS:hello.txt" -- see strip_device_prefix's doc (issue
+        // #14): ap_Buf holds a path *relative to the volume*, not the
+        // fully device-qualified form.
+        assert_eq!(path, b"hello.txt");
     }
 
     #[test]
