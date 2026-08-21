@@ -3975,3 +3975,50 @@ flag parsing) + 1 new config-file test, all passing; clippy
 `-D warnings` and fmt clean; `mkdocs build --strict` clean
 (`CLI-Reference.md`/`Configuration.md` updated with the real benchmark
 numbers above).
+
+## Phase 6 (issue #19) implemented: multi-arch static container image — 2026-08-21
+
+New `Dockerfile`: `rust:alpine` builder stage -> `gcr.io/distroless/
+static-debian12:nonroot` final stage. Alpine's default Rust target is
+already `*-unknown-linux-musl` for whatever platform buildx assigns the
+stage to, and musl targets statically link libc by default, so no
+`--target`/cross-linker setup was needed at all -- each platform's
+build stage just compiles natively for itself (under QEMU emulation
+when that platform isn't the CI runner's own). Considered cross-
+compiling from a single native builder stage instead (avoids QEMU
+entirely), but it needs a real cross-linker toolchain `rust:alpine`
+doesn't ship (would mean switching to something like `messense/
+rust-musl-cross` plus a per-arch `docker build` + `buildx imagetools
+create` to stitch a manifest) -- deferred as unnecessary complexity for
+a tag-triggered publish job; simple QEMU-per-platform is what's
+shipped. distroless `static-debian12:nonroot` over plain `scratch`
+buys a nonroot user (UID 65532) for near-zero size cost.
+
+**Verified both target architectures locally** (Docker Desktop on
+Apple Silicon, `--platform linux/arm64` native + `linux/amd64` via
+Rosetta/QEMU emulation): the project's own fixture corpus
+(echoargs/filetest/dirtest/exectest/systest/runcmdtest) runs correctly
+in both, including real file writes under the nonroot user against a
+mounted volume and a nested `System()`/`RunCommand()` child process.
+**Then the real behavioral bar** the issue asked for (not just a smoke
+test): the real SAS/C 6.58 compiler, run *inside* both containers
+against `~/amiga/sasc/hello.c`, produces a `hello.o` byte-identical
+(via `cmp`) to the native host build -- on both `linux/arm64` and
+`linux/amd64`. (SAS/C itself is licensed and never vendored into this
+repo or CI -- see `fixtures/README.md` -- so this compiler-level check
+stays a local, hand-run verification, same established split as
+`compare_three_way.py`.)
+
+**CI**: new `docker` job in `.github/workflows/ci.yml`, split so the
+expensive/side-effecting parts only run on a real `v*` tag push: every
+push/PR builds a runner-native single-platform image and validates it
+behaviorally via new `tools/compare_docker.py` (diffs the fixture
+corpus's output between the native binary and `docker run
+<image>` -- no external oracle needed, since the container can only
+regress *how* volamos runs, not what a fixture is supposed to output);
+only on a tag does it additionally build+push the real
+`linux/amd64,linux/arm64` multi-arch manifest to `ghcr.io/sidick/
+volamos`, using the workflow's own `GITHUB_TOKEN` (no new secret
+needed for same-repo GHCR publishing). Filed issue #25 as an explicit
+follow-up (standalone per-arch binary zips on the GitHub Release, for
+users who don't want Docker) rather than folding it into this scope.

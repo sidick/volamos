@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 env:
@@ -89,3 +90,78 @@ jobs:
 
       - name: Run interpreter/--jit dual-mode harness
         run: python3 tools/compare_jit.py --volamos target/release/volamos
+
+  docker:
+    name: Docker image (build, validate, publish on tags)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: docker-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            docker-cargo-
+
+      # Native build, used only as compare_docker.py's reference side --
+      # never published.
+      - name: Build native volamos (release)
+        run: cargo build --release -p volamos
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Single-platform (runner-native) build, loaded locally so it can
+      # actually run -- a multi-platform manifest built below can't be
+      # `docker run` directly. This is what compare_docker.py exercises.
+      - name: Build image for validation
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: volamos:validate
+
+      - name: Validate container behavior against the native binary
+        run: python3 tools/compare_docker.py --image volamos:validate --volamos target/release/volamos
+
+      # Everything below only runs for a real release tag (v*) -- pull
+      # requests and ordinary main-branch pushes stop at the validation
+      # step above.
+      - name: Set up QEMU
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract tag
+        if: startsWith(github.ref, 'refs/tags/')
+        id: tag
+        run: echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push multi-arch image
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/sidick/volamos:${{ steps.tag.outputs.value }}
+            ghcr.io/sidick/volamos:latest
