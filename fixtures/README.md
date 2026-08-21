@@ -372,3 +372,95 @@ python3 fixtures/gen_recurse.py
 ```
 
 If you change a `.s` file, update its `gen_*.py` counterpart to match.
+
+## Phase L3 fixtures: `testlib`, `testlib_initfail`, `libcall`
+
+Added for `library-device-loading-plan.md`'s phase L3 (real disk-based
+`OpenLibrary`): a hand-authored `RTF_AUTOINIT` library pair plus a CLI
+client that opens and calls one of them. Unlike every fixture above,
+`testlib`/`testlib_initfail` are **not run directly** -- they're loaded
+via the real `OpenLibrary` disk-load path (`crates/volamos-core/src/
+execlib.rs`), exactly like a real `.library` file on `LIBS:`.
+
+### `testlib`
+
+Source: `testlib.s`; generator: `gen_testlib.py`.
+
+A tiny, genuine `struct Resident`-headed `RTF_AUTOINIT`/`NT_LIBRARY`
+library, **all in a single CODE hunk** (the struct Resident, AUTOINIT
+table, absolute-pointer vector table, and name strings all live in the
+same hunk as the code -- the real on-disk shape of a vasm-built `.library`
+file; see the `.s` file's header comment for the full byte layout). Six
+vectors: Open (increments `lib_OpenCnt`, a real library's own job, not
+volamos's), Close/Expunge/Reserved (trivial), and two user vectors --
+`UserFunc` (LVO -30, `moveq #42,d0`) and `AddFunc` (LVO -36, `D0 = D0 +
+D1`) -- executed *natively* by the CPU backend once opened, no host
+dispatch involved. `InitFunc` proves it really ran (writes a marker into
+`lib_Revision`), that `A0`/`D0` were passed per the AUTOINIT calling
+convention (two marker longwords past `struct Library`'s own 34 bytes),
+and that the L2 trampoline supports a *nested* library call mid-init (an
+`AllocMem` call, its result also stored as a marker).
+
+`crates/volamos-core/src/execlib.rs`'s `loaded_library_e2e` test module
+drives this fixture through real A-line trap dispatch end to end.
+
+### `testlib_initfail`
+
+Source: `testlib_initfail.s`; generator: `gen_testlib_initfail.py`.
+
+Identical shape to `testlib`, except its `initFunc` unconditionally
+returns `NULL` (refuses the open). Exercises `execlib.rs`'s `after_init`
+NULL-init-result cleanup path (seglist unload + `make_library` allocation
+freed, nothing leaked -- see `loaded_library_e2e`'s heap-free-bytes test).
+
+### `libcall`
+
+Source: `libcall.s`; generator: `gen_libcall.py`.
+
+A CLI client, real startup convention (`.s`'s header comment has the full
+flow): reads its one command-line argument (the library name) into a
+scratch buffer, `OpenLibrary`s it (works for either a bare name via
+`LIBS:` or a full path -- the same binary exercises both, since
+`OpenLibrary`'s own name-resolution logic is what tells them apart), calls
+both `testlib` user vectors and checks their results, re-opens the same
+library to check `lib_OpenCnt` reads back `2`, `CloseLibrary`s both opens
+(currently a no-op for a loaded library -- forward-compatible, L4 wires
+the real Close vector), and exits `0`. Prints `user ok\n`/`add ok\n`/
+`cnt ok\n` on success; `open failed\n` + exit 10 if `OpenLibrary` returns
+NULL; `bad\n` + exit 20 if any check fails.
+
+Run e.g.
+`volamos -V SYS:/dir/with/libs -a LIBS:SYS:libs fixtures/libcall test.library`
+(with `dir/libs/test.library` present) or with `SYS:libs/test.library` as
+the argument instead, to exercise the full-path open.
+`crates/volamos/tests/libcall_e2e.rs` drives both, plus the
+library-missing failure path.
+
+### Regenerating
+
+```sh
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/testlib          fixtures/testlib.s
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/testlib_initfail fixtures/testlib_initfail.s
+vasmm68k_mot -Fhunkexe -nosym -o fixtures/libcall           fixtures/libcall.s
+```
+
+or, without vasm, the authoritative toolchain-free build:
+
+```sh
+python3 fixtures/gen_testlib.py
+python3 fixtures/gen_testlib_initfail.py
+python3 fixtures/gen_libcall.py
+```
+
+`testlib`/`testlib_initfail` use `amiga_asm.py`'s
+`build_single_hunk_executable` (added for this phase) instead of
+`build_hunk_executable`, since they're single-CODE-hunk files with
+self-targeting `HUNK_RELOC32` fixups rather than a separate DATA hunk --
+see `gen_testlib.py`'s module docstring and `amiga_asm.py`'s
+`dc_w`/`dc_l_imm`/`dc_l_selfptr`/`dc_bytes`/`resolve_self` for the
+mechanics, and the handful of new `CodeBuilder` instruction encodings
+(`movem_l_to_predec`/`movem_l_from_postinc`, `move_w_imm_to_disp_a`,
+`move_l_a_to_disp_a`/`move_l_d_to_disp_a`, `move_w_disp_a_to_d`,
+`addq_w_disp_a`, `cmpi_b_imm_to_d`/`cmpi_l_imm_to_d`, `clr_b_ind`,
+`add_l_d_to_d`) they needed. If you change a `.s` file, update its
+`gen_*.py` counterpart to match.

@@ -37,6 +37,7 @@ pub mod dosstr;
 pub mod dosvar;
 pub mod execchunk;
 pub mod execfmt;
+pub mod execlib;
 pub mod execlist;
 pub mod execmem;
 pub mod execsem;

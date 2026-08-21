@@ -108,6 +108,11 @@ class CodeBuilder:
         self._abs32_fixups: list[tuple[int, str, int]] = []
         # (word_index_of_disp_word, code_label)
         self._branch_fixups: list[tuple[int, str]] = []
+        # (word_index_of_high_half, code_label, addend) -- pointers to a
+        # label *in this same builder* (self-hunk), as opposed to
+        # _abs32_fixups' pointers into a separate DATA hunk. Added for
+        # Phase L3's testlib fixtures (see dc_l_selfptr/resolve_self).
+        self._self_abs32_fixups: list[tuple[int, str, int]] = []
 
     def word(self, value: int) -> int:
         self.words.append(value & 0xFFFF)
@@ -200,6 +205,42 @@ class CodeBuilder:
         self.word(0x10FC | (an << 9))
         self.word(imm & 0xFF)
 
+    # --- raw data emission (single-hunk fixtures: fixtures/testlib.s's
+    # struct Resident/AUTOINIT table/vector table/name strings all live
+    # in the CODE hunk itself, with self-targeting HUNK_RELOC32 fixups --
+    # see the module's "single-hunk fixtures" section below) ---
+
+    def dc_w(self, value: int) -> int:
+        """Raw `dc.w value` -- a bare word, no fixup."""
+        return self.word(value)
+
+    def dc_l_imm(self, value: int) -> None:
+        """Raw `dc.l value` -- a bare longword constant (e.g. a vector
+        table's `-1` terminator), no relocation."""
+        self.word((value >> 16) & 0xFFFF)
+        self.word(value & 0xFFFF)
+
+    def dc_l_selfptr(self, label: str, addend: int = 0) -> None:
+        """Raw `dc.l label` -- an absolute pointer to a label *in this
+        same hunk* (unlike `move_l_label_to_d/_a`, which point into a
+        separate DATA hunk). A real vasm-built single-CODE-hunk library
+        emits exactly this shape: a `HUNK_RELOC32` group whose target
+        hunk is the hunk currently being assembled (see
+        `fixtures/testlib.s`'s header comment). Resolved by
+        `resolve_self`."""
+        idx = self.word(0)
+        self.word(0)
+        self._self_abs32_fixups.append((idx, label, addend))
+
+    def dc_bytes(self, data: bytes) -> None:
+        """Raw byte data (e.g. a NUL-terminated library name string),
+        packed two-per-word; pads with one zero byte if `data` has odd
+        length (the `even` directive's effect in the `.s` source) so
+        word-granular label offsets stay exact."""
+        padded = data if len(data) % 2 == 0 else data + b"\0"
+        for i in range(0, len(padded), 2):
+            self.word((padded[i] << 8) | padded[i + 1])
+
     # --- control flow / calls ---
 
     def jsr_disp16_a(self, an: int, disp: int) -> None:
@@ -249,6 +290,116 @@ class CodeBuilder:
         idx = self.word(0)
         self._branch_fixups.append((idx, label))
 
+    # --- added for fixtures/gen_testlib.py / fixtures/gen_libcall.py
+    # (Phase L3): register-list move, displaced-EA moves, displaced ADDQ,
+    # CMPI, byte CLR to (An), and a register-direct ADD. Each derived
+    # directly from the M68000 PRM's encoding tables, same style/rigor as
+    # every helper above.
+
+    @staticmethod
+    def _movem_mask(regs: list[str], predecrement: bool) -> int:
+        """Builds a MOVEM register-list mask from names like "d0"/"a6".
+        Normal (postincrement/control) addressing: bit0=D0..bit7=D7,
+        bit8=A0..bit15=A7. Predecrement addressing reverses this: the
+        register closest to the pointer goes in the low bits, so
+        bit0=A7..bit7=A0, bit8=D7..bit15=D0 (M68000 PRM, MOVEM)."""
+        mask = 0
+        for r in regs:
+            kind = r[0]
+            n = int(r[1])
+            assert kind in ("d", "a") and 0 <= n <= 7, f"bad register {r!r}"
+            if predecrement:
+                bit = (7 - n) if kind == "a" else (15 - n)
+            else:
+                bit = n if kind == "d" else (8 + n)
+            mask |= 1 << bit
+        return mask
+
+    def movem_l_to_predec(self, an: int, regs: list[str]) -> None:
+        """`movem.l <reglist>,-(An)`."""
+        self.word(0x48E0 | an)
+        self.word(self._movem_mask(regs, predecrement=True))
+
+    def movem_l_from_postinc(self, an: int, regs: list[str]) -> None:
+        """`movem.l (An)+,<reglist>`."""
+        self.word(0x4CD8 | an)
+        self.word(self._movem_mask(regs, predecrement=False))
+
+    def move_w_imm_to_disp_a(self, an: int, disp: int, imm: int) -> None:
+        """`move.w #imm,<disp16>(An)`. Extension word order is
+        source-then-destination: the immediate word first, then the
+        destination displacement word."""
+        self.word(0x3000 | (an << 9) | 0x17C)
+        self.word(imm & 0xFFFF)
+        self.word(disp & 0xFFFF)
+
+    def move_l_a_to_disp_a(self, dst_an: int, disp: int, src_an: int) -> None:
+        """`move.l An,<disp16>(Am)` -- src=An direct, dest=d16(Am)."""
+        self.word(0x2000 | (dst_an << 9) | 0x148 | src_an)
+        self.word(disp & 0xFFFF)
+
+    def move_l_d_to_disp_a(self, dst_an: int, disp: int, src_dn: int) -> None:
+        """`move.l Dn,<disp16>(Am)` -- src=Dn direct, dest=d16(Am)."""
+        self.word(0x2000 | (dst_an << 9) | 0x140 | src_dn)
+        self.word(disp & 0xFFFF)
+
+    def move_w_disp_a_to_d(self, an: int, disp: int, dn: int) -> None:
+        """`move.w <disp16>(An),Dn` -- src=d16(An), dest=Dn direct."""
+        self.word(0x3028 | (dn << 9) | an)
+        self.word(disp & 0xFFFF)
+
+    def move_l_disp_a_to_d(self, an: int, disp: int, dn: int) -> None:
+        """`move.l <disp16>(An),Dn` -- src=d16(An), dest=Dn direct; same
+        shape as [`move_w_disp_a_to_d`] with the long-size base (`0x2000`,
+        matching every other long MOVE helper above) instead of the
+        word-size base (`0x3000`). Added for `fixtures/testlib.s`'s real
+        `CloseFunc` (phase L4): loading the stored segList BPTR
+        (`SEGLIST_MARKER_OFFSET(a6)`) into D0 on the last close."""
+        self.word(0x2028 | (dn << 9) | an)
+        self.word(disp & 0xFFFF)
+
+    def addq_w_disp_a(self, an: int, disp: int, imm: int) -> None:
+        """`addq.w #imm,<disp16>(An)` (`1 <= imm <= 8`, encoded as `imm %
+        8`; dest addressing mode d16(An) = 101)."""
+        assert 1 <= imm <= 8
+        q = imm % 8
+        self.word(0x5068 | (q << 9) | an)  # size=word(01)<<6=0x40, mode=d16(An)(101)<<3=0x28
+        self.word(disp & 0xFFFF)
+
+    def subq_w_disp_a(self, an: int, disp: int, imm: int) -> None:
+        """`subq.w #imm,<disp16>(An)` (`1 <= imm <= 8`, encoded as `imm %
+        8`) -- same ADDQ/SUBQ family as [`addq_w_disp_a`], just with the
+        S bit (bit 8) set to select SUBQ instead of ADDQ (M68000 PRM,
+        ADDQ/SUBQ): `0x5068 | 0x0100 == 0x5168`. Added for
+        `fixtures/testlib.s`'s real `CloseFunc` (phase L4), which
+        decrements `lib_OpenCnt` in place before checking it."""
+        assert 1 <= imm <= 8
+        q = imm % 8
+        self.word(0x5168 | (q << 9) | an)
+        self.word(disp & 0xFFFF)
+
+    def cmpi_b_imm_to_d(self, dn: int, imm: int) -> None:
+        """`cmpi.b #imm,Dn`."""
+        self.word(0x0C00 | dn)
+        self.word(imm & 0xFF)
+
+    def cmpi_l_imm_to_d(self, dn: int, imm: int) -> None:
+        """`cmpi.l #imm,Dn` (long immediate: two extension words, hi then
+        lo)."""
+        self.word(0x0C80 | dn)
+        self.word((imm >> 16) & 0xFFFF)
+        self.word(imm & 0xFFFF)
+
+    def clr_b_ind(self, an: int) -> None:
+        """`clr.b (An)`."""
+        self.word(0x4210 | an)
+
+    def add_l_d_to_d(self, dst: int, src: int) -> None:
+        """`add.l Dsrc,Ddst` -- `Ddst = Ddst + Dsrc` (ADD, long, dest=Dn
+        direct, opmode 010 = "Dn + <ea> -> Dn", src=Dn direct addressing
+        mode 000)."""
+        self.word(0xD080 | (dst << 9) | src)
+
     # --- resolution ---
 
     def resolve(self, data: DataBuilder) -> list[tuple[int, int]]:
@@ -265,6 +416,27 @@ class CodeBuilder:
             self.words[word_idx] = (target >> 16) & 0xFFFF
             self.words[word_idx + 1] = target & 0xFFFF
             relocs.append((word_idx * 2, 1))
+        for word_idx, label in self._branch_fixups:
+            target_addr = self.labels[label] * 2
+            disp_word_addr = word_idx * 2
+            disp = target_addr - disp_word_addr
+            assert -32768 <= disp <= 32767, "branch displacement out of word range"
+            self.words[word_idx] = disp & 0xFFFF
+        return relocs
+
+    def resolve_self(self) -> list[int]:
+        """Like `resolve`, but for a single-hunk build with no DATA hunk
+        (`fixtures/testlib.s`/`fixtures/testlib_initfail.s`'s shape):
+        resolves `dc_l_selfptr` fixups against this same builder's own
+        `labels` and branch fixups exactly as `resolve` does. Returns the
+        list of byte offsets (within this hunk) needing a
+        self-targeting `HUNK_RELOC32` entry."""
+        relocs: list[int] = []
+        for word_idx, label, addend in self._self_abs32_fixups:
+            target = self.labels[label] * 2 + addend
+            self.words[word_idx] = (target >> 16) & 0xFFFF
+            self.words[word_idx + 1] = target & 0xFFFF
+            relocs.append(word_idx * 2)
         for word_idx, label in self._branch_fixups:
             target_addr = self.labels[label] * 2
             disp_word_addr = word_idx * 2
@@ -323,6 +495,47 @@ def build_hunk_executable(code: CodeBuilder, data: DataBuilder) -> bytes:
     out += u32(HUNK_DATA)
     out += u32(data_longwords)
     out += data_bytes
+    out += u32(HUNK_END)
+
+    return bytes(out)
+
+
+def build_single_hunk_executable(code: CodeBuilder) -> bytes:
+    """Emits a *single*-CODE-hunk executable from `code` alone -- no DATA
+    hunk, with self-targeting `HUNK_RELOC32` fixups only (via
+    `CodeBuilder.resolve_self`). This is the real on-disk shape of a
+    hand-authored `RTF_AUTOINIT` library like `fixtures/testlib.s`: the
+    `struct Resident`/AUTOINIT table/vector table/name strings all live in
+    the same hunk as the code, and every absolute pointer among them
+    relocates against that same hunk (see `fixtures/testlib.s`'s header
+    comment; a real vasm build of a one-hunk `.s` file emits exactly this
+    shape too)."""
+    if len(code.words) % 2 != 0:
+        code.word(0x4E71)
+    relocs = code.resolve_self()
+    code_bytes = code.to_bytes()
+    assert len(code_bytes) % 4 == 0, "code hunk must be a whole number of longwords"
+
+    code_longwords = len(code_bytes) // 4
+
+    out = bytearray()
+    out += u32(HUNK_HEADER)
+    out += u32(0)  # no resident library names
+    out += u32(1)  # table_size: 1 hunk
+    out += u32(0)  # first_hunk
+    out += u32(0)  # last_hunk
+    out += u32(code_longwords)
+
+    out += u32(HUNK_CODE)
+    out += u32(code_longwords)
+    out += code_bytes
+    if relocs:
+        out += u32(HUNK_RELOC32)
+        out += u32(len(relocs))
+        out += u32(0)  # target hunk: this same hunk (self-relocated)
+        for offset in relocs:
+            out += u32(offset)
+        out += u32(0)  # terminate RELOC32 groups
     out += u32(HUNK_END)
 
     return bytes(out)

@@ -105,6 +105,16 @@ const EXCEPTION_VECTOR_TABLE_SIZE: u32 = 0xC0;
 /// available to [`LibraryTable::register`].
 const FAKE_LIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 2;
 
+/// The slot index reserved for the trampoline primitive's continuation
+/// stub (see [`ContinuationStack`] and [`CONTINUATION_STUB_ADDR`]). Like
+/// [`FAKE_LIB_SLOT`], bound once via `register_fixed_slot` rather than
+/// handed out by [`LibraryTable::register`]'s counter -- there is only
+/// ever one continuation-stub address, so only one opcode word is ever
+/// written for it (at [`Runtime::new`] time), unlike `FAKE_LIB_SLOT`
+/// which gets rewritten across many fake libraries' jump-table blocks.
+/// Not available to [`LibraryTable::register`].
+const CONTINUATION_SLOT: u16 = MAX_LIBRARY_SLOTS - 3;
+
 /// Size in bytes of the jump-table block [`open_library_handler`] carves
 /// out of the guest heap for each newly auto-created fake library.
 /// Generous (matches [`crate::backend::TRAP_TABLE_SIZE`]) so any
@@ -198,7 +208,12 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     "no separate host-side mirror" convention
 ///                     `crate::exectask`'s module docs establish for
 ///                     task/signal state.
-/// 0x00C4 .. 0x02CC   unused headroom
+/// 0x00C4 .. 0x00C6   CONTINUATION_STUB_ADDR: a single A-line opcode
+///                     word bound to CONTINUATION_SLOT -- the trampoline
+///                     primitive's fixed "resume here after a
+///                     trampolined guest subroutine's rts" address. See
+///                     ContinuationStack's docs for the full mechanism.
+/// 0x00C6 .. 0x02CC   unused headroom
 /// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
@@ -421,7 +436,7 @@ fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
 /// `docs/plan.md`'s empirical-corpus notes), though `Version`'s own
 /// Kickstart-version report turned out to come from a simpler, more
 /// direct source ([`EXEC_BASE_SOFTVER_OFFSET`]) rather than this list.
-const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
+pub(crate) const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 
 /// Byte offset of `ExecBase.SemaphoreList` from [`EXEC_LIBRARY_BASE`] --
 /// same field-by-field derivation as [`EXEC_BASE_LIBLIST_OFFSET`],
@@ -502,6 +517,13 @@ pub const CACHE_BITS_ADDR: u32 = 0x00C0;
 /// checks bits its own `AttnFlags`-detected CPU actually has).
 pub(crate) const CACHE_BITS_DEFAULT: u32 = 0xC000_3111;
 
+/// Guest address of the trampoline primitive's continuation stub -- see
+/// [`ContinuationStack`]'s docs and [`EXEC_LIBRARY_BASE`]'s "Reserved-
+/// region memory map" doc. Sits in the headroom immediately after
+/// [`CACHE_BITS_ADDR`]'s cell, well clear of `dos.library`'s registered
+/// LVOs starting at `0x02CC`.
+pub const CONTINUATION_STUB_ADDR: u32 = 0x00C4;
+
 /// Byte length of each library's `ln_Name` string, including its `NUL`
 /// terminator, as laid out by [`write_library_list_nodes`] in the
 /// headroom above `ExecBase.LibList` -- see the "Reserved-region memory
@@ -579,6 +601,15 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// examples. Reset to `None` before every dispatched call; almost
     /// every handler leaves it alone.
     pub call_detail: &'a mut Option<String>,
+    /// Host-side pending stack for the trampoline primitive -- see
+    /// [`ContinuationStack`]'s docs. Any handler can call
+    /// [`ContinuationStack::trampoline`] on this to run a guest
+    /// subroutine (which may itself make ordinary library calls) and
+    /// resume, host-side, once it returns -- the mechanism that lets a
+    /// multi-phase operation like a disk library's `initFunction`/`Open`
+    /// sequence (see the library/device-loading plan's L3) run as
+    /// ordinary guest code instead of needing CPU-reentrancy machinery.
+    pub continuations: &'a mut ContinuationStack<C>,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -690,6 +721,15 @@ pub enum DispatchError {
     /// [`crate::exectask::fold_pending_host_break`]) -- see
     /// [`Runtime::run`]'s doc for the granularity caveat.
     StackOverflow { a7: u32, lower: u32, upper: u32 },
+    /// The guest reached [`CONTINUATION_STUB_ADDR`] with nothing on
+    /// [`ContinuationStack`]'s pending list to run -- see
+    /// [`continuation_stub_handler`]. Always a bug (either this
+    /// runtime's own trampoline bookkeeping is out of sync, or a guest
+    /// program somehow jumped straight to the internal stub address
+    /// without going through [`ContinuationStack::trampoline`]), never a
+    /// legitimate guest program state -- reported loudly rather than
+    /// treated as a silently-swallowed `rts`.
+    EmptyContinuationStack { pc: u32 },
 }
 
 impl fmt::Display for DispatchError {
@@ -730,6 +770,12 @@ impl fmt::Display for DispatchError {
                 f,
                 "stack overflow: A7 {a7:#010x} is outside the current task's stack bounds \
                  [{lower:#010x}, {upper:#010x}] -- try running with a larger --stack"
+            ),
+            DispatchError::EmptyContinuationStack { pc } => write!(
+                f,
+                "continuation stub trapped at {pc:#010x} with no pending continuation \
+                 (guest jumped to the trampoline stub directly, or ContinuationStack \
+                 bookkeeping is out of sync)"
             ),
         }
     }
@@ -792,10 +838,17 @@ impl<C: Cpu> LibraryTable<C> {
         handler: impl LibraryHandler<C> + 'static,
     ) -> u16 {
         let slot = self.next_slot;
+        // < CONTINUATION_SLOT, not just < FAKE_LIB_SLOT: CONTINUATION_SLOT
+        // (MAX_LIBRARY_SLOTS - 3) sits below FAKE_LIB_SLOT
+        // (MAX_LIBRARY_SLOTS - 2) and is bound once via
+        // register_fixed_slot, not through this counter -- an unbounded
+        // run of ordinary registrations must stop short of it too, or
+        // next_slot could eventually collide with and silently overwrite
+        // the trampoline stub's own slot entry.
         assert!(
-            slot < FAKE_LIB_SLOT,
+            slot < CONTINUATION_SLOT,
             "LibraryTable: too many registered handlers (max {})",
-            FAKE_LIB_SLOT - 1
+            CONTINUATION_SLOT - 1
         );
         self.next_slot += 1;
 
@@ -951,6 +1004,36 @@ pub enum LibraryKind {
     /// passthrough for e.g. the math libraries) can slot in as a third
     /// kind without disturbing this one.
     Faked,
+    /// A library base backed by a genuinely `LoadSeg`ed, `InitResident`ed
+    /// disk library (`library-device-loading-plan.md`'s L3) -- real
+    /// relocated 68k code, with a real jump table built by
+    /// [`crate::execlib::make_library`]. A repeat `OpenLibrary` of the
+    /// same name must run the real protocol again (version check, then
+    /// the library's own `Open` vector) rather than just handing back the
+    /// cached base -- see [`crate::execlib::reopen`].
+    Loaded,
+}
+
+/// The host-side record [`LibraryRegistry::register_loaded`] keeps for a
+/// [`LibraryKind::Loaded`] library -- everything a later `CloseLibrary`
+/// (L4) will need to unwind a load (`seglist_bptr`/`alloc_addr`), plus the
+/// `base` already available via [`LibraryRegistry::lookup`] (duplicated
+/// here too since it's cheaper to carry than to look up twice, and this
+/// record is the natural place a future L4 `CloseLibrary` handler will
+/// index from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadedLibrary {
+    /// The library base address (same value [`LibraryRegistry::lookup`]
+    /// returns for this name).
+    pub base: u32,
+    /// The `BPTR` [`crate::dosfile::DosState::load_seg`] returned for this
+    /// library's seglist -- what a future `CloseLibrary`'s delayed-expunge
+    /// path would pass to `UnLoadSeg`.
+    pub seglist_bptr: u32,
+    /// The [`GuestHeap`] allocation-start address
+    /// [`crate::execlib::make_library`] returned -- what a future
+    /// `CloseLibrary`'s expunge path would pass to [`GuestHeap::free`].
+    pub alloc_addr: u32,
 }
 
 /// One auto-created fake library's jump-table block, recorded so
@@ -985,6 +1068,9 @@ struct FakeLibrary {
 pub struct LibraryRegistry {
     known: HashMap<String, (u32, LibraryKind)>,
     fakes: Vec<FakeLibrary>,
+    /// [`LibraryKind::Loaded`] libraries' extra bookkeeping, keyed by the
+    /// same name as `known` -- see [`LoadedLibrary`]'s doc.
+    loaded: HashMap<String, LoadedLibrary>,
 }
 
 impl LibraryRegistry {
@@ -1018,6 +1104,64 @@ impl LibraryRegistry {
         });
     }
 
+    /// Records a newly `LoadSeg`ed-and-`InitResident`ed library base
+    /// ([`crate::execlib`]'s L3 open state machine, on a successful
+    /// `initFunc`) -- both in `known` (so [`Self::lookup`] returns
+    /// [`LibraryKind::Loaded`] for `name` from here on) and in `loaded`
+    /// (so a future `CloseLibrary`/`reopen` can find the seglist/alloc
+    /// bookkeeping [`LoadedLibrary`] carries).
+    pub fn register_loaded(&mut self, name: &str, base: u32, seglist_bptr: u32, alloc_addr: u32) {
+        self.known
+            .insert(name.to_string(), (base, LibraryKind::Loaded));
+        self.loaded.insert(
+            name.to_string(),
+            LoadedLibrary {
+                base,
+                seglist_bptr,
+                alloc_addr,
+            },
+        );
+    }
+
+    /// Looks up a [`LibraryKind::Loaded`] library's [`LoadedLibrary`]
+    /// bookkeeping by name -- `None` for anything not registered via
+    /// [`Self::register_loaded`] (including `Real`/`Faked` entries).
+    pub fn loaded_library(&self, name: &str) -> Option<&LoadedLibrary> {
+        self.loaded.get(name)
+    }
+
+    /// Reverse lookup of a [`LibraryKind::Loaded`] library's name by its
+    /// base address (`library-device-loading-plan.md` §2.4, L4):
+    /// `CloseLibrary`'s only argument is a base (`A1`), not a name, so
+    /// [`crate::dispatch::close_library_handler`] needs this to decide
+    /// whether a given base belongs to a genuinely loaded library at all
+    /// (as opposed to a [`LibraryKind::Real`]/[`LibraryKind::Faked`] base,
+    /// which stays a no-op) before handing off to
+    /// [`crate::execlib::begin_close`]. A plain linear scan over `loaded`
+    /// -- kept minimal per the plan's brief, since this map holds at most
+    /// a handful of entries (the libraries a given run has actually
+    /// disk-loaded), not a hot path worth indexing by base.
+    pub fn loaded_library_by_base(&self, base: u32) -> Option<&str> {
+        self.loaded
+            .iter()
+            .find(|(_, l)| l.base == base)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Removes a [`LibraryKind::Loaded`] library's registry entries
+    /// entirely -- both `known` (so a later `OpenLibrary` of the same name
+    /// finds nothing and triggers a completely fresh disk load, rather
+    /// than resolving to a stale cached base) and `loaded` (its
+    /// bookkeeping is meaningless once the library is expunged). Called
+    /// from [`crate::execlib`]'s `CloseLibrary` delayed-expunge path
+    /// (`library-device-loading-plan.md` §2.4) once the library's own
+    /// Close vector has signalled (by returning a non-`NULL` segList) that
+    /// this was the last close.
+    pub fn unregister_loaded(&mut self, name: &str) {
+        self.known.remove(name);
+        self.loaded.remove(name);
+    }
+
     /// Given the guest address a trapped call landed at, finds the fake
     /// library (if any) whose jump-table block contains it, returning
     /// its name and the LVO offset (`pc - base`, always `<= 0`) within
@@ -1030,73 +1174,272 @@ impl LibraryRegistry {
     }
 }
 
-/// `exec.library`'s `OpenLibrary` handler (LVO -552): `A1` = pointer to
-/// the library name (C string), `D0` = requested minimum version
-/// (ignored -- this runtime doesn't track library versions). Returns
-/// the library's base in `D0`.
+/// One pending host continuation, boxed so [`ContinuationStack`] can hold
+/// a heterogeneous stack of them. `FnOnce` (not `FnMut`/`Fn`) is
+/// deliberate: [`ContinuationStack::trampoline`] arranges for a
+/// continuation to run exactly once -- when its paired guest
+/// subroutine's `rts` traps back to [`CONTINUATION_STUB_ADDR`] -- and
+/// popping the `Box` out of the pending stack to call it already
+/// consumes it; there's no scenario where it needs to run again.
+type Continuation<C> = Box<dyn FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError>>;
+
+/// The trampoline primitive (library/device-loading plan §2.1, phase
+/// "L2"): lets a [`LibraryHandler`] run an arbitrary guest subroutine --
+/// one that may itself make ordinary library calls, which is the whole
+/// point, see below -- and get control back, host-side, once that
+/// subroutine returns.
 ///
-/// # vamos escape hatch
+/// # Why this exists
+///
+/// [`Runtime::run`]'s dispatch loop performs the `rts` for every
+/// dispatched handler *itself*, in host code (module docs, "Jump-table
+/// mechanics" step 4): after a handler returns, the loop pops whatever
+/// is on top of the guest stack into `PC`. That means a handler that
+/// pushes a chosen address onto the guest stack before returning
+/// controls where execution resumes next -- and if that address is the
+/// entry point of a real guest subroutine, the *ordinary* main loop runs
+/// it natively, dispatching any library calls it makes exactly like any
+/// other guest code. No new stepping/reentrancy machinery is needed for
+/// that part; it falls out of the loop's existing behavior for free.
+///
+/// This is the fix for a real, already-documented limitation:
+/// `execfmt.rs`'s `RawDoFmt` `PutChProc` callout and `Supervisor`
+/// handler both step the CPU themselves, in a private loop, to call back
+/// into guest code synchronously -- and both explicitly do *not* support
+/// the stepped routine making further library calls (see
+/// `call_put_ch_proc`'s doc comment: "calling back into another library
+/// call from a RawDoFmt PutChProc isn't supported"), because a nested
+/// `Cpu::step` loop has no way to route a trap through
+/// [`LibraryTable::dispatch`] without reentering [`Runtime::run`] itself.
+/// The trampoline sidesteps the problem entirely by not stepping at all:
+/// it lets the *existing* dispatch loop do the work, split across two
+/// (or more) handler invocations instead of one.
+///
+/// # Mechanism
+///
+/// [`ContinuationStack::trampoline`], called from inside a handler:
+///
+/// 1. Pushes [`CONTINUATION_STUB_ADDR`] onto the guest stack.
+/// 2. Pushes `subroutine_entry` onto the guest stack, on top of that.
+/// 3. Pushes `continuation` onto this (host-side) stack.
+///
+/// The handler then simply returns `Ok(())`. [`Runtime::run`]'s generic
+/// post-dispatch `rts` pops `subroutine_entry` into `PC`, and the guest
+/// subroutine runs natively through the ordinary main loop. Its own
+/// final `rts` pops `CONTINUATION_STUB_ADDR` into `PC`, which traps
+/// ([`continuation_stub_handler`], bound to [`CONTINUATION_SLOT`] via
+/// `register_fixed_slot` exactly like [`FAKE_LIB_SLOT`]/[`EXIT_SLOT`]):
+/// the stub pops the most recently pushed continuation off this stack
+/// and runs it with the live `HandlerContext`, free to read the
+/// subroutine's `D0`, push another trampoline for a further phase, or
+/// set final result registers. After the continuation returns, the
+/// *same* generic post-dispatch `rts` fires again and pops whatever is
+/// now on top of the guest stack -- either the original caller's return
+/// address (untouched beneath everything, if this was the final phase)
+/// or a fresh entry address the continuation itself just pushed (if it
+/// chained another trampoline). One stub address and one slot therefore
+/// serve arbitrarily many phases and arbitrary nesting; the phases
+/// themselves live entirely host-side, as closures on this stack.
+///
+/// # Register discipline is the caller's job
+///
+/// This primitive only manipulates the guest stack and this host-side
+/// pending list. It never touches `D0`/`D1`/`A0`/`A1`/`A6`/etc. -- the
+/// handler calling [`ContinuationStack::trampoline`] is responsible for
+/// setting whatever input registers the trampolined subroutine expects,
+/// either before or after the `trampoline` call (both work equally well,
+/// since `trampoline` doesn't read or write any register itself). Per
+/// the plan's §2.1 register-preservation note, the only register this
+/// runtime is ever on the hook to *restore* across a trampolined call is
+/// `A6` (the ABI makes `D0`/`D1`/`A0`/`A1` scratch, and a well-behaved
+/// callee preserves `D2`-`D7`/`A2`-`A5` itself) -- and doing that is a
+/// specific state machine's business (e.g. an L3 `OpenLibrary`
+/// continuation saving and restoring its caller's `A6` around the Open
+/// vector call), not something this generic primitive tracks for every
+/// use.
+///
+/// # Why not on [`LibraryRegistry`]
+///
+/// The plan's §2.1 sketch initially suggested this pending state could
+/// live on [`LibraryRegistry`] alongside the fake-library bookkeeping.
+/// It can't: a continuation closure is generic over `C: Cpu` (it takes a
+/// `&mut HandlerContext<'_, C>`), but `LibraryRegistry` is deliberately
+/// *not* generic (its own doc comment explains why: it's held
+/// independently of `LibraryTable<C>` on `Runtime<C>` to sidestep a
+/// mutable-borrow aliasing conflict) and derives `Clone`/`Debug`, neither
+/// of which a boxed `dyn FnOnce` can support. So this pending list lives
+/// in its own small type instead, held as its own field on `Runtime<C>`
+/// (alongside `registry`, not inside it) and threaded into
+/// [`HandlerContext`] as a new field, the same way `call_detail` already
+/// is. This is a mechanical necessity forced by the closure's generic
+/// type, not a reconsideration of the plan's design.
+///
+/// # Failure hygiene
+///
+/// No unwind or cleanup machinery backs this stack. A [`DispatchError`]/
+/// [`RuntimeError`] raised while a continuation is pending (by the
+/// trampolined subroutine, by the continuation itself, or by anything
+/// else in the run) is already fatal to the whole [`Runtime::run`] call
+/// -- the run stops and the error propagates out, discarding this
+/// `Runtime` (and its half-unwound pending stack) entirely. There is
+/// deliberately nothing here that tries to run "cleanup" continuations
+/// on the error path; per the plan's §5.5, that would only matter for a
+/// scenario (recovering a *live* `Runtime` after a failed trampoline and
+/// continuing to run it) this codebase has never needed. Symmetrically,
+/// if the guest program reaches [`EXIT_STUB_ADDR`] while continuations
+/// are still pending here (a guest that exits mid-trampoline, bypassing
+/// the stub entirely), [`Runtime::run`] just returns the exit code as
+/// usual -- the run is over either way, so an unpopped continuation or
+/// two is inert, not a leak worth detecting.
+pub struct ContinuationStack<C: Cpu> {
+    pending: Vec<Continuation<C>>,
+}
+
+impl<C: Cpu> Default for ContinuationStack<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: Cpu> ContinuationStack<C> {
+    /// Creates an empty stack (no continuations pending).
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Arranges for `subroutine_entry` to run next -- via
+    /// [`Runtime::run`]'s generic post-dispatch `rts`, see this type's
+    /// docs -- and for `continuation` to run, host-side, once that
+    /// subroutine's own `rts` returns. Call this from inside a
+    /// [`LibraryHandler`] and then return `Ok(())`; do not call it more
+    /// than once per handler invocation (each call pushes one more layer
+    /// of "resume here" onto the guest stack, which is only correct if
+    /// exactly one is unwound per handler dispatch).
+    pub fn trampoline<F>(
+        &mut self,
+        cpu: &mut C,
+        mem: &mut C::Memory,
+        subroutine_entry: u32,
+        continuation: F,
+    ) where
+        F: FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError> + 'static,
+    {
+        let sp = cpu.address_register(AddressRegister(7));
+        // Push CONTINUATION_STUB_ADDR first (deeper on the stack) so it's
+        // what the subroutine's own `rts` pops once it has consumed its
+        // own local pushes -- see this type's "Mechanism" doc.
+        let sp = sp.wrapping_sub(4);
+        mem.write_u32(sp, CONTINUATION_STUB_ADDR);
+        // Then push subroutine_entry on top: the very next thing
+        // Runtime::run's post-dispatch rts (for *this* handler) pops.
+        let sp = sp.wrapping_sub(4);
+        mem.write_u32(sp, subroutine_entry);
+        cpu.set_address_register(AddressRegister(7), sp);
+
+        self.pending.push(Box::new(continuation));
+    }
+}
+
+/// The stub handler bound to [`CONTINUATION_SLOT`] at
+/// [`CONTINUATION_STUB_ADDR`] -- see [`ContinuationStack`]'s docs for the
+/// full trampoline mechanism this completes. Pops the most recently
+/// pushed continuation off [`HandlerContext::continuations`] and runs it
+/// with the current context. An empty pending stack here is always a
+/// bug (see [`DispatchError::EmptyContinuationStack`]'s doc), not a
+/// state a correctly-behaving trampoline user can reach.
+fn continuation_stub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let Some(continuation) = ctx.continuations.pending.pop() else {
+        return Err(DispatchError::EmptyContinuationStack { pc: ctx.pc });
+    };
+    continuation(ctx)
+}
+
+/// `exec.library`'s `OpenLibrary` handler (LVO -552): `A1` = pointer to
+/// the library name (C string), `D0` = requested minimum version. `D0`
+/// must be captured here, before anything else touches it (`library-
+/// device-loading-plan.md` §2.3's explicit ordering requirement) --
+/// [`open_library_common`]'s disk-load path (`D0`-writing library calls
+/// happen along the way to servicing this very call) would otherwise
+/// clobber it before it's read. Returns the library's base in `D0`.
+///
+/// # vamos escape hatch, refined by real disk loading (L3)
 ///
 /// Ported from vamos's own behavior (see `docs/plan.md`'s "vamos escape
-/// hatches" note), but refined to match a real distinction the naive
-/// "always auto-create a fake" version glossed over: **ROM-resident**
-/// libraries (`exec.library`, `dos.library`, `utility.library` -- every
-/// library this runtime actually implements, i.e. everything
-/// [`LibraryRegistry::lookup`] already finds) are unconditionally
-/// present on any real Kickstart, so those never fail here regardless
-/// of `Vfs` state. Everything else is a **disk-based** library on real
-/// AmigaOS (loaded from `LIBS:<name>` at `OpenLibrary` time) -- real
-/// `OpenLibrary` for one of *those* only succeeds if the file is
-/// actually present on the searched disk, and fails (`D0` = `0`) if
-/// it's missing, exactly like any other disk-based command or handler.
-/// So for a name not in the registry, this checks whether
-/// `LIBS:<name>` resolves on the configured `Vfs` (or fails outright if
-/// there's no `Vfs` at all, matching every other path-based call's
-/// established "no `Vfs`" convention):
+/// hatches" note), refined in two stages:
 ///
-/// - **Found on disk** (or genuinely no way to tell -- see below): a
-///   fake base is auto-created (and reused on repeat requests for the
-///   same name, via [`LibraryRegistry`]) -- a block of
-///   [`FAKE_LIB_JUMP_TABLE_SIZE`] bytes carved from the guest heap,
-///   entirely prefilled with the shared [`FAKE_LIB_SLOT`] opcode, base
-///   set to the end of that block (so every plausible negative LVO
-///   offset lands inside it and traps). This runtime doesn't implement
-///   loading and running arbitrary real disk library code (a real
-///   system would), so this is the best available stand-in: `OpenLibrary`
-///   succeeds like it would for real, and [`fake_lib_vector_handler`]
-///   turns the *first actual call* into a diagnostic naming exactly
-///   which library/LVO is missing -- still far more useful than
-///   silently limping along.
-/// - **Not found on disk**: `OpenLibrary` fails (`D0` = `0`), matching
-///   real behavior for a disk that doesn't have that library -- letting
-///   a well-behaved caller's own "library didn't open" fallback path run
-///   (many programs speculatively `OpenLibrary` optional libraries like
-///   `locale.library` and degrade gracefully) instead of masking that
-///   choice behind an always-succeeds fake.
+/// - T12 first refined the naive "always auto-create a fake" version to
+///   match a real distinction: **ROM-resident** libraries (`exec.library`,
+///   `dos.library`, `utility.library` -- every library this runtime
+///   actually implements, i.e. everything [`LibraryRegistry::lookup`]
+///   already finds) are unconditionally present on any real Kickstart, so
+///   those never fail here regardless of `Vfs` state.
+/// - L3 (`library-device-loading-plan.md`) then replaced the fake-stub
+///   fallback for anything else with a **real load attempt** when the
+///   name resolves on the `Vfs`: [`crate::execlib::begin_open`] actually
+///   `LoadSeg`s the file, finds its `struct Resident`, and runs the real
+///   `InitResident`/`MakeLibrary`/`Open` sequence via
+///   [`ContinuationStack::trampoline`] -- see [`open_library_common`]'s
+///   doc for the full lookup order. The fake-stub path (below) now only
+///   fires for a name that doesn't resolve on disk at all
+///   ([`STANDARD_WORKBENCH_LIBRARIES`] only) or that resolves but fails
+///   to load as a genuine `RTF_AUTOINIT` library (a loud, named
+///   diagnostic on `stderr`, matching [`crate::intuition`]'s `Alert`
+///   diagnostic posture) -- everything that used to reach the fake path
+///   still can, just as a documented fallback instead of the default.
 fn open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
-    open_library_common(ctx, &name)
+    let requested_version = ctx.cpu.data_register(DataRegister(0));
+    open_library_common(ctx, &name, requested_version)
 }
 
 /// `exec.library`'s `OldOpenLibrary` handler (LVO -408): the pre-V36
 /// single-argument form of `OpenLibrary` (`A1` = library name, no
-/// version). Shares [`open_library_common`] with [`open_library_handler`].
+/// version -- per `exec.doc`'s own `OldOpenLibrary` autodoc, equivalent to
+/// `OpenLibrary(name, 0)`). Shares [`open_library_common`] with
+/// [`open_library_handler`].
 fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
-    open_library_common(ctx, &name)
+    open_library_common(ctx, &name, 0)
 }
 
-/// Shared `OpenLibrary`/`OldOpenLibrary` implementation: looks `name` up
-/// in [`HandlerContext::registry`], auto-creating a fake base per the
-/// vamos escape hatch (see [`open_library_handler`]) if it isn't there,
-/// and writes the resulting base into `D0`.
+/// Shared `OpenLibrary`/`OldOpenLibrary` implementation
+/// (`library-device-loading-plan.md` §2.3's lookup order):
+///
+/// 1. [`HandlerContext::registry`] hit: `Real`/`Faked` return the cached
+///    base unchanged; [`LibraryKind::Loaded`] re-runs the real open
+///    protocol via [`crate::execlib::reopen`] (a real library maintains
+///    its own `lib_OpenCnt`, so a repeat open must genuinely call its
+///    `Open` vector again, not just hand back the cached base -- see
+///    `library-device-loading-plan.md` §2.4).
+/// 2. No hit: resolve `name` on the `Vfs` (full path as-is if it contains
+///    `:`, else `LIBS:name` -- see the NDK `OpenLibrary` autodoc's own
+///    "A full path name for the library name is legitimate" note, found
+///    needed by the real SAS/C `sc` driver's `"sc:libs/sc1.library"`).
+///    If it resolves, attempt a real load via [`crate::execlib::
+///    begin_open`] -- on success the open is now running asynchronously
+///    (via the trampoline primitive) and this handler returns
+///    immediately, `D0` untouched (a later continuation sets it). On a
+///    *structural* load failure (no `Resident`, non-`AUTOINIT`, a
+///    `.device` opened by mistake, `InitStruct` not yet implemented, ...)
+///    this prints one loud, named `stderr` line and falls back to the
+///    fake-stub path below, so every previously-working case (a corpus
+///    binary that doesn't yet get a real load) keeps working.
+/// 3. Not resolved on the `Vfs` (or no `Vfs` at all): [`STANDARD_WORKBENCH_
+///    LIBRARIES`] names still fake-succeed unconditionally (see
+///    [`open_library_handler`]'s doc); everything else fails (`D0` = `0`).
 fn open_library_common<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     name: &str,
+    requested_version: u32,
 ) -> Result<(), DispatchError> {
-    if let Some((base, _kind)) = ctx.registry.lookup(name) {
+    if let Some((base, kind)) = ctx.registry.lookup(name) {
+        if kind == LibraryKind::Loaded {
+            return crate::execlib::reopen(ctx, name, base, requested_version);
+        }
         *ctx.call_detail = Some(format!("library {name:?} -> base {base:#010x} (real)"));
         ctx.cpu.set_data_register(DataRegister(0), base);
         return Ok(());
@@ -1105,27 +1448,37 @@ fn open_library_common<C: Cpu>(
     // Not a ROM-resident library this runtime implements: on real
     // AmigaOS this is a disk-based library, only openable if it
     // actually exists on the searched disk -- see this function's doc
-    // comment. Per the NDK autodoc's own OpenLibrary FUNCTION text ("A
-    // full path name for the library name is legitimate. For example
-    // 'wp:libs/wp.library'."), a name already containing a `:` is a
-    // caller-supplied full path and must be resolved as-is, *not*
-    // prefixed with `LIBS:` -- found running the real SAS/C `sc`
-    // compiler driver, which explicitly opens
-    // "sc:libs/sc1.library". Exception: a handful of standard
-    // Workbench 3.1 libraries (see [`STANDARD_WORKBENCH_LIBRARIES`])
-    // ship on every real install and are treated as always present.
+    // comment. A name already containing a `:` is a caller-supplied full
+    // path and must be resolved as-is, *not* prefixed with `LIBS:`.
+    // Exception: a handful of standard Workbench 3.1 libraries (see
+    // [`STANDARD_WORKBENCH_LIBRARIES`]) ship on every real install and
+    // are treated as always present.
     let search_path = if name.contains(':') {
         name.to_string()
     } else {
         format!("LIBS:{name}")
     };
-    let found_on_disk = STANDARD_WORKBENCH_LIBRARIES.contains(&name)
-        || ctx
-            .dos
-            .vfs
-            .as_ref()
-            .is_some_and(|vfs| vfs.resolve(&search_path, ResolveMode::MustExist).is_ok());
-    if !found_on_disk {
+    let resolves_on_disk = ctx
+        .dos
+        .vfs
+        .as_ref()
+        .is_some_and(|vfs| vfs.resolve(&search_path, ResolveMode::MustExist).is_ok());
+
+    if resolves_on_disk {
+        match crate::execlib::begin_open(ctx, name, &search_path, requested_version)? {
+            crate::execlib::LoadAttempt::Started => return Ok(()),
+            crate::execlib::LoadAttempt::StructuralFailure(reason) => {
+                // Loud, unconditional stderr note -- same posture as
+                // crate::intuition's Alert diagnostic -- naming exactly
+                // which library and why the real load didn't happen,
+                // before falling back to the fake-stub path below.
+                eprintln!(
+                    "volamos: OpenLibrary {name:?} ({search_path}): {reason} -- falling back \
+                     to an unimplemented fake library"
+                );
+            }
+        }
+    } else if !STANDARD_WORKBENCH_LIBRARIES.contains(&name) {
         *ctx.call_detail = Some(format!("library {name:?} -> NULL (not found on disk)"));
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
@@ -1167,12 +1520,33 @@ fn open_library_common<C: Cpu>(
 }
 
 /// `exec.library`'s `CloseLibrary` handler (LVO -414): `A1` = library
-/// base. A no-op -- this runtime doesn't refcount library opens/closes,
-/// and real `CloseLibrary` only returns a meaningful (non-`NULL`) `D0`
-/// (a `BPTR` segList) when the close actually expunges the library from
-/// memory, which never applies to anything faked or fixed-address here.
-fn close_library_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    Ok(())
+/// base. Real `CloseLibrary` tolerates a `NULL` base (`exec.doc`'s
+/// `CloseLibrary` autodoc doesn't special-case it, but every real caller
+/// does -- and RKRM's own sample idiom is `if (lib) CloseLibrary(lib)`,
+/// so a stray unconditional call is common enough to be worth not
+/// crashing on) -- stays a no-op for that case, same as before this
+/// phase.
+///
+/// For anything else: [`LibraryKind::Real`]/[`LibraryKind::Faked`] bases
+/// (this runtime's own emulated libraries, and vamos-style auto-created
+/// stubs) also stay a no-op -- neither is backed by a real Close vector,
+/// and this runtime doesn't refcount their opens. Only a
+/// [`LibraryKind::Loaded`] base (found via
+/// [`LibraryRegistry::loaded_library_by_base`]) gets the real protocol
+/// (`library-device-loading-plan.md` §2.4): [`crate::execlib::
+/// begin_close`] trampolines into the library's own Close vector and
+/// interprets its result (stay resident, or a delayed-expunge segList to
+/// unload).
+fn close_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let base = ctx.cpu.address_register(AddressRegister(1));
+    if base == 0 {
+        return Ok(());
+    }
+    let Some(name) = ctx.registry.loaded_library_by_base(base) else {
+        return Ok(());
+    };
+    let name = name.to_string();
+    crate::execlib::begin_close(ctx, &name, base)
 }
 
 /// The shared handler bound to [`FAKE_LIB_SLOT`]: every vector of every
@@ -1381,6 +1755,11 @@ pub struct Runtime<C: Cpu> {
     /// Guest address of the fake "current task" struct -- see
     /// [`HandlerContext::current_task`] and [`crate::exectask`].
     task: u32,
+    /// The trampoline primitive's host-side pending-continuation stack
+    /// -- see [`ContinuationStack`]'s docs. Held as its own field
+    /// (rather than inside `registry`) for the aliasing/generics reasons
+    /// documented there.
+    continuations: ContinuationStack<C>,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -1656,6 +2035,15 @@ impl<C: Cpu + 'static> Runtime<C> {
         // open_library_handler writes them, per fake library, on demand.
         table.register_fixed_slot(FAKE_LIB_SLOT, fake_lib_vector_handler::<C>);
 
+        // The trampoline primitive's continuation stub (L2): bound once,
+        // to CONTINUATION_STUB_ADDR -- see ContinuationStack's module
+        // docs for the full mechanism. Unlike FAKE_LIB_SLOT above, there
+        // is only ever one such address (not one per fake library), so
+        // its opcode word is written directly here rather than by
+        // another handler on demand.
+        table.register_fixed_slot(CONTINUATION_SLOT, continuation_stub_handler::<C>);
+        mem.write_u16(CONTINUATION_STUB_ADDR, 0xA000 | CONTINUATION_SLOT);
+
         // AbsExecBase: guest address 4 holds EXEC_LIBRARY_BASE, the
         // pointer real startup code reads via `move.l 4,a6`. Written
         // after the sentinel prefill above so it isn't overwritten by
@@ -1850,6 +2238,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             registry,
             dos,
             task,
+            continuations: ContinuationStack::new(),
         }
     }
 
@@ -2001,6 +2390,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         dos: &mut self.dos,
                         current_task: self.task,
                         call_detail: &mut call_detail,
+                        continuations: &mut self.continuations,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
@@ -2881,6 +3271,84 @@ mod tests {
         assert_eq!(code, 0);
     }
 
+    /// L4: `CloseLibrary(NULL)` must stay a safe no-op -- real
+    /// `CloseLibrary` tolerates a `NULL` base (see
+    /// `close_library_handler`'s doc), and [`LibraryRegistry::
+    /// loaded_library_by_base`] would never find a `Loaded` library at
+    /// address 0 anyway, but this asserts the explicit early-return, not
+    /// just the registry miss.
+    #[test]
+    fn close_library_of_null_is_a_no_op() {
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 = NULL
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -414); // CloseLibrary(NULL)
+        words.push(MOVEQ_D0_0);
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("CloseLibrary(NULL) should be a no-op, not error");
+        assert_eq!(code, 0);
+    }
+
+    /// L4: `CloseLibrary` of a [`LibraryKind::Faked`] base (an
+    /// auto-created vamos-style stub) must also stay a no-op --
+    /// [`LibraryRegistry::loaded_library_by_base`] only ever matches a
+    /// genuinely [`LibraryKind::Loaded`] base, so a faked one falls
+    /// through to the same early return as `Real`. The name must be one
+    /// that *actually* produces a fake base with no `Vfs` configured:
+    /// only [`STANDARD_WORKBENCH_LIBRARIES`] names fake-succeed then (an
+    /// arbitrary unknown name would just return `NULL`, silently turning
+    /// this into a second copy of the `NULL` test above), and
+    /// `mathieeesingbas.library` is on that list without being backed by
+    /// a `Real` registered base.
+    #[test]
+    fn close_library_of_a_faked_base_is_a_no_op() {
+        let entry = TRAP_TABLE_END;
+        let name = b"mathieeesingbas.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary -> D0 = fake base
+        words.push(movea_dn(1, 0)); // A1 = D0 (the fake base -- CloseLibrary's argument)
+        words.push(0x2400); // move.l d0,d2 -- keep the base for the exit code
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -414); // CloseLibrary(fake base)
+        words.push(0x2002); // move.l d2,d0 -- exit code = the base
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("CloseLibrary of a faked base should be a no-op, not error");
+        // The exit code is the fake base itself: non-zero proves the open
+        // really did fake-succeed (the guard this test's doc comment
+        // explains -- an unknown name with no Vfs would return NULL and
+        // quietly test nothing new).
+        assert_ne!(code, 0, "the open should have produced a fake base");
+    }
+
     #[test]
     fn location_4_holds_exec_library_base() {
         let rt = runtime_with_program(&[RTS]);
@@ -3016,5 +3484,376 @@ mod tests {
             a0 > load_end,
             "A0 (command-line buffer) should sit after the task struct + name string"
         );
+    }
+
+    // --- ContinuationStack / trampoline primitive (L2) ---
+    //
+    // These tests build small hand-assembled "guest subroutines" and
+    // exercise ContinuationStack::trampoline directly from custom
+    // LibraryHandlers, the same way a future L3 OpenLibrary state
+    // machine will. The headline case (test 1) is exactly what
+    // execfmt.rs's RawDoFmt PutChProc/Supervisor stepping loops cannot
+    // do: a trampolined guest subroutine that itself makes an ordinary
+    // library call mid-flight.
+    mod trampoline {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        /// A fresh library base for these tests, far from every real/
+        /// fake base this runtime otherwise registers, so hand-picked
+        /// LVOs here can never collide with a real dos/exec/utility.
+        /// library registration.
+        const TEST_LIB_BASE: u32 = 0x1_8000;
+        const LVO_OUTER: i32 = -4;
+        const LVO_INNER: i32 = -8;
+
+        fn moveq_d0(imm: u8) -> u16 {
+            MOVEQ_D0_0 | u16::from(imm)
+        }
+
+        /// `movea.l #TEST_LIB_BASE,a6` -- same encoding `execfmt.rs`'s
+        /// tests use for `#EXEC_LIBRARY_BASE`.
+        fn movea_test_lib_to_a6() -> [u16; 3] {
+            [
+                0x207C | (6 << 9),
+                (TEST_LIB_BASE >> 16) as u16,
+                TEST_LIB_BASE as u16,
+            ]
+        }
+
+        fn jsr_disp16_a6(disp: i32) -> [u16; 2] {
+            [0x4EAE, disp as u16]
+        }
+
+        /// Builds a runtime whose program is `main_words`, followed
+        /// immediately (word-aligned) by `sub_words` -- returning the
+        /// runtime plus the guest address `sub_words` was loaded at, so
+        /// callers can hand that address to `ContinuationStack::
+        /// trampoline` as `subroutine_entry`.
+        fn runtime_with_main_and_subroutine(
+            main_words: &[u16],
+            sub_words: &[u16],
+        ) -> (Runtime<M68kCpu>, u32) {
+            let entry = TRAP_TABLE_END;
+            let sub_addr = entry + (main_words.len() as u32) * 2;
+            let mut all = main_words.to_vec();
+            all.extend_from_slice(sub_words);
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &all);
+            let load_end = sub_addr + (sub_words.len() as u32) * 2 + 64;
+            let rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+            (rt, sub_addr)
+        }
+
+        #[test]
+        fn trampolined_subroutine_can_itself_make_a_library_call() {
+            // main:      movea.l #TEST_LIB_BASE,a6 ; jsr LVO_OUTER(a6) ; rts
+            // subroutine: jsr LVO_INNER(a6) ; moveq #0x7E,d0 ; rts
+            //
+            // TestOuter's handler trampolines into `subroutine` instead
+            // of doing any work itself; `subroutine` calls TestInner (an
+            // ordinary registered library handler -- dispatched by the
+            // *same* main loop, zero new machinery) before overwriting
+            // D0 with a value only reachable if it ran to completion.
+            // The continuation reads that value, records it, and writes
+            // the run's actual exit code -- proving control flow really
+            // went main -> OUTER (host) -> subroutine (guest) -> INNER
+            // (host) -> back into subroutine (guest) -> continuation
+            // (host) -> back to main's own `rts`.
+            let mut main_words = movea_test_lib_to_a6().to_vec();
+            main_words.extend_from_slice(&jsr_disp16_a6(LVO_OUTER));
+            main_words.push(RTS);
+
+            let mut sub_words = jsr_disp16_a6(LVO_INNER).to_vec();
+            sub_words.push(moveq_d0(0x7E));
+            sub_words.push(RTS);
+
+            let (mut rt, sub_addr) = runtime_with_main_and_subroutine(&main_words, &sub_words);
+
+            let inner_called = Rc::new(Cell::new(false));
+            let continuation_saw_d0 = Rc::new(Cell::new(None::<u32>));
+
+            {
+                let inner_called = inner_called.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_INNER,
+                    "testlib",
+                    "TestInner",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        inner_called.set(true);
+                        ctx.cpu.set_data_register(DataRegister(0), 0x55);
+                        Ok(())
+                    },
+                );
+            }
+            {
+                let continuation_saw_d0 = continuation_saw_d0.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_OUTER,
+                    "testlib",
+                    "TestOuter",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let continuation_saw_d0 = continuation_saw_d0.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                let d0 = ctx.cpu.data_register(DataRegister(0));
+                                continuation_saw_d0.set(Some(d0));
+                                ctx.cpu.set_data_register(DataRegister(0), 0xAB);
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+
+            assert!(inner_called.get(), "TestInner should have been dispatched");
+            assert_eq!(
+                continuation_saw_d0.get(),
+                Some(0x7E),
+                "continuation should observe the subroutine's own D0, set after \
+                 its library call returned"
+            );
+            assert_eq!(
+                code, 0xAB,
+                "the run's final exit code should be the continuation's value, \
+                 reached via main's own untouched rts"
+            );
+        }
+
+        #[test]
+        fn chained_phases_run_in_order_and_return_to_original_caller() {
+            // A continuation that itself trampolines into a second guest
+            // subroutine with a second continuation. Both must run, in
+            // order, before control returns to main's own `rts`.
+            let mut main_words = movea_test_lib_to_a6().to_vec();
+            main_words.extend_from_slice(&jsr_disp16_a6(LVO_OUTER));
+            main_words.push(RTS);
+
+            // subroutine1: moveq #0x11,d0 ; rts
+            let sub1_words = vec![moveq_d0(0x11), RTS];
+            // subroutine2: moveq #0x22,d0 ; rts
+            let sub2_words = vec![moveq_d0(0x22), RTS];
+
+            let entry = TRAP_TABLE_END;
+            let sub1_addr = entry + (main_words.len() as u32) * 2;
+            let sub2_addr = sub1_addr + (sub1_words.len() as u32) * 2;
+            let mut all = main_words.clone();
+            all.extend_from_slice(&sub1_words);
+            all.extend_from_slice(&sub2_words);
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &all);
+            let mut rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: sub2_addr + (sub2_words.len() as u32) * 2 + 64,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+
+            let order = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+
+            {
+                let order = order.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_OUTER,
+                    "testlib",
+                    "TestOuter",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let order = order.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub1_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                assert_eq!(ctx.cpu.data_register(DataRegister(0)), 0x11);
+                                order.borrow_mut().push("phase1");
+                                let order = order.clone();
+                                ctx.continuations.trampoline(
+                                    ctx.cpu,
+                                    ctx.mem,
+                                    sub2_addr,
+                                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                        assert_eq!(ctx.cpu.data_register(DataRegister(0)), 0x22);
+                                        order.borrow_mut().push("phase2");
+                                        ctx.cpu.set_data_register(DataRegister(0), 0x99);
+                                        Ok(())
+                                    },
+                                );
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+
+            assert_eq!(*order.borrow(), vec!["phase1", "phase2"]);
+            assert_eq!(code, 0x99);
+        }
+
+        #[test]
+        fn nested_trampoline_from_within_a_trampolined_library_call() {
+            // subroutine1 (reached via TestOuter's trampoline) calls
+            // TestInner, which -- instead of returning synchronously --
+            // starts its *own* trampoline into subroutine3 before
+            // returning. This exercises the pending stack's LIFO
+            // discipline for real: subroutine1's own "resume here" entry
+            // (pushed by its `jsr LVO_INNER(a6)`) sits *beneath*
+            // TestInner's freshly pushed stub+entry, and TestInner's
+            // continuation (continuation3) must run and be popped before
+            // subroutine1 itself ever resumes. Deliberately not folded
+            // into the "chained phases" test above: that one nests two
+            // trampolines pushed by the *same* continuation, back to
+            // back; this one nests a trampoline started from *inside*
+            // another trampolined subroutine's own library call --
+            // different stack shape, worth covering directly.
+            let mut main_words = movea_test_lib_to_a6().to_vec();
+            main_words.extend_from_slice(&jsr_disp16_a6(LVO_OUTER));
+            main_words.push(RTS);
+
+            // subroutine1: jsr LVO_INNER(a6) ; moveq #0x7E,d0 ; rts
+            let mut sub1_words = jsr_disp16_a6(LVO_INNER).to_vec();
+            sub1_words.push(moveq_d0(0x7E));
+            sub1_words.push(RTS);
+            // subroutine3: moveq #0x19,d0 ; rts (moveq sign-extends its
+            // 8-bit immediate, so this stays clear of 0x80.. values,
+            // unlike the 0x99 used elsewhere in this test via a direct
+            // set_data_register write).
+            let sub3_words = vec![moveq_d0(0x19), RTS];
+
+            let entry = TRAP_TABLE_END;
+            let sub1_addr = entry + (main_words.len() as u32) * 2;
+            let sub3_addr = sub1_addr + (sub1_words.len() as u32) * 2;
+            let mut all = main_words.clone();
+            all.extend_from_slice(&sub1_words);
+            all.extend_from_slice(&sub3_words);
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &all);
+            let mut rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: sub3_addr + (sub3_words.len() as u32) * 2 + 64,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+
+            let order = Rc::new(RefCell::new(Vec::<(&'static str, u32)>::new()));
+
+            {
+                let order = order.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_INNER,
+                    "testlib",
+                    "TestInner",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let order = order.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub3_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                let d0 = ctx.cpu.data_register(DataRegister(0));
+                                order.borrow_mut().push(("continuation3", d0));
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+            {
+                let order = order.clone();
+                rt.table.register(
+                    &mut rt.mem,
+                    TEST_LIB_BASE,
+                    LVO_OUTER,
+                    "testlib",
+                    "TestOuter",
+                    move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                        let order = order.clone();
+                        ctx.continuations.trampoline(
+                            ctx.cpu,
+                            ctx.mem,
+                            sub1_addr,
+                            move |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                                let d0 = ctx.cpu.data_register(DataRegister(0));
+                                order.borrow_mut().push(("outer_continuation", d0));
+                                ctx.cpu.set_data_register(DataRegister(0), 0xAB);
+                                Ok(())
+                            },
+                        );
+                        Ok(())
+                    },
+                );
+            }
+
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+
+            assert_eq!(
+                *order.borrow(),
+                vec![("continuation3", 0x19), ("outer_continuation", 0x7E)],
+                "the inner trampoline's continuation must run (and be popped) \
+                 before subroutine1 resumes and eventually reaches the outer \
+                 continuation"
+            );
+            assert_eq!(code, 0xAB);
+        }
+
+        #[test]
+        fn jumping_straight_to_the_stub_with_no_pending_continuation_is_a_loud_error() {
+            // jmp CONTINUATION_STUB_ADDR.abs.l -- a guest that somehow
+            // discovers and jumps to the internal stub address directly,
+            // never having gone through ContinuationStack::trampoline.
+            let words = [
+                0x4EF9, // jmp abs.l
+                (CONTINUATION_STUB_ADDR >> 16) as u16,
+                CONTINUATION_STUB_ADDR as u16,
+            ];
+            let mut rt = runtime_with_program(&words);
+
+            let mut out = Vec::new();
+            let err = rt.run(&mut out, None).unwrap_err();
+            match err {
+                RuntimeError::Dispatch(DispatchError::EmptyContinuationStack { pc }) => {
+                    assert_eq!(pc, CONTINUATION_STUB_ADDR);
+                }
+                other => panic!("expected EmptyContinuationStack, got {other:?}"),
+            }
+        }
     }
 }

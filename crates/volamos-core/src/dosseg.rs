@@ -176,10 +176,15 @@ const DOSFALSE: u32 = 0;
 /// payload -- see the module docs' "Seglist memory layout" section. The
 /// `BPTR` a caller actually holds addresses `SEG_HEADER_SIZE - 4` bytes
 /// into this (just past `seg_length`), not the allocation's own start.
-const SEG_HEADER_SIZE: u32 = 8;
+///
+/// `pub(crate)` (not just module-private): [`crate::execlib::
+/// find_resident`] walks this same BPTR chain by this same framing, and
+/// reuses this constant rather than duplicating the magic number.
+pub(crate) const SEG_HEADER_SIZE: u32 = 8;
 /// Byte offset of `next_seg` within a segment allocation -- also where a
 /// segment's `BPTR` points (`bptr_from_addr(alloc_addr + NEXT_SEG_OFFSET)`).
-const NEXT_SEG_OFFSET: u32 = 4;
+/// `pub(crate)` for the same reason as [`SEG_HEADER_SIZE`].
+pub(crate) const NEXT_SEG_OFFSET: u32 = 4;
 
 /// The in-guest-memory result of [`build_seglist`]: where execution would
 /// begin (the first segment's payload address -- see the module docs;
