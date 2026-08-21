@@ -242,6 +242,15 @@ enum HostHandle {
     /// enum; this variant exists so `Close`/`Read`/lookup-by-address
     /// still see a consistent entry for it.
     Stdout,
+    /// `Open("NIL:", ...)`'s handle -- the real AmigaOS null device:
+    /// `Write` always succeeds, discarding the data (real hardware's
+    /// `NIL:` handler is a genuine, silent bit-bucket); `Read` always
+    /// reports immediate EOF (`0` bytes, matching real `NIL:`'s
+    /// documented behavior of never blocking and never producing data).
+    /// Found needed alongside `*`/`CONSOLE:` (see [`DosState::open`]'s
+    /// doc) -- real programs commonly try `NIL:` as a fallback
+    /// destination when a real console/window isn't available.
+    Null,
 }
 
 /// Host-side dos.library state for one running guest program. See the
@@ -521,6 +530,12 @@ impl DosState {
         if name == "*" || name.eq_ignore_ascii_case("CONSOLE:") {
             return self.output_addr(heap, mem).map(bptr_from_addr);
         }
+        if name.eq_ignore_ascii_case("NIL:") {
+            let id = self.next_id();
+            let addr = alloc_file_handle(heap, mem, id).map_err(|_| ERROR_NO_FREE_STORE)?;
+            self.handles.insert(addr, HostHandle::Null);
+            return Ok(bptr_from_addr(addr));
+        }
 
         let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
 
@@ -605,6 +620,9 @@ impl DosState {
                 Ok(buf)
             }
             Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
+            // NIL: always reports immediate EOF -- real hardware's null
+            // device never produces data.
+            Some(HostHandle::Null) => Ok(Vec::new()),
             None => Err(ERROR_INVALID_LOCK),
         }
     }
@@ -618,6 +636,10 @@ impl DosState {
         match self.handles.get_mut(&addr) {
             Some(HostHandle::HostFile(f, _)) => f.write(data).map_err(|e| map_io_error(&e)),
             Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
+            // NIL: discards the data but reports success, as if every
+            // byte were written -- real hardware's null device never
+            // fails a Write.
+            Some(HostHandle::Null) => Ok(data.len()),
             None => Err(ERROR_INVALID_LOCK),
         }
     }
@@ -655,7 +677,9 @@ impl DosState {
     pub fn name_from_fh(&self, addr: u32) -> Result<String, i32> {
         match self.handles.get(&addr) {
             Some(HostHandle::HostFile(_, amiga_path)) => Ok(amiga_path.clone()),
-            Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
+            Some(HostHandle::Stdin) | Some(HostHandle::Stdout) | Some(HostHandle::Null) => {
+                Err(ERROR_ACTION_NOT_KNOWN)
+            }
             None => Err(ERROR_INVALID_LOCK),
         }
     }
@@ -1448,6 +1472,42 @@ mod tests {
             .open(&mut heap, &mut mem, "console:", MODE_OLDFILE)
             .expect("Open(\"console:\") should succeed");
         assert_eq!(console_bptr_lower, output_bptr);
+    }
+
+    #[test]
+    fn open_nil_reads_as_immediate_eof_and_discards_writes() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let bptr = dos
+            .open(&mut heap, &mut mem, "NIL:", MODE_OLDFILE)
+            .expect("Open(\"NIL:\") should succeed even with no Vfs");
+        let addr = addr_from_bptr(bptr);
+
+        let read = dos.read(addr, 64).expect("Read should succeed");
+        assert!(read.is_empty(), "NIL: should report immediate EOF");
+
+        let n = dos.write(addr, b"discarded").expect("Write should succeed");
+        assert_eq!(n, 9, "NIL: should report every byte as written");
+
+        assert!(dos.close(&mut heap, addr));
+    }
+
+    #[test]
+    fn open_nil_is_case_insensitive_and_a_distinct_handle_per_open() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let a = dos
+            .open(&mut heap, &mut mem, "nil:", MODE_OLDFILE)
+            .expect("Open(\"nil:\") should succeed");
+        let b = dos
+            .open(&mut heap, &mut mem, "NIL:", MODE_OLDFILE)
+            .expect("Open(\"NIL:\") should succeed");
+        assert_ne!(
+            a, b,
+            "unlike */CONSOLE:, NIL: is a real per-open object, not an alias for a shared default"
+        );
     }
 
     #[test]
