@@ -135,7 +135,7 @@ ALL_ENGINES = frozenset({"volamos", "vamos", "copperline"})
 # out and verified by hand, same discipline `compare_vamos.py`'s own
 # corpus followed.
 CORPUS = [
-    ("list-c", "List SYS:C", normalize_list, frozenset({"volamos", "copperline"})),
+    ("list-c", "List SYS:C", normalize_list, frozenset({"volamos", "copperline"}), None),
     # Regression guard for issue #10 (MatchFirst+CurrentDir+relative-Open
     # composition): Type of a nested-path file -- a real text file
     # (S/Shell-Startup), deliberately not a binary one, since this
@@ -145,22 +145,95 @@ CORPUS = [
     # survive. Content is unaffected by the .uaem/date issues that scope
     # other entries down to volamos-vs-copperline -- all three engines
     # are meaningful here.
-    ("type-s-shell-startup", "Type SYS:S/Shell-Startup", lambda s: s, ALL_ENGINES),
+    ("type-s-shell-startup", "Type SYS:S/Shell-Startup", lambda s: s, ALL_ENGINES, None),
+    # Deterministic path lookup, no scratch-write. vamos has its own,
+    # separate divergence here (exits 5 with no output; volamos already
+    # matches real Kickstart) -- not a volamos bug, so scoped down rather
+    # than tracked as a permanent KNOWN entry for a bug that isn't ours.
+    ("which-list", "Which SYS:C/List", lambda s: s, frozenset({"volamos", "copperline"}), None),
+    # Deterministic arithmetic -- was issue #12 (VFWritef used the wrong,
+    # C-printf format grammar instead of real BCPL Writef), fixed
+    # 2026-08-21; all three engines now agree.
+    ("eval-2plus2", "Eval 2+2", lambda s: s, ALL_ENGINES, None),
+    # Deterministic file-content operation, result written to a file
+    # rather than stdout. vamos truncates its output to 1 line here (its
+    # own, separate divergence) -- scoped down for the same reason as
+    # which-list above.
+    (
+        "sort-shell-startup",
+        "Sort SYS:S/Shell-Startup SYS:sorted.txt",
+        lambda s: s,
+        frozenset({"volamos", "copperline"}),
+        "sorted.txt",
+    ),
+    # Was issue #13 (cli_StandardInput unpopulated + Cli() not
+    # BADDR-converted + dospattern using invented, not real, dosasl.h
+    # token bytes), fixed 2026-08-21. vamos has its own, separate
+    # failure mode here (exits 5, no output) -- scoped down for the same
+    # reason as which-list/sort-shell-startup above.
+    (
+        "search-shell-startup-alias",
+        "Search SYS:S/Shell-Startup Alias",
+        lambda s: s,
+        frozenset({"volamos", "copperline"}),
+        None,
+    ),
+    # Deterministic file-content operation, result written to a file.
+    # Clean 3-way pass, no known divergences.
+    (
+        "join-shell-startup",
+        'Join SYS:S/Shell-Startup AS SYS:joined.txt',
+        lambda s: s,
+        ALL_ENGINES,
+        "joined.txt",
+    ),
 ]
 
 
-def run_volamos(binary: str, corpus: Path, command: str) -> tuple[str, int]:
-    prog, *args = command.split()
-    cmd = [binary, "-V", f"SYS:{corpus}", str(corpus / "C" / prog), *args]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    return result.stdout, result.returncode
+def read_output_file(scratch: Path, output_file: str | None, stdout: str) -> str:
+    """For a corpus entry that writes its real result to a file (`Sort`,
+    `Join`, ...) rather than printing it, reads that file back from the
+    engine's own scratch copy instead of using its captured stdout --
+    `output_file` is a path relative to the `SYS:` volume root (e.g.
+    `"sorted.txt"`). `None` means "compare stdout as normal"."""
+    if output_file is None:
+        return stdout
+    path = scratch / output_file
+    if not path.exists():
+        return f"<{output_file} was never written>"
+    return path.read_text()
 
 
-def run_vamos(binary: str, corpus: Path, command: str) -> tuple[str, int]:
-    prog, *args = command.split()
-    cmd = [binary, "-q", "-V", f"SYS:{corpus}", str(corpus / "C" / prog), *args]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    return result.stdout, result.returncode
+def run_volamos(
+    binary: str, corpus: Path, command: str, output_file: str | None = None
+) -> tuple[str, int]:
+    """Runs `command` against a fresh scratch copy of `corpus` -- some
+    corpus entries (`Sort`, `Join`, ...) write an output file into the
+    volume they're given, and must never do that to the shared,
+    original corpus tree (mutating it would corrupt later runs, and
+    two engines racing to write the same real path would cross-
+    contaminate their results). Every engine gets its own independent
+    copy, same principle as `run_copperline`'s own scratch copy."""
+    with tempfile.TemporaryDirectory(prefix="compare-three-way-volamos-") as tmp:
+        scratch = Path(tmp) / "sys"
+        shutil.copytree(corpus, scratch)
+        prog, *args = command.split()
+        cmd = [binary, "-V", f"SYS:{scratch}", str(scratch / "C" / prog), *args]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return read_output_file(scratch, output_file, result.stdout), result.returncode
+
+
+def run_vamos(
+    binary: str, corpus: Path, command: str, output_file: str | None = None
+) -> tuple[str, int]:
+    """As [`run_volamos`], but for `vamos -q`."""
+    with tempfile.TemporaryDirectory(prefix="compare-three-way-vamos-") as tmp:
+        scratch = Path(tmp) / "sys"
+        shutil.copytree(corpus, scratch)
+        prog, *args = command.split()
+        cmd = [binary, "-q", "-V", f"SYS:{scratch}", str(scratch / "C" / prog), *args]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return read_output_file(scratch, output_file, result.stdout), result.returncode
 
 
 def copperline_command(command: str) -> str:
@@ -184,6 +257,7 @@ def run_copperline(
     rom: Path,
     corpus: Path,
     command: str,
+    output_file: str | None = None,
     timeout_seconds: int = 60,
 ) -> tuple[str, int]:
     with tempfile.TemporaryDirectory(prefix="compare-three-way-copperline-") as tmp:
@@ -259,7 +333,12 @@ def run_copperline(
             rc_line = next(line for line in lines if line.startswith("RC="))
             rc = int(rc_line[len("RC="):])
             body_lines = lines[: lines.index(rc_line)]
-            return "\n".join(body_lines) + ("\n" if body_lines else ""), rc
+            stdout = "\n".join(body_lines) + ("\n" if body_lines else "")
+            # The scratch volume is a real host directory (the same
+            # `[[filesys]]` mount `RESULT.TXT` itself landed in), so an
+            # output-file entry can just be read directly -- no need to
+            # `Type` it back through the guest.
+            return read_output_file(scratch, output_file, stdout), rc
         finally:
             proc.kill()
             proc.wait(timeout=10)
@@ -294,16 +373,18 @@ def main() -> int:
     rom = Path(args.rom).resolve()
 
     runners = {
-        "volamos": lambda command: run_volamos(args.volamos, corpus, command),
-        "vamos": lambda command: run_vamos(args.vamos, corpus, command),
-        "copperline": lambda command: run_copperline(
-            args.copperline, args.copperline_ctl, rom, corpus, command
+        "volamos": lambda command, output_file: run_volamos(
+            args.volamos, corpus, command, output_file
+        ),
+        "vamos": lambda command, output_file: run_vamos(args.vamos, corpus, command, output_file),
+        "copperline": lambda command, output_file: run_copperline(
+            args.copperline, args.copperline_ctl, rom, corpus, command, output_file
         ),
     }
 
     results = []
-    for name, command, normalize, engines in CORPUS:
-        outputs = {engine: runners[engine](command) for engine in engines}
+    for name, command, normalize, engines, output_file in CORPUS:
+        outputs = {engine: runners[engine](command, output_file) for engine in engines}
         normalized = {engine: (normalize(stdout), code) for engine, (stdout, code) in outputs.items()}
         skipped = ALL_ENGINES - engines
 

@@ -332,6 +332,18 @@ const CLI_STRUCT_SIZE: u32 = 64;
 /// (see [`crate::dosfile::get_program_name_handler`]) -- found needed
 /// running the real `AmiSnap` binary.
 pub(crate) const CLI_COMMAND_NAME_OFFSET: u32 = 16;
+/// `cli_StandardInput`: `BPTR`, offset 28 within `struct
+/// CommandLineInterface` (`cli_Result2`/`cli_SetName`/`cli_CommandDir`/
+/// `cli_ReturnCode`/`cli_CommandName`/`cli_FailLevel`/`cli_Prompt` 4
+/// each = 28, `cli_StandardInput` is the 8th field). Real programs
+/// (e.g. `C:Search`) read this directly -- not via `Input()` -- to
+/// decide whether their input has been redirected, by comparing it
+/// against `Input()`'s own return value and `IsInteractive()`. Found
+/// via disassembling the real `Search` binary: leaving this at 0
+/// (unset) makes it look, to any guest program that checks, as if
+/// input was redirected from a non-interactive, non-`Input()` source
+/// even on a plain unredirected CLI invocation.
+pub(crate) const CLI_STANDARD_INPUT_OFFSET: u32 = 28;
 
 // --- struct StackSwapStruct field offsets (bytes from the struct's own
 // address) -- per <exec/execbase.h>: `struct StackSwapStruct { APTR
@@ -461,6 +473,7 @@ pub fn create_current_task<M: AddressSpace>(
     sp_lower: u32,
     sp_upper: u32,
     program_name: &str,
+    input_addr: u32,
 ) -> u32 {
     let task = heap
         .alloc(PROCESS_STRUCT_SIZE)
@@ -524,6 +537,13 @@ pub fn create_current_task<M: AddressSpace>(
     mem.write_u32(
         cli_addr + CLI_COMMAND_NAME_OFFSET,
         bptr_from_addr(cli_command_name_addr),
+    );
+
+    // cli_StandardInput: the same handle this process's own Input()
+    // returns -- see CLI_STANDARD_INPUT_OFFSET's doc.
+    mem.write_u32(
+        cli_addr + CLI_STANDARD_INPUT_OFFSET,
+        bptr_from_addr(input_addr),
     );
 
     task

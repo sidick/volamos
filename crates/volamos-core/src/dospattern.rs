@@ -264,32 +264,53 @@ pub(crate) fn parse(source: &[u8]) -> Result<(Node, bool), i32> {
     Ok((node, parser.has_wildcard))
 }
 
-// --- Byte encoding: a literal transliteration (module docs) ---
+// --- Byte encoding ---
+//
+// The first two tokens (`C_MANY`/`C_ANY`) use the *real* numeric values
+// from the NDK's `dos/dosasl.h` (`P_ANY`/`P_SINGLE`) rather than an
+// arbitrary self-consistent choice -- found necessary running the real
+// Workbench 3.1.4 `Search` binary (issue #13), which hard-codes a
+// pre-tokenized `#?text#?` pattern as a compile-time constant in its
+// own data segment instead of calling `ParsePattern()` at runtime, so
+// its bytes must decode per dos.library's real, if nominally
+// "internal", encoding -- not just whatever `ParsePattern`/
+// `MatchPattern` privately agree on between themselves. Every other
+// token below has no confirmed real-hardware value (`dosasl.h` only
+// documents `P_ANY`/`P_SINGLE`, not the full internal grammar for
+// classes/alternation/general repeats) and keeps this module's
+// original self-consistent, non-conflicting choice.
 
-/// `?`.
-const C_ANY: u8 = 0x80;
+/// `#?` (real `P_ANY`, `dos/dosasl.h`) -- a *single* reserved byte for
+/// "zero or more of any character" (`Node::Repeat(Node::Any)`), matching
+/// real dos.library's dedicated token for this specific, extremely
+/// common wildcard rather than this module's general `#`-prefix
+/// encoding (see [`C_REPEAT`]).
+const C_MANY: u8 = 0x80;
+/// `?` (real `P_SINGLE`, `dos/dosasl.h`).
+const C_ANY: u8 = 0x81;
 /// `%`.
-const C_EMPTY: u8 = 0x81;
-/// `#`, prefixing the one atom it repeats.
-const C_REPEAT: u8 = 0x82;
+const C_EMPTY: u8 = 0x82;
+/// `#`, prefixing the one atom it repeats (any atom other than a bare
+/// `?`, which [`C_MANY`] encodes directly instead).
+const C_REPEAT: u8 = 0x83;
 /// `~`, prefixing the one atom it negates.
-const C_NOT: u8 = 0x83;
+const C_NOT: u8 = 0x84;
 /// `(`.
-const C_GROUP_START: u8 = 0x84;
+const C_GROUP_START: u8 = 0x85;
 /// `|`.
-const C_ALT_SEP: u8 = 0x85;
+const C_ALT_SEP: u8 = 0x86;
 /// `)`.
-const C_GROUP_END: u8 = 0x86;
+const C_GROUP_END: u8 = 0x87;
 /// `[` (or `[~` -- see [`C_CLASS_NEGATE`]).
-const C_CLASS_START: u8 = 0x87;
+const C_CLASS_START: u8 = 0x88;
 /// The `~` immediately after `[` negating a class; only ever appears
 /// right after [`C_CLASS_START`].
-const C_CLASS_NEGATE: u8 = 0x88;
+const C_CLASS_NEGATE: u8 = 0x89;
 /// `]`.
-const C_CLASS_END: u8 = 0x89;
+const C_CLASS_END: u8 = 0x8A;
 /// The `-` inside a class denoting a range (`lo`-`hi`); a single-byte
 /// class member is written without one.
-const C_RANGE_DASH: u8 = 0x8A;
+const C_RANGE_DASH: u8 = 0x8B;
 
 fn encode(node: &Node, out: &mut Vec<u8>) {
     match node {
@@ -329,6 +350,7 @@ fn encode(node: &Node, out: &mut Vec<u8>) {
             out.push(C_NOT);
             encode_prefixed_atom(inner, out);
         }
+        Node::Repeat(inner) if matches!(inner.as_ref(), Node::Any) => out.push(C_MANY),
         Node::Repeat(inner) => {
             out.push(C_REPEAT);
             encode_prefixed_atom(inner, out);
@@ -460,6 +482,7 @@ fn decode_seq<S: ByteSource>(s: &mut Stream<S>) -> Option<(Node, u8)> {
 
 fn decode_atom<S: ByteSource>(s: &mut Stream<S>) -> Option<Node> {
     match s.bump()? {
+        C_MANY => Some(Node::Repeat(Box::new(Node::Any))),
         C_ANY => Some(Node::Any),
         C_EMPTY => Some(Node::Empty),
         C_REPEAT => decode_atom(s).map(|n| Node::Repeat(Box::new(n))),

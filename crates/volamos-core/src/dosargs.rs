@@ -805,6 +805,25 @@ mod tests {
         assert_eq!(items, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
     }
 
+    /// Regression test for issue #13: real `C:Search`'s full 9-item
+    /// template (`FROM/M` followed by a trailing required `SEARCH/A`)
+    /// parses a plain two-token command line fine -- confirming the
+    /// bug wasn't in `/M`'s borrow-from-tail logic (as first suspected)
+    /// but in `Search` itself picking the wrong template at runtime,
+    /// due to an unpopulated `cli_StandardInput` (see
+    /// `exectask::CLI_STANDARD_INPUT_OFFSET`).
+    #[test]
+    fn optional_multi_with_trailing_required_parses_plain_input() {
+        let (mut heap, mut mem, mut dos) = setup(&["SYS:S/Shell-Startup", "Alias"]);
+        call_read_args(
+            &mut heap,
+            &mut mem,
+            &mut dos,
+            "FROM/M,SEARCH/A,ALL/S,NONUM/S,QUIET/S,QUICK/S,FILE/S,PATTERN/S,CASE/S",
+            9,
+        );
+    }
+
     #[test]
     fn quoted_string_with_escapes() {
         let (mut heap, mut mem, mut dos) = setup(&[r#""Hello*NThere""#]);

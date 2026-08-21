@@ -3598,3 +3598,72 @@ fix). Full `cargo build/test (540)/clippy -D warnings/fmt --check`
 clean; re-ran `compare_vamos.py` inside `ghcr.io/sidick/amiga-dev:1`
 to confirm the harness still correctly reports `exectest` as `KNOWN`
 (not a regression to `FAIL`) with the updated reason text.
+
+## Issues #12/#13 resolved, `tools/compare_three_way.py` corpus extended to `Which`/`Eval`/`Sort`/`Search`/`Join` — 2026-08-21
+
+Added `Which`/`Eval`/`Sort`/`Search`/`Join` to the local three-way
+corpus. Manual runs against all three engines found two genuine
+volamos bugs (filed as #12/#13) and two `vamos`-side divergences
+(`Which`, `Sort` -- volamos already matches real Kickstart; not
+tracked further, out of scope for this project).
+
+**Issue #12 (`Eval` prints literal `%n`)**: `dos.library`'s
+`VFWritef`/`FWritef` were aliased onto the same handler as `VFPrintf`
+(`RawDoFmt`-style C-`printf` directives), on the assumption they're
+"functionally identical" beyond the LVO name. Wrong -- per the RKRM,
+`VFWritef` follows the older **BCPL `Writef`** directive grammar
+(`%S`/`%T<w>`/`%C`/`%O<w>`/`%X<w>`/`%D<w>`/`%N`/`%U<w>`/`%*`/`%%`), is
+not locale-patched, and is unrelated to `RawDoFmt`. Real `Eval`'s
+default format is the literal `"%n"` (`%N` = unlimited-width signed
+decimal); volamos's C-`printf` parser didn't recognize `n`/`N` as any
+directive it understood, so it printed `%n` through unsubstituted.
+Fixed by implementing a real `Writef` formatter
+(`dosprintf::render_writef_format`) and giving `VFWritef` its own
+handler. Confirmed empirically (not just from the RKRM's prose) that
+directive letters are case-insensitive on real hardware -- both
+`Eval`'s lowercase `%n` and a pre-existing test built from the real
+`Which` binary's lowercase `%s` work; the less common directives
+(`%C`/`%O`/`%X`/`%D`/`%U`/`%*`) are implemented from the RKRM's
+description and well-known convention, not independently
+disassembly-confirmed.
+
+**Issue #13 (`Search` "Too many arguments")**: misdiagnosed at filing
+time as a `ReadArgs` `/M` bug -- a targeted regression test confirmed
+the core `/M`+trailing-`/A` borrow-from-tail parsing was already
+correct. Disassembling the real `Search` binary
+(`m68k-amigaos-objdump -b amiga -m m68k -D`, which works on real hunk
+executables where `vobjdump` doesn't) found the real causes:
+`cli_StandardInput` (offset 28 in the fake `CommandLineInterface`
+struct) was never populated, so `Search`'s own template-selection
+logic (comparing `Input()`/`Cli()->cli_StandardInput`/
+`IsInteractive()`) always picked the wrong (short) template; `Cli()`
+returned the raw, unconverted `pr_CLI` `BPTR` instead of a real
+`BADDR`-converted pointer (per its documented
+`struct CommandLineInterface *Cli(void)` prototype), so real compiled
+code's direct, unshifted struct-field reads off it landed on garbage;
+and, once those two were fixed, `dospattern.rs`'s own tokenized
+pattern-encoding used self-invented byte values instead of the real
+NDK `dos/dosasl.h` ones (`P_ANY = 0x80` for `#?`, `P_SINGLE = 0x81`
+for `?`) -- fine for patterns volamos's own `ParsePattern`/
+`MatchPattern` round-trip themselves, but wrong for `Search`, which
+hard-codes a pre-tokenized `#?ALIAS#?`-style pattern as a compile-time
+constant, bypassing `ParsePattern`'s LVO entirely. Fixed all three:
+`exectask::create_current_task` now eagerly allocates the process's
+`Input()` handle (moved earlier in `Runtime::new`) and writes it into
+`cli_StandardInput`; `cli_handler` now converts with `addr_from_bptr`;
+`dospattern.rs`'s token constants were renumbered to match the real,
+confirmed `P_ANY`/`P_SINGLE` values (the real header is at
+`/Users/simond/src/amiga-gcc/projects/NDK3.2/Include_H/dos/dosasl.h`).
+Also fixed a related, if less severe, bug found along the way:
+`IsInteractive(NULL)` read arbitrary guest memory near address 0
+instead of returning `DOSFALSE` cleanly for a `NULL` `BPTR`.
+
+**Verification**: both fixes confirmed byte-identical output and exit
+code against real Kickstart 3.1 via Copperline (`Eval 2+2` -> `4`;
+`Search SYS:S/Shell-Startup Alias` -> the two matching `Alias` lines,
+line-numbered) -- `vamos` still diverges on both with its own,
+separate, unrelated failures. Full `cargo build/test (541)/clippy -D
+warnings/fmt --check` clean. `tools/compare_three_way.py`'s corpus now
+has 7 entries (`list-c`, `type-s-shell-startup`, `which-list`,
+`eval-2plus2`, `sort-shell-startup`, `search-shell-startup-alias`,
+`join-shell-startup`), all passing locally.

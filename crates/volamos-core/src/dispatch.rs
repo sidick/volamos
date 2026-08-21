@@ -1743,6 +1743,23 @@ impl<C: Cpu + 'static> Runtime<C> {
         let stack_base = top.saturating_sub(stack_size) & !3;
         let mut heap = GuestHeap::new(config.load_end, stack_base);
 
+        // dos.library state, created here (rather than at this
+        // function's end, where it used to live) so its Input() handle
+        // can be eagerly allocated below and threaded into the fake
+        // CLI struct's cli_StandardInput -- see
+        // exectask::CLI_STANDARD_INPUT_OFFSET's doc.
+        let mut dos = DosState::new(None);
+
+        // Input() handle: allocated eagerly (rather than on first
+        // guest Input() call, dos.library's normal lazy-allocation
+        // path) so cli_StandardInput can be populated below with the
+        // same address a later Input() call will return, matching
+        // real AmigaOS where a CLI's standard input already exists at
+        // process-creation time.
+        let input_addr = dos
+            .input_addr(&mut heap, &mut mem)
+            .expect("guest heap has room for the eagerly allocated Input() handle");
+
         // Fake current task (Phase 3 stage 5; stack bounds since stage
         // 6): a real, guest-visible struct Task allocated on the heap
         // just created above, before anything else claims heap space.
@@ -1757,6 +1774,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             stack_base,
             top,
             &config.program_name,
+            input_addr,
         );
         mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, task);
 
@@ -1812,7 +1830,6 @@ impl<C: Cpu + 'static> Runtime<C> {
         // command-line buffer just built above, per crate::dosargs's
         // module docs. Registers hold this too, but a guest program is
         // free to clobber A0/D0 before ever calling ReadArgs.
-        let mut dos = DosState::new(None);
         dos.cmdline = Some((args_addr, line_len));
 
         Self {
@@ -2924,9 +2941,12 @@ mod tests {
         // crate::exectask) and its process-name string are allocated
         // from the heap *before* the command-line buffer, so A0 (the
         // command-line buffer's address) no longer equals load_end
-        // directly -- but the task struct itself does, since it's the
-        // very first thing Runtime::new allocates from the heap.
-        assert_eq!(rt.task, load_end);
+        // directly. And since the cli_StandardInput fix (issue #13),
+        // the eagerly-allocated Input() file handle is now the very
+        // first thing Runtime::new allocates from the heap, so the
+        // task struct sits right after it rather than at load_end
+        // itself.
+        assert_eq!(rt.task, load_end + 44); // 44 = dosfile::FILE_HANDLE_SIZE
         let a0 = rt.cpu.address_register(AddressRegister(0));
         assert!(
             a0 > load_end,

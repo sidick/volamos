@@ -9,6 +9,18 @@
 //! autodoc) aren't separate LVOs -- they're compiled to call these same
 //! two entry points with the caller's own stack as the data stream, so
 //! implementing `VPrintf`/`VFPrintf` covers both.
+//!
+//! `VFWritef`/`FWritef` are a *different* formatter, despite the
+//! superficially identical `(fh, fmt, argv)` signature: per the RKRM's
+//! own description, `VFWritef` follows the BCPL `Writef` directive
+//! syntax (`%S`/`%T<w>`/`%C`/`%O<w>`/`%X<w>`/`%D<w>`/`%N`/`%U<w>`/
+//! `%*`/`%%`), is not locale-patched, and is unrelated to `RawDoFmt`'s
+//! C-`printf`-style directives -- despite an earlier version of this
+//! module aliasing it straight onto [`vfprintf_handler`] (wrong: it
+//! left a real `Eval`'s `%N` directive completely unsubstituted,
+//! printing the literal text `%n` instead of the computed result --
+//! issue #12). See [`render_writef_format`] for the real syntax this
+//! module now implements instead.
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
@@ -16,6 +28,7 @@ use crate::dosbuf::write_bytes;
 use crate::execfmt::render_format;
 use crate::guestmem::{addr_from_bptr, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
+use crate::memory::AddressSpace;
 
 const RESULT_ERROR: u32 = 0xFFFF_FFFF;
 
@@ -70,6 +83,140 @@ fn vfprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     Ok(())
 }
 
+/// Decodes a BCPL `Writef` field-width character: `'0'`-`'9'` -> `0`-`9`
+/// directly, `'A'`-`'Z'`/`'a'`-`'z'` -> `10`-`35` (per the RKRM: "a
+/// digit from 0 to 9 indicates the field widths from 0 to 9 directly;
+/// characters A to Z indicate field widths from 10 onward" -- accepting
+/// lowercase too since real directive *letters* turned out to be
+/// case-insensitive, per this module's own doc note, and there's no
+/// documented reason width chars would be stricter).
+fn writef_width(c: u8) -> usize {
+    match c {
+        b'0'..=b'9' => (c - b'0') as usize,
+        b'A'..=b'Z' => (c - b'A') as usize + 10,
+        b'a'..=b'z' => (c - b'a') as usize + 10,
+        _ => 0,
+    }
+}
+
+/// Renders a BCPL `Writef`-style format string (`VFWritef`/`FWritef` --
+/// see this module's doc note) against the `LONG` array at `argv_ptr`,
+/// returning the formatted bytes. Every directive consumes exactly one
+/// 4-byte array slot except `%%` (consumes none) -- `argv` is a plain
+/// `LONG*`, unlike [`render_format`]'s mixed 16-/32-bit `RawDoFmt`
+/// stream, so slot advancement is always by 4.
+///
+/// Directive letters are matched case-insensitively: `%S`/`%T<w>` are
+/// confirmed against the real `Which` binary (issue tracker: an
+/// existing end-to-end test uses `%s`, lowercase, as that binary
+/// literally embeds it), and `%N` against the real `Eval` binary
+/// (issue #12, lowercase `%n`). The rest (`%C`/`%O<w>`/`%X<w>`/
+/// `%D<w>`/`%U<w>`/`%*`) are implemented per the RKRM's prose
+/// description of `Writef`'s directive set, not independently
+/// disassembly-confirmed against a real binary the way `%S`/`%N` were.
+fn render_writef_format(mem: &dyn AddressSpace, fmt: &[u8], argv_ptr: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut argv = argv_ptr;
+    let next_arg = |mem: &dyn AddressSpace, argv: &mut u32| {
+        let v = mem.read_u32(*argv);
+        *argv = argv.wrapping_add(4);
+        v
+    };
+
+    let mut i = 0;
+    while i < fmt.len() {
+        let c = fmt[i];
+        if c != b'%' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&directive) = fmt.get(i) else {
+            out.push(b'%');
+            break;
+        };
+        i += 1;
+        match directive.to_ascii_uppercase() {
+            b'%' => out.push(b'%'),
+            b'*' => {
+                next_arg(mem, &mut argv);
+            }
+            b'S' => {
+                let ptr = next_arg(mem, &mut argv);
+                out.extend(read_c_string(mem, ptr));
+            }
+            b'T' => {
+                let width = fmt.get(i).copied().map(writef_width).unwrap_or(0);
+                if fmt.get(i).is_some() {
+                    i += 1;
+                }
+                let ptr = next_arg(mem, &mut argv);
+                let s = read_c_string(mem, ptr);
+                out.extend(&s);
+                if s.len() < width {
+                    out.resize(out.len() + (width - s.len()), b' ');
+                }
+            }
+            b'C' => {
+                let v = next_arg(mem, &mut argv);
+                out.push(v as u8);
+            }
+            b'O' | b'X' | b'D' | b'U' => {
+                let width = fmt.get(i).copied().map(writef_width).unwrap_or(0);
+                if fmt.get(i).is_some() {
+                    i += 1;
+                }
+                let v = next_arg(mem, &mut argv);
+                let digits = match directive.to_ascii_uppercase() {
+                    b'O' => format!("{v:o}"),
+                    b'X' => format!("{v:x}"),
+                    b'D' => format!("{}", v as i32),
+                    _ => format!("{v}"),
+                };
+                let zero_pad = matches!(directive.to_ascii_uppercase(), b'O' | b'X');
+                if digits.len() < width {
+                    let pad = width - digits.len();
+                    out.resize(out.len() + pad, if zero_pad { b'0' } else { b' ' });
+                }
+                out.extend(digits.as_bytes());
+            }
+            b'N' => {
+                let v = next_arg(mem, &mut argv);
+                out.extend(format!("{}", v as i32).as_bytes());
+            }
+            _ => {
+                out.push(b'%');
+                out.push(directive);
+            }
+        }
+    }
+    out
+}
+
+/// `VFWritef` (`D1` = file handle `BPTR`, `D2` = format string, `D3` =
+/// `LONG*` data stream). `D0` = number of characters written, or `-1`
+/// (+ `IoErr()` set). See this module's doc note for why this isn't
+/// just [`vfprintf_handler`] under another name.
+fn vfwritef_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let fmt_ptr = ctx.cpu.data_register(DataRegister(2));
+    let data_ptr = ctx.cpu.data_register(DataRegister(3));
+    let addr = addr_from_bptr(bptr);
+
+    let fmt = read_c_string(ctx.mem, fmt_ptr);
+    let rendered = render_writef_format(ctx.mem, &fmt, data_ptr);
+
+    match write_bytes(ctx, addr, &rendered) {
+        Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
+        }
+    }
+    Ok(())
+}
+
 /// Registers `VPrintf`/`VFPrintf` onto [`DOS_LIBRARY_BASE`], looked up
 /// by name through [`DOS_LVOS`]. Called from [`crate::dispatch::
 /// Runtime::new`] alongside the other `dos.library` registrations.
@@ -93,11 +240,10 @@ pub fn register_dosprintf_handlers<C: Cpu + 'static>(
     }
     reg!("VPrintf", vprintf_handler::<C>);
     reg!("VFPrintf", vfprintf_handler::<C>);
-    // VFWritef(fh, fmt, argv) is functionally identical to VFPrintf --
-    // same D1/D2/D3 signature, same RawDoFmt-based formatting -- per the
-    // RKRM's own `#define VWritef(format,argv) VFWritef(Output(),
-    // (format),(argv))` macro, mirroring `WriteStr(s) = FPuts(Output(),s)`.
-    reg!("VFWritef", vfprintf_handler::<C>);
+    // VFWritef(fh, fmt, argv) has the same D1/D2/D3 signature as
+    // VFPrintf, but a different (BCPL Writef) format-string syntax --
+    // see this module's doc note and vfwritef_handler.
+    reg!("VFWritef", vfwritef_handler::<C>);
 }
 
 #[cfg(test)]

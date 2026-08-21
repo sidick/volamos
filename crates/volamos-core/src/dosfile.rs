@@ -912,9 +912,17 @@ fn output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 
 /// `IsInteractive` (`D1` = `BPTR`). `D0` = `DOSTRUE`/`DOSFALSE`. Reads
 /// `fh_Port` directly out of guest memory -- cannot fail, and doesn't
-/// touch `IoErr()`, matching the real function.
+/// touch `IoErr()`, matching the real function. A `NULL` (`0`) handle
+/// (real callers never pass one, but a guest reading an unset
+/// `BPTR`-typed struct field -- e.g. a stale `cli_StandardInput` --
+/// might) reports `DOSFALSE` directly rather than dereferencing
+/// `fh_Port` at guest address 0.
 fn is_interactive_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
+    if bptr == 0 {
+        ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        return Ok(());
+    }
     let addr = addr_from_bptr(bptr);
     let fh_port = ctx.mem.read_u32(addr.wrapping_add(FH_PORT_OFFSET));
     ctx.cpu.set_data_register(
@@ -954,25 +962,35 @@ fn wait_for_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
-/// `Cli` (no args). `D0` = the current task's `pr_CLI` field (a `BPTR` to
-/// a real, heap-allocated `struct CommandLineInterface` -- see
-/// [`crate::exectask::PR_CLI_OFFSET`]'s doc). This runtime represents
-/// CLI-style direct execution (running a binary through volamos is
-/// equivalent to running it from a real Shell), not a Workbench icon
-/// launch, so `pr_CLI` is always non-`NULL` and this always returns a
-/// real `BPTR`. Found needed while running the real `AmiSnap` binary
-/// (`~/src/amisnap`, linked with libnix): its startup code checks
-/// `pr_CLI` directly (an inline struct-field read, not a call through
-/// this handler) to decide whether to `WaitPort()` for a `WBStartup`
-/// message that this runtime never sends -- returning `0` here would
-/// have been consistent with that same (wrong) inline read, but real
-/// `Cli()` and a real, non-`NULL` `pr_CLI` are the correct match for a
-/// CLI-launched program either way. Doesn't touch `IoErr()`, matching
-/// the real function.
+/// `Cli` (no args). `D0` = a real, dereferenceable pointer to the
+/// current task's `struct CommandLineInterface` (per the RKRM's own
+/// prototype, `struct CommandLineInterface *Cli(void)` -- unlike the
+/// `pr_CLI` field it wraps, which is a raw `BPTR`, `Cli()` itself
+/// returns the already-`BADDR`-converted address). This runtime
+/// represents CLI-style direct execution (running a binary through
+/// volamos is equivalent to running it from a real Shell), not a
+/// Workbench icon launch, so `pr_CLI` is always non-`NULL` and this
+/// always returns a real, non-`NULL` pointer. Found needed while
+/// running the real `AmiSnap` binary (`~/src/amisnap`, linked with
+/// libnix): its startup code checks `pr_CLI` directly (an inline
+/// struct-field read, not a call through this handler) to decide
+/// whether to `WaitPort()` for a `WBStartup` message that this runtime
+/// never sends -- returning `0` here would have been consistent with
+/// that same (wrong) inline read, but real `Cli()` and a real,
+/// non-`NULL` `pr_CLI` are the correct match for a CLI-launched
+/// program either way. Returning the *raw*, unconverted `BPTR` (rather
+/// than converting it) was a separate bug found later, disassembling
+/// the real `Search` binary (issue #13): its compiled code reads
+/// `cli_StandardInput` via a direct, unshifted `28(a3)` offset off
+/// `Cli()`'s own result, per the documented pointer-returning
+/// prototype -- a caller that (wrongly, per real `pr_CLI` semantics)
+/// tried to shift this back into `BPTR` units would get nonsense.
+/// Doesn't touch `IoErr()`, matching the real function.
 fn cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    let cli = ctx
+    let cli_bptr = ctx
         .mem
         .read_u32(ctx.current_task + crate::exectask::PR_CLI_OFFSET);
+    let cli = addr_from_bptr(cli_bptr);
     ctx.cpu.set_data_register(DataRegister(0), cli);
     Ok(())
 }
