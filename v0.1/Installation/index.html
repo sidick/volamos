@@ -424,6 +424,45 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Getting the binary">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#prebuilt-release-binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prebuilt release binary
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#container-image" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Container image
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#build-from-source" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Build from source
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -852,6 +891,45 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Getting the binary">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#prebuilt-release-binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prebuilt release binary
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#container-image" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Container image
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#build-from-source" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Build from source
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -910,12 +988,9 @@
   cleanly to a real Windows executable (see
   <a href="../Building-from-Source/#cross-platform-notes">Building from Source</a>)
   — but running it under Windows/Wine hasn't been verified, so treat
-  it as untested at runtime even though the build itself works.</li>
-<li><strong>A recent stable Rust toolchain</strong> (edition 2024 support) to build
-  it — see <a href="../Building-from-Source/">Building from Source</a>. volamos
-  has not yet had a tagged release, so building from source is
-  currently the only way to get the binary (see
-  <a href="../">the index page</a>'s note on project status).</li>
+  it as untested at runtime even though the build itself works. A
+  prebuilt Windows zip is published on each release (see below) purely
+  as a cross-compiled convenience binary, with the same caveat.</li>
 <li><strong>No Amiga hardware, ROM image, or Workbench disk of any kind.</strong>
   volamos doesn't emulate a whole machine — it loads and runs a single
   AmigaOS hunk executable directly. The guest program itself is
@@ -923,7 +998,43 @@
   ship one.</li>
 </ul>
 <h2 id="getting-the-binary">Getting the binary<a class="headerlink" href="#getting-the-binary" title="Permanent link">&para;</a></h2>
-<p>Until a tagged release exists, build it yourself:</p>
+<p>Pick whichever of these fits your workflow:</p>
+<h3 id="prebuilt-release-binary">Prebuilt release binary<a class="headerlink" href="#prebuilt-release-binary" title="Permanent link">&para;</a></h3>
+<p>Each tagged release publishes standalone, statically-linked binaries
+for <code>x86_64-unknown-linux-musl</code>, <code>aarch64-unknown-linux-musl</code>,
+<code>aarch64-apple-darwin</code> (Apple Silicon), and <code>x86_64-pc-windows-gnu</code> —
+download the archive for your platform from the
+<a href="https://github.com/sidick/volamos/releases">GitHub Releases page</a>,
+extract it, and put <code>volamos</code> on your <code>PATH</code>. No Rust toolchain or
+build step required. Intel Mac (<code>x86_64-apple-darwin</code>) isn't published
+— build from source instead if you need it.</p>
+<h3 id="container-image">Container image<a class="headerlink" href="#container-image" title="Permanent link">&para;</a></h3>
+<p>A multi-arch (<code>linux/amd64</code>, <code>linux/arm64</code>) image is published to
+GHCR on every release:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>ghcr.io/sidick/volamos:latest<span class="w"> </span>--help
+</code></pre></div>
+<p>or pin a specific version instead of <code>latest</code> (e.g.
+<code>ghcr.io/sidick/volamos:v0.1</code>). It's a static binary on a
+<a href="https://github.com/GoogleContainerTools/distroless">distroless</a>
+<code>nonroot</code> base — no shell, no libc, runs as an unprivileged user by
+default. To run a guest program against host files, bind-mount a
+directory and map it as a volume with <code>-V</code>:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-v<span class="w"> </span><span class="s2">"</span><span class="nv">$PWD</span><span class="s2">/work:/data"</span><span class="w"> </span>ghcr.io/sidick/volamos:latest<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-V<span class="w"> </span>TEST:/data<span class="w"> </span>/fixtures/hello
+</code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Mounted directories must be writable by the container's user</p>
+<p>Because the image runs as <code>nonroot</code> rather than root, it can't
+write into a bind-mounted host directory unless that directory's
+permissions actually allow it — a directory created with a
+restrictive default mode (e.g. <code>0700</code>, owned by your host user) is
+invisible to the container's UID even though it works fine when
+running the binary natively. If a guest program's <code>Open()</code> for
+writing mysteriously fails only under Docker, this is the first
+thing to check — <code>chmod 777</code> (or otherwise open up) the directory
+you're mounting before running the container.</p>
+</div>
+<h3 id="build-from-source">Build from source<a class="headerlink" href="#build-from-source" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/sidick/volamos.git
 <span class="nb">cd</span><span class="w"> </span>volamos
 cargo<span class="w"> </span>build<span class="w"> </span>--release
@@ -933,8 +1044,9 @@ executable — copy it anywhere on your <code>PATH</code>, or install it directl
 with Cargo:</p>
 <div class="highlight"><pre><span></span><code>cargo<span class="w"> </span>install<span class="w"> </span>--path<span class="w"> </span>crates/volamos<span class="w"> </span>--locked
 </code></pre></div>
-<p>See <a href="../Building-from-Source/">Building from Source</a> for the full
-details (running the test suite, cross-platform notes).</p>
+<p>Requires a recent stable Rust toolchain (edition 2024 support). See
+<a href="../Building-from-Source/">Building from Source</a> for the full details
+(running the test suite, cross-platform notes).</p>
 <h2 id="checking-it-works">Checking it works<a class="headerlink" href="#checking-it-works" title="Permanent link">&para;</a></h2>
 <p>volamos ships a handful of pre-built test fixtures — tiny AmigaOS
 executables used by its own test suite — that double as a quick sanity

@@ -913,8 +913,8 @@ console-tool use case.</p>
 </ul>
 <h2 id="where-to-start">Where to start<a class="headerlink" href="#where-to-start" title="Permanent link">&para;</a></h2>
 <ul>
-<li><a href="Installation/">Installation</a> — getting the binary built and onto
-  your <code>PATH</code>.</li>
+<li><a href="Installation/">Installation</a> — prebuilt release binaries, the
+  container image, or building from source.</li>
 <li><a href="Getting-Started/">Getting Started</a> — running your first guest
   program, and mapping a real directory onto an Amiga volume.</li>
 <li><a href="CLI-Reference/">CLI Reference</a> — every flag.</li>
@@ -942,9 +942,11 @@ project). A full audit against <code>vamos</code>'s own library/device coverage
 closed the remaining gaps it flagged, including <code>ReadArgs</code>/<code>FreeArgs</code>,
 the full <code>SignalSemaphore</code> API, the math libraries, <code>locale.library</code>,
 and a thin <code>intuition.library</code> stub.</p>
-<p>What hasn't happened yet: a formal three-oracle parity pass (volamos
-vs. <code>vamos</code> vs. real Kickstart, on a shared corpus) and a tagged
-release. If a guest program hits an unimplemented call, volamos fails
+<p>What hasn't happened yet: a formal, CI-integrated three-oracle parity
+pass (volamos vs. <code>vamos</code> vs. real Kickstart, on a shared corpus) — a
+local-only harness exists and has already caught and fixed real
+divergences, but it isn't wired into CI yet. If a guest program hits
+an unimplemented call, volamos fails
 loudly with a clear diagnostic naming the exact library/function
 rather than silently misbehaving — see
 <a href="Supported-Libraries/">Supported Libraries</a> for what's covered, and
