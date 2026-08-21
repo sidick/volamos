@@ -150,7 +150,14 @@ jobs:
   release-binaries-linux:
     name: Standalone binary (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [test]
+    # Waits on `docker` rather than running in parallel with it -- both
+    # jobs build the same `builder` stage/platforms via the shared
+    # volamos-docker-builder gha cache scope, but a cache written by one
+    # job isn't visible to another job still running concurrently. Only
+    # sequencing after `docker` (whose push step already builds+caches
+    # both platforms) guarantees this job hits a warm cache instead of
+    # independently recompiling everything from scratch.
+    needs: [test, docker]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
