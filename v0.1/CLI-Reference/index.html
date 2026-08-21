@@ -641,6 +641,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#-jit-no-jit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --jit, --no-jit
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#no-flags-at-all" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1042,6 +1053,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#-jit-no-jit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --jit, --no-jit
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#no-flags-at-all" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1080,7 +1102,7 @@
 <h1 id="cli-reference">CLI Reference<a class="headerlink" href="#cli-reference" title="Permanent link">&para;</a></h1>
 <div class="highlight"><pre><span></span><code>volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
-        [--cpu MODEL] [--fpu|--no-fpu] &lt;program&gt; [args...]
+        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] &lt;program&gt; [args...]
 </code></pre></div>
 <p><code>volamos --help</code> prints this same reference from the binary itself.
 Everything before <code>&lt;program&gt;</code> is a volamos flag; <code>&lt;program&gt;</code> is a host
@@ -1206,6 +1228,50 @@ interface at all, so F-line (FPU) instructions always trap on them
 regardless of this flag.</p>
 <div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>--fpu<span class="w"> </span>fixtures/hello
 </code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Performance: software math libraries are faster than a real FPU</p>
+<p>Programs that do floating-point math through <code>mathffp.library</code>/
+<code>mathtrans.library</code>/<code>mathieeedoubbas.library</code> (the common path for
+code that doesn't require a real 68881/882 — e.g. most <code>--cpu 68000</code>
+binaries) run at full host CPU speed under volamos, since those
+libraries are implemented as genuine host <code>f64</code>/<code>f32</code> arithmetic,
+not emulated 1980s FPU hardware. Programs that instead execute real
+F-line FPU instructions (needing <code>--cpu 68020</code>+ and <code>--fpu</code>) go
+through the <code>m68k</code> crate's <em>interpreted</em> FPU emulation instead,
+which is considerably slower — confirmed with a real BYTEmark 2.2
+Fourier run: <code>--cpu 68000</code> (library math) scored an index of 1.46
+(faster than a 233 MHz AMD K6 reference machine); the same binary's
+real-FPU path under <code>--cpu 68020 --fpu</code> scored 0.09, in line with
+the rest of the suite's plain-interpreted-CPU results. <code>--fpu</code>
+doesn't force a program to use one path or the other — that's
+determined by how the program itself was written/compiled — it
+just decides whether real F-line instructions execute instead of
+trapping.</p>
+</div>
+<h2 id="-jit-no-jit"><code>--jit</code>, <code>--no-jit</code><a class="headerlink" href="#-jit-no-jit" title="Permanent link">&para;</a></h2>
+<p>Whether guest code runs through the <code>m68k</code> crate's trace JIT
+(<code>CpuCore::run_batch</code>) instead of stepping one instruction at a time.
+Default: off — the plain interpreter is this runtime's correctness
+reference, and every emulated library call still traps out to volamos
+identically either way, so <code>--jit</code> never changes a program's observable
+behavior, only its speed.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--jit<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Where the win actually shows up</p>
+<p>volamos is a Wine-style HLE runtime: guest code traps out to Rust on
+essentially every AmigaOS library call, and the JIT only accelerates
+the CPU-bound work <em>between</em> those traps (compiling hot
+backward-branch loops). For trap-dense glue code that spends most of
+its time inside library calls, <code>--jit</code> has little to offer. For
+CPU-bound guest work — the case that actually motivated this flag —
+compiling a real 577-line C source (<code>sc guiprof.c</code>, SAS/C 6.58)
+dropped from ~3.1s to ~2.3s of CPU time (a ~25% reduction) with
+<code>--jit</code>, though wall-clock barely moved, since most of <code>sc</code>'s wall
+time isn't CPU-bound at all. Expect <code>--jit</code>'s benefit to scale with
+how CPU-heavy the guest program's own work is, not with how many
+library calls it makes.</p>
+</div>
 <h2 id="no-flags-at-all">No flags at all<a class="headerlink" href="#no-flags-at-all" title="Permanent link">&para;</a></h2>
 <p>If none of <code>-V</code>/<code>-a</code>/<code>--cwd</code>/<code>--auto-assign</code> are given, no volume/assign
 filesystem is installed at all: <code>dos.library</code> path-based calls

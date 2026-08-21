@@ -922,6 +922,7 @@ STACK=256K
 RAM=32M
 CPU=68020
 FPU=true
+JIT=false
 VERBOSE=false
 SNOOP=false
 </code></pre></div>
@@ -976,6 +977,11 @@ SNOOP=false
 <td><code>true</code>/<code>false</code></td>
 </tr>
 <tr>
+<td><code>JIT</code></td>
+<td><code>--jit</code>/<code>--no-jit</code></td>
+<td><code>true</code>/<code>false</code></td>
+</tr>
+<tr>
 <td><code>VERBOSE</code></td>
 <td><code>-v</code>/<code>--verbose</code></td>
 <td><code>true</code>/<code>false</code></td>
@@ -997,7 +1003,7 @@ relative path — <em>not</em> against the config file's own location. Prefer
 absolute paths in <code>~/.volamos</code> for anything meant to work regardless
 of where volamos is invoked from.</p>
 <h2 id="precedence">Precedence<a class="headerlink" href="#precedence" title="Permanent link">&para;</a></h2>
-<p>For <code>CWD</code>/<code>AUTO_ASSIGN</code>/<code>STACK</code>/<code>RAM</code>/<code>CPU</code>/<code>FPU</code>/<code>VERBOSE</code>/<code>SNOOP</code>:</p>
+<p>For <code>CWD</code>/<code>AUTO_ASSIGN</code>/<code>STACK</code>/<code>RAM</code>/<code>CPU</code>/<code>FPU</code>/<code>JIT</code>/<code>VERBOSE</code>/<code>SNOOP</code>:</p>
 <div class="highlight"><pre><span></span><code>command-line flag  &gt;  ./.volamos  &gt;  ~/.volamos  &gt;  built-in default
 </code></pre></div>
 <p>For <code>VOLUME</code>/<code>ASSIGN</code>: entries from every source all apply — nothing
