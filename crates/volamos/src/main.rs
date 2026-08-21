@@ -602,6 +602,9 @@ fn run_nested_program(
             Err(_) => return -1,
         }
     }
+    if let Some(dir) = host_path.parent() {
+        runtime.set_program_dir(dir);
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -637,6 +640,9 @@ fn run(opts: &Options) -> Result<i32, String> {
     if let Some(config) = vfs_config.clone() {
         let vfs = Vfs::new(config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
         runtime.set_vfs(vfs);
+    }
+    if let Some(dir) = std::path::Path::new(&opts.program).parent() {
+        runtime.set_program_dir(dir);
     }
 
     // System()/Execute/RunCommand (Phase 3 stage 7): a nested program is

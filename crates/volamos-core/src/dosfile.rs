@@ -1118,6 +1118,60 @@ fn max_cli_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     Ok(())
 }
 
+/// `GetProgramDir` (no args). `D0` = `pr_HomeDir` verbatim -- a `BPTR`
+/// lock on the directory the running program was loaded from, or `0`
+/// if none exists (RKRM `processes.md`: "`ZERO` ... indicates that no
+/// home directory exists"). Populated once, at startup, by
+/// [`crate::dispatch::Runtime::set_program_dir`] -- see
+/// [`crate::exectask::PR_HOMEDIR_OFFSET`]'s doc for why that isn't
+/// [`create_current_task`][crate::exectask::create_current_task]
+/// itself. Doesn't touch `IoErr()`, matching the real function.
+fn get_program_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let home_dir = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_HOMEDIR_OFFSET);
+    ctx.cpu.set_data_register(DataRegister(0), home_dir);
+    Ok(())
+}
+
+/// `SetProgramDir` (`D1` = new `BPTR` lock). `D0` = the *previous*
+/// `pr_HomeDir` value. Per the RKRM: "installs `lock` into `pr_HomeDir`
+/// ... and is used to resolve the `PROGDIR` pseudo-assign" -- so this
+/// also repoints the `PROGDIR:` assign, not just the raw field: to
+/// whatever `Vfs`-resolved `amiga_path` the registry has on file for
+/// `lock` (every lock in this runtime carries one -- see
+/// [`crate::doslock::LockEntry`]), or, if `lock` is `0` or isn't a
+/// currently-open lock this runtime issued, removes the assign
+/// entirely -- matching "if `ZERO` is installed, the current process
+/// will be unable to resolve this pseudo-assign", and, for the unknown-
+/// lock case, erring on the side of *not* leaving a stale `PROGDIR:`
+/// pointed at the previous directory once the caller's own `pr_HomeDir`
+/// no longer agrees with it.
+fn set_program_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let new_lock = ctx.cpu.data_register(DataRegister(1));
+    let old = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_HOMEDIR_OFFSET);
+    ctx.mem.write_u32(
+        ctx.current_task + crate::exectask::PR_HOMEDIR_OFFSET,
+        new_lock,
+    );
+
+    let amiga_path = (new_lock != 0)
+        .then(|| addr_from_bptr(new_lock))
+        .and_then(|addr| ctx.dos.locks.get(&addr))
+        .map(|entry| entry.amiga_path.clone());
+    if let Some(vfs) = ctx.dos.vfs.as_mut() {
+        match amiga_path {
+            Some(path) => vfs.set_assign("PROGDIR", vec![path]),
+            None => vfs.remove_assign("PROGDIR"),
+        }
+    }
+
+    ctx.cpu.set_data_register(DataRegister(0), old);
+    Ok(())
+}
+
 /// `GetProgramName` (`D1` = buffer, `D2` = buffer size in bytes). `D0` =
 /// `DOSTRUE`/`DOSFALSE`. Copies `cli_CommandName` (a `BSTR`, see
 /// [`crate::exectask::create_current_task`]) into the caller's buffer,
@@ -1409,6 +1463,8 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("WaitForChar", wait_for_char_handler::<C>);
     reg!("Cli", cli_handler::<C>);
     reg!("MaxCli", max_cli_handler::<C>);
+    reg!("GetProgramDir", get_program_dir_handler::<C>);
+    reg!("SetProgramDir", set_program_dir_handler::<C>);
     reg!("GetProgramName", get_program_name_handler::<C>);
     reg!("AllocDosObject", alloc_dos_object_handler::<C>);
     reg!("FreeDosObject", free_dos_object_handler::<C>);
@@ -2289,6 +2345,96 @@ mod tests {
         assert_eq!(
             code, 0,
             "MaxCli() should report an empty table -- no simulated CLI process table"
+        );
+    }
+
+    #[test]
+    fn end_to_end_get_program_dir_returns_zero_by_default() {
+        // No Runtime::set_program_dir call -- matches real AmigaOS's
+        // own "no home directory exists" case (issue #17).
+        let words = [jsr_disp16(6), (-600i16) as u16, RTS]; // jsr GetProgramDir(a6); rts
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn end_to_end_get_program_dir_returns_non_null_after_set_program_dir() {
+        let tmp = TempDir::new("progdir-e2e");
+        let words = [jsr_disp16(6), (-600i16) as u16, RTS]; // jsr GetProgramDir(a6); rts
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], Some(tmp.path()));
+        rt.set_program_dir(tmp.path());
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            code, 0,
+            "GetProgramDir() should report a real, non-NULL lock once Runtime::set_program_dir \
+             has resolved the launched binary's own directory"
+        );
+    }
+
+    #[test]
+    fn end_to_end_progdir_resolves_via_open_after_set_program_dir() {
+        let tmp = TempDir::new("progdir-open-e2e");
+        fs::write(tmp.path().join("marker.txt"), b"hi").unwrap();
+        let name = b"PROGDIR:marker.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched below)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, MODE_OLDFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = BPTR or 0
+        words.push(RTS); // exit code = D0
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        rt.set_program_dir(tmp.path());
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            code, 0,
+            "PROGDIR:marker.txt should resolve through the ordinary Vfs path once \
+             Runtime::set_program_dir has installed the PROGDIR: assign (issue #17)"
+        );
+    }
+
+    #[test]
+    fn end_to_end_set_program_dir_zero_removes_the_progdir_assign() {
+        let tmp = TempDir::new("setprogdir-e2e");
+        fs::write(tmp.path().join("marker.txt"), b"hi").unwrap();
+        let name = b"PROGDIR:marker.txt\0";
+
+        let mut words = Vec::new();
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = 0 (new lock)
+        push_jsr(&mut words, 6, -594); // SetProgramDir(a6): D0 = old lock
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched below)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, MODE_OLDFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = BPTR or 0
+        words.push(RTS); // exit code = D0
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        rt.set_program_dir(tmp.path());
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "SetProgramDir(0) should remove the PROGDIR: assign, matching the RKRM's own \
+             \"if ZERO is installed, the current process will be unable to resolve this \
+             pseudo-assign\""
         );
     }
 

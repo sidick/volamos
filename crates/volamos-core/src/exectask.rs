@@ -309,6 +309,18 @@ pub const PR_MSGPORT_OFFSET: u32 = TASK_STRUCT_SIZE;
 /// [`crate::dosfile::cli_handler`] (`dos.library`'s `Cli()`, which
 /// just returns this same field) for the guest-visible read path.
 pub const PR_CLI_OFFSET: u32 = 172;
+/// `pr_HomeDir`: `BPTR`, offset 188 (`pr_CLI` 172 + 4, `pr_ReturnAddr`
+/// 176, `pr_PktWait` 180, `pr_WindowPtr` 184, `pr_HomeDir` 188). A lock
+/// on the directory the running program was loaded from, or `0` if
+/// none exists (resident/ROM commands, shell built-ins) -- used to
+/// resolve the `PROGDIR:` pseudo-assign and returned by
+/// `GetProgramDir()`/set by `SetProgramDir()` (RKRM `processes.md`).
+/// Left `0` by [`create_current_task`] itself (set later, once a `Vfs`
+/// exists to resolve the launched binary's own host directory back to
+/// an Amiga path -- see [`crate::dispatch::Runtime::set_program_dir`],
+/// called once from `crates/volamos/src/main.rs` after `set_vfs`).
+/// Found needed running the real SAS/C `sc` compiler (issue #17).
+pub const PR_HOMEDIR_OFFSET: u32 = 188;
 /// `sizeof(struct Process)` per `<dos/dosextens.h>` -- `pr_CLI`'s own
 /// offset (172) plus every field after it (`pr_ReturnAddr`/
 /// `pr_PktWait`/`pr_WindowPtr`/`pr_HomeDir` 4 each = 16, `pr_Flags` 4,

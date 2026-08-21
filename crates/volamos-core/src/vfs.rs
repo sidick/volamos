@@ -301,6 +301,49 @@ impl Vfs {
         &self.config.volumes
     }
 
+    /// Reverse lookup: the Amiga path for `dir` (a host directory),
+    /// if it's under (or exactly) one of the configured volumes' host
+    /// roots -- `None` otherwise. Only volumes are considered (not
+    /// assigns, which point at Amiga paths rather than host ones, and
+    /// would need their own recursive resolution to compare against a
+    /// host path at all); the *longest* matching root wins, so a
+    /// directory under a more specific volume mapping isn't
+    /// mis-attributed to a broader one that happens to also contain
+    /// it. Paths are canonicalized before comparing (falling back to
+    /// the as-given path if canonicalization fails, e.g. it doesn't
+    /// exist) so relative `-V`/program-path arguments and `..`
+    /// components don't defeat the prefix match.
+    ///
+    /// Added for `PROGDIR:` (issue #17): the launched binary's own
+    /// containing directory is a host path (`<program>` on the CLI is
+    /// resolved directly against the host filesystem, not through this
+    /// `Vfs`), so turning it back into an Amiga path -- needed both to
+    /// give `GetProgramDir()`'s lock a real, `Vfs`-resolvable
+    /// `amiga_path` (see `doslock.rs`'s `LockEntry`) and to point the
+    /// `PROGDIR:` assign somewhere -- has no other route.
+    pub fn amiga_path_for_host_dir(&self, dir: &Path) -> Option<String> {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut best: Option<(&str, PathBuf, usize)> = None;
+        for (name, root) in &self.config.volumes {
+            let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            if let Ok(rel) = dir.strip_prefix(&root_canon) {
+                let depth = root_canon.components().count();
+                if best.as_ref().is_none_or(|(_, _, d)| depth > *d) {
+                    best = Some((name, rel.to_path_buf(), depth));
+                }
+            }
+        }
+        let (name, rel, _) = best?;
+        let rel_str = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if rel_str.is_empty() {
+            Some(format!("{name}:"))
+        } else {
+            Some(format!("{name}:{rel_str}"))
+        }
+    }
+
     /// Creates or replaces the assign `name:` -> `targets` (an ordered
     /// list of Amiga paths, per [`VfsConfig::assigns`]'s own
     /// convention -- a single-element list for a regular assign,
@@ -1343,5 +1386,57 @@ mod tests {
             .resolve("SYS:foo:bar", ResolveMode::MustExist)
             .unwrap_err();
         assert!(matches!(err, VfsError::InvalidPath { .. }));
+    }
+
+    // --- amiga_path_for_host_dir (issue #17, PROGDIR:) ---
+
+    #[test]
+    fn amiga_path_for_host_dir_finds_the_volume_root_itself() {
+        let tmp = TempDir::new("progdir-root");
+        let vfs = simple_vfs(tmp.path());
+        assert_eq!(
+            vfs.amiga_path_for_host_dir(tmp.path()),
+            Some("SYS:".to_string())
+        );
+    }
+
+    #[test]
+    fn amiga_path_for_host_dir_finds_a_nested_directory() {
+        let tmp = TempDir::new("progdir-nested");
+        let c_dir = tmp.mkdir("C");
+        let vfs = simple_vfs(tmp.path());
+        assert_eq!(
+            vfs.amiga_path_for_host_dir(&c_dir),
+            Some("SYS:C".to_string())
+        );
+    }
+
+    #[test]
+    fn amiga_path_for_host_dir_prefers_the_most_specific_volume() {
+        let tmp = TempDir::new("progdir-specific");
+        let inner = tmp.mkdir("inner");
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![
+                ("OUTER".to_string(), tmp.path().to_path_buf()),
+                ("INNER".to_string(), inner.clone()),
+            ],
+            assigns: vec![],
+            auto_assign_root: None,
+            cwd: "OUTER:".to_string(),
+        })
+        .expect("build vfs");
+        assert_eq!(
+            vfs.amiga_path_for_host_dir(&inner),
+            Some("INNER:".to_string()),
+            "the more specific (deeper) volume root should win, not OUTER:inner"
+        );
+    }
+
+    #[test]
+    fn amiga_path_for_host_dir_returns_none_outside_every_volume() {
+        let tmp = TempDir::new("progdir-outside");
+        let elsewhere = TempDir::new("progdir-elsewhere");
+        let vfs = simple_vfs(tmp.path());
+        assert_eq!(vfs.amiga_path_for_host_dir(elsewhere.path()), None);
     }
 }

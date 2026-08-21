@@ -2259,6 +2259,52 @@ impl<C: Cpu + 'static> Runtime<C> {
         self.dos.vfs = Some(vfs);
     }
 
+    /// Populates `PROGDIR:` (issue #17): if `host_dir` (the launched
+    /// binary's own containing directory -- a host path, since
+    /// `<program>` on the CLI is resolved directly against the host
+    /// filesystem, not through the `Vfs`) reverse-resolves to a real
+    /// Amiga path under one of the configured volumes (see
+    /// [`crate::vfs::Vfs::amiga_path_for_host_dir`]), this locks it
+    /// (matching every other lock's own `Vfs`-resolved `amiga_path`,
+    /// which `CurrentDir`/relative resolution require -- there's no
+    /// "raw host path, no Amiga path" lock variant in this runtime),
+    /// writes the lock into `pr_HomeDir`
+    /// ([`crate::exectask::PR_HOMEDIR_OFFSET`]), and installs the
+    /// `PROGDIR:` assign so ordinary path-based calls resolve it too.
+    ///
+    /// A no-op (leaving `pr_HomeDir` at its `create_current_task`
+    /// default of `0`, and `PROGDIR:` unresolvable) if there's no `Vfs`
+    /// yet, or `host_dir` isn't under any configured volume -- matching
+    /// real AmigaOS's own "no home directory exists" case (resident/ROM
+    /// commands), just reached by a different, host-invocation-specific
+    /// route here. Must be called *after* [`Self::set_vfs`] (the
+    /// reverse lookup needs it) -- `crates/volamos/src/main.rs` calls
+    /// this once, right after `set_vfs`, for both the top-level run and
+    /// every nested `System()`/`Execute()`/`RunCommand()` one.
+    pub fn set_program_dir(&mut self, host_dir: &std::path::Path) {
+        let Some(vfs) = self.dos.vfs.as_ref() else {
+            return;
+        };
+        let Some(amiga_path) = vfs.amiga_path_for_host_dir(host_dir) else {
+            return;
+        };
+        let Ok(bptr) = self.dos.lock(
+            &mut self.heap,
+            &mut self.mem,
+            &amiga_path,
+            crate::doslock::SHARED_LOCK,
+        ) else {
+            return;
+        };
+        self.mem
+            .write_u32(self.task + exectask::PR_HOMEDIR_OFFSET, bptr);
+        self.dos
+            .vfs
+            .as_mut()
+            .expect("checked above")
+            .set_assign("PROGDIR", vec![amiga_path]);
+    }
+
     /// Installs a host-side `System()`/`Execute()` runner callback (Phase
     /// 3 stage 7) -- see [`crate::dosseg`]'s module docs for why this
     /// indirection exists and what a CLI's callback is expected to do

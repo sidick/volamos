@@ -3885,3 +3885,43 @@ tests for the new handle fields; 591 tests, clippy `-D warnings`, fmt
 all clean; all 11 `compare_three_way.py` corpus entries still pass;
 and the headline check above -- `hello.o` byte-identical to real
 hardware's.
+
+## Issue #17 implemented: `PROGDIR:` — 2026-08-21
+
+`PROGDIR:` was entirely unimplemented (`pr_HomeDir` always zeroed).
+Real AmigaOS sets `pr_HomeDir` to a lock on the directory the running
+program was loaded from, resolved via a `PROGDIR:` pseudo-assign --
+but volamos's `<program>` argument is a host path, resolved directly
+against the host filesystem, not through the `Vfs` at all, so there
+was no existing route from "the binary's own directory" back to an
+Amiga path.
+
+**New**: `Vfs::amiga_path_for_host_dir` (a reverse lookup: the
+longest-matching configured volume root wins, so a nested volume
+isn't mis-attributed to a broader one that also contains it) --
+`crates/volamos/src/main.rs` calls the new `Runtime::set_program_dir`
+once, right after `set_vfs`, for both the top-level run and every
+nested `System()`/`Execute()`/`RunCommand()`. If the reverse lookup
+succeeds, it locks the resulting Amiga path (reusing the ordinary
+`Lock()` path, so `CurrentDir(GetProgramDir())` -- which needs a real
+`Vfs`-resolvable `amiga_path` on the lock, like every other lock in
+this runtime -- works too), writes it into `pr_HomeDir`
+(`exectask::PR_HOMEDIR_OFFSET`, offset 188), and installs `PROGDIR:`
+as an ordinary `Vfs` assign (confirmed harmless: `LockDosList`/
+`NextDosEntry` never enumerate assigns at all, so this doesn't leak
+into a `List DEVS:`-style scan, matching PROGDIR's real "pseudo-
+assign, not a real DosList entry" status for free). If the binary's
+directory isn't under any configured volume, this is a clean no-op --
+`pr_HomeDir` stays `0`, `PROGDIR:` stays unresolvable, matching real
+AmigaOS's own "no home directory exists" case for resident/ROM
+commands, just reached by a host-invocation-specific route instead.
+Also implemented `GetProgramDir()`/`SetProgramDir()` (the documented
+accessors) -- the latter also repoints the `PROGDIR:` assign, per the
+RKRM, not just the raw field.
+
+**Verification**: `List PROGDIR:` from a binary running out of `SYS:C`
+now prints all 51 files, matching real Kickstart 3.1 via Copperline
+exactly (`vamos` doesn't implement `PROGDIR:` either, for context --
+`ERROR_OBJECT_NOT_FOUND`). 8 new unit/e2e tests; 599 tests, clippy
+`-D warnings`, fmt clean; all 11 `compare_three_way.py` entries still
+pass; `sc hello.c` still produces the byte-identical `hello.o`.
