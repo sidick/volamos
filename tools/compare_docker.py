@@ -71,6 +71,13 @@ def main() -> int:
             native_stdout, native_code = run_native(args.volamos, fixture, guest_args, test_dir)
         with tempfile.TemporaryDirectory(prefix=f"compare-docker-{fixture}-") as tmp:
             test_dir = setup(Path(tmp)) if setup else None
+            if test_dir is not None:
+                # TemporaryDirectory defaults to 0700, owned by the host
+                # user -- fine for the native run above, but the
+                # container runs as the image's nonroot UID, which isn't
+                # that owner, so it can't write into the bind mount
+                # without this.
+                test_dir.chmod(0o777)
             container_stdout, container_code = run_container(args.image, fixture, guest_args, test_dir)
 
         native_norm = normalize(fixture, native_stdout)
