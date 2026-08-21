@@ -64,6 +64,8 @@
 //! `MakeLibrary`'s own alignment guarantee for free, with no extra
 //! rounding logic needed at the `base` end.
 
+use crate::cpu::{AddressRegister, Cpu, DataRegister};
+use crate::dispatch::{DispatchError, EXEC_BASE_LIBLIST_OFFSET, EXEC_LIBRARY_BASE, HandlerContext};
 use crate::dosseg::{NEXT_SEG_OFFSET, SEG_HEADER_SIZE};
 use crate::guestmem::{GuestHeap, GuestHeapError, addr_from_bptr};
 use crate::memory::AddressSpace;
@@ -488,6 +490,344 @@ pub fn make_library(
     );
 
     Ok(MadeLibrary { alloc_addr, base })
+}
+
+// --- L3: the OpenLibrary open state machine ---
+//
+// `library-device-loading-plan.md` §2.1/§3 (phase L3): runs a disk
+// library's real `InitResident`/`MakeLibrary`/`Open` sequence as a small
+// host-side state machine driven by `crate::dispatch::ContinuationStack::
+// trampoline` -- see that type's own doc for the underlying "push a resume
+// address, let the ordinary dispatch loop run the guest subroutine
+// natively, get control back once it returns" mechanism this all rests
+// on. Nothing below steps the CPU itself; every phase transition happens
+// either synchronously (phase 1's own scan/`MakeLibrary`, and the
+// version check) or via a `trampoline`-pushed continuation (running the
+// library's own `initFunc`/`Open` code, which may itself call other
+// library functions -- exactly the case `execfmt.rs`'s `RawDoFmt`
+// stepping loop can't support, and the reason this mechanism exists at
+// all).
+
+/// State carried from [`begin_open`]'s synchronous phase 1 into the
+/// `initFunc` continuation (phase 2) -- see [`after_init`]. Not `Clone`/
+/// `Debug`: it's only ever moved into exactly one `'static` closure.
+struct PendingOpen {
+    /// The name `OpenLibrary` was called with (for diagnostics and
+    /// [`crate::dispatch::LibraryRegistry::register_loaded`]).
+    name: String,
+    /// [`MadeLibrary::alloc_addr`] -- freed via [`GuestHeap::free`] if
+    /// `initFunc` refuses (returns `NULL`).
+    alloc_addr: u32,
+    /// The `BPTR` [`crate::dosfile::DosState::load_seg`] returned --
+    /// unloaded via [`crate::dosfile::DosState::unload_seg`] if
+    /// `initFunc` refuses, otherwise handed to
+    /// [`crate::dispatch::LibraryRegistry::register_loaded`].
+    seglist_bptr: u32,
+    /// The version `OpenLibrary`/`OldOpenLibrary` was actually called
+    /// with (captured before anything could clobber `D0` -- see
+    /// [`crate::dispatch::open_library_handler`]'s doc).
+    requested_version: u32,
+    /// `A6` as it stood when `OpenLibrary` was entered -- the only
+    /// register this whole state machine is on the hook to restore
+    /// before the caller's own `rts` resumes (plan §2.1's register-
+    /// preservation note; `D0`/`D1`/`A0`/`A1` are scratch, and `A6` is
+    /// deliberately repointed at [`EXEC_LIBRARY_BASE`] then at the new
+    /// library's own `base` along the way, for `initFunc`'s and `Open`'s
+    /// respective calling conventions).
+    caller_a6: u32,
+}
+
+/// The outcome of [`begin_open`]'s synchronous phase-1 attempt.
+pub enum LoadAttempt {
+    /// A real load was kicked off (either still running asynchronously
+    /// via a pushed continuation, or -- if `initFunc` was `NULL` --
+    /// already finished synchronously). Either way `D0`/`A6` are fully
+    /// owned by this state machine from here on; the caller
+    /// ([`crate::dispatch::open_library_common`]) must return
+    /// immediately without touching them.
+    Started,
+    /// The file resolved on the `Vfs` but isn't a loadable `RTF_AUTOINIT`
+    /// library -- no continuation was pushed, nothing was left half-open
+    /// (any partial seglist/heap allocation was already unwound). The
+    /// caller should fall back to the fake-stub path, after logging
+    /// `reason` loudly.
+    StructuralFailure(String),
+}
+
+/// Phase 1 (`library-device-loading-plan.md` §2.1): `LoadSeg`s
+/// `search_path`, scans for a `struct Resident`, validates it's an
+/// `RTF_AUTOINIT` `NT_LIBRARY`, reads its AUTOINIT table and vector
+/// table, and runs [`make_library`]. On any structural failure, unwinds
+/// whatever was partially built (`unload_seg`, and -- since `make_library`
+/// is the last step -- there's never a `make_library` allocation to free
+/// on a structural-failure path, only on the *behavioral* `initFunc`-
+/// refused path [`after_init`] handles) and returns
+/// [`LoadAttempt::StructuralFailure`] with a diagnostic naming why.
+///
+/// On success: if `initFunc` is `NULL`, skips straight to phase 2's
+/// post-init logic inline (no guest code to run first -- plan §2.1 step
+/// 1's shortcut). Otherwise saves the caller's `A6`, sets up `initFunc`'s
+/// calling convention (`D0` = base, `A0` = segList *BPTR* -- per the
+/// plan's own §1.3 text, real `InitResident` passes the BPTR, not a
+/// resolved address -- `A6` = [`EXEC_LIBRARY_BASE`]), and trampolines
+/// into it with a continuation that resumes at [`after_init`].
+pub fn begin_open<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+    search_path: &str,
+    requested_version: u32,
+) -> Result<LoadAttempt, DispatchError> {
+    let caller_a6 = ctx.cpu.address_register(AddressRegister(6));
+
+    let seglist_bptr = match ctx.dos.load_seg(ctx.heap, ctx.mem, search_path) {
+        Ok(bptr) => bptr,
+        Err(code) => {
+            return Ok(LoadAttempt::StructuralFailure(format!(
+                "LoadSeg failed (IoErr {code})"
+            )));
+        }
+    };
+
+    let Some(resident_addr) = find_resident(ctx.mem, seglist_bptr) else {
+        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        return Ok(LoadAttempt::StructuralFailure(
+            "no struct Resident (romtag) found -- not a loadable library".to_string(),
+        ));
+    };
+    let resident = read_resident(ctx.mem, resident_addr);
+
+    if resident.flags & RTF_AUTOINIT == 0 {
+        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        return Ok(LoadAttempt::StructuralFailure(
+            "Resident isn't RTF_AUTOINIT -- non-AUTOINIT libraries aren't implemented yet"
+                .to_string(),
+        ));
+    }
+    if resident.node_type != NT_LIBRARY {
+        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        return Ok(LoadAttempt::StructuralFailure(format!(
+            "Resident's node type is {} ({}), not NT_LIBRARY ({NT_LIBRARY}) -- opening a \
+             .device via OpenLibrary is a caller bug",
+            resident.node_type,
+            if resident.node_type == NT_DEVICE {
+                "NT_DEVICE"
+            } else {
+                "unknown"
+            }
+        )));
+    }
+
+    let autoinit = read_autoinit(ctx.mem, resident.init_ptr);
+    let vectors = match read_vectors(ctx.mem, autoinit.vectors) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+            return Ok(LoadAttempt::StructuralFailure(e));
+        }
+    };
+
+    let made = match make_library(
+        ctx.mem,
+        ctx.heap,
+        &resident,
+        autoinit.d_size,
+        autoinit.structure,
+        &vectors,
+        name,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+            return Ok(LoadAttempt::StructuralFailure(e.to_string()));
+        }
+    };
+
+    let pending = PendingOpen {
+        name: name.to_string(),
+        alloc_addr: made.alloc_addr,
+        seglist_bptr,
+        requested_version,
+        caller_a6,
+    };
+
+    if autoinit.init_func == 0 {
+        after_init(ctx, pending, made.base)?;
+    } else {
+        ctx.cpu.set_data_register(DataRegister(0), made.base);
+        ctx.cpu
+            .set_address_register(AddressRegister(0), seglist_bptr);
+        ctx.cpu
+            .set_address_register(AddressRegister(6), EXEC_LIBRARY_BASE);
+        ctx.continuations
+            .trampoline(ctx.cpu, ctx.mem, autoinit.init_func, move |ctx| {
+                let init_result = ctx.cpu.data_register(DataRegister(0));
+                after_init(ctx, pending, init_result)
+            });
+    }
+
+    Ok(LoadAttempt::Started)
+}
+
+/// Phase 2 (`library-device-loading-plan.md` §2.1): runs once `initFunc`
+/// has returned (or immediately, for the `initFunc == 0` shortcut) with
+/// `init_result` = what `initFunc` left in `D0` (or, for the shortcut,
+/// [`begin_open`]'s own `made.base`, standing in for "init trivially
+/// succeeded with its original base").
+///
+/// - `init_result == 0`: `initFunc` refused the open. Unloads the
+///   seglist, frees the [`make_library`] allocation, restores the
+///   caller's `A6`, sets `D0 = 0`. Nothing is registered -- a later
+///   `OpenLibrary` of the same name gets a completely fresh attempt.
+/// - Otherwise: `init_result` becomes the library's
+///   base from here on -- a real `initFunc` must return the base, and
+///   while it's conventionally the same value `make_library` handed it,
+///   the AUTOINIT contract is "trust `initFunc`'s own `D0`", so that's
+///   what this does. Links the base's `struct Node` onto
+///   `ExecBase.LibList` (the AddLibrary equivalent -- `ln_Name` already
+///   points at the Resident's own name string, written by
+///   [`make_library`], so no extra name-string bookkeeping is needed
+///   here, unlike the built-in libraries' `write_library_list_nodes`).
+///   Registers the library in [`crate::dispatch::LibraryRegistry`] as
+///   [`crate::dispatch::LibraryKind::Loaded`]. Then checks `lib_Version`
+///   (read fresh from guest memory -- `initFunc` may have raised it past
+///   the Resident's own `rt_Version`) against `pending.requested_version`:
+///   too low refuses the open (`D0 = 0`, caller's `A6` restored) but
+///   *leaves the library registered/loaded* (matching real exec, which
+///   keeps a version-refused library in memory -- a later, lower-version
+///   request can still succeed). Otherwise trampolines into the `Open`
+///   vector (`base - 6`, the jump-table's own `JMP` instruction --
+///   perfectly valid as a call target) with `D0 = requested_version`,
+///   `A6 = base` (plan §1.4's `OPEN` calling convention), resuming at
+///   [`finish_open`].
+fn after_init<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    pending: PendingOpen,
+    init_result: u32,
+) -> Result<(), DispatchError> {
+    if init_result == 0 {
+        // Both unwind steps below are deliberately best-effort (`let _`),
+        // an exception to this codebase's usual loud-failure discipline,
+        // because the real AUTOINIT contract makes the base's fate
+        // ambiguous here: per the `MakeLibrary` autodoc (plan §1.3 item
+        // 4), a failing `initFunc` returns `NULL` *having freed the base
+        // itself* -- a contract-compliant library will already have
+        // `FreeMem`ed the `negsize + dSize` block through this same
+        // [`GuestHeap`], so the host-side `free(alloc_addr)` is then a
+        // double free that must be tolerated, not reported. A library
+        // that *didn't* free its own base (like this runtime's own
+        // `testlib_initfail` fixture) gets the block reclaimed here
+        // instead, so neither style of failing library leaks.
+        let _ = ctx.dos.unload_seg(ctx.heap, pending.seglist_bptr);
+        let _ = ctx.heap.free(pending.alloc_addr);
+        ctx.cpu
+            .set_address_register(AddressRegister(6), pending.caller_a6);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        *ctx.call_detail = Some(format!(
+            "library {:?} -> NULL (initFunc refused)",
+            pending.name
+        ));
+        return Ok(());
+    }
+
+    let base = init_result;
+
+    let list_addr = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
+    crate::execlist::add_tail_impl(ctx.mem, list_addr, base);
+    ctx.registry.register_loaded(
+        &pending.name,
+        base,
+        pending.seglist_bptr,
+        pending.alloc_addr,
+    );
+
+    let lib_version = u32::from(ctx.mem.read_u16(base.wrapping_add(LIB_VERSION_OFFSET)));
+    if lib_version < pending.requested_version {
+        ctx.cpu
+            .set_address_register(AddressRegister(6), pending.caller_a6);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        *ctx.call_detail = Some(format!(
+            "library {:?} -> NULL (version {lib_version} < requested {})",
+            pending.name, pending.requested_version
+        ));
+        return Ok(());
+    }
+
+    let name = pending.name;
+    let caller_a6 = pending.caller_a6;
+    ctx.cpu
+        .set_data_register(DataRegister(0), pending.requested_version);
+    ctx.cpu.set_address_register(AddressRegister(6), base);
+    ctx.continuations
+        .trampoline(ctx.cpu, ctx.mem, base.wrapping_sub(6), move |ctx| {
+            finish_open(ctx, &name, caller_a6)
+        });
+    Ok(())
+}
+
+/// Phase 3 (`library-device-loading-plan.md` §2.1): runs once the
+/// library's own `Open` vector has returned. `D0` already holds `Open`'s
+/// result (the base, or `NULL` if the library itself refused -- e.g. a
+/// single-open device-style library already in use); this phase doesn't
+/// touch it either way, it's already the correct final `OpenLibrary`
+/// result. Restores the caller's `A6` (the one register this whole state
+/// machine owns restoring) and records a snoop detail. An `Open`-refused
+/// library stays loaded/registered, same reasoning as the version-refusal
+/// case in [`after_init`] -- `OpenLibrary` failing doesn't mean the
+/// library isn't in memory.
+///
+/// Shared verbatim by [`reopen`] (a registry `Loaded` hit) -- the repeat-
+/// open protocol is exactly "version check, then `Open` again", so this
+/// is the same completion either way.
+fn finish_open<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+    caller_a6: u32,
+) -> Result<(), DispatchError> {
+    let result = ctx.cpu.data_register(DataRegister(0));
+    ctx.cpu.set_address_register(AddressRegister(6), caller_a6);
+    *ctx.call_detail = Some(if result != 0 {
+        format!("library {name:?} -> base {result:#010x} (loaded from disk)")
+    } else {
+        format!("library {name:?} -> NULL (Open refused)")
+    });
+    Ok(())
+}
+
+/// A repeat `OpenLibrary`/`OldOpenLibrary` of an already-[`crate::
+/// dispatch::LibraryKind::Loaded`] library (`library-device-loading-
+/// plan.md` §2.4): real exec doesn't cache the previous `Open` result --
+/// the library maintains its own `lib_OpenCnt`, so a second open must
+/// genuinely re-run the version check and call `Open` again. Shares
+/// [`after_init`]'s version-check logic and [`finish_open`]'s completion,
+/// just without a phase-1 `LoadSeg`/`MakeLibrary` step (the library is
+/// already resident).
+pub fn reopen<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+    base: u32,
+    requested_version: u32,
+) -> Result<(), DispatchError> {
+    let caller_a6 = ctx.cpu.address_register(AddressRegister(6));
+
+    let lib_version = u32::from(ctx.mem.read_u16(base.wrapping_add(LIB_VERSION_OFFSET)));
+    if lib_version < requested_version {
+        ctx.cpu.set_address_register(AddressRegister(6), caller_a6);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        *ctx.call_detail = Some(format!(
+            "library {name:?} -> NULL (version {lib_version} < requested {requested_version})"
+        ));
+        return Ok(());
+    }
+
+    let name = name.to_string();
+    ctx.cpu
+        .set_data_register(DataRegister(0), requested_version);
+    ctx.cpu.set_address_register(AddressRegister(6), base);
+    ctx.continuations
+        .trampoline(ctx.cpu, ctx.mem, base.wrapping_sub(6), move |ctx| {
+            finish_open(ctx, &name, caller_a6)
+        });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -944,5 +1284,621 @@ mod tests {
         )
         .expect("make_library should succeed for scspill.library");
         assert_ne!(made.base, 0);
+    }
+
+    /// Opt-in: drives a real [`crate::dispatch::Runtime`] through the L3
+    /// `OpenLibrary` state machine against the real `scspill.library`
+    /// binary -- its own `initFunc`/`Open` code runs for real, not just
+    /// [`make_library`] in isolation (the test above). Same skip-if-
+    /// absent posture as `real_scspill_library_loads_and_makes_a_library`.
+    #[test]
+    fn real_scspill_library_opens_end_to_end_via_openlibrary() {
+        let libs_dir = "/Users/simond/amiga/sasc/libs";
+        if !std::path::Path::new(libs_dir)
+            .join("scspill.library")
+            .exists()
+        {
+            eprintln!(
+                "skipping real_scspill_library_opens_end_to_end_via_openlibrary: \
+                 {libs_dir}/scspill.library not present"
+            );
+            return;
+        }
+
+        use super::loaded_library_e2e::{jsr, load_words, movea_dn, movea_imm, moveq};
+        use crate::backend::{M68kCpu, TRAP_TABLE_END};
+        use crate::dispatch::{EXEC_LIBRARY_BASE, Runtime, StartConfig};
+        use crate::memory::FlatMemory;
+        use crate::vfs::{Vfs, VfsConfig};
+
+        const RTS: u16 = 0x4E75;
+        let entry = TRAP_TABLE_END;
+        let name = b"scspill.library\0";
+
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0)); // D0 = requested version 0
+        jsr(&mut words, 6, -552); // OpenLibrary("scspill.library", 0)
+        words.push(movea_dn(6, 0)); // A6 = D0 (returned base), also exit code
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(
+            Vfs::new(VfsConfig {
+                volumes: vec![("LIBS".to_string(), std::path::PathBuf::from(libs_dir))],
+                assigns: vec![],
+                auto_assign_root: None,
+                cwd: "LIBS:".to_string(),
+            })
+            .expect("build vfs"),
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            code, 0,
+            "OpenLibrary(\"scspill.library\", 0) should return a non-NULL base"
+        );
+    }
+}
+
+/// Phase L3 end-to-end tests: drive a real [`crate::dispatch::Runtime`]
+/// through the full `OpenLibrary` disk-load state machine against
+/// `fixtures/testlib`/`fixtures/testlib_initfail` (synthesized,
+/// hand-authored `RTF_AUTOINIT` libraries -- see `fixtures/testlib.s`'s
+/// own doc comment for exactly what each vector does and why). Unlike
+/// the pure-mechanics tests above (in-process calls to `find_resident`/
+/// `make_library`/...), every test here goes through real A-line trap
+/// dispatch: the guest program itself executes `jsr -552(a6)`
+/// (`OpenLibrary`), and once opened, `jsr -30(a6)` against the *library's
+/// own* relocated code runs natively on the CPU backend -- no host
+/// dispatch at all for that call, which is the whole architectural point
+/// of loading a real library (`library-device-loading-plan.md` §1.4).
+#[cfg(test)]
+mod loaded_library_e2e {
+    use crate::backend::{M68kCpu, TRAP_TABLE_END};
+    use crate::dispatch::{DispatchError, EXEC_LIBRARY_BASE, Runtime, RuntimeError, StartConfig};
+    use crate::memory::{AddressSpace, FlatMemory};
+    use crate::vfs::{Vfs, VfsConfig};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TESTLIB: &[u8] = include_bytes!("../../../fixtures/testlib");
+    const TESTLIB_INITFAIL: &[u8] = include_bytes!("../../../fixtures/testlib_initfail");
+
+    /// Offsets into `fixtures/testlib`'s library base -- must match
+    /// `fixtures/testlib.s`'s own `equ` constants exactly.
+    const LIB_REVISION_OFFSET: u32 = 22;
+    const SEGLIST_MARKER_OFFSET: u32 = 36;
+    const ALLOCMEM_MARKER_OFFSET: u32 = 40;
+    const INIT_MARKER: u16 = 0x2A2A;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("volamos-execlib-test-{tag}-{pid}-{n}"));
+            fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Builds a temp dir with a `libs/` subdirectory containing `bytes`
+    /// as `libs/<file_name>`, and a [`Vfs`] mapping `LIBS:` to it.
+    fn vfs_with_libs_file(tag: &str, file_name: &str, bytes: &[u8]) -> (TempDir, Vfs) {
+        let tmp = TempDir::new(tag);
+        fs::create_dir(tmp.path().join("libs")).unwrap();
+        fs::write(tmp.path().join("libs").join(file_name), bytes).unwrap();
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), tmp.path().to_path_buf())],
+            assigns: vec![("LIBS".to_string(), vec!["SYS:libs".to_string()])],
+            auto_assign_root: None,
+            cwd: "SYS:".to_string(),
+        })
+        .expect("build vfs");
+        (tmp, vfs)
+    }
+
+    pub(super) fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
+        let mut offset = addr;
+        for &w in words {
+            mem.write_u16(offset, w);
+            offset += 2;
+        }
+    }
+
+    /// `movea.l #imm32,An` (3 words: opcode + hi + lo).
+    pub(super) fn movea_imm(words: &mut Vec<u16>, an: u16, imm: u32) {
+        words.push(0x207C | (an << 9));
+        words.push((imm >> 16) as u16);
+        words.push(imm as u16);
+    }
+
+    /// `move.l #imm32,Dn` (3 words: opcode + hi + lo).
+    fn move_imm_dn(words: &mut Vec<u16>, dn: u16, imm: u32) {
+        words.push(0x203C | (dn << 9));
+        words.push((imm >> 16) as u16);
+        words.push(imm as u16);
+    }
+
+    /// `movea.l Dx,An`.
+    pub(super) fn movea_dn(an: u16, dn: u16) -> u16 {
+        0x2040 | (an << 9) | dn
+    }
+
+    /// `move.l An,Dn`.
+    fn move_an_dn(an: u16, dn: u16) -> u16 {
+        0x2000 | (dn << 9) | 0x008 | an
+    }
+
+    /// `jsr <disp16>(An)` (2 words: opcode + displacement).
+    pub(super) fn jsr(words: &mut Vec<u16>, an: u16, disp: i32) {
+        words.push(0x4EA8 | an);
+        words.push(disp as u16);
+    }
+
+    /// `moveq #imm,Dn`.
+    pub(super) fn moveq(dn: u16, imm: u8) -> u16 {
+        0x7000 | (dn << 9) | u16::from(imm)
+    }
+
+    /// `move.w <disp16>(An),Dn` (2 words: opcode + displacement).
+    fn move_w_disp(words: &mut Vec<u16>, an: u16, disp: i16, dn: u16) {
+        words.push(0x3028 | (dn << 9) | an);
+        words.push(disp as u16);
+    }
+
+    const RTS: u16 = 0x4E75;
+
+    /// Runs `words` (with `lib_name` written just past the code and `A1`
+    /// pre-patched to point at it) against a [`Vfs`] whose `LIBS:` volume
+    /// contains `lib_bytes` as `lib_file_name`. Returns the run's exit
+    /// code (i.e. whatever the program left in `D0` when it hit the exit
+    /// stub) and the resulting [`Runtime`] (still alive, so a test can
+    /// inspect [`Runtime::memory`] afterward).
+    fn run_against_library(
+        tag: &str,
+        lib_file_name: &str,
+        lib_bytes: &[u8],
+        lib_name: &[u8],
+        mut words: Vec<u16>,
+    ) -> (Result<i32, RuntimeError>, Runtime<M68kCpu>) {
+        let entry = TRAP_TABLE_END;
+        // A1 is always patched at word index 1 (right after the first
+        // `movea.l #imm32,a1` opcode word) by every test program below --
+        // see each caller.
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, lib_name);
+
+        let (_tmp, vfs) = vfs_with_libs_file(tag, lib_file_name, lib_bytes);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + lib_name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+        (result, rt)
+    }
+
+    /// Test 1 + 2 + 7 (see the delegated brief): opens `test.library`,
+    /// calls its first user vector (LVO -30) *natively* -- no host
+    /// dispatch at all for that call -- and returns the *library base*
+    /// itself as the exit code (rather than the user vector's own D0),
+    /// so the test can inspect the base's data area afterward: the
+    /// `initFunc`-ran marker (`lib_Revision`), the `A0`=segList marker,
+    /// and the AllocMem-result marker (proving the trampoline supports a
+    /// *nested* library call from inside `initFunc` -- the L2 trampoline
+    /// primitive's whole reason for existing).
+    #[test]
+    fn open_calls_user_vector_natively_and_init_really_ran() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0)); // D0 = requested version 0
+        jsr(&mut words, 6, -552); // OpenLibrary("test.library", 0) -> D0 = base
+        words.push(movea_dn(6, 0)); // A6 = base
+        words.push(movea_dn(3, 0)); // A3 = base (kept, for the exit-code move below)
+        jsr(&mut words, 6, -30); // call the first user vector natively
+        words.push(moveq(0, 0)); // (result unused here -- see the OpenCnt test)
+        words.push(move_an_dn(3, 0)); // D0 = base (the exit code)
+        words.push(RTS);
+
+        let (result, rt) = run_against_library(
+            "open-user-vector",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        let base = result.expect("run should succeed") as u32;
+        assert_ne!(base, 0, "OpenLibrary(\"test.library\", 0) should succeed");
+
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u16(base + LIB_REVISION_OFFSET),
+            INIT_MARKER,
+            "initFunc should have run and written its marker into lib_Revision"
+        );
+        assert_ne!(
+            mem.read_u32(base + SEGLIST_MARKER_OFFSET),
+            0,
+            "initFunc's A0 (segList BPTR) marker should be non-zero"
+        );
+        assert_ne!(
+            mem.read_u32(base + ALLOCMEM_MARKER_OFFSET),
+            0,
+            "initFunc's nested AllocMem call (mid-init, via the L2 trampoline) should \
+             have succeeded and stored a non-NULL pointer"
+        );
+    }
+
+    /// Test 1's other half: the user vector's own return value (`moveq
+    /// #42,d0`) really is what a native `jsr -30(a6)` produces -- proving
+    /// the call executed the library's own relocated code, not a host
+    /// trap.
+    #[test]
+    fn user_vector_return_value_comes_from_native_execution() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary -> D0 = base
+        words.push(movea_dn(6, 0)); // A6 = base
+        jsr(&mut words, 6, -30); // UserFunc -> D0 = 42
+        words.push(RTS);
+
+        let (result, _rt) = run_against_library(
+            "open-user-vector-value",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        assert_eq!(
+            result.expect("run should succeed"),
+            42,
+            "the user vector's own moveq #42,d0 should reach the exit code untouched"
+        );
+    }
+
+    /// Test 3: `lib_OpenCnt` is 1 after one open.
+    #[test]
+    fn open_cnt_is_one_after_a_single_open() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary -> D0 = base
+        words.push(movea_dn(2, 0)); // A2 = base
+        words.push(moveq(0, 0)); // D0 = 0 (clears the upper word before the .w load)
+        move_w_disp(&mut words, 2, 32, 0); // D0 = lib_OpenCnt (word)
+        words.push(RTS);
+
+        let (result, _rt) = run_against_library(
+            "opencnt-one",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        assert_eq!(result.expect("run should succeed"), 1);
+    }
+
+    /// Test 3 continued: `lib_OpenCnt` is 2 after opening twice -- the
+    /// second open must go through the real `Open` vector again (the
+    /// [`crate::dispatch::LibraryKind::Loaded`] repeat-open path,
+    /// [`reopen`]), which is the only thing that increments it a second
+    /// time (`OpenLibrary` itself never touches `lib_OpenCnt` -- see
+    /// `library-device-loading-plan.md` §2.4).
+    #[test]
+    fn open_cnt_is_two_after_opening_twice() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open #1
+        words.push(movea_dn(2, 0)); // A2 = base
+        // A second `movea.l #imm32,a1` placeholder starts here -- captured
+        // dynamically (rather than hand-computed) so a future edit to the
+        // instructions above this point can't silently desync the patch
+        // offset below.
+        let second_placeholder_idx = words.len();
+        movea_imm(&mut words, 1, 0); // A1 placeholder (patched to the same string address)
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // open #2 (registry Loaded hit -> reopen)
+        words.push(moveq(0, 0));
+        move_w_disp(&mut words, 2, 32, 0); // D0 = lib_OpenCnt
+        words.push(RTS);
+
+        // Two `movea.l #imm32,a1` placeholders now exist -- both must
+        // point at the same string, so patch both explicitly rather than
+        // relying on run_against_library's single-patch convention.
+        let entry = TRAP_TABLE_END;
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+        words[second_placeholder_idx + 1] = (str_addr >> 16) as u16;
+        words[second_placeholder_idx + 2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let name = b"test.library\0";
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+        let (_tmp, vfs) = vfs_with_libs_file("opencnt-two", "test.library", TESTLIB);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 2, "lib_OpenCnt should be 2 after two real opens");
+    }
+
+    /// Test 4: `OpenLibrary(name, 999)` -> `D0 == 0` (the version check
+    /// itself, read directly as this tiny program's exit code).
+    #[test]
+    fn version_refusal_returns_null() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        move_imm_dn(&mut words, 0, 999); // D0 = requested version 999
+        jsr(&mut words, 6, -552); // OpenLibrary(name, 999) -> D0 (exit code)
+        words.push(RTS);
+
+        let (result, _rt) = run_against_library(
+            "version-refusal",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        assert_eq!(
+            result.expect("run should succeed"),
+            0,
+            "test.library's real lib_Version (1) is below the requested 999"
+        );
+    }
+
+    /// Test 4 continued: the caller's `A6` is restored across a
+    /// version-refused open -- read directly via `move.l a6,d0`
+    /// immediately after the refused call, before anything else could
+    /// touch `A6`.
+    #[test]
+    fn version_refusal_preserves_callers_a6() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        move_imm_dn(&mut words, 0, 999);
+        jsr(&mut words, 6, -552); // refused -> D0 = 0
+        words.push(move_an_dn(6, 0)); // D0 = A6 (should still be EXEC_LIBRARY_BASE)
+        words.push(RTS);
+
+        let (result, _rt) = run_against_library(
+            "version-refusal-a6",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        assert_eq!(
+            result.expect("run should succeed") as u32,
+            EXEC_LIBRARY_BASE,
+            "A6 must be restored to the caller's own value after a version-refused open"
+        );
+    }
+
+    /// Builds and runs a program that calls `OpenLibrary("initfail.library",
+    /// 0)` `n` times in a row (each one refused by `testlib_initfail`'s
+    /// unconditionally-`NULL`-returning `initFunc`), then returns the
+    /// [`Runtime`]'s guest heap's free-byte count afterward. `load_end` is
+    /// a fixed constant (independent of `n`, generous enough for `n` up
+    /// to a handful) so the heap's own starting address -- and hence this
+    /// count -- is directly comparable across different `n` values; if
+    /// [`after_init`]'s `NULL`-init-result cleanup ever leaked the
+    /// seglist or [`make_library`] allocation, more failed attempts would
+    /// consume more heap space and this count would drop with `n`.
+    fn free_bytes_after_n_failed_opens(n: usize) -> u32 {
+        let entry = TRAP_TABLE_END;
+        let fixed_load_end = entry + 0x400;
+
+        let mut words = Vec::new();
+        let mut placeholder_indices = Vec::new();
+        for _ in 0..n {
+            placeholder_indices.push(words.len());
+            movea_imm(&mut words, 1, 0);
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            words.push(moveq(0, 0));
+            jsr(&mut words, 6, -552);
+        }
+        words.push(RTS);
+
+        let str_addr = entry + (words.len() as u32) * 2;
+        for idx in placeholder_indices {
+            words[idx + 1] = (str_addr >> 16) as u16;
+            words[idx + 2] = str_addr as u16;
+        }
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let name = b"initfail.library\0";
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+        assert!(
+            str_addr + name.len() as u32 + 4 <= fixed_load_end,
+            "fixed_load_end must stay generous enough for the largest n this test uses"
+        );
+
+        let (_tmp, vfs) = vfs_with_libs_file(
+            &format!("initfail-{n}"),
+            "initfail.library",
+            TESTLIB_INITFAIL,
+        );
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: fixed_load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        rt.heap_mut().free_bytes()
+    }
+
+    /// Test 5: an `initFunc` that returns `NULL` -> `OpenLibrary` returns
+    /// `NULL`, and the seglist/[`make_library`] allocation are unwound
+    /// cleanly, with no leak -- proven via heap state (per the delegated
+    /// brief's own suggested alternative): 1 vs 5 failed opens of the
+    /// same never-succeeding library leave the guest heap with exactly
+    /// the same amount of free space, since a leak-free cleanup returns
+    /// every byte a failed attempt touched.
+    #[test]
+    fn init_func_returning_null_fails_the_open_and_does_not_leak() {
+        let free_after_one = free_bytes_after_n_failed_opens(1);
+        let free_after_five = free_bytes_after_n_failed_opens(5);
+        assert_eq!(
+            free_after_one, free_after_five,
+            "heap free space should be identical after 1 vs 5 failed opens of the same \
+             library -- each initFunc-refused open must fully unwind its seglist and \
+             make_library allocation, or repeated attempts would leak heap space"
+        );
+    }
+
+    /// Test 6: a file that parses as a hunk executable but has no
+    /// `struct Resident` -- `fixtures/hello` fits exactly (see
+    /// `fixtures/README.md`), it's a plain two-hunk CLI program with no
+    /// romtag at all. `OpenLibrary` should fall back to the pre-existing
+    /// fake-stub path: a non-NULL base is returned, but calling a vector
+    /// on it fails with the fake-library diagnostic ([`crate::dispatch::
+    /// DispatchError::HandlerFailed`] naming the library) -- the same
+    /// observable behavior the existing `open_library_of_unknown_name_
+    /// found_on_disk_auto_creates_fake_and_succeeds` dispatch.rs test
+    /// asserts for a library that isn't a hunk file at all. Asserting on
+    /// stderr's loud fallback note directly is awkward from an in-process
+    /// test (see the delegated brief); this asserts the *behavior* that
+    /// note announces instead.
+    #[test]
+    fn library_with_no_resident_falls_back_to_fake_stub() {
+        const HELLO: &[u8] = include_bytes!("../../../fixtures/hello");
+
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary -> D0 = fake base
+        words.push(movea_dn(6, 0)); // A6 = fake base
+        jsr(&mut words, 6, -6); // call an arbitrary vector on it
+        words.push(RTS);
+
+        let (result, _rt) = run_against_library(
+            "no-resident",
+            "nores.library",
+            HELLO,
+            b"nores.library\0",
+            words,
+        );
+        match result.unwrap_err() {
+            RuntimeError::Dispatch(DispatchError::HandlerFailed { library, lvo, .. }) => {
+                assert_eq!(library, "nores.library");
+                assert_eq!(lvo, -6);
+            }
+            other => panic!("expected a HandlerFailed naming nores.library, got {other:?}"),
+        }
+    }
+
+    /// Test 8: after a successful load, `ExecBase.LibList` really is
+    /// walkable and contains a node whose `ln_Name` reads
+    /// `"test.library"` -- the `AddLibrary` equivalent
+    /// [`crate::execlib::after_init`] performs via `execlist::
+    /// add_tail_impl`.
+    #[test]
+    fn liblist_contains_the_loaded_library_by_name() {
+        use crate::dispatch::EXEC_BASE_LIBLIST_OFFSET;
+        use crate::execlist::{LH_HEAD, LN_NAME, LN_SUCC};
+        use crate::guestmem::read_c_string;
+
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary -> D0 = base
+        words.push(RTS);
+
+        let (result, rt) =
+            run_against_library("liblist", "test.library", TESTLIB, b"test.library\0", words);
+        result.expect("run should succeed");
+
+        let mem = rt.memory();
+        let list_addr = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
+        let mut node = mem.read_u32(list_addr + LH_HEAD);
+        let mut found = false;
+        while mem.read_u32(node + LN_SUCC) != 0 {
+            let name_ptr = mem.read_u32(node + LN_NAME);
+            if read_c_string(mem, name_ptr) == b"test.library" {
+                found = true;
+                break;
+            }
+            node = mem.read_u32(node + LN_SUCC);
+        }
+        assert!(
+            found,
+            "ExecBase.LibList should contain a node named \"test.library\" after a \
+             successful load"
+        );
     }
 }

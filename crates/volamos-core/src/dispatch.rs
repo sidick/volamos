@@ -436,7 +436,7 @@ fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
 /// `docs/plan.md`'s empirical-corpus notes), though `Version`'s own
 /// Kickstart-version report turned out to come from a simpler, more
 /// direct source ([`EXEC_BASE_SOFTVER_OFFSET`]) rather than this list.
-const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
+pub(crate) const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 
 /// Byte offset of `ExecBase.SemaphoreList` from [`EXEC_LIBRARY_BASE`] --
 /// same field-by-field derivation as [`EXEC_BASE_LIBLIST_OFFSET`],
@@ -997,6 +997,36 @@ pub enum LibraryKind {
     /// passthrough for e.g. the math libraries) can slot in as a third
     /// kind without disturbing this one.
     Faked,
+    /// A library base backed by a genuinely `LoadSeg`ed, `InitResident`ed
+    /// disk library (`library-device-loading-plan.md`'s L3) -- real
+    /// relocated 68k code, with a real jump table built by
+    /// [`crate::execlib::make_library`]. A repeat `OpenLibrary` of the
+    /// same name must run the real protocol again (version check, then
+    /// the library's own `Open` vector) rather than just handing back the
+    /// cached base -- see [`crate::execlib::reopen`].
+    Loaded,
+}
+
+/// The host-side record [`LibraryRegistry::register_loaded`] keeps for a
+/// [`LibraryKind::Loaded`] library -- everything a later `CloseLibrary`
+/// (L4) will need to unwind a load (`seglist_bptr`/`alloc_addr`), plus the
+/// `base` already available via [`LibraryRegistry::lookup`] (duplicated
+/// here too since it's cheaper to carry than to look up twice, and this
+/// record is the natural place a future L4 `CloseLibrary` handler will
+/// index from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadedLibrary {
+    /// The library base address (same value [`LibraryRegistry::lookup`]
+    /// returns for this name).
+    pub base: u32,
+    /// The `BPTR` [`crate::dosfile::DosState::load_seg`] returned for this
+    /// library's seglist -- what a future `CloseLibrary`'s delayed-expunge
+    /// path would pass to `UnLoadSeg`.
+    pub seglist_bptr: u32,
+    /// The [`GuestHeap`] allocation-start address
+    /// [`crate::execlib::make_library`] returned -- what a future
+    /// `CloseLibrary`'s expunge path would pass to [`GuestHeap::free`].
+    pub alloc_addr: u32,
 }
 
 /// One auto-created fake library's jump-table block, recorded so
@@ -1031,6 +1061,9 @@ struct FakeLibrary {
 pub struct LibraryRegistry {
     known: HashMap<String, (u32, LibraryKind)>,
     fakes: Vec<FakeLibrary>,
+    /// [`LibraryKind::Loaded`] libraries' extra bookkeeping, keyed by the
+    /// same name as `known` -- see [`LoadedLibrary`]'s doc.
+    loaded: HashMap<String, LoadedLibrary>,
 }
 
 impl LibraryRegistry {
@@ -1062,6 +1095,32 @@ impl LibraryRegistry {
             base,
             size,
         });
+    }
+
+    /// Records a newly `LoadSeg`ed-and-`InitResident`ed library base
+    /// ([`crate::execlib`]'s L3 open state machine, on a successful
+    /// `initFunc`) -- both in `known` (so [`Self::lookup`] returns
+    /// [`LibraryKind::Loaded`] for `name` from here on) and in `loaded`
+    /// (so a future `CloseLibrary`/`reopen` can find the seglist/alloc
+    /// bookkeeping [`LoadedLibrary`] carries).
+    pub fn register_loaded(&mut self, name: &str, base: u32, seglist_bptr: u32, alloc_addr: u32) {
+        self.known
+            .insert(name.to_string(), (base, LibraryKind::Loaded));
+        self.loaded.insert(
+            name.to_string(),
+            LoadedLibrary {
+                base,
+                seglist_bptr,
+                alloc_addr,
+            },
+        );
+    }
+
+    /// Looks up a [`LibraryKind::Loaded`] library's [`LoadedLibrary`]
+    /// bookkeeping by name -- `None` for anything not registered via
+    /// [`Self::register_loaded`] (including `Real`/`Faked` entries).
+    pub fn loaded_library(&self, name: &str) -> Option<&LoadedLibrary> {
+        self.loaded.get(name)
     }
 
     /// Given the guest address a trapped call landed at, finds the fake
@@ -1259,72 +1318,89 @@ fn continuation_stub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
 }
 
 /// `exec.library`'s `OpenLibrary` handler (LVO -552): `A1` = pointer to
-/// the library name (C string), `D0` = requested minimum version
-/// (ignored -- this runtime doesn't track library versions). Returns
-/// the library's base in `D0`.
+/// the library name (C string), `D0` = requested minimum version. `D0`
+/// must be captured here, before anything else touches it (`library-
+/// device-loading-plan.md` §2.3's explicit ordering requirement) --
+/// [`open_library_common`]'s disk-load path (`D0`-writing library calls
+/// happen along the way to servicing this very call) would otherwise
+/// clobber it before it's read. Returns the library's base in `D0`.
 ///
-/// # vamos escape hatch
+/// # vamos escape hatch, refined by real disk loading (L3)
 ///
 /// Ported from vamos's own behavior (see `docs/plan.md`'s "vamos escape
-/// hatches" note), but refined to match a real distinction the naive
-/// "always auto-create a fake" version glossed over: **ROM-resident**
-/// libraries (`exec.library`, `dos.library`, `utility.library` -- every
-/// library this runtime actually implements, i.e. everything
-/// [`LibraryRegistry::lookup`] already finds) are unconditionally
-/// present on any real Kickstart, so those never fail here regardless
-/// of `Vfs` state. Everything else is a **disk-based** library on real
-/// AmigaOS (loaded from `LIBS:<name>` at `OpenLibrary` time) -- real
-/// `OpenLibrary` for one of *those* only succeeds if the file is
-/// actually present on the searched disk, and fails (`D0` = `0`) if
-/// it's missing, exactly like any other disk-based command or handler.
-/// So for a name not in the registry, this checks whether
-/// `LIBS:<name>` resolves on the configured `Vfs` (or fails outright if
-/// there's no `Vfs` at all, matching every other path-based call's
-/// established "no `Vfs`" convention):
+/// hatches" note), refined in two stages:
 ///
-/// - **Found on disk** (or genuinely no way to tell -- see below): a
-///   fake base is auto-created (and reused on repeat requests for the
-///   same name, via [`LibraryRegistry`]) -- a block of
-///   [`FAKE_LIB_JUMP_TABLE_SIZE`] bytes carved from the guest heap,
-///   entirely prefilled with the shared [`FAKE_LIB_SLOT`] opcode, base
-///   set to the end of that block (so every plausible negative LVO
-///   offset lands inside it and traps). This runtime doesn't implement
-///   loading and running arbitrary real disk library code (a real
-///   system would), so this is the best available stand-in: `OpenLibrary`
-///   succeeds like it would for real, and [`fake_lib_vector_handler`]
-///   turns the *first actual call* into a diagnostic naming exactly
-///   which library/LVO is missing -- still far more useful than
-///   silently limping along.
-/// - **Not found on disk**: `OpenLibrary` fails (`D0` = `0`), matching
-///   real behavior for a disk that doesn't have that library -- letting
-///   a well-behaved caller's own "library didn't open" fallback path run
-///   (many programs speculatively `OpenLibrary` optional libraries like
-///   `locale.library` and degrade gracefully) instead of masking that
-///   choice behind an always-succeeds fake.
+/// - T12 first refined the naive "always auto-create a fake" version to
+///   match a real distinction: **ROM-resident** libraries (`exec.library`,
+///   `dos.library`, `utility.library` -- every library this runtime
+///   actually implements, i.e. everything [`LibraryRegistry::lookup`]
+///   already finds) are unconditionally present on any real Kickstart, so
+///   those never fail here regardless of `Vfs` state.
+/// - L3 (`library-device-loading-plan.md`) then replaced the fake-stub
+///   fallback for anything else with a **real load attempt** when the
+///   name resolves on the `Vfs`: [`crate::execlib::begin_open`] actually
+///   `LoadSeg`s the file, finds its `struct Resident`, and runs the real
+///   `InitResident`/`MakeLibrary`/`Open` sequence via
+///   [`ContinuationStack::trampoline`] -- see [`open_library_common`]'s
+///   doc for the full lookup order. The fake-stub path (below) now only
+///   fires for a name that doesn't resolve on disk at all
+///   ([`STANDARD_WORKBENCH_LIBRARIES`] only) or that resolves but fails
+///   to load as a genuine `RTF_AUTOINIT` library (a loud, named
+///   diagnostic on `stderr`, matching [`crate::intuition`]'s `Alert`
+///   diagnostic posture) -- everything that used to reach the fake path
+///   still can, just as a documented fallback instead of the default.
 fn open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
-    open_library_common(ctx, &name)
+    let requested_version = ctx.cpu.data_register(DataRegister(0));
+    open_library_common(ctx, &name, requested_version)
 }
 
 /// `exec.library`'s `OldOpenLibrary` handler (LVO -408): the pre-V36
 /// single-argument form of `OpenLibrary` (`A1` = library name, no
-/// version). Shares [`open_library_common`] with [`open_library_handler`].
+/// version -- per `exec.doc`'s own `OldOpenLibrary` autodoc, equivalent to
+/// `OpenLibrary(name, 0)`). Shares [`open_library_common`] with
+/// [`open_library_handler`].
 fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
-    open_library_common(ctx, &name)
+    open_library_common(ctx, &name, 0)
 }
 
-/// Shared `OpenLibrary`/`OldOpenLibrary` implementation: looks `name` up
-/// in [`HandlerContext::registry`], auto-creating a fake base per the
-/// vamos escape hatch (see [`open_library_handler`]) if it isn't there,
-/// and writes the resulting base into `D0`.
+/// Shared `OpenLibrary`/`OldOpenLibrary` implementation
+/// (`library-device-loading-plan.md` §2.3's lookup order):
+///
+/// 1. [`HandlerContext::registry`] hit: `Real`/`Faked` return the cached
+///    base unchanged; [`LibraryKind::Loaded`] re-runs the real open
+///    protocol via [`crate::execlib::reopen`] (a real library maintains
+///    its own `lib_OpenCnt`, so a repeat open must genuinely call its
+///    `Open` vector again, not just hand back the cached base -- see
+///    `library-device-loading-plan.md` §2.4).
+/// 2. No hit: resolve `name` on the `Vfs` (full path as-is if it contains
+///    `:`, else `LIBS:name` -- see the NDK `OpenLibrary` autodoc's own
+///    "A full path name for the library name is legitimate" note, found
+///    needed by the real SAS/C `sc` driver's `"sc:libs/sc1.library"`).
+///    If it resolves, attempt a real load via [`crate::execlib::
+///    begin_open`] -- on success the open is now running asynchronously
+///    (via the trampoline primitive) and this handler returns
+///    immediately, `D0` untouched (a later continuation sets it). On a
+///    *structural* load failure (no `Resident`, non-`AUTOINIT`, a
+///    `.device` opened by mistake, `InitStruct` not yet implemented, ...)
+///    this prints one loud, named `stderr` line and falls back to the
+///    fake-stub path below, so every previously-working case (a corpus
+///    binary that doesn't yet get a real load) keeps working.
+/// 3. Not resolved on the `Vfs` (or no `Vfs` at all): [`STANDARD_WORKBENCH_
+///    LIBRARIES`] names still fake-succeed unconditionally (see
+///    [`open_library_handler`]'s doc); everything else fails (`D0` = `0`).
 fn open_library_common<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     name: &str,
+    requested_version: u32,
 ) -> Result<(), DispatchError> {
-    if let Some((base, _kind)) = ctx.registry.lookup(name) {
+    if let Some((base, kind)) = ctx.registry.lookup(name) {
+        if kind == LibraryKind::Loaded {
+            return crate::execlib::reopen(ctx, name, base, requested_version);
+        }
         *ctx.call_detail = Some(format!("library {name:?} -> base {base:#010x} (real)"));
         ctx.cpu.set_data_register(DataRegister(0), base);
         return Ok(());
@@ -1333,27 +1409,37 @@ fn open_library_common<C: Cpu>(
     // Not a ROM-resident library this runtime implements: on real
     // AmigaOS this is a disk-based library, only openable if it
     // actually exists on the searched disk -- see this function's doc
-    // comment. Per the NDK autodoc's own OpenLibrary FUNCTION text ("A
-    // full path name for the library name is legitimate. For example
-    // 'wp:libs/wp.library'."), a name already containing a `:` is a
-    // caller-supplied full path and must be resolved as-is, *not*
-    // prefixed with `LIBS:` -- found running the real SAS/C `sc`
-    // compiler driver, which explicitly opens
-    // "sc:libs/sc1.library". Exception: a handful of standard
-    // Workbench 3.1 libraries (see [`STANDARD_WORKBENCH_LIBRARIES`])
-    // ship on every real install and are treated as always present.
+    // comment. A name already containing a `:` is a caller-supplied full
+    // path and must be resolved as-is, *not* prefixed with `LIBS:`.
+    // Exception: a handful of standard Workbench 3.1 libraries (see
+    // [`STANDARD_WORKBENCH_LIBRARIES`]) ship on every real install and
+    // are treated as always present.
     let search_path = if name.contains(':') {
         name.to_string()
     } else {
         format!("LIBS:{name}")
     };
-    let found_on_disk = STANDARD_WORKBENCH_LIBRARIES.contains(&name)
-        || ctx
-            .dos
-            .vfs
-            .as_ref()
-            .is_some_and(|vfs| vfs.resolve(&search_path, ResolveMode::MustExist).is_ok());
-    if !found_on_disk {
+    let resolves_on_disk = ctx
+        .dos
+        .vfs
+        .as_ref()
+        .is_some_and(|vfs| vfs.resolve(&search_path, ResolveMode::MustExist).is_ok());
+
+    if resolves_on_disk {
+        match crate::execlib::begin_open(ctx, name, &search_path, requested_version)? {
+            crate::execlib::LoadAttempt::Started => return Ok(()),
+            crate::execlib::LoadAttempt::StructuralFailure(reason) => {
+                // Loud, unconditional stderr note -- same posture as
+                // crate::intuition's Alert diagnostic -- naming exactly
+                // which library and why the real load didn't happen,
+                // before falling back to the fake-stub path below.
+                eprintln!(
+                    "volamos: OpenLibrary {name:?} ({search_path}): {reason} -- falling back \
+                     to an unimplemented fake library"
+                );
+            }
+        }
+    } else if !STANDARD_WORKBENCH_LIBRARIES.contains(&name) {
         *ctx.call_detail = Some(format!("library {name:?} -> NULL (not found on disk)"));
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
