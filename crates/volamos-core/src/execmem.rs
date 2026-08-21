@@ -558,6 +558,32 @@ fn cache_control_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
+/// `exec.library`'s `CacheClearU` (LVO -636, no args, `void`): "Flush
+/// out the contents of any CPU instruction and data caches... Caches
+/// must be cleared after *any* operation that could cause invalid or
+/// stale data" -- self-modifying code, building jump tables, relocating
+/// code, loading code from disk (`exec.doc`'s own examples, the last of
+/// which is exactly what [`crate::execlib`]'s disk-library loading does
+/// on every `OpenLibrary`). This runtime has no real CPU cache to flush
+/// (guest code is read fresh from guest memory on every fetch, same
+/// "nothing here is ever actually cached" reasoning as
+/// [`cache_control_handler`]), so this is a genuine no-op, not an
+/// approximation -- there's no stale state for it to have to clear.
+/// Found running the real SAS/C `sc` compiler's `sc1.library`, which
+/// calls this immediately after its own disk-library init code runs.
+fn cache_clear_u_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// `exec.library`'s `CacheClearE` (LVO -642: `A0` = `address`, `D0` =
+/// `length`, `D1` = `caches`, `void`): the range-qualified sibling of
+/// [`cache_clear_u_handler`] -- same "nothing to actually flush"
+/// reasoning applies regardless of which range/cache-type bits are
+/// requested, so this ignores all three arguments and is a no-op too.
+fn cache_clear_e_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
 /// Registers every T16 `exec.library` memory-allocation handler onto
 /// [`EXEC_LIBRARY_BASE`], looked up by name through [`EXEC_LVOS`] (the T7
 /// table), following [`crate::dosfile::register_dos_handlers`]'s
@@ -589,6 +615,8 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
     reg!("CopyMem", copy_mem_handler::<C>);
     reg!("CopyMemQuick", copy_mem_handler::<C>);
     reg!("CacheControl", cache_control_handler::<C>);
+    reg!("CacheClearU", cache_clear_u_handler::<C>);
+    reg!("CacheClearE", cache_clear_e_handler::<C>);
     reg!("CreatePool", create_pool_handler::<C>);
     reg!("DeletePool", delete_pool_handler::<C>);
     reg!("AllocPooled", alloc_pooled_handler::<C>);
@@ -1066,6 +1094,47 @@ mod tests {
         let mut out2 = Vec::new();
         rt2.run(&mut out2, None).expect("run should succeed");
         assert_eq!(rt2.memory().read_u32(CACHE_BITS_ADDR), old);
+    }
+
+    // --- CacheClearU / CacheClearE ---
+
+    #[test]
+    fn cache_clear_u_is_a_no_op_that_does_not_disturb_cache_control_state() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.extend_from_slice(&jsr_disp16_a6(-636)); // CacheClearU(a6)
+        words.push(RTS);
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            rt.memory().read_u32(CACHE_BITS_ADDR),
+            crate::dispatch::CACHE_BITS_DEFAULT,
+            "CacheClearU takes no args and touches no state -- CacheControl's \
+             bits must be untouched"
+        );
+    }
+
+    #[test]
+    fn cache_clear_e_is_a_no_op_regardless_of_its_arguments() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_a(0)); // A0 = address (arbitrary, ignored)
+        words.push(0x1234);
+        words.push(0x5678);
+        words.push(move_imm_to_d(0)); // D0 = length (arbitrary, ignored)
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // D1 = caches (arbitrary, ignored)
+        words.push(0);
+        words.push(3);
+        words.extend_from_slice(&jsr_disp16_a6(-642)); // CacheClearE(a6)
+        words.push(RTS);
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            rt.memory().read_u32(CACHE_BITS_ADDR),
+            crate::dispatch::CACHE_BITS_DEFAULT
+        );
     }
 
     // --- CreatePool/DeletePool/AllocPooled/FreePooled ---
