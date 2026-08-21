@@ -497,6 +497,31 @@ impl DosState {
         name: &str,
         access_mode: i32,
     ) -> Result<u32, i32> {
+        // `*` (the process's current console/window) and `CONSOLE:` (a
+        // request for a *new* one): neither is a real `Vfs` path, so
+        // falling through to path resolution below would always fail
+        // with `ERROR_OBJECT_NOT_FOUND` -- a real, confirmed divergence
+        // (found running the real SAS/C `sc` compiler, which opens `*`
+        // as one of its first two calls and takes a different,
+        // eventually-`WaitPort`-deadlocking code path when that fails;
+        // `vamos` backs the same call with a real stdout-connected
+        // handle and `sc` completes normally). This runtime has no real
+        // windowing model to open a genuinely *new* console for
+        // `CONSOLE:` (a deliberate, documented non-goal -- see
+        // `docs/plan.md`'s "Out of scope for all phases" section), so
+        // both are given the same honest stand-in: the process's own
+        // `Output()` default handle (real, host-stdout-backed,
+        // already `FH_PORT_INTERACTIVE`) -- matching `vamos`'s own
+        // choice for `*`. Returning the *same* handle `Output()` itself
+        // uses (not a fresh copy) means `Close()` on it already hits
+        // the existing "closing the Input()/Output() default is a
+        // no-op" path for free, and any `Write`/`IsInteractive()` call
+        // against it already works through the existing default-output
+        // machinery.
+        if name == "*" || name.eq_ignore_ascii_case("CONSOLE:") {
+            return self.output_addr(heap, mem).map(bptr_from_addr);
+        }
+
         let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
 
         let (resolve_mode, is_new) = match access_mode {
@@ -1382,6 +1407,62 @@ mod tests {
             .open(&mut heap, &mut mem, "SYS:nope.txt", MODE_OLDFILE)
             .unwrap_err();
         assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn open_star_returns_the_same_handle_output_uses() {
+        // No Vfs at all -- `*` must still work, since it isn't a real
+        // path lookup (issue #22/found running the real SAS/C `sc`
+        // compiler: it opens `*` before anything else, unconditionally).
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let output_bptr = bptr_from_addr(
+            dos.output_addr(&mut heap, &mut mem)
+                .expect("Output() should succeed"),
+        );
+        let star_bptr = dos
+            .open(&mut heap, &mut mem, "*", MODE_OLDFILE)
+            .expect("Open(\"*\") should succeed");
+        assert_eq!(
+            star_bptr, output_bptr,
+            "Open(\"*\") should hand back the exact same handle Output() uses"
+        );
+    }
+
+    #[test]
+    fn open_console_also_returns_the_output_handle() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let output_bptr = bptr_from_addr(
+            dos.output_addr(&mut heap, &mut mem)
+                .expect("Output() should succeed"),
+        );
+        let console_bptr = dos
+            .open(&mut heap, &mut mem, "CONSOLE:", MODE_NEWFILE)
+            .expect("Open(\"CONSOLE:\") should succeed");
+        assert_eq!(console_bptr, output_bptr);
+        // Case-insensitive, matching every other Amiga device/volume name.
+        let console_bptr_lower = dos
+            .open(&mut heap, &mut mem, "console:", MODE_OLDFILE)
+            .expect("Open(\"console:\") should succeed");
+        assert_eq!(console_bptr_lower, output_bptr);
+    }
+
+    #[test]
+    fn close_on_the_star_handle_is_the_existing_output_default_no_op() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let star_bptr = dos
+            .open(&mut heap, &mut mem, "*", MODE_OLDFILE)
+            .expect("Open(\"*\") should succeed");
+        let addr = addr_from_bptr(star_bptr);
+        assert!(dos.close(&mut heap, addr));
+        // Output() must still work afterward -- closing "*" mustn't have
+        // torn down the real default handle it aliases.
+        assert!(dos.output_addr(&mut heap, &mut mem).is_ok());
     }
 
     #[test]
