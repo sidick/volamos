@@ -165,3 +165,181 @@ jobs:
           tags: |
             ghcr.io/sidick/volamos:${{ steps.tag.outputs.value }}
             ghcr.io/sidick/volamos:latest
+
+  # Standalone per-arch binary zips for users who don't want the Docker
+  # image (issue #25, follow-up to #19). Each target builds in its own
+  # parallel job rather than one cross-compiling environment -- the linux
+  # musl builds reuse the Dockerfile's `builder` stage via buildx (same
+  # static output #19 already produces, no separate cargo build), macOS
+  # builds natively on an arm64 runner, and Windows cross-compiles with
+  # mingw-w64 (confirmed working locally). Intel Mac is deliberately out
+  # of scope -- no machine to validate it on.
+  release-binaries-linux:
+    name: Standalone binary (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract static binary from the Dockerfile's builder stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=dist
+
+      - name: Package
+        id: package
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          name="volamos-${tag}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "dist/volamos" "$name/"
+          chmod +x "$name/volamos"
+          tar czf "${name}.tar.gz" "$name"
+          echo "path=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.target }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+
+  release-binaries-macos:
+    name: Standalone binary (aarch64-apple-darwin)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-macos-cargo-
+
+      - name: Build (release)
+        run: cargo build --release -p volamos --target aarch64-apple-darwin
+
+      - name: Package
+        id: package
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          name="volamos-${tag}-aarch64-apple-darwin"
+          mkdir "$name"
+          cp target/aarch64-apple-darwin/release/volamos "$name/"
+          tar czf "${name}.tar.gz" "$name"
+          echo "path=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-aarch64-apple-darwin
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+
+  release-binaries-windows:
+    name: Standalone binary (x86_64-pc-windows-gnu)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-windows-cargo-
+
+      - name: Build (release)
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release -p volamos --target x86_64-pc-windows-gnu
+
+      - name: Package
+        id: package
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          name="volamos-${tag}-x86_64-pc-windows-gnu"
+          mkdir "$name"
+          cp target/x86_64-pc-windows-gnu/release/volamos.exe "$name/"
+          zip -r "${name}.zip" "$name"
+          echo "path=${name}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-x86_64-pc-windows-gnu
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+
+  release-publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - release-binaries-linux
+      - release-binaries-macos
+      - release-binaries-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release and attach binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          fi
