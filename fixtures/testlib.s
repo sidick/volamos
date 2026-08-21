@@ -37,6 +37,11 @@
 ;                    executed *natively* by the CPU backend once called --
 ;                    no host dispatch at all, the whole architectural
 ;                    point of loading a real library (plan §1.4).
+;   AddFunc      -- the second user vector (LVO -36), appended after
+;                    UserFunc so nothing existing shifts: a real
+;                    two-argument register-convention function,
+;                    `D0 = D0 + D1 ; rts` (the plan's "an 'add'... function"
+;                    fixture requirement). Vector count grows from 5 to 6.
 ;
 ; Regenerating: `vasmm68k_mot -Fhunkexe -nosym -o fixtures/testlib fixtures/testlib.s`
 
@@ -78,19 +83,27 @@ VecTable:
         dc.l    ExpungeFunc
         dc.l    ReservedFunc
         dc.l    UserFunc
+        dc.l    AddFunc
         dc.l    -1                       ; terminator
 
 InitFunc:
         ; D0=libBase, A0=segList (BPTR), A6=ExecBase.
-        movem.l d0/a0/a6,-(sp)
-        move.l  d0,a1                    ; a1 = libBase, kept across the call below
-        move.w  #INIT_MARKER,LIB_REVISION_OFFSET(a1)
-        move.l  a0,SEGLIST_MARKER_OFFSET(a1)
+        movem.l d0/a0/a2/a6,-(sp)
+        move.l  d0,a2                    ; a2 = libBase, kept across the call below --
+                                          ; A1 is a caller-clobbered ("scratch")
+                                          ; register per the RKRM calling convention
+                                          ; (D0/D1/A0/A1), so it can't be trusted to
+                                          ; survive the AllocMem call below on real
+                                          ; hardware; A2 is callee-saved, like every
+                                          ; other library-base-across-a-call fixture
+                                          ; convention (see libcall.s's A3/A4/A5).
+        move.w  #INIT_MARKER,LIB_REVISION_OFFSET(a2)
+        move.l  a0,SEGLIST_MARKER_OFFSET(a2)
         moveq   #4,d0                    ; AllocMem(4, MEMF_ANY) -- proves the
         moveq   #0,d1                    ; trampoline supports a nested library
         jsr     _LVOAllocMem(a6)         ; call mid-initFunc (plan's L2 point)
-        move.l  d0,ALLOCMEM_MARKER_OFFSET(a1)
-        movem.l (sp)+,d0/a0/a6           ; restore original D0 (libBase)/A0/A6
+        move.l  d0,ALLOCMEM_MARKER_OFFSET(a2)
+        movem.l (sp)+,d0/a0/a2/a6        ; restore original D0 (libBase)/A0/A2/A6
         rts                              ; return libBase in D0, per MakeLibrary's contract
 
 OpenFunc:
@@ -112,6 +125,10 @@ ReservedFunc:
 
 UserFunc:
         moveq   #42,d0
+        rts
+
+AddFunc:
+        add.l   d1,d0                    ; D0 = D0 + D1
         rts
 
 LibName:
