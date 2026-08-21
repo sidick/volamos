@@ -39,8 +39,8 @@ console-tool use case.
 
 ## Where to start
 
-- [Installation](Installation.md) — getting the binary built and onto
-  your `PATH`.
+- [Installation](Installation.md) — prebuilt release binaries, the
+  container image, or building from source.
 - [Getting Started](Getting-Started.md) — running your first guest
   program, and mapping a real directory onto an Amiga volume.
 - [CLI Reference](CLI-Reference.md) — every flag.
@@ -70,9 +70,11 @@ closed the remaining gaps it flagged, including `ReadArgs`/`FreeArgs`,
 the full `SignalSemaphore` API, the math libraries, `locale.library`,
 and a thin `intuition.library` stub.
 
-What hasn't happened yet: a formal three-oracle parity pass (volamos
-vs. `vamos` vs. real Kickstart, on a shared corpus) and a tagged
-release. If a guest program hits an unimplemented call, volamos fails
+What hasn't happened yet: a formal, CI-integrated three-oracle parity
+pass (volamos vs. `vamos` vs. real Kickstart, on a shared corpus) — a
+local-only harness exists and has already caught and fixed real
+divergences, but it isn't wired into CI yet. If a guest program hits
+an unimplemented call, volamos fails
 loudly with a clear diagnostic naming the exact library/function
 rather than silently misbehaving — see
 [Supported Libraries](Supported-Libraries.md) for what's covered, and
