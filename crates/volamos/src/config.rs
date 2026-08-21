@@ -1,6 +1,6 @@
 //! Config-file support (GitHub issue #5): `~/.volamos` supplies
 //! user-global defaults for the CLI's own "scaffolding" flags
-//! (`-V`/`-a`/`--cwd`/`--auto-assign`/`--stack`/`--ram`/`--cpu`/`--fpu`/
+//! (`-V`/`-a`/`--cwd`/`--auto-assign`/`--stack`/`--ram`/`--cpu`/`--fpu`/`--jit`/
 //! `-v`/`-s`), so a repeated-use project doesn't need to retype them on
 //! every invocation; a `.volamos` in the current directory overrides it
 //! for per-project settings; an explicit CLI flag always wins over
@@ -11,7 +11,7 @@
 //! ignored, whitespace around `=` trimmed. Keys mirror the CLI flags:
 //! `VOLUME`/`ASSIGN` (repeatable, same `NAME:value` grammar as `-V`/
 //! `-a`), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM` (same `K`/`M`-suffixed
-//! syntax as the flags), `CPU`, `FPU`/`VERBOSE`/`SNOOP` (`true`/
+//! syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
 //! `false`). A repeated *singular* key within one file follows the same
 //! "last one wins" rule repeating a CLI flag already has. Relative
 //! `VOLUME`/`AUTO_ASSIGN` host directories resolve against volamos's
@@ -48,6 +48,7 @@ pub(crate) struct Overrides {
     pub(crate) ram_size: Option<u32>,
     pub(crate) cpu_type: Option<CpuType>,
     pub(crate) fpu: Option<bool>,
+    pub(crate) jit: Option<bool>,
 }
 
 /// Parses a `true`/`false` value (case-insensitive), for the `FPU`/
@@ -102,6 +103,7 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
             }
             "CPU" => overrides.cpu_type = Some(parse_cpu_type(value).map_err(with_line)?),
             "FPU" => overrides.fpu = Some(parse_bool("FPU", value).map_err(with_line)?),
+            "JIT" => overrides.jit = Some(parse_bool("JIT", value).map_err(with_line)?),
             "VERBOSE" => overrides.verbose = Some(parse_bool("VERBOSE", value).map_err(with_line)?),
             "SNOOP" => overrides.snoop = Some(parse_bool("SNOOP", value).map_err(with_line)?),
             other => return Err(with_line(format!("unknown key {other:?}"))),
@@ -133,6 +135,7 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         ram_size: higher.ram_size.or(lower.ram_size),
         cpu_type: higher.cpu_type.or(lower.cpu_type),
         fpu: higher.fpu.or(lower.fpu),
+        jit: higher.jit.or(lower.jit),
     }
 }
 
@@ -293,6 +296,12 @@ mod tests {
     fn malformed_bool_is_an_error() {
         let err = parse("FPU=yes\n").unwrap_err();
         assert!(err.contains("line 1"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn jit_key_parses() {
+        let overrides = parse("JIT=true\n").unwrap();
+        assert_eq!(overrides.jit, Some(true));
     }
 
     #[test]

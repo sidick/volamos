@@ -3925,3 +3925,53 @@ exactly (`vamos` doesn't implement `PROGDIR:` either, for context --
 `ERROR_OBJECT_NOT_FOUND`). 8 new unit/e2e tests; 599 tests, clippy
 `-D warnings`, fmt clean; all 11 `compare_three_way.py` entries still
 pass; `sc hello.c` still produces the byte-identical `hello.o`.
+
+## Phase 5 (issue #18) implemented: JIT enablement, as a runtime flag not a cargo feature — 2026-08-21
+
+Scoped first (see issue #18's comments): the `m68k` crate 0.11.0's
+`CpuCore::run_batch` is *always* compiled in (no `#[cfg(feature =
+"jit")]` gate on the method itself) -- the crate's own `jit` Cargo
+feature only gates whether `trace_jit.rs`'s Cranelift native-code
+backend is linked; `run_batch`'s trap surfacing (`BatchExit`) already
+matches this runtime's `StopReason`/`TrapKind` one-for-one. That
+changed the plan from "add a volamos-core cargo feature" to something
+better-fitting this project's own convention (every other CPU-shape
+knob -- `--cpu`, `--fpu`, `--ram` -- is a single binary's runtime
+flag, never a separate build): `volamos-core` now always depends on
+`m68k` with `features = ["jit"]` (Cranelift and its Wasmtime-derived
+deps always linked), and a new `M68kCpu::jit: bool` field (default
+`false`, set via `--jit`/`--no-jit`/`JIT=` config key, mirroring
+`--fpu`) picks at runtime between the plain step loop and
+`run_batch`, inside a single (no longer `cfg`-gated)
+`M68kCpu::run` override -- see `backend.rs`. `FlatMemory` also grew a
+real `AddressBus::fast_mem` impl (its `Vec<u8>` backing store is
+already side-effect-free end to end, exactly the contract `fast_mem`
+needs).
+
+**Baseline measured first** (per the plan's own precedent of never
+committing to a perf change without a number): `sc hello.c` -- the
+default smoke-test fixture -- was too trivial (~0.03s) to say anything
+useful, so `~/amiga/sasc/extras/guiprof/guiprof.c` (577 lines, real
+prototyped code, part of the shipped SAS/C SDK) was used instead:
+~9.2s wall / ~3.1s user CPU under the interpreter, every run.
+
+**Verification**: `--jit` produces a byte-identical `guiprof.o` (and
+byte-identical `hello.o`) to the interpreter -- confirmed by `cmp`, not
+just diffed stdout. CPU time dropped ~25% (3.1s -> 2.3s user), but
+wall-clock barely moved (9.2s -> ~8.5s): most of `sc`'s wall time isn't
+CPU-bound at all, matching the up-front feasibility read that this
+runtime's heavy trap-dispatch overhead (every AmigaOS library call
+exits to Rust) limits how much a batch/trace JIT can help -- the win
+scales with how CPU-bound the guest program's *own* work is, not with
+how many library calls it makes. New `tools/compare_jit.py` (no
+external oracle needed -- `--jit` only changes *how* volamos executes
+guest code, never what it computes, so any diff between the two modes
+on the existing fixture corpus is a real bug) wired into CI's
+`compare` job alongside the existing `compare_vamos.py` step. 601
+volamos-core tests (2 new: a DBRA backward-branch-loop parity test
+comparing interpreter vs. `--jit` register/PC state exactly, plus a
+`PcOutOfBounds`-under-jit test) + 3 new volamos CLI tests (`--jit`
+flag parsing) + 1 new config-file test, all passing; clippy
+`-D warnings` and fmt clean; `mkdocs build --strict` clean
+(`CLI-Reference.md`/`Configuration.md` updated with the real benchmark
+numbers above).

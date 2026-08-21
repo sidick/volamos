@@ -3,7 +3,7 @@
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
-        [--cpu MODEL] [--fpu|--no-fpu] <program> [args...]
+        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself.
@@ -201,6 +201,33 @@ volamos --cpu 68020 --fpu fixtures/hello
     determined by how the program itself was written/compiled — it
     just decides whether real F-line instructions execute instead of
     trapping.
+
+## `--jit`, `--no-jit`
+
+Whether guest code runs through the `m68k` crate's trace JIT
+(`CpuCore::run_batch`) instead of stepping one instruction at a time.
+Default: off — the plain interpreter is this runtime's correctness
+reference, and every emulated library call still traps out to volamos
+identically either way, so `--jit` never changes a program's observable
+behavior, only its speed.
+
+```sh
+volamos --jit fixtures/hello
+```
+
+!!! note "Where the win actually shows up"
+    volamos is a Wine-style HLE runtime: guest code traps out to Rust on
+    essentially every AmigaOS library call, and the JIT only accelerates
+    the CPU-bound work *between* those traps (compiling hot
+    backward-branch loops). For trap-dense glue code that spends most of
+    its time inside library calls, `--jit` has little to offer. For
+    CPU-bound guest work — the case that actually motivated this flag —
+    compiling a real 577-line C source (`sc guiprof.c`, SAS/C 6.58)
+    dropped from ~3.1s to ~2.3s of CPU time (a ~25% reduction) with
+    `--jit`, though wall-clock barely moved, since most of `sc`'s wall
+    time isn't CPU-bound at all. Expect `--jit`'s benefit to scale with
+    how CPU-heavy the guest program's own work is, not with how many
+    library calls it makes.
 
 ## No flags at all
 

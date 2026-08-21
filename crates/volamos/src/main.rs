@@ -110,6 +110,7 @@ struct Options {
     ram_size: u32,
     cpu_type: CpuType,
     fpu: bool,
+    jit: bool,
 }
 
 impl Options {
@@ -129,7 +130,7 @@ fn print_usage(program_name: &str) {
         "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] <program> [args...]"
+         [--fpu|--no-fpu] [--jit|--no-jit] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -173,6 +174,19 @@ fn print_usage(program_name: &str) {
     eprintln!("                            only meaningful for --cpu 68020 and later -- earlier");
     eprintln!("                            models have no coprocessor interface at all, so F-line");
     eprintln!("                            (FPU) instructions always trap on them regardless");
+    eprintln!(
+        "  --jit / --no-jit          batch-execute guest code via the m68k crate's trace JIT"
+    );
+    eprintln!(
+        "                            instead of stepping one instruction at a time (default:"
+    );
+    eprintln!(
+        "                            no JIT -- the interpreter is this runtime's correctness"
+    );
+    eprintln!(
+        "                            reference); every library-call trap boundary is identical"
+    );
+    eprintln!("                            either way");
     eprintln!();
     eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
     eprintln!();
@@ -413,6 +427,8 @@ fn parse_args_raw(
             }
             "--fpu" => overrides.fpu = Some(true),
             "--no-fpu" => overrides.fpu = Some(false),
+            "--jit" => overrides.jit = Some(true),
+            "--no-jit" => overrides.jit = Some(false),
             _ => program = Some(arg),
         }
     }
@@ -439,6 +455,7 @@ fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String
         ram_size: overrides.ram_size.unwrap_or(DEFAULT_RAM_SIZE),
         cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
         fpu: overrides.fpu.unwrap_or(false),
+        jit: overrides.jit.unwrap_or(false),
     }
 }
 
@@ -570,6 +587,7 @@ fn run_nested_program(
     ram_size: u32,
     cpu_type: CpuType,
     fpu: bool,
+    jit: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
         return -1;
@@ -594,7 +612,9 @@ fn run_nested_program(
         attn_flags: attn_flags_for(cpu_type, fpu),
         program_name: program_name_from_path(host_path),
     };
-    let mut runtime = Runtime::new(M68kCpu::with_config(cpu_type, fpu), mem, config);
+    let mut cpu = M68kCpu::with_config(cpu_type, fpu);
+    cpu.set_jit(jit);
+    let mut runtime = Runtime::new(cpu, mem, config);
 
     if let Some(vfs_config) = vfs_config {
         match Vfs::new(vfs_config) {
@@ -624,7 +644,8 @@ fn run(opts: &Options) -> Result<i32, String> {
         .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
     check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
 
-    let cpu = M68kCpu::with_config(opts.cpu_type, opts.fpu);
+    let mut cpu = M68kCpu::with_config(opts.cpu_type, opts.fpu);
+    cpu.set_jit(opts.jit);
     let config = StartConfig {
         entry: load_result.entry,
         load_end: load_result.end,
@@ -656,6 +677,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_ram_size = opts.ram_size;
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
+    let nested_jit = opts.jit;
     runtime.set_system_runner(move |req| {
         run_nested_program(
             &req.resolved_program_host_path,
@@ -666,6 +688,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_ram_size,
             nested_cpu_type,
             nested_fpu,
+            nested_jit,
         )
     });
 
@@ -1159,6 +1182,24 @@ mod tests {
         // makes this the natural, unsurprising behavior either way).
         let opts = parse_args(args(&["--fpu", "--no-fpu", "prog"])).unwrap();
         assert!(!opts.fpu);
+    }
+
+    #[test]
+    fn default_jit_is_off() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.jit);
+    }
+
+    #[test]
+    fn jit_flag_enables_jit() {
+        let opts = parse_args(args(&["--jit", "prog"])).unwrap();
+        assert!(opts.jit);
+    }
+
+    #[test]
+    fn no_jit_flag_after_jit_wins() {
+        let opts = parse_args(args(&["--jit", "--no-jit", "prog"])).unwrap();
+        assert!(!opts.jit);
     }
 
     // --- attn_flags_for ---

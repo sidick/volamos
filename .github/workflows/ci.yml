@@ -86,3 +86,6 @@ jobs:
 
       - name: Run comparison harness
         run: python3 tools/compare_vamos.py --volamos target/release/volamos
+
+      - name: Run interpreter/--jit dual-mode harness
+        run: python3 tools/compare_jit.py --volamos target/release/volamos

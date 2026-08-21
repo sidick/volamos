@@ -24,6 +24,7 @@ STACK=256K
 RAM=32M
 CPU=68020
 FPU=true
+JIT=false
 VERBOSE=false
 SNOOP=false
 ```
@@ -40,6 +41,7 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 | `RAM` | `--ram` | same `K`/`M`-suffixed `SIZE` syntax |
 | `CPU` | `--cpu` | same model names |
 | `FPU` | `--fpu`/`--no-fpu` | `true`/`false` |
+| `JIT` | `--jit`/`--no-jit` | `true`/`false` |
 | `VERBOSE` | `-v`/`--verbose` | `true`/`false` |
 | `SNOOP` | `-s`/`--snoop` | `true`/`false` |
 
@@ -56,7 +58,7 @@ of where volamos is invoked from.
 
 ## Precedence
 
-For `CWD`/`AUTO_ASSIGN`/`STACK`/`RAM`/`CPU`/`FPU`/`VERBOSE`/`SNOOP`:
+For `CWD`/`AUTO_ASSIGN`/`STACK`/`RAM`/`CPU`/`FPU`/`JIT`/`VERBOSE`/`SNOOP`:
 
 ```
 command-line flag  >  ./.volamos  >  ~/.volamos  >  built-in default

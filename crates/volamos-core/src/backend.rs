@@ -106,6 +106,21 @@ impl AddressBus for FlatMemory {
     fn write_long(&mut self, address: u32, value: u32) {
         AddressSpace::write_u32(self, address, value);
     }
+
+    /// The whole guest address space is one plain, side-effect-free
+    /// `Vec<u8>` (see [`FlatMemory`]'s doc comment) -- exactly what the
+    /// `jit` feature's [`m68k::CpuCore::run_batch`] fast path needs, and
+    /// harmless to expose unconditionally since `step`/`execute` never
+    /// call this hook regardless of feature flags (see
+    /// [`m68k::AddressBus::fast_mem`]'s doc comment).
+    fn fast_mem(&mut self) -> Option<m68k::FastMem> {
+        let len = AddressSpace::len(self) as u32;
+        Some(m68k::FastMem {
+            ptr: self.as_mut_slice().as_mut_ptr(),
+            base: 0,
+            len,
+        })
+    }
 }
 
 /// A [`Cpu`] implementation backed by the `m68k` crate's `CpuCore`.
@@ -118,6 +133,13 @@ impl AddressBus for FlatMemory {
 /// for the rare binary that does (the CLI's `--cpu`/`--fpu` flags).
 pub struct M68kCpu {
     core: CpuCore,
+    /// Whether [`Cpu::run`] should batch-execute via
+    /// [`m68k::CpuCore::run_batch`] (the crate's trace JIT) instead of
+    /// stepping one instruction at a time. Defaults to `false` -- the
+    /// plain interpreter remains this runtime's correctness reference
+    /// (see the CLI's `--jit`/`--no-jit` flags); set with
+    /// [`Self::set_jit`].
+    jit: bool,
 }
 
 impl M68kCpu {
@@ -126,6 +148,13 @@ impl M68kCpu {
     /// struct's doc comment for why that's the default.
     pub fn new() -> Self {
         Self::with_config(CpuType::M68000, false)
+    }
+
+    /// Enables or disables the batch-execution (`run_batch`/trace JIT)
+    /// path for [`Cpu::run`] -- see [`Self::jit`]'s field doc and the
+    /// CLI's `--jit`/`--no-jit` flags. Off by default.
+    pub fn set_jit(&mut self, jit: bool) {
+        self.jit = jit;
     }
 
     /// Creates a new core for `cpu_type`, with `fpu_present` controlling
@@ -155,7 +184,7 @@ impl M68kCpu {
         core.set_cpu_type(cpu_type);
         core.fpu_present = fpu_present;
         core.reset_soft();
-        Self { core }
+        Self { core, jit: false }
     }
 }
 
@@ -192,6 +221,84 @@ impl Cpu for M68kCpu {
                 kind: TrapKind::Illegal { opcode },
                 pc: self.core.ppc,
             }),
+        }
+    }
+
+    /// When [`Self::jit`] is set, runs a whole batch of instructions via
+    /// [`m68k::CpuCore::run_batch`] instead of stepping one at a time --
+    /// the crate's trace JIT compiles hot backward-branch loops under
+    /// the hood, but every trap/halt this runtime cares about is still
+    /// surfaced at exactly the same boundary [`Cpu::step`]'s default
+    /// `run` loop would stop at (see [`m68k::BatchExit`]'s doc comment:
+    /// traps are reported, never taken as hardware exceptions, matching
+    /// [`StepResult`] one-for-one). `max_instructions` is unbounded
+    /// (`u32::MAX`) since this runtime has no use for budget-based
+    /// preemption; a `BudgetExhausted` exit (astronomically unlikely in
+    /// practice, since AmigaOS guest code traps out to library calls
+    /// constantly) just resumes the batch loop rather than returning
+    /// early. When unset, falls back to the plain step loop (the same
+    /// logic as [`Cpu::run`]'s own default implementation, duplicated
+    /// here since overriding `run` at all requires handling both
+    /// branches in one method).
+    fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
+        use m68k::BatchExit;
+
+        if !self.jit {
+            loop {
+                let pc = self.pc();
+                if pc as usize >= AddressSpace::len(mem) {
+                    return StopReason::PcOutOfBounds { pc };
+                }
+                match self.step(mem) {
+                    StopReason::Step => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        loop {
+            let pc = self.pc();
+            if pc as usize >= AddressSpace::len(mem) {
+                return StopReason::PcOutOfBounds { pc };
+            }
+            let result = self.core.run_batch(mem, u32::MAX, &[]);
+            match result.exit {
+                BatchExit::BudgetExhausted => continue,
+                BatchExit::Stopped => return StopReason::Halted,
+                BatchExit::WatchedPc { .. } => {
+                    unreachable!("no watch_pcs are ever passed to run_batch")
+                }
+                BatchExit::AlineTrap { opcode } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::ALine { opcode },
+                        pc: self.core.ppc,
+                    });
+                }
+                BatchExit::FlineTrap { opcode } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::FLine { opcode },
+                        pc: self.core.ppc,
+                    });
+                }
+                BatchExit::TrapInstruction { trap_num } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::Trap { trap_num },
+                        pc: self.core.ppc,
+                    });
+                }
+                BatchExit::Breakpoint { bp_num } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::Breakpoint { bp_num },
+                        pc: self.core.ppc,
+                    });
+                }
+                BatchExit::IllegalInstruction { opcode } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::Illegal { opcode },
+                        pc: self.core.ppc,
+                    });
+                }
+            }
         }
     }
 
@@ -472,5 +579,53 @@ mod tests {
         let reason = cpu.run(&mut mem);
 
         assert_eq!(reason, StopReason::PcOutOfBounds { pc: 0xFFFF_FFD1 });
+    }
+
+    #[test]
+    fn jit_mode_also_reports_pc_out_of_bounds() {
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        cpu.set_jit(true);
+        cpu.set_pc(0xFFFF_FFD1);
+
+        let reason = cpu.run(&mut mem);
+
+        assert_eq!(reason, StopReason::PcOutOfBounds { pc: 0xFFFF_FFD1 });
+    }
+
+    #[test]
+    fn jit_batch_execution_matches_interpreter_for_a_backward_branch_loop() {
+        // A DBRA-based backward-branch loop -- deliberately chosen since
+        // it's the specific pattern the trace JIT compiles (see
+        // `M68kCpu::run`'s doc comment), so this exercises the actual
+        // native-code path rather than just trap/budget plumbing. Both
+        // modes must agree exactly: the interpreter is this runtime's
+        // correctness reference (see the CLI's `--jit`/`--no-jit`
+        // flags' doc), so any divergence here would be a real bug.
+        let words: &[u16] = &[
+            0x7004, // MOVEQ #4, D0
+            0x4E71, // [loop] NOP
+            0x51C8, 0xFFFC, // DBRA D0, loop (disp = -4)
+            0xA000, // A-line trap: stop here
+        ];
+
+        let mut interp_mem = FlatMemory::new(0x3000);
+        load_words(&mut interp_mem, TRAP_TABLE_END, words);
+        let mut interp_cpu = M68kCpu::new();
+        interp_cpu.set_pc(TRAP_TABLE_END);
+        let interp_reason = interp_cpu.run(&mut interp_mem);
+
+        let mut jit_mem = FlatMemory::new(0x3000);
+        load_words(&mut jit_mem, TRAP_TABLE_END, words);
+        let mut jit_cpu = M68kCpu::new();
+        jit_cpu.set_jit(true);
+        jit_cpu.set_pc(TRAP_TABLE_END);
+        let jit_reason = jit_cpu.run(&mut jit_mem);
+
+        assert_eq!(interp_reason, jit_reason);
+        assert_eq!(
+            interp_cpu.data_register(DataRegister(0)),
+            jit_cpu.data_register(DataRegister(0)),
+        );
+        assert_eq!(interp_cpu.pc(), jit_cpu.pc());
     }
 }

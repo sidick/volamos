@@ -8,4 +8,9 @@ authors.workspace = true
 description = "Core library for volamos: CPU/memory abstractions and AmigaOS library emulation"
 
 [dependencies]
-m68k = "=0.11.0"
+# "jit" pulls in the crate's Cranelift-backed trace compiler for
+# `CpuCore::run_batch`. Linked unconditionally (not a volamos-core cargo
+# feature) so `--jit` is a single binary's runtime choice, matching every
+# other CPU-shape flag (`--cpu`, `--fpu`) -- see `backend.rs`'s
+# `M68kCpu::run` override and the CLI's `--jit`/`--no-jit` flags.
+m68k = { version = "=0.11.0", features = ["jit"] }
