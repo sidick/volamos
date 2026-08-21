@@ -1103,18 +1103,28 @@ fn open_library_common<C: Cpu>(
     }
 
     // Not a ROM-resident library this runtime implements: on real
-    // AmigaOS this is a disk-based library, only openable if
-    // `LIBS:<name>` actually exists on the searched disk -- see this
-    // function's doc comment. Exception: a handful of standard
+    // AmigaOS this is a disk-based library, only openable if it
+    // actually exists on the searched disk -- see this function's doc
+    // comment. Per the NDK autodoc's own OpenLibrary FUNCTION text ("A
+    // full path name for the library name is legitimate. For example
+    // 'wp:libs/wp.library'."), a name already containing a `:` is a
+    // caller-supplied full path and must be resolved as-is, *not*
+    // prefixed with `LIBS:` -- found running the real SAS/C `sc`
+    // compiler driver, which explicitly opens
+    // "sc:libs/sc1.library". Exception: a handful of standard
     // Workbench 3.1 libraries (see [`STANDARD_WORKBENCH_LIBRARIES`])
     // ship on every real install and are treated as always present.
-    let libs_path = format!("LIBS:{name}");
+    let search_path = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("LIBS:{name}")
+    };
     let found_on_disk = STANDARD_WORKBENCH_LIBRARIES.contains(&name)
         || ctx
             .dos
             .vfs
             .as_ref()
-            .is_some_and(|vfs| vfs.resolve(&libs_path, ResolveMode::MustExist).is_ok());
+            .is_some_and(|vfs| vfs.resolve(&search_path, ResolveMode::MustExist).is_ok());
     if !found_on_disk {
         *ctx.call_detail = Some(format!("library {name:?} -> NULL (not found on disk)"));
         ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -2652,6 +2662,60 @@ mod tests {
                 assert_eq!(lvo, -6);
             }
             other => panic!("expected a HandlerFailed naming xyz.library, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_library_with_a_full_path_name_resolves_that_path_directly() {
+        // Per the NDK autodoc's own OpenLibrary FUNCTION text: "A full
+        // path name for the library name is legitimate. For example
+        // 'wp:libs/wp.library'." -- issue #15, found running the real
+        // SAS/C compiler driver (`sc`), which explicitly opens
+        // "sc:libs/sc1.library". A name containing ':' must be resolved
+        // as-is, not prefixed with LIBS: (which would look for
+        // "LIBS:sc:libs/sc1.library", never found).
+        let tmp = TempDir::new("open-library-full-path");
+        fs::create_dir(tmp.path().join("custom")).unwrap();
+        fs::write(tmp.path().join("custom").join("xyz.library"), b"").unwrap();
+
+        let entry = TRAP_TABLE_END;
+        let name = b"sys:custom/xyz.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("sys:custom/xyz.library") -> D0
+        words.push(movea_dn(6, 0)); // A6 = D0 (the fake base)
+        push_jsr(&mut words, 6, -6); // call an arbitrary vector on it
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs_over(tmp.path()));
+
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err();
+        match err {
+            RuntimeError::Dispatch(DispatchError::HandlerFailed { library, lvo, .. }) => {
+                assert_eq!(library, "sys:custom/xyz.library");
+                assert_eq!(lvo, -6);
+            }
+            other => panic!("expected a HandlerFailed naming the full path, got {other:?}"),
         }
     }
 

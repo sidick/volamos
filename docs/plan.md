@@ -3711,3 +3711,34 @@ happened" check) and `makedir-newdir` (silent on success either way;
 manually confirmed the directory is actually created across all three
 engines by hand, since `output_file` can't check directory presence).
 Corpus is now 11 entries; all passing locally.
+
+## Issue #15 fixed: `OpenLibrary` ignored full-path library names — 2026-08-21
+
+Simon set up a real SAS/C 6.58 Amiga compiler toolchain at
+`~/amiga/sasc` (own `.volamos`: `SC:`/`LIB:`/`INCLUDE:`/`CXXINCLUDE:`
+volumes, `CPU=68020`) -- a new, real third-party corpus beyond
+Workbench 3.1 `C:` commands. `grep`/`diff`/`lstat` run cleanly.
+Running the actual compiler driver (`c/sc hello.c`) found a real bug:
+`OpenLibrary("sc:libs/sc1.library", 0)` failed with "can't open" --
+`open_library_common` (`dispatch.rs`) unconditionally prefixed every
+non-ROM library name with `LIBS:`, even when the caller already
+supplied a full device-qualified path. Per the NDK's own `exec.doc`
+autodoc: *"A full path name for the library name is legitimate. For
+example 'wp:libs/wp.library'."* -- explicitly documented, legitimate
+behavior. Fixed: a name containing `:` now resolves as-is; only a bare
+name gets the `LIBS:` prefix. Added a regression test
+(`open_library_with_a_full_path_name_resolves_that_path_directly`).
+Full `cargo build/test (542)/clippy -D warnings/fmt --check` clean.
+
+With that fixed, `sc` now successfully opens `sc1.library`/
+`sc2.library`/etc. and progresses to actually calling into them --
+stopping cleanly at the first real call into `scspill.library` (a
+SAS/C-internal register-spiller module) with volamos's standard
+"unimplemented library call" diagnostic, not a crash. This surfaces
+(doesn't fix -- out of scope for this fix) a known, much larger
+limitation: volamos has no general mechanism to load and execute
+arbitrary real disk-library code; any non-built-in library gets a fake
+stub whose vectors trap on first real use. Getting `sc` to actually
+compile something would need that solved first -- a real feature, not
+a quick fix. Tracked as a standing scope question, not filed as an
+issue (no proposed fix yet).
