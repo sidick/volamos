@@ -1,0 +1,49 @@
+# Shared "install Rust toolchain + cache cargo" steps -- every ci.yml
+# job used to hand-roll its own copy of this (dtolnay/rust-toolchain +
+# actions/cache), differing only in targets/components/cache key.
+# Requires actions/checkout to have already run in the calling job (a
+# local composite action can't be resolved before the repo is checked
+# out).
+
+name: Rust setup
+description: Install a Rust toolchain and cache cargo registry/target dirs.
+
+inputs:
+  cache-key:
+    description: Prefix for the cargo cache key, to keep jobs' caches from colliding.
+    required: true
+  targets:
+    description: Comma-separated extra compile targets to install (e.g. aarch64-apple-darwin).
+    required: false
+    default: ''
+  components:
+    description: Comma-separated rustup components to install (e.g. "clippy, rustfmt").
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust (no extra targets)
+      if: inputs.targets == ''
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+
+    - name: Install Rust (with target)
+      if: inputs.targets != ''
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}
+
+    - name: Cache cargo
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ inputs.cache-key }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ inputs.cache-key }}-cargo-

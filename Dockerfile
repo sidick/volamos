@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Multi-arch static build (issue #19). `rust:alpine`'s default target is
 # already `*-unknown-linux-musl` for whatever platform buildx selects (via
 # `--platform linux/amd64,linux/arm64`) -- musl targets link libc
@@ -6,12 +8,23 @@
 # QEMU emulation when that platform isn't the host's own.
 FROM rust:alpine AS builder
 
+ARG TARGETPLATFORM
+
 RUN apk add --no-cache musl-dev
 
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release -p volamos && \
+# BuildKit cache mounts for the cargo registry and target dir -- these
+# aren't part of the final image layer (only /volamos, copied out below,
+# is), but persist across builds via CI's `cache-from`/`cache-to:
+# type=gha`, so a source change no longer forces refetching every crate
+# and recompiling from a clean target dir. IDs are keyed by
+# $TARGETPLATFORM so amd64/arm64 (built concurrently in the multi-arch
+# job) don't lock-contend on the same cache.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    --mount=type=cache,target=/src/target,id=cargo-target-${TARGETPLATFORM} \
+    cargo build --release -p volamos && \
     cp target/release/volamos /volamos
 
 # distroless static + nonroot: no libc at all (matching the fully static
