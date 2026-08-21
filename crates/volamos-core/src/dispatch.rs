@@ -838,10 +838,17 @@ impl<C: Cpu> LibraryTable<C> {
         handler: impl LibraryHandler<C> + 'static,
     ) -> u16 {
         let slot = self.next_slot;
+        // < CONTINUATION_SLOT, not just < FAKE_LIB_SLOT: CONTINUATION_SLOT
+        // (MAX_LIBRARY_SLOTS - 3) sits below FAKE_LIB_SLOT
+        // (MAX_LIBRARY_SLOTS - 2) and is bound once via
+        // register_fixed_slot, not through this counter -- an unbounded
+        // run of ordinary registrations must stop short of it too, or
+        // next_slot could eventually collide with and silently overwrite
+        // the trampoline stub's own slot entry.
         assert!(
-            slot < FAKE_LIB_SLOT,
+            slot < CONTINUATION_SLOT,
             "LibraryTable: too many registered handlers (max {})",
-            FAKE_LIB_SLOT - 1
+            CONTINUATION_SLOT - 1
         );
         self.next_slot += 1;
 

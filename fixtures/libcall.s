@@ -136,7 +136,8 @@ parsedone:
         move.l  #cntoktxt,d1
         jsr     LVO_PUTSTR(a6)
 
-        ; close both opens (forward-compatible no-op today, see header)
+        ; close both opens -- genuinely runs test.library's real Close
+        ; vector each time (phase L4); see header comment step 8
         move.l  a5,a6
         move.l  a3,a1
         jsr     LVO_CLOSELIBRARY(a6)
