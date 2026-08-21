@@ -3742,3 +3742,83 @@ stub whose vectors trap on first real use. Getting `sc` to actually
 compile something would need that solved first -- a real feature, not
 a quick fix. Tracked as a standing scope question, not filed as an
 issue (no proposed fix yet).
+
+## Real disk-based `.library` loading and execution (issue #23, phases L1-L4) — 2026-08-21
+
+Implemented the design from a dedicated planning pass (grounded in the
+NDK/RKRM plus a byte-level inspection of the real `scspill.library`
+from `~/amiga/sasc`): `OpenLibrary` can now genuinely `LoadSeg` a real
+disk-based `RTF_AUTOINIT` library, run its actual `initFunc`/`Open`
+vectors, and hand back a real jump table backed by relocated 68k code
+-- not just the old fake-stub-that-traps-on-first-call. Built via
+multi-agent orchestration (a planning pass, then delegated
+implementation with independent review both from the orchestrator
+itself and a separate review pass) rather than a single linear
+session; recording the outcome here in the project's own voice per
+usual.
+
+**New module** `crates/volamos-core/src/execlib.rs`: `struct Resident`
+(romtag) scanning over a loaded seglist (self-pointing `RTC_MATCHWORD`
+`$4AFC` check), `AUTOINIT` table reading (both real vector-table
+encodings -- absolute pointers and word displacements), a Rust
+reimplementation of real exec's `MakeLibrary` (real `JMP abs.l` jump
+table + `struct Library` header on the guest heap), and the
+open/close state machine.
+
+**The hardest piece, in `dispatch.rs`**: a library's `initFunc`/Open/
+Close vectors are real 68k code that may themselves make library
+calls, but `Runtime::run`'s dispatch loop isn't reentrant (the same
+limitation `execfmt.rs`'s `RawDoFmt` `PutChProc` stepping and
+`Supervisor` already had to work around by *not* supporting nested
+calls). Solved with a **trampoline/continuation primitive**
+(`ContinuationStack`): a handler pushes a fixed stub address plus a
+guest subroutine's entry point onto the guest stack and a host-side
+closure onto its own pending stack, then returns -- the *ordinary*
+post-dispatch `rts` in the main loop naturally "returns into" the
+guest subroutine, which runs natively (any library calls it makes
+dispatch through the normal loop, no new machinery needed), and its
+own final `rts` traps back to the stub, popping and running the
+pending closure. One stub address, one slot, arbitrary phases and
+nesting -- the mechanism this project's own `RunCommand`-overlay
+scope note (issue #8) flagged as needing "a genuine architectural
+extension" turned out to have a solution that doesn't require true
+CPU reentrancy after all.
+
+**Staged and verified**: L1 (mechanics, inert) -> L2 (trampoline,
+tested standalone with a nested-library-call case `RawDoFmt`/
+`Supervisor` explicitly can't support) -> L3 (wired into `OpenLibrary`
+-- committed `fixtures/testlib.s`/`fixtures/libcall.s`, a hand-written
+real AUTOINIT library and CLI client, dual-build convention;
+milestone: a real library's four standard vectors load and run
+end-to-end, and the *real* `scspill.library` now genuinely
+initializes) -> L4 (`CloseLibrary` via the real Close vector,
+delayed-expunge unload, zero-leak verified). L5 (real `sc hello.c`
+compilation) and L6 (broader real-library corpus) deliberately not
+attempted -- open-ended gap-chases for a follow-up session, not this
+one. `.device` support stays out of scope (shares the Resident/
+`MakeLibrary` mechanics but needs `DoIO`/`BeginIO` reworked around
+real `IORequest` semantics -- a distinct problem).
+
+**Review found two minor issues, both fixed**: `LibraryTable::
+register`'s slot-count assert checked against `FAKE_LIB_SLOT` rather
+than the lower `CONTINUATION_SLOT` (an implausibly large run of
+registrations could otherwise eventually collide with the trampoline
+stub's own slot -- not reachable at current handler counts, but a
+real bug in the bound); and a stale comment in `libcall.s` left over
+from before L4 landed. No correctness bugs found in the trampoline
+mechanism, ABI/struct-layout facts, or fixture register discipline
+(every register held across a `jsr` in the new fixtures is
+callee-saved, the exact class of bug `exectest.s` was bitten by
+earlier this project).
+
+**Verification**: `cargo build/test (683, up from 542)/clippy -D
+warnings/fmt --check` clean; a real Workbench 3.1.4 binary (`C:List`)
+confirmed to produce byte-identical output before and after this work
+(no regression to existing behavior).
+
+**Next steps for a human-driven session**: L5 (drive `sc hello.c`
+under the real SAS/C install, chasing whatever gap chain
+`scspill.library`'s own real code hits next), a three-way-harness
+corpus entry for `testlib`/`libcall` under real Kickstart via
+Copperline (the fixtures are real-hardware-ABI-clean specifically to
+enable this), and L6's broader real-library corpus pass.
