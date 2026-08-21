@@ -3667,3 +3667,17 @@ warnings/fmt --check` clean. `tools/compare_three_way.py`'s corpus now
 has 7 entries (`list-c`, `type-s-shell-startup`, `which-list`,
 `eval-2plus2`, `sort-shell-startup`, `search-shell-startup-alias`,
 `join-shell-startup`), all passing locally.
+
+## `tools/compare_three_way.py` corpus: `Copy`/`Rename` added — 2026-08-21
+
+Added `copy-shell-startup` (`Copy SYS:S/Shell-Startup SYS:copied.txt`)
+and `rename-shell-startup` (`Rename SYS:S/Shell-Startup
+SYS:renamed.txt`), both using the existing `output_file` mechanism to
+read the result back rather than comparing stdout. Manually verified
+byte-identical content across volamos, `vamos`, and real Kickstart 3.1
+via Copperline before wiring in -- clean 3-way passes, no known
+divergences for either. Also doubles as a real-world regression guard
+for the earlier Copy gap chain and the dospattern encoding rewrite
+(real `Rename` reuses `ParsePattern`'s output buffer as a plain
+`STRPTR`, per that entry). Corpus is now 9 entries; all passing
+locally.

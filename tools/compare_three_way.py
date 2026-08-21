@@ -187,6 +187,29 @@ CORPUS = [
         ALL_ENGINES,
         "joined.txt",
     ),
+    # Deterministic file copy, result written to a file. Clean 3-way
+    # pass, no known divergences -- also a real-world regression guard
+    # for the Copy gap chain (see docs/plan.md's Copy work).
+    (
+        "copy-shell-startup",
+        "Copy SYS:S/Shell-Startup SYS:copied.txt",
+        lambda s: s,
+        ALL_ENGINES,
+        "copied.txt",
+    ),
+    # Deterministic rename, result (the renamed file's content) written
+    # to a file under its new name. Clean 3-way pass -- also a
+    # real-world regression guard for the dospattern encoding rewrite
+    # (see docs/plan.md's "dospattern encoding rewrite" entry), since
+    # real Rename reuses ParsePattern's output buffer as a plain
+    # STRPTR.
+    (
+        "rename-shell-startup",
+        "Rename SYS:S/Shell-Startup SYS:renamed.txt",
+        lambda s: s,
+        ALL_ENGINES,
+        "renamed.txt",
+    ),
 ]
 
 
