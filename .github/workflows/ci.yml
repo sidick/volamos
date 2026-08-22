@@ -198,7 +198,7 @@ jobs:
           echo "path=${name}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-binary-${{ matrix.target }}
           path: ${{ steps.package.outputs.path }}
@@ -231,7 +231,7 @@ jobs:
           echo "path=${name}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-binary-aarch64-apple-darwin
           path: ${{ steps.package.outputs.path }}
@@ -269,7 +269,7 @@ jobs:
           echo "path=${name}.zip" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-binary-x86_64-pc-windows-gnu
           path: ${{ steps.package.outputs.path }}
@@ -287,7 +287,7 @@ jobs:
       contents: write
     steps:
       - name: Download all packaged binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-binary-*
           path: dist
