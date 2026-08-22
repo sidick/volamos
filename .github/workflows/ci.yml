@@ -89,7 +89,7 @@ jobs:
         run: cargo build --release -p volamos
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Single-platform (runner-native) build, loaded locally so it can
       # actually run -- a multi-platform manifest built below can't be
@@ -174,7 +174,7 @@ jobs:
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Extract static binary from the Dockerfile's builder stage
         uses: docker/build-push-action@v6
