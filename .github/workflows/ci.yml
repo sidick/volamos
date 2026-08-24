@@ -95,7 +95,7 @@ jobs:
       # actually run -- a multi-platform manifest built below can't be
       # `docker run` directly. This is what compare_docker.py exercises.
       - name: Build image for validation
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
@@ -128,7 +128,7 @@ jobs:
 
       - name: Build and push multi-arch image
         if: startsWith(github.ref, 'refs/tags/')
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -177,7 +177,7 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Extract static binary from the Dockerfile's builder stage
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: builder
