@@ -10,6 +10,7 @@
 //! - `HUNK_BSS`    (0x3EB)
 //! - `HUNK_RELOC32`(0x3EC)
 //! - `HUNK_DREL32` (0x3F7)
+//! - `HUNK_RELOC32SHORT` (0x3FC)
 //! - `HUNK_END`    (0x3F2)
 //!
 //! `HUNK_DREL32` (found running the real `PhxAss` assembler -- itself a
@@ -59,6 +60,7 @@ const HUNK_SYMBOL: u32 = 0x3F0;
 const HUNK_DEBUG: u32 = 0x3F1;
 const HUNK_END: u32 = 0x3F2;
 const HUNK_DREL32: u32 = 0x3F7;
+const HUNK_RELOC32SHORT: u32 = 0x3FC;
 
 /// Mask for the memory-flag bits (`MEMF_CHIP`/`MEMF_FAST`/extended-flag
 /// marker) that can be packed into the top bits of a hunk-size longword in
@@ -403,7 +405,19 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
                         });
                     }
                 },
-                HUNK_DREL32 => {
+                // HUNK_RELOC32SHORT and HUNK_DREL32 are two different
+                // linker-assigned IDs for the identical on-disk format and
+                // fixup arithmetic (confirmed against
+                // <https://amiga-dev.wikidot.com/file-format:hunk>, which
+                // documents HUNK_DREL32 as "handled exactly the same as
+                // HUNK_RELOC32SHORT") -- same uint16 count/hunk-number/
+                // offsets list, same absolute mem[loc] += target_hunk_addr
+                // arithmetic as HUNK_RELOC32, same longword realignment
+                // after. Different real linkers emit one ID or the other
+                // for this identical optimization (found while auditing
+                // this file's hunk-type coverage against the spec, not
+                // from a specific corpus binary yet).
+                HUNK_DREL32 | HUNK_RELOC32SHORT => {
                     loop {
                         let count = r.read_u16()?;
                         if count == 0 {
@@ -873,6 +887,54 @@ mod tests {
         let result = load(&file, &mut mem, 0x100).unwrap();
 
         // Hunk 0 at 0x100 (8 bytes), hunk 1 at 0x108.
+        assert_eq!(result.hunk_addrs, vec![0x100, 0x108]);
+        assert_eq!(mem.read_u32(0x100), 0x108, "offset 0 relocated");
+        assert_eq!(mem.read_u32(0x104), 0x108, "offset 4 relocated");
+    }
+
+    /// `HUNK_RELOC32SHORT` (0x3FC) is a distinct block-type ID from
+    /// `HUNK_DREL32` (0x3F7), but the spec documents them as byte-for-byte
+    /// the identical on-disk format and fixup arithmetic -- different real
+    /// linkers pick one ID or the other for the same optimization. Same
+    /// shape as `inter_hunk_drel32_applies_like_reloc32_despite_the_name`,
+    /// just with `HUNK_RELOC32SHORT` in place of `HUNK_DREL32`.
+    #[test]
+    fn inter_hunk_reloc32short_applies_same_as_drel32() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 2); // hunk 0 size: 2 longwords
+        push_u32(&mut buf, 1); // hunk 1 size: 1 longword
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0); // addend placeholder, offset 0
+        push_u32(&mut buf, 0); // addend placeholder, offset 4
+        push_u32(&mut buf, HUNK_RELOC32SHORT);
+        buf.extend_from_slice(&2u16.to_be_bytes()); // count = 2 offsets
+        buf.extend_from_slice(&1u16.to_be_bytes()); // target hunk 1
+        buf.extend_from_slice(&0u16.to_be_bytes()); // offset 0
+        buf.extend_from_slice(&4u16.to_be_bytes()); // offset 4
+        buf.extend_from_slice(&0u16.to_be_bytes()); // terminate (count=0)
+        // Odd number of u16 reads again -- same mid-longword realignment
+        // as the HUNK_DREL32 test.
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        push_u32(&mut buf, HUNK_END);
+
+        push_u32(&mut buf, HUNK_DATA);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).unwrap();
+        assert_eq!(file.hunks[0].relocs.len(), 2);
+
+        let mut mem = FlatMemory::new(0x1000);
+        let result = load(&file, &mut mem, 0x100).unwrap();
+
         assert_eq!(result.hunk_addrs, vec![0x100, 0x108]);
         assert_eq!(mem.read_u32(0x100), 0x108, "offset 0 relocated");
         assert_eq!(mem.read_u32(0x104), 0x108, "offset 4 relocated");
