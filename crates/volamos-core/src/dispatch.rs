@@ -141,6 +141,28 @@ const FAKE_LIB_JUMP_TABLE_SIZE: u32 = 0x1000;
 /// the real `PhxAss` assembler, which unconditionally `OpenLibrary`s
 /// `mathtrans.library` and, on real hardware, never needs to handle it
 /// being absent.
+///
+/// `graphics.library` joined this list after the real Aminet `lha`
+/// binary (`c/lha`, SAS/C-linked) turned out to `OpenLibrary` it
+/// unconditionally at startup, right alongside `intuition.library` --
+/// even for a plain CLI archive listing, before looking at its own
+/// argv. Disassembly showed why: `lha`'s startup walks a fixed
+/// `{name, version}` table opening `dos.library`/`utility.library`/
+/// `intuition.library`/`graphics.library` in that order so it can show
+/// an `EasyRequest` on failure, and Intuition's own requesters need
+/// `graphics.library` to allocate a RastPort even for a text-only
+/// dialog. No LVOs are registered for it (nothing in this runtime's
+/// corpus has called an actual `graphics.library` function yet); this
+/// only gets `OpenLibrary` itself past the "library not found" gap --
+/// same fake-stub jump table every other unregistered
+/// [`open_library_common`] fallback gets, so a real call still traps
+/// loudly with a named diagnostic instead of silently misbehaving.
+///
+/// `gadtools.library` joined the same way, one step later in the same
+/// `lha` startup table (the fifth and last entry, right after
+/// `graphics.library`) -- another real, standard 2.0+ Workbench library
+/// (ships in `LIBS:` on every real install), also with no LVOs
+/// registered here yet.
 const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "mathtrans.library",
     "mathieeesingbas.library",
@@ -150,6 +172,8 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "mathffp.library",
     "locale.library",
     "intuition.library",
+    "graphics.library",
+    "gadtools.library",
 ];
 
 /// Guest address of the exit sentinel: the last word inside the reserved
