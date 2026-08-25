@@ -280,6 +280,14 @@ impl<'a> Reader<'a> {
         Ok(u16::from_be_bytes([slice[0], slice[1]]))
     }
 
+    /// Steps back over the longword just read, so it can be re-read by the
+    /// next `read_u32`. Used to hand an implicit hunk terminator back to the
+    /// outer loop (see the `HUNK_END` handling in [`parse`]).
+    fn unread_u32(&mut self) {
+        debug_assert!(self.pos >= 4);
+        self.pos -= 4;
+    }
+
     /// Realigns to the next 4-byte boundary if `read_u16` calls left the
     /// position mid-longword (the rest of the hunk format is entirely
     /// longword-based, so a `HUNK_DREL32` list -- an odd number of
@@ -425,6 +433,15 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
                     r.skip_longwords(n_longwords as usize)?;
                 }
                 HUNK_END => break,
+                // A new hunk body implicitly ends the current hunk: HUNK_END
+                // is not required between hunks, and real linkers omit it
+                // (Commodore's own `Installer` does). LoadSeg accepts this,
+                // so put the block type back and let the outer loop read it
+                // as the next hunk's body.
+                HUNK_CODE | HUNK_DATA | HUNK_BSS => {
+                    r.unread_u32();
+                    break;
+                }
                 other => {
                     return Err(LoadError::UnknownBlockType {
                         hunk_index,
@@ -587,6 +604,131 @@ mod tests {
 
         push_u32(&mut buf, HUNK_END);
         buf
+    }
+
+    /// Builds a two-code-hunk file, optionally omitting the `HUNK_END` that
+    /// would normally separate hunk 0 from hunk 1. Commodore's `Installer`
+    /// is laid out this way.
+    fn build_two_hunk_code_file(code0: &[u8], code1: &[u8], end_after_first: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0); // no resident library names
+        push_u32(&mut buf, 2); // table_size: 2 hunks
+        push_u32(&mut buf, 0); // first_hunk
+        push_u32(&mut buf, 1); // last_hunk
+        push_u32(&mut buf, (code0.len() / 4) as u32);
+        push_u32(&mut buf, (code1.len() / 4) as u32);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, (code0.len() / 4) as u32);
+        buf.extend_from_slice(code0);
+        if end_after_first {
+            push_u32(&mut buf, HUNK_END);
+        }
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, (code1.len() / 4) as u32);
+        buf.extend_from_slice(code1);
+        push_u32(&mut buf, HUNK_END);
+        buf
+    }
+
+    /// `HUNK_END` between hunks is optional: a new hunk body ends the
+    /// previous hunk. Both spellings must parse identically.
+    #[test]
+    fn hunk_end_between_hunks_is_optional() {
+        let code0 = [0x70, 0x00, 0x4E, 0x75]; // moveq #0,d0 ; rts
+        let code1 = [0x70, 0x01, 0x4E, 0x75]; // moveq #1,d0 ; rts
+
+        let with_end = parse(&build_two_hunk_code_file(&code0, &code1, true)).expect("with END");
+        let without_end =
+            parse(&build_two_hunk_code_file(&code0, &code1, false)).expect("without END");
+
+        for file in [&with_end, &without_end] {
+            assert_eq!(file.hunks.len(), 2);
+            assert_eq!(file.hunks[0].kind, HunkKind::Code);
+            assert_eq!(file.hunks[0].data, code0);
+            assert_eq!(file.hunks[1].kind, HunkKind::Code);
+            assert_eq!(file.hunks[1].data, code1);
+        }
+        assert_eq!(with_end.hunks, without_end.hunks);
+    }
+
+    /// The omitted-`HUNK_END` case is realistic only if it still works with
+    /// a `HUNK_RELOC32` block between the hunk body and the implicit end --
+    /// real linker output almost always has relocs there, unlike the bare
+    /// two-hunk fixture above.
+    #[test]
+    fn hunk_end_between_hunks_is_optional_after_a_reloc_block() {
+        let code0 = [0x70, 0x00, 0x4E, 0x75]; // moveq #0,d0 ; rts
+        let code1 = [0x70, 0x01, 0x4E, 0x75]; // moveq #1,d0 ; rts
+
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, (code0.len() / 4) as u32);
+        push_u32(&mut buf, (code1.len() / 4) as u32);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, (code0.len() / 4) as u32);
+        buf.extend_from_slice(&code0);
+        // A RELOC32 block pointing at hunk 1, then straight into hunk 1's
+        // body with no HUNK_END in between.
+        push_u32(&mut buf, HUNK_RELOC32);
+        push_u32(&mut buf, 1); // one reloc
+        push_u32(&mut buf, 1); // target hunk 1
+        push_u32(&mut buf, 0); // offset 0
+        push_u32(&mut buf, 0); // terminate RELOC32 groups
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, (code1.len() / 4) as u32);
+        buf.extend_from_slice(&code1);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("reloc block then implicit end should parse");
+        assert_eq!(file.hunks.len(), 2);
+        assert_eq!(file.hunks[0].kind, HunkKind::Code);
+        assert_eq!(file.hunks[0].data, code0);
+        assert_eq!(file.hunks[0].relocs.len(), 1);
+        assert_eq!(file.hunks[0].relocs[0].target_hunk, 1);
+        assert_eq!(file.hunks[1].kind, HunkKind::Code);
+        assert_eq!(file.hunks[1].data, code1);
+    }
+
+    /// The implicit-end match arm covers all three hunk-body types, not
+    /// just `HUNK_CODE` -- a `HUNK_BSS` (no body bytes, just a repeated
+    /// size field) must also be able to follow a `HUNK_END`-less hunk.
+    #[test]
+    fn hunk_end_between_hunks_is_optional_before_a_bss_hunk() {
+        let code0 = [0x70, 0x00, 0x4E, 0x75]; // moveq #0,d0 ; rts
+        let bss_longwords: u32 = 4; // 16 bytes of BSS
+
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, (code0.len() / 4) as u32);
+        push_u32(&mut buf, bss_longwords);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, (code0.len() / 4) as u32);
+        buf.extend_from_slice(&code0);
+        // No HUNK_END: straight into hunk 1's HUNK_BSS body.
+
+        push_u32(&mut buf, HUNK_BSS);
+        push_u32(&mut buf, bss_longwords);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("BSS hunk after implicit end should parse");
+        assert_eq!(file.hunks.len(), 2);
+        assert_eq!(file.hunks[0].kind, HunkKind::Code);
+        assert_eq!(file.hunks[1].kind, HunkKind::Bss);
+        assert_eq!(file.hunks[1].reserved_size, bss_longwords as usize * 4);
     }
 
     #[test]
