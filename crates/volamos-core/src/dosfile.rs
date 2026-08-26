@@ -377,6 +377,12 @@ pub struct DosState {
     ///
     /// [`LoadSeg`]: crate::dosseg
     pub(crate) seglist_host_paths: HashMap<u32, std::path::PathBuf>,
+    /// Live overlay-root `LoadSeg` state, keyed by the `BPTR` of the
+    /// root's `oh_Segments` array (the same value patched into hunk 0's
+    /// `OverlayHeader`, and what `LoadSeg(NULL, table, fh)`'s `D2`
+    /// carries back on every subsequent overlay-node load) -- see
+    /// `crate::dosseg`'s module docs.
+    pub(crate) overlay_roots: HashMap<u32, crate::dosseg::OverlayRootState>,
     /// Host-side callback installed by a CLI (never by library code
     /// itself) to actually run a resolved `System()`/`Execute()` command
     /// as a nested guest invocation -- see `crate::dosseg`'s module docs
@@ -473,6 +479,7 @@ impl DosState {
             next_lock_id: 0,
             seglists: HashMap::new(),
             seglist_host_paths: HashMap::new(),
+            overlay_roots: HashMap::new(),
             system_runner: None,
             cmdline: None,
             cmdline_pos: 0,
@@ -658,6 +665,40 @@ impl DosState {
         let addr = self.alloc_file_handle(heap, mem, false)?;
         self.handles
             .insert(addr, HostHandle::HostFile(file, resolved.amiga_path));
+        Ok(bptr_from_addr(addr))
+    }
+
+    /// Opens `host_path` directly (no `Vfs` resolution at all) and
+    /// allocates a guest `FileHandle` for it, exactly like
+    /// [`Self::open`]'s `MODE_OLDFILE` case (read+write, falling back to
+    /// read-only). For the one caller that needs a real, `Seek`/`Read`-
+    /// able guest handle to a file that was never an Amiga path to begin
+    /// with: `crate::dispatch::Runtime`'s top-level-program launch (the
+    /// `<program>` argument on the CLI is a host path, resolved directly
+    /// against the host filesystem, never through a `Vfs` -- see
+    /// `crates/volamos/src/main.rs`), loading an overlay executable
+    /// whose manager needs `oh_FileHandle` to be exactly this kind of
+    /// handle (see `crate::dosseg`'s module docs). The handle's
+    /// `NameFromFH`-visible path is `host_path` itself, stringified --
+    /// not a real Amiga path (there isn't one), but nothing in this
+    /// runtime's overlay-loading path ever reads it back.
+    pub fn open_host_file_direct(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        host_path: &std::path::Path,
+    ) -> Result<u32, i32> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(host_path)
+            .or_else(|_| OpenOptions::new().read(true).open(host_path))
+            .map_err(|e| map_io_error(&e))?;
+        let addr = self.alloc_file_handle(heap, mem, false)?;
+        self.handles.insert(
+            addr,
+            HostHandle::HostFile(file, host_path.to_string_lossy().into_owned()),
+        );
         Ok(bptr_from_addr(addr))
     }
 

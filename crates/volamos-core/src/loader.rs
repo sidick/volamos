@@ -29,9 +29,40 @@
 //!
 //! `HUNK_SYMBOL` (0x3F0) and `HUNK_DEBUG` (0x3F1) blocks are recognized and
 //! skipped (their contents are discarded) so binaries built with `-nosym`
-//! *or* with symbol/debug info left in still load. Overlays (`HUNK_LIB`,
-//! `HUNK_OVERLAY`, or a header whose first/last hunk range is a strict
-//! subset of the hunk table) are not supported.
+//! *or* with symbol/debug info left in still load. `HUNK_LIB` (link
+//! library archives) is still not supported -- that's a different format
+//! entirely (an indexed collection of object modules for a linker to pull
+//! from, not something `LoadSeg` ever sees).
+//!
+//! # Overlay files (`HUNK_OVERLAY` / `HUNK_BREAK`)
+//!
+//! A hunk executable whose `HUNK_HEADER` declares a hunk range
+//! (`first_hunk..=last_hunk`) that's a strict prefix of the full hunk
+//! table (`last_hunk + 1 < table_size`) is an overlay file's *root node*:
+//! only its own hunks are loaded up front, terminated by a `HUNK_OVERLAY`
+//! (0x3F5) block instead of running off the end of the table. That block
+//! carries the overlay manager's own bookkeeping data (see [`OverlayInfo`])
+//! -- ground truth for its exact layout confirmed by disassembling a real
+//! `SLink`-linked overlay executable (`AExplorer`, from Aminet) against
+//! the AmigaDOS Manual's "Overlays" chapter; every field offset the
+//! manager's own compiled code reads matches the documented layout
+//! exactly. [`parse`] returns the root node's hunks plus
+//! [`HunkFile::overlay`] when this shape is detected, instead of failing.
+//!
+//! The remaining hunks live in one or more *overlay nodes* later in the
+//! file, each its own `HUNK_HEADER`...hunks...`HUNK_BREAK` (0x3F6) block,
+//! loaded on demand by the overlay manager (guest code shipped inside the
+//! root node) via `LoadSeg(NULL, table, fh)` -- see [`parse_overlay_node`],
+//! which parses one such node given the file offset the overlay manager
+//! seeks to before calling it (that offset itself comes from the
+//! `HUNK_OVERLAY` table's `ot_FilePosition` field, at runtime, not
+//! something this parser needs to track). A node's hunks continue the
+//! root's global hunk numbering (`first_hunk` can be nonzero) and their
+//! relocations may target already-loaded ancestor hunks outside the
+//! node's own range, so [`OverlayNode`] reports [`OverlayNode::first_hunk`]
+//! and leaves cross-node relocation-target validation to the caller
+//! (this parser alone can't know whether a target hunk index is valid
+//! without the full tree's hunk count on hand).
 //!
 //! All values in a hunk file are big-endian 32-bit words ("longwords").
 //!
@@ -61,6 +92,8 @@ const HUNK_DEBUG: u32 = 0x3F1;
 const HUNK_END: u32 = 0x3F2;
 const HUNK_DREL32: u32 = 0x3F7;
 const HUNK_RELOC32SHORT: u32 = 0x3FC;
+const HUNK_OVERLAY: u32 = 0x3F5;
+const HUNK_BREAK: u32 = 0x3F6;
 
 /// Mask for the memory-flag bits (`MEMF_CHIP`/`MEMF_FAST`/extended-flag
 /// marker) that can be packed into the top bits of a hunk-size longword in
@@ -80,11 +113,13 @@ pub enum LoadError {
     UnexpectedEof,
     /// The first longword wasn't `HUNK_HEADER` (0x3F3).
     BadMagic { found: u32 },
-    /// The header's `first_hunk`/`last_hunk` range doesn't cover the
-    /// whole hunk table, i.e. this is an overlay file, which isn't
-    /// supported.
-    OverlaysNotSupported,
-    /// The header's `first_hunk` is greater than `last_hunk`.
+    /// The root node's `first_hunk`/`last_hunk` range doesn't cover the
+    /// whole hunk table (i.e. this is an overlay file) but the root node's
+    /// hunks aren't followed by the required `HUNK_OVERLAY` marker.
+    ExpectedOverlayMarker { hunk_index: usize, found: u32 },
+    /// The header's `first_hunk` is greater than `last_hunk`, or (for a
+    /// root node specifically) `first_hunk` isn't `0`, or a declared hunk
+    /// range extends past the header's own `table_size`.
     BadHunkRange { first: usize, last: usize },
     /// While reading hunk bodies, encountered a hunk-type longword that
     /// isn't a valid hunk body start (`HUNK_CODE`/`HUNK_DATA`/`HUNK_BSS`)
@@ -118,7 +153,11 @@ impl std::fmt::Display for LoadError {
                     "not a hunk executable: expected HUNK_HEADER (0x3F3), found {found:#x}"
                 )
             }
-            LoadError::OverlaysNotSupported => write!(f, "overlay hunk files are not supported"),
+            LoadError::ExpectedOverlayMarker { hunk_index, found } => write!(
+                f,
+                "hunk {hunk_index}: expected HUNK_OVERLAY (0x3F5) to follow the root node's \
+                 partial hunk range, found {found:#x}"
+            ),
             LoadError::BadHunkRange { first, last } => {
                 write!(
                     f,
@@ -195,10 +234,56 @@ pub struct Hunk {
     pub relocs: Vec<Reloc32>,
 }
 
+/// The `HUNK_OVERLAY` block's payload, verbatim -- exactly the longwords
+/// `oh_OVTab` points to at runtime (starting at the tree-depth element,
+/// per the table in the module docs), not reinterpreted into a richer
+/// structure here since its internal layout (ordinate array, then
+/// 7-longword `SymTab` entries) is specific to the hierarchical overlay
+/// manager and this parser doesn't need to understand it to load nodes --
+/// only the overlay *manager* (guest code) reads it, driving `LoadSeg`
+/// calls this runtime services like any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayTable {
+    /// The `l+1` longwords following the `HUNK_OVERLAY` block's own
+    /// length field `l` (see the module docs -- this off-by-one is the
+    /// real on-disk convention, confirmed against a real overlay file).
+    pub raw: Vec<u32>,
+}
+
+/// A root node's overlay metadata: the [`OverlayTable`] itself, plus the
+/// full hunk table size from the root `HUNK_HEADER` (`t_size`) -- needed
+/// by a caller building the runtime `oh_Segments` array, whose length
+/// this defines (see the module docs and the AmigaDOS Manual's
+/// `OverlayHeader` description).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayInfo {
+    pub table: OverlayTable,
+    /// Total hunk count across the whole overlay tree (root + every
+    /// node), i.e. the root `HUNK_HEADER`'s `table_size`.
+    pub total_hunks: usize,
+}
+
 /// A fully parsed hunk executable: an ordered list of hunks (hunk 0 is
-/// conventionally the entry hunk).
+/// conventionally the entry hunk). `overlay` is `Some` when this is an
+/// overlay file's root node -- see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HunkFile {
+    pub hunks: Vec<Hunk>,
+    pub overlay: Option<OverlayInfo>,
+}
+
+/// One overlay node's hunks, as parsed by [`parse_overlay_node`]. Unlike
+/// [`HunkFile::hunks`] (always 0-indexed), `hunks[i]` here is the node's
+/// `i`th hunk in file order but the *global* hunk index (continuing the
+/// root's numbering) is `first_hunk + i` -- callers loading this into a
+/// shared runtime segment table need that offset. Relocation targets
+/// inside these hunks (`Hunk::relocs`' `target_hunk`) are also global
+/// indices, and may point outside `hunks` entirely (at an
+/// already-resident ancestor node's hunk) -- this parser doesn't validate
+/// them, since it has no way to know the full tree's hunk count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayNode {
+    pub first_hunk: usize,
     pub hunks: Vec<Hunk>,
 }
 
@@ -302,13 +387,24 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parses a hunk executable's bytes into a [`HunkFile`].
-///
-/// This only interprets the file structure; it does not decide where
-/// anything is loaded in guest memory (see [`load`] for that).
-pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
-    let mut r = Reader::new(bytes);
+/// A parsed `HUNK_HEADER`'s own fields, returned alongside the hunks
+/// [`parse_node`] reads for its declared range.
+struct HeaderInfo {
+    table_size: usize,
+    first_hunk: usize,
+    last_hunk: usize,
+}
 
+/// Reads one node's `HUNK_HEADER` and the hunk bodies for its declared
+/// `first_hunk..=last_hunk` range (the *global* indices; the returned
+/// `Vec<Hunk>` is 0-indexed by *position within this node*, i.e.
+/// `hunks[i]` is global hunk `first_hunk + i`). Shared by [`parse`] (the
+/// root node, which requires `first_hunk == 0`) and
+/// [`parse_overlay_node`] (any later node, `first_hunk` typically
+/// nonzero). Does not validate `Reloc32::target_hunk` against any global
+/// hunk count -- callers do that themselves, since only they know whether
+/// cross-node targets are in range (see the module docs).
+fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> {
     let magic = r.read_u32()?;
     if magic != HUNK_HEADER {
         return Err(LoadError::BadMagic { found: magic });
@@ -334,27 +430,32 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
     if table_size == 0 {
         return Err(LoadError::NoHunks);
     }
-    if first_hunk > last_hunk {
+    if first_hunk > last_hunk || last_hunk >= table_size {
         return Err(LoadError::BadHunkRange {
             first: first_hunk,
             last: last_hunk,
         });
     }
-    // We don't support overlays: the loadable range must be the whole
-    // table (first_hunk == 0, last_hunk == table_size - 1).
-    if first_hunk != 0 || last_hunk + 1 != table_size {
-        return Err(LoadError::OverlaysNotSupported);
-    }
 
-    let mut declared_sizes = Vec::with_capacity(table_size);
-    for _ in 0..table_size {
+    // Unlike the (now-historical) assumption that a header always
+    // declares `table_size` size entries, a header only ever declares
+    // sizes for the hunks *it* is about to load -- `last_hunk - first_hunk
+    // + 1` entries, which just happens to equal `table_size` in the
+    // common (non-overlay, first_hunk == 0) case. Confirmed against a
+    // real overlay node's on-disk header, whose size table has exactly
+    // one entry for its one hunk despite `table_size` naming the whole
+    // tree's hunk count.
+    let n_sizes = last_hunk - first_hunk + 1;
+    let mut declared_sizes = Vec::with_capacity(n_sizes);
+    for _ in 0..n_sizes {
         let raw = r.read_u32()?;
         let longwords = raw & !HUNK_SIZE_FLAGS_MASK;
         declared_sizes.push(longwords as usize * 4);
     }
 
-    let mut hunks = Vec::with_capacity(table_size);
-    for (hunk_index, &reserved_size) in declared_sizes.iter().enumerate() {
+    let mut hunks = Vec::with_capacity(n_sizes);
+    for (i, &reserved_size) in declared_sizes.iter().enumerate() {
+        let hunk_index = first_hunk + i;
         let body_type = r.read_u32()?;
         let (kind, data) = match body_type {
             HUNK_CODE | HUNK_DATA => {
@@ -451,8 +552,12 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
                 // is not required between hunks, and real linkers omit it
                 // (Commodore's own `Installer` does). LoadSeg accepts this,
                 // so put the block type back and let the outer loop read it
-                // as the next hunk's body.
-                HUNK_CODE | HUNK_DATA | HUNK_BSS => {
+                // as the next hunk's body. HUNK_OVERLAY/HUNK_BREAK are the
+                // same story one level up: they terminate the *node* (not
+                // just this hunk), so they're put back too, for the node
+                // reader (parse/parse_overlay_node) to interpret once this
+                // hunk-range loop is done.
+                HUNK_CODE | HUNK_DATA | HUNK_BSS | HUNK_OVERLAY | HUNK_BREAK => {
                     r.unread_u32();
                     break;
                 }
@@ -465,8 +570,10 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
             }
         }
 
-        // Validate relocation offsets now that we know this hunk's size;
-        // target-hunk validity is checked below once all hunks exist.
+        // Validate relocation offsets now that we know this hunk's size
+        // (an intra-hunk check, always valid regardless of node/root
+        // context). Cross-hunk target validity is the caller's job (see
+        // this function's doc).
         for reloc in &relocs {
             if (reloc.offset as usize)
                 .checked_add(4)
@@ -487,6 +594,43 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
         });
     }
 
+    Ok((
+        HeaderInfo {
+            table_size,
+            first_hunk,
+            last_hunk,
+        },
+        hunks,
+    ))
+}
+
+/// Parses a hunk executable's bytes into a [`HunkFile`]: the root node's
+/// hunks (index 0 is the entry hunk), plus [`HunkFile::overlay`] if the
+/// root's header only declares a prefix of the full hunk table -- see the
+/// module docs' "Overlay files" section.
+///
+/// This only interprets the file structure; it does not decide where
+/// anything is loaded in guest memory (see [`load`] for that).
+pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
+    let mut r = Reader::new(bytes);
+    let (header, hunks) = parse_node(&mut r)?;
+
+    if header.first_hunk != 0 {
+        // A root node always starts numbering at 0; a nonzero first_hunk
+        // here would mean this "file" is actually a bare overlay node
+        // with no root, which isn't a loadable top-level executable.
+        return Err(LoadError::BadHunkRange {
+            first: header.first_hunk,
+            last: header.last_hunk,
+        });
+    }
+
+    // Root-only relocation-target validation: a root hunk's relocations
+    // can only ever target other root hunks (forward references into
+    // not-yet-loaded overlay nodes go through the overlay manager's
+    // symbol table instead, never a plain RELOC32), so `hunks.len()` is
+    // the right bound here specifically -- unlike parse_overlay_node,
+    // which can't assume that.
     for (hunk_index, hunk) in hunks.iter().enumerate() {
         for reloc in &hunk.relocs {
             if reloc.target_hunk >= hunks.len() {
@@ -498,7 +642,49 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
         }
     }
 
-    Ok(HunkFile { hunks })
+    let overlay = if header.last_hunk + 1 == header.table_size {
+        None
+    } else {
+        let marker = r.read_u32()?;
+        if marker != HUNK_OVERLAY {
+            return Err(LoadError::ExpectedOverlayMarker {
+                hunk_index: header.last_hunk + 1,
+                found: marker,
+            });
+        }
+        // Table size is l+1 longwords, not l -- a real, if unorthogonal,
+        // on-disk convention (see the module docs), confirmed against a
+        // real overlay executable's raw bytes.
+        let l = r.read_u32()? as usize;
+        let mut raw = Vec::with_capacity(l + 1);
+        for _ in 0..=l {
+            raw.push(r.read_u32()?);
+        }
+        Some(OverlayInfo {
+            table: OverlayTable { raw },
+            total_hunks: header.table_size,
+        })
+    };
+
+    Ok(HunkFile { hunks, overlay })
+}
+
+/// Parses one overlay node's hunks (its own `HUNK_HEADER` through
+/// `HUNK_BREAK`/EOF) starting at `file_offset` bytes into `bytes` -- the
+/// file position an overlay manager `Seek()`s to before calling
+/// `LoadSeg(NULL, table, fh)` (see the module docs). A trailing
+/// `HUNK_BREAK` is consumed if present but not required (the last node in
+/// a file may simply end at EOF, matching the AmigaDOS Manual's own
+/// leniency here -- "It is not required at the end of the root node",
+/// and real linkers extend the same leniency to the very last node).
+pub fn parse_overlay_node(bytes: &[u8], file_offset: usize) -> Result<OverlayNode, LoadError> {
+    let slice = bytes.get(file_offset..).ok_or(LoadError::UnexpectedEof)?;
+    let mut r = Reader::new(slice);
+    let (header, hunks) = parse_node(&mut r)?;
+    Ok(OverlayNode {
+        first_hunk: header.first_hunk,
+        hunks,
+    })
 }
 
 /// Lays out `file`'s hunks contiguously in `mem` starting at `base`
@@ -1048,19 +1234,90 @@ mod tests {
         assert_eq!(err, LoadError::UnexpectedEof);
     }
 
-    #[test]
-    fn rejects_overlay_hunk_ranges() {
+    /// Builds an overlay-shaped root node (`table_size` > its own hunk
+    /// range) with one real `HUNK_CODE` hunk, followed by whatever bytes
+    /// `after` supplies verbatim (the caller controls whether that's a
+    /// real `HUNK_OVERLAY` block or something else).
+    fn build_overlay_shaped_root(table_size: u32, after: &[u8]) -> Vec<u8> {
+        let code = [0x70u8, 0x00, 0x4E, 0x75]; // moveq #0,d0 ; rts
         let mut buf = Vec::new();
         push_u32(&mut buf, HUNK_HEADER);
         push_u32(&mut buf, 0);
-        push_u32(&mut buf, 3); // table_size 3
+        push_u32(&mut buf, table_size); // table_size (whole tree)
         push_u32(&mut buf, 0); // first_hunk
-        push_u32(&mut buf, 1); // last_hunk (only covers 0..=1, not 0..=2)
-        push_u32(&mut buf, 0);
-        push_u32(&mut buf, 0);
-        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0); // last_hunk (root is just hunk 0)
+        push_u32(&mut buf, 1); // hunk 0 size: 1 longword
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        buf.extend_from_slice(&code);
+        push_u32(&mut buf, HUNK_END);
+
+        buf.extend_from_slice(after);
+        buf
+    }
+
+    #[test]
+    fn rejects_overlay_shaped_root_without_a_real_overlay_marker() {
+        let mut after = Vec::new();
+        push_u32(&mut after, 0xDEAD); // not HUNK_OVERLAY
+        let buf = build_overlay_shaped_root(3, &after);
         let err = parse(&buf).unwrap_err();
-        assert_eq!(err, LoadError::OverlaysNotSupported);
+        assert_eq!(
+            err,
+            LoadError::ExpectedOverlayMarker {
+                hunk_index: 1,
+                found: 0xDEAD
+            }
+        );
+    }
+
+    #[test]
+    fn parses_overlay_root_and_captures_the_overlay_table() {
+        let mut after = Vec::new();
+        push_u32(&mut after, HUNK_OVERLAY);
+        push_u32(&mut after, 2); // l = 2 -> table is l+1 = 3 longwords
+        push_u32(&mut after, 3); // od (tree depth)
+        push_u32(&mut after, 0); // ordinate[0]
+        push_u32(&mut after, 0); // ordinate[1]
+        let buf = build_overlay_shaped_root(3, &after);
+
+        let file = parse(&buf).expect("overlay root should parse");
+        assert_eq!(file.hunks.len(), 1, "only the root's own hunk range");
+        let overlay = file.overlay.expect("overlay info should be captured");
+        assert_eq!(overlay.total_hunks, 3);
+        assert_eq!(overlay.table.raw, vec![3, 0, 0]);
+    }
+
+    #[test]
+    fn parse_overlay_node_reads_hunks_at_the_given_file_offset_with_global_numbering() {
+        // A node whose HUNK_HEADER declares first_hunk = last_hunk = 2
+        // (continuing a root's global numbering), preceded by some
+        // unrelated filler bytes at the start of the buffer to exercise
+        // the file_offset parameter.
+        let filler = [0xAAu8; 16];
+        let code = [0x70u8, 0x01, 0x4E, 0x75]; // moveq #1,d0 ; rts
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&filler);
+        let node_offset = buf.len();
+
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 3); // table_size (whole tree)
+        push_u32(&mut buf, 2); // first_hunk
+        push_u32(&mut buf, 2); // last_hunk
+        push_u32(&mut buf, 1); // hunk 2's size: 1 longword
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        buf.extend_from_slice(&code);
+        push_u32(&mut buf, HUNK_BREAK);
+
+        let node = parse_overlay_node(&buf, node_offset).expect("node should parse");
+        assert_eq!(node.first_hunk, 2);
+        assert_eq!(node.hunks.len(), 1);
+        assert_eq!(node.hunks[0].data, code);
     }
 
     #[test]

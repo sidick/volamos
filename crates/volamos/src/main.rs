@@ -631,6 +631,29 @@ fn run_nested_program(
     runtime.run(&mut out, None).unwrap_or(-1)
 }
 
+/// Builds a [`Runtime`] and installs its `Vfs`/`PROGDIR:` from `opts`
+/// (shared by both of [`run`]'s loading strategies, see that function's
+/// doc). `mem`/`config` are already fully built by the caller -- this
+/// only handles the `Vfs`/program-dir wiring common to both.
+fn build_runtime_with_vfs(
+    opts: &Options,
+    cpu: M68kCpu,
+    mem: FlatMemory,
+    config: StartConfig,
+    vfs_config: Option<VfsConfig>,
+) -> Result<Runtime<M68kCpu>, String> {
+    let mut runtime = Runtime::new(cpu, mem, config);
+    if let Some(vfs_config) = vfs_config {
+        let vfs =
+            Vfs::new(vfs_config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
+        runtime.set_vfs(vfs);
+    }
+    if let Some(dir) = std::path::Path::new(&opts.program).parent() {
+        runtime.set_program_dir(dir);
+    }
+    Ok(runtime)
+}
+
 fn run(opts: &Options) -> Result<i32, String> {
     let bytes = std::fs::read(&opts.program)
         .map_err(|e| format!("couldn't read '{}': {e}", opts.program))?;
@@ -639,32 +662,52 @@ fn run(opts: &Options) -> Result<i32, String> {
         format!("'{}' is not a valid hunk executable: {e}", opts.program)
     })?;
 
-    let mut mem = FlatMemory::new(opts.ram_size as usize);
-    let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
-        .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
-    check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
-
     let mut cpu = M68kCpu::with_config(opts.cpu_type, opts.fpu);
     cpu.set_jit(opts.jit);
-    let config = StartConfig {
-        entry: load_result.entry,
-        load_end: load_result.end,
-        args: opts.guest_args.clone(),
-        raw_command_line: None,
-        stack_size: opts.stack_size,
-        attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
-        program_name: program_name_from_path(std::path::Path::new(&opts.program)),
-    };
-    let mut runtime = Runtime::new(cpu, mem, config);
-
+    let program_name = program_name_from_path(std::path::Path::new(&opts.program));
     let vfs_config = vfs_config_from_opts(opts);
-    if let Some(config) = vfs_config.clone() {
-        let vfs = Vfs::new(config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
-        runtime.set_vfs(vfs);
-    }
-    if let Some(dir) = std::path::Path::new(&opts.program).parent() {
-        runtime.set_program_dir(dir);
-    }
+
+    // Overlay executables (crate::loader's module docs) need the real
+    // AmigaOS seglist framing (seg_length/next_seg immediately before
+    // every hunk) -- their manager reads its own next_seg field to find
+    // its second hunk before making a single library call, and its
+    // OverlayHeader needs a real, open guest FileHandle. The ordinary
+    // flat crate::loader::load placement doesn't provide either, and a
+    // program built that way runs straight into a wild-PC crash --
+    // found running a real overlay-linked binary. See
+    // Runtime::load_top_level_program's doc for the full story.
+    let mut runtime = if hunk_file.overlay.is_some() {
+        let mem = FlatMemory::new(opts.ram_size as usize);
+        let config = StartConfig {
+            entry: 0, // overridden by load_top_level_program below
+            load_end: TRAP_TABLE_END,
+            args: opts.guest_args.clone(),
+            raw_command_line: None,
+            stack_size: opts.stack_size,
+            attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
+            program_name,
+        };
+        let mut runtime = build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?;
+        runtime
+            .load_top_level_program(std::path::Path::new(&opts.program))
+            .map_err(|e| format!("couldn't LoadSeg '{}': IoErr {e}", opts.program))?;
+        runtime
+    } else {
+        let mut mem = FlatMemory::new(opts.ram_size as usize);
+        let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
+            .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
+        check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
+        let config = StartConfig {
+            entry: load_result.entry,
+            load_end: load_result.end,
+            args: opts.guest_args.clone(),
+            raw_command_line: None,
+            stack_size: opts.stack_size,
+            attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
+            program_name,
+        };
+        build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?
+    };
 
     // System()/Execute/RunCommand (Phase 3 stage 7): a nested program is
     // loaded and run through run_nested_program, sharing this run's

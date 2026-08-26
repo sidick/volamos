@@ -2329,6 +2329,39 @@ impl<C: Cpu + 'static> Runtime<C> {
             .set_assign("PROGDIR", vec![amiga_path]);
     }
 
+    /// Loads `host_path` as this runtime's own program via a real seglist
+    /// (see `crate::dosseg`'s module docs), overriding [`StartConfig::
+    /// entry`] with the loaded seglist's own entry point. Unlike the
+    /// ordinary flat [`crate::loader::load`] placement `Runtime::new`'s
+    /// caller typically uses instead, a seglist carries the real
+    /// AmigaOS `seg_length`/`next_seg` framing immediately before every
+    /// hunk -- required for an **overlay executable**, whose manager
+    /// (guest code in hunk 0) reads its own `next_seg` field to find its
+    /// second hunk before it's ever made a single library call, and
+    /// whose `OverlayHeader` needs a real, `Seek`/`Read`-able
+    /// `oh_FileHandle` this method's [`crate::dosseg::DosState::
+    /// load_seg_from_host_path`] call provides -- found the hard way,
+    /// running a real overlay-linked binary (`AExplorer`, Aminet)
+    /// straight into a wild-PC crash under the flat loader before this
+    /// method existed. Also correct (if unnecessary) for an ordinary,
+    /// non-overlay program.
+    ///
+    /// Must be called after [`Self::set_vfs`]/[`Self::set_program_dir`]
+    /// if the caller wants those to apply, and before [`Self::run`] (it
+    /// overwrites `PC`, which `Runtime::new` already set from
+    /// `StartConfig::entry` -- calling this after `run` has started
+    /// would be meaningless). Returns the same error a `LoadSeg()` LVO
+    /// call would set `IoErr()` to on failure (unreadable file, not a
+    /// valid hunk executable, or out of guest heap).
+    pub fn load_top_level_program(&mut self, host_path: &std::path::Path) -> Result<(), i32> {
+        let bptr = self
+            .dos
+            .load_seg_from_host_path(&mut self.heap, &mut self.mem, host_path)?;
+        let entry = crate::guestmem::addr_from_bptr(bptr).wrapping_add(crate::dosseg::NEXT_SEG_OFFSET);
+        self.cpu.set_pc(entry);
+        Ok(())
+    }
+
     /// Installs a host-side `System()`/`Execute()` runner callback (Phase
     /// 3 stage 7) -- see [`crate::dosseg`]'s module docs for why this
     /// indirection exists and what a CLI's callback is expected to do

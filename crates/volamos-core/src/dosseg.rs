@@ -61,6 +61,65 @@
 //! ready "is this actually a live seglist?" check for its bug-catching
 //! posture below).
 //!
+//! # Overlay executables
+//!
+//! `LoadSeg`ing a [`HunkFile`] whose [`HunkFile::overlay`] is `Some`
+//! (see `crate::loader`'s module docs for the on-disk format, ground-
+//! truthed against a real `SLink`-linked overlay binary) needs more than
+//! [`build_seglist`]:
+//!
+//! - The `struct OverlayHeader` at the very start of hunk 0's payload
+//!   (`oh_Jump`/`oh_Magic`/`oh_FileHandle`/`oh_OVTab`/`oh_Segments`/
+//!   `oh_GV`, per the AmigaDOS Manual) needs its four loader-filled
+//!   fields patched with real values -- this is what makes the overlay
+//!   manager (guest code shipped inside hunk 0) able to load further
+//!   nodes on demand.
+//! - A *global* segment table (`oh_Segments`, one `BPTR` slot per hunk
+//!   across the whole tree, sized from [`loader::OverlayInfo::
+//!   total_hunks`]) has to live in guest memory, since overlay nodes
+//!   loaded later need to land in the *same* array the root's own hunks
+//!   populated, so relocations in later nodes can resolve against
+//!   already-resident ancestor hunks.
+//! - The `name`d file has to stay open for the program's lifetime (the
+//!   overlay manager `Seek`s and re-reads it every time it loads a node)
+//!   -- unlike a plain `LoadSeg`, which never needs the bytes again once
+//!   the seglist is built. [`DosState::load_seg`] opens it through the
+//!   ordinary [`DosState::open`] machinery (not a bare host `File`) so
+//!   the resulting `BPTR` is a real, `Seek`/`Read`-able guest
+//!   `FileHandle` the manager's own `Seek()` calls resolve through
+//!   normally.
+//!
+//! [`DosState::overlay_roots`] (declared in `dosfile.rs`, per that
+//! module's own convention) tracks all of this per overlay-root load,
+//! keyed by the `oh_Segments` `BPTR` -- exactly the value the overlay
+//! manager passes back as `D2` on every subsequent `LoadSeg(NULL, table,
+//! fh)` call, per the documented calling convention (confirmed against
+//! the real manager's own compiled code: `D1 = 0`, `D2 = oh_Segments`,
+//! `D3 = oh_FileHandle`). [`loadseg_handler`] detects `D1 == 0` and
+//! routes to [`DosState::load_overlay_node`] instead of the ordinary
+//! named-file path.
+//!
+//! [`DosState::load_overlay_node`] re-reads the *whole* host file (rather
+//! than tracking a live cursor into the already-open `FileHandle`) each
+//! time it loads a node: it only needs to know the current file position
+//! (read via [`DosState::seek`] with a zero-delta `OFFSET_CURRENT`
+//! `Seek`, matching what the manager itself just did before calling
+//! `LoadSeg`) and [`loader::parse_overlay_node`] wants a byte slice, not
+//! a stream -- simpler than threading incremental reads through, at the
+//! cost of one redundant full-file read per node load. Revisit if a
+//! corpus binary's overlay tree is large/deep enough for that to matter.
+//!
+//! **Scope cut**: `UnLoadSeg` on an overlay root only frees the root's
+//! own segments today (via the ordinary [`DosState::seglists`] entry
+//! [`DosState::load_seg`] also registers for it) -- it doesn't yet walk
+//! [`DosState::overlay_roots`] to also free loaded node segments, the
+//! `oh_Segments` array, the `oh_OVTab` copy, or close `oh_FileHandle`,
+//! unlike real `UnLoadSeg`'s magic-`0xABCD`-triggered cleanup (AmigaDOS
+//! Manual section 1.4.8). Not yet needed by any corpus binary (which
+//! `LoadSeg`s and runs to completion without ever unloading); revisit
+//! alongside real overlay-node *unloading* (a currently-loaded node being
+//! displaced by a sibling), which needs the same bookkeeping.
+//!
 //! # `UnLoadSeg`: loud failure on an unknown seglist
 //!
 //! Real `UnLoadSeg` trusts its argument -- an unknown/already-freed BPTR
@@ -158,9 +217,12 @@ use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::ERROR_OBJECT_NOT_FOUND;
 use crate::dosfile::{
-    DosState, ERROR_FILE_NOT_OBJECT, ERROR_NO_FREE_STORE, map_io_error, map_vfs_error,
+    DosState, ERROR_FILE_NOT_OBJECT, ERROR_NO_FREE_STORE, MODE_OLDFILE, OFFSET_CURRENT,
+    map_io_error, map_vfs_error,
 };
-use crate::guestmem::{GuestHeap, GuestHeapError, bptr_from_addr, read_c_string};
+#[cfg(test)]
+use crate::dosfile::OFFSET_BEGINNING;
+use crate::guestmem::{GuestHeap, GuestHeapError, addr_from_bptr, bptr_from_addr, read_c_string};
 use crate::loader::{self, HunkFile};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
@@ -301,6 +363,144 @@ pub(crate) fn build_seglist(
     })
 }
 
+// --- Overlay executables (HUNK_OVERLAY) -- see the module docs. ---
+
+/// Byte offsets of the loader-filled fields within `struct
+/// OverlayHeader`, relative to the start of hunk 0's payload -- see the
+/// AmigaDOS Manual's "Overlay File Format" section (ground-truthed
+/// against a real overlay executable's disassembled manager, which reads
+/// every one of these at exactly these offsets).
+mod overlay_header {
+    /// `oh_Magic`: must already hold `0x0000ABCD` in the file itself
+    /// (not loader-filled, but checked as a sanity guard before writing
+    /// the fields after it).
+    pub(super) const MAGIC_OFFSET: u32 = 4;
+    pub(super) const MAGIC_VALUE: u32 = 0x0000_ABCD;
+    pub(super) const FILE_HANDLE_OFFSET: u32 = 8;
+    pub(super) const OVTAB_OFFSET: u32 = 0x0c;
+    pub(super) const SEGMENTS_OFFSET: u32 = 0x10;
+    pub(super) const GV_OFFSET: u32 = 0x14;
+}
+
+/// Live state for one `LoadSeg`ed overlay root, keyed (in
+/// [`DosState::overlay_roots`]) by the `BPTR` of its `oh_Segments` array
+/// -- see the module docs.
+#[derive(Debug)]
+pub struct OverlayRootState {
+    /// Host path to re-read from on every subsequent node load (see the
+    /// module docs for why this re-reads rather than tracking a live
+    /// cursor).
+    host_path: PathBuf,
+    /// Guest address of the `oh_Segments` array's first slot (not its
+    /// `BPTR` -- the map key already carries that).
+    segments_array_addr: u32,
+    /// Every hunk's payload address across the whole tree, by *global*
+    /// hunk index -- `None` for a not-yet-loaded overlay node's hunks.
+    /// Used to resolve `RELOC32` targets in later-loaded nodes that
+    /// reference already-resident ancestor hunks.
+    payload_addrs: Vec<Option<u32>>,
+}
+
+/// Builds an overlay root's seglist: allocates and links the root's own
+/// hunks exactly like [`build_seglist`] (reused directly), then also
+/// allocates the global `oh_Segments` array and the `oh_OVTab` copy in
+/// guest memory, and patches hunk 0's `OverlayHeader` fields (see the
+/// module docs). `file_handle_bptr` is the already-open guest
+/// `FileHandle` `BPTR` (see [`DosState::open`]) to record as
+/// `oh_FileHandle`.
+///
+/// Returns the root [`SegList`] (exactly as [`build_seglist`] would) and
+/// the [`OverlayRootState`] to register under the `oh_Segments` `BPTR`
+/// (`bptr_from_addr(state.segments_array_addr)`).
+fn build_overlay_root_seglist(
+    file: &HunkFile,
+    overlay: &loader::OverlayInfo,
+    file_handle_bptr: u32,
+    host_path: PathBuf,
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+) -> Result<(SegList, OverlayRootState), GuestHeapError> {
+    let seglist = build_seglist(file, heap, mem)?;
+
+    let root_payload_addrs: Vec<u32> = seglist
+        .alloc_addrs
+        .iter()
+        .map(|&a| a.wrapping_add(SEG_HEADER_SIZE))
+        .collect();
+
+    // oh_OVTab: a plain copy of the HUNK_OVERLAY payload in guest memory
+    // (not a BPTR -- the manager indexes into it with byte offsets
+    // directly, per the disassembly-confirmed convention).
+    let ovtab_bytes = overlay.table.raw.len() as u32 * 4;
+    let ovtab_addr = match heap.alloc(ovtab_bytes.max(4)) {
+        Ok(a) => a,
+        Err(e) => {
+            for &addr in &seglist.alloc_addrs {
+                let _ = heap.free(addr);
+            }
+            return Err(e);
+        }
+    };
+    for (i, &word) in overlay.table.raw.iter().enumerate() {
+        mem.write_u32(ovtab_addr.wrapping_add(i as u32 * 4), word);
+    }
+
+    // oh_Segments: one BPTR slot per hunk in the whole tree, zeroed for
+    // not-yet-loaded overlay-node hunks, filled in for the root's own.
+    let segments_bytes = overlay.total_hunks as u32 * 4;
+    let segments_addr = match heap.alloc(segments_bytes.max(4)) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = heap.free(ovtab_addr);
+            for &addr in &seglist.alloc_addrs {
+                let _ = heap.free(addr);
+            }
+            return Err(e);
+        }
+    };
+    let mut payload_addrs: Vec<Option<u32>> = vec![None; overlay.total_hunks];
+    for (i, &alloc_addr) in seglist.alloc_addrs.iter().enumerate() {
+        let seg_bptr = bptr_from_addr(alloc_addr.wrapping_add(NEXT_SEG_OFFSET));
+        mem.write_u32(segments_addr.wrapping_add(i as u32 * 4), seg_bptr);
+        payload_addrs[i] = Some(root_payload_addrs[i]);
+    }
+    for i in seglist.alloc_addrs.len()..overlay.total_hunks {
+        mem.write_u32(segments_addr.wrapping_add(i as u32 * 4), 0);
+    }
+
+    // Patch hunk 0's OverlayHeader. hunk 0 is always the root's entry
+    // hunk (seglist.entry is its payload address).
+    let hunk0_payload = seglist.entry;
+    debug_assert_eq!(
+        mem.read_u32(hunk0_payload.wrapping_add(overlay_header::MAGIC_OFFSET)),
+        overlay_header::MAGIC_VALUE,
+        "an overlay-root HunkFile's hunk 0 should always start with the 0x0000ABCD magic"
+    );
+    mem.write_u32(
+        hunk0_payload.wrapping_add(overlay_header::FILE_HANDLE_OFFSET),
+        file_handle_bptr,
+    );
+    mem.write_u32(
+        hunk0_payload.wrapping_add(overlay_header::OVTAB_OFFSET),
+        ovtab_addr,
+    );
+    let segments_bptr = bptr_from_addr(segments_addr);
+    mem.write_u32(
+        hunk0_payload.wrapping_add(overlay_header::SEGMENTS_OFFSET),
+        segments_bptr,
+    );
+    // oh_GV: the BCPL global vector. Unused by C/asm managers (this
+    // runtime has no BCPL global-vector support at all); left 0.
+    mem.write_u32(hunk0_payload.wrapping_add(overlay_header::GV_OFFSET), 0);
+
+    let state = OverlayRootState {
+        host_path,
+        segments_array_addr: segments_addr,
+        payload_addrs,
+    };
+    Ok((seglist, state))
+}
+
 /// A resolved `System()`/`Execute()` request, handed to the host-side
 /// [`DosState::system_runner`] callback -- see the module docs'
 /// "`System()`/`Execute()` architecture" section.
@@ -348,7 +548,9 @@ impl DosState {
     /// exist, matching `Open(MODE_OLDFILE)`'s semantics -- see
     /// [`crate::dosfile`]'s own "No VFS configured" note, which applies
     /// here identically), reads it, parses it as a hunk executable, and
-    /// builds a seglist for it via [`build_seglist`]. Returns the
+    /// builds a seglist for it via [`build_seglist`] -- or, if it's an
+    /// overlay executable's root node, via [`build_overlay_root_seglist`]
+    /// (see the module docs' "Overlay executables" section). Returns the
     /// seglist's `BPTR` on success, or an `IoErr()` code on failure:
     /// [`crate::dosfile::ERROR_OBJECT_NOT_FOUND`] (no `Vfs`, or the path
     /// doesn't resolve), a mapped host I/O error, or
@@ -366,12 +568,228 @@ impl DosState {
             .map_err(|e| map_vfs_error(&e))?;
         let bytes = std::fs::read(&host_path).map_err(|e| map_io_error(&e))?;
         let hunk_file = loader::parse(&bytes).map_err(|_| ERROR_FILE_NOT_OBJECT)?;
+
+        if let Some(overlay) = &hunk_file.overlay {
+            // Overlay root: needs a real, Seek/Read-able guest FileHandle
+            // the manager's own Seek() calls will resolve through later
+            // (not just the raw bytes we already have) -- see the module
+            // docs.
+            let file_handle_bptr = self.open(heap, mem, name, MODE_OLDFILE)?;
+            let (seglist, state) = build_overlay_root_seglist(
+                &hunk_file,
+                overlay,
+                file_handle_bptr,
+                host_path.clone(),
+                heap,
+                mem,
+            )
+            .map_err(|_| ERROR_NO_FREE_STORE)?;
+            let segments_bptr = bptr_from_addr(state.segments_array_addr);
+            self.overlay_roots.insert(segments_bptr, state);
+            self.seglists
+                .insert(seglist.first_bptr, seglist.alloc_addrs);
+            self.seglist_host_paths
+                .insert(seglist.first_bptr, host_path);
+            return Ok(seglist.first_bptr);
+        }
+
         let seglist = build_seglist(&hunk_file, heap, mem).map_err(|_| ERROR_NO_FREE_STORE)?;
         self.seglists
             .insert(seglist.first_bptr, seglist.alloc_addrs);
         self.seglist_host_paths
             .insert(seglist.first_bptr, host_path);
         Ok(seglist.first_bptr)
+    }
+
+    /// Loads `host_path` directly (no `Vfs` resolution) into a seglist,
+    /// exactly like [`Self::load_seg`] but for the one caller that has a
+    /// host path with no corresponding Amiga name to begin with:
+    /// [`crate::dispatch::Runtime`]'s top-level-program launch (see
+    /// [`crate::dosfile::DosState::open_host_file_direct`]'s doc, and
+    /// the module docs' "Overlay executables" section for why an overlay
+    /// root specifically needs a real guest `FileHandle` at all). Same
+    /// error/return contract as [`Self::load_seg`].
+    pub fn load_seg_from_host_path(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        host_path: &std::path::Path,
+    ) -> Result<u32, i32> {
+        let bytes = std::fs::read(host_path).map_err(|e| map_io_error(&e))?;
+        let hunk_file = loader::parse(&bytes).map_err(|_| ERROR_FILE_NOT_OBJECT)?;
+        let host_path = host_path.to_path_buf();
+
+        if let Some(overlay) = &hunk_file.overlay {
+            let file_handle_bptr = self.open_host_file_direct(heap, mem, &host_path)?;
+            let (seglist, state) = build_overlay_root_seglist(
+                &hunk_file,
+                overlay,
+                file_handle_bptr,
+                host_path.clone(),
+                heap,
+                mem,
+            )
+            .map_err(|_| ERROR_NO_FREE_STORE)?;
+            let segments_bptr = bptr_from_addr(state.segments_array_addr);
+            self.overlay_roots.insert(segments_bptr, state);
+            self.seglists
+                .insert(seglist.first_bptr, seglist.alloc_addrs);
+            self.seglist_host_paths
+                .insert(seglist.first_bptr, host_path);
+            return Ok(seglist.first_bptr);
+        }
+
+        let seglist = build_seglist(&hunk_file, heap, mem).map_err(|_| ERROR_NO_FREE_STORE)?;
+        self.seglists
+            .insert(seglist.first_bptr, seglist.alloc_addrs);
+        self.seglist_host_paths
+            .insert(seglist.first_bptr, host_path);
+        Ok(seglist.first_bptr)
+    }
+
+    /// `LoadSeg(NULL, table, fh)` -- the overlay-continuation form a
+    /// resident overlay manager calls to load one more node once it's
+    /// `Seek()`ed `fh` to the node's `HUNK_HEADER` file offset (see the
+    /// module docs' "Overlay executables" section, and the AmigaDOS
+    /// Manual's "Loading an Overlaid Node"). `table` is the `oh_Segments`
+    /// `BPTR` (looked up in [`Self::overlay_roots`]); `fh` is the guest
+    /// `FileHandle` `BPTR` [`Self::load_seg`] opened for this root.
+    ///
+    /// Allocates and links the node's own hunks (their `next_seg` chain
+    /// starts fresh -- linking them after the segment table's existing
+    /// entries at `ot_FirstSegment` is the *manager's* job, not
+    /// `LoadSeg`'s, per the Manual), resolves their relocations (which
+    /// may target already-resident ancestor hunks), and writes each new
+    /// hunk's segment `BPTR` into the shared global `oh_Segments` array.
+    /// Returns the first new segment's `BPTR`, or `0` with `IoErr()` set
+    /// on failure ([`crate::dosfile::ERROR_OBJECT_NOT_FOUND`] for an
+    /// unknown `table`/`fh`, a mapped host I/O error, or
+    /// [`crate::dosfile::ERROR_FILE_NOT_OBJECT`] if the node doesn't
+    /// parse, or its relocations target a hunk that isn't loaded).
+    pub fn load_overlay_node(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        table_bptr: u32,
+        fh_bptr: u32,
+    ) -> Result<u32, i32> {
+        let state = self
+            .overlay_roots
+            .get(&table_bptr)
+            .ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        let host_path = state.host_path.clone();
+
+        let fh_addr = addr_from_bptr(fh_bptr);
+        // A zero-delta OFFSET_CURRENT Seek reports (without moving) the
+        // position the manager itself just Seek()ed fh to.
+        let position = self.seek(fh_addr, 0, OFFSET_CURRENT)?;
+
+        let bytes = std::fs::read(&host_path).map_err(|e| map_io_error(&e))?;
+        let node = loader::parse_overlay_node(&bytes, position as usize)
+            .map_err(|_| ERROR_FILE_NOT_OBJECT)?;
+
+        // Pass 1: allocate every new hunk (mirroring build_seglist's own
+        // passes, just targeting global segment-table slots instead of a
+        // fresh 0-indexed array).
+        let mut alloc_addrs: Vec<u32> = Vec::with_capacity(node.hunks.len());
+        for hunk in &node.hunks {
+            let total = SEG_HEADER_SIZE.wrapping_add(hunk.reserved_size as u32);
+            match heap.alloc(total) {
+                Ok(addr) => alloc_addrs.push(addr),
+                Err(_) => {
+                    for &addr in &alloc_addrs {
+                        let _ = heap.free(addr);
+                    }
+                    return Err(ERROR_NO_FREE_STORE);
+                }
+            }
+        }
+        let payload_addrs: Vec<u32> = alloc_addrs
+            .iter()
+            .map(|&a| a.wrapping_add(SEG_HEADER_SIZE))
+            .collect();
+
+        // Pass 2: header + payload content, chained within this node only
+        // (next_seg = 0 for the node's own last hunk -- linking into the
+        // rest of the tree is the manager's job).
+        for (i, hunk) in node.hunks.iter().enumerate() {
+            let alloc_addr = alloc_addrs[i];
+            let payload_addr = payload_addrs[i];
+            let seg_length = heap
+                .size_of_live_alloc(alloc_addr)
+                .unwrap_or(SEG_HEADER_SIZE.wrapping_add(hunk.reserved_size as u32));
+            mem.write_u32(alloc_addr, seg_length);
+            let next_bptr = alloc_addrs
+                .get(i + 1)
+                .map(|&next_addr| bptr_from_addr(next_addr.wrapping_add(NEXT_SEG_OFFSET)))
+                .unwrap_or(0);
+            mem.write_u32(alloc_addr.wrapping_add(NEXT_SEG_OFFSET), next_bptr);
+
+            match hunk.kind {
+                loader::HunkKind::Code | loader::HunkKind::Data => {
+                    for (off, &byte) in hunk.data.iter().enumerate() {
+                        mem.write_u8(payload_addr.wrapping_add(off as u32), byte);
+                    }
+                    for off in hunk.data.len()..hunk.reserved_size {
+                        mem.write_u8(payload_addr.wrapping_add(off as u32), 0);
+                    }
+                }
+                loader::HunkKind::Bss => {
+                    for off in 0..hunk.reserved_size {
+                        mem.write_u8(payload_addr.wrapping_add(off as u32), 0);
+                    }
+                }
+            }
+        }
+
+        // Register the new hunks' payload addresses *before* resolving
+        // relocations, so a node whose hunks reference each other (as
+        // well as ancestors) resolves correctly.
+        let state = self
+            .overlay_roots
+            .get_mut(&table_bptr)
+            .ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        for (i, &payload_addr) in payload_addrs.iter().enumerate() {
+            let global_index = node.first_hunk + i;
+            if global_index >= state.payload_addrs.len() {
+                for &addr in &alloc_addrs {
+                    let _ = heap.free(addr);
+                }
+                return Err(ERROR_FILE_NOT_OBJECT);
+            }
+            state.payload_addrs[global_index] = Some(payload_addr);
+        }
+
+        // Pass 3: relocations, which may target already-resident
+        // ancestor hunks outside this node's own range.
+        for (i, hunk) in node.hunks.iter().enumerate() {
+            for reloc in &hunk.relocs {
+                let Some(Some(target_addr)) = state.payload_addrs.get(reloc.target_hunk).copied()
+                else {
+                    for &addr in &alloc_addrs {
+                        let _ = heap.free(addr);
+                    }
+                    return Err(ERROR_FILE_NOT_OBJECT);
+                };
+                let loc = payload_addrs[i].wrapping_add(reloc.offset);
+                let existing = mem.read_u32(loc);
+                mem.write_u32(loc, existing.wrapping_add(target_addr));
+            }
+        }
+
+        // Write each new hunk's own segment BPTR into the shared global
+        // oh_Segments array.
+        let segments_array_addr = state.segments_array_addr;
+        for (i, &alloc_addr) in alloc_addrs.iter().enumerate() {
+            let global_index = node.first_hunk + i;
+            let seg_bptr = bptr_from_addr(alloc_addr.wrapping_add(NEXT_SEG_OFFSET));
+            mem.write_u32(
+                segments_array_addr.wrapping_add(global_index as u32 * 4),
+                seg_bptr,
+            );
+        }
+
+        Ok(bptr_from_addr(alloc_addrs[0].wrapping_add(NEXT_SEG_OFFSET)))
     }
 
     /// `UnLoadSeg(seglist)`: frees every segment of a seglist previously
@@ -518,12 +936,22 @@ impl DosState {
 
 // --- LVO handlers ---
 
-/// `LoadSeg` (`D1` = name `CString*`). `D0` = seglist `BPTR`, or `0` with
-/// `IoErr()` set.
+/// `LoadSeg` (`D1` = name `CString*`, or `0` for the overlay-continuation
+/// form -- see [`DosState::load_overlay_node`] and the module docs --
+/// with `D2` = `oh_Segments` `BPTR`, `D3` = `oh_FileHandle` `BPTR`). `D0`
+/// = seglist `BPTR`, or `0` with `IoErr()` set.
 fn loadseg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.data_register(DataRegister(1));
-    let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
-    match ctx.dos.load_seg(ctx.heap, ctx.mem, &name) {
+    let result = if name_ptr == 0 {
+        let table_bptr = ctx.cpu.data_register(DataRegister(2));
+        let fh_bptr = ctx.cpu.data_register(DataRegister(3));
+        ctx.dos
+            .load_overlay_node(ctx.heap, ctx.mem, table_bptr, fh_bptr)
+    } else {
+        let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+        ctx.dos.load_seg(ctx.heap, ctx.mem, &name)
+    };
+    match result {
         Ok(bptr) => ctx.cpu.set_data_register(DataRegister(0), bptr),
         Err(code) => {
             ctx.dos.set_io_err(code);
@@ -755,6 +1183,63 @@ mod tests {
         buf
     }
 
+    /// Builds an overlay executable: a root node (one `HUNK_CODE` hunk
+    /// shaped like `struct OverlayHeader` -- `oh_Jump`/`oh_Magic` plus
+    /// four zeroed loader-filled longwords) terminated by `HUNK_OVERLAY`
+    /// (a minimal one-level table, `od = 1`, no ordinates/symbols), then
+    /// one overlay node (global hunk 1, one `HUNK_CODE` hunk with a
+    /// `RELOC32` targeting hunk 0 -- the *root*, an ancestor outside the
+    /// node's own range) terminated by `HUNK_BREAK`. Returns the file
+    /// bytes and the byte offset of the node's own `HUNK_HEADER` (what a
+    /// real overlay manager would `Seek()` to before calling
+    /// `LoadSeg(NULL, table, fh)`).
+    fn overlay_root_and_one_node_file() -> (Vec<u8>, usize) {
+        fn u32be(v: u32) -> [u8; 4] {
+            v.to_be_bytes()
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32be(0x3F3)); // HUNK_HEADER
+        buf.extend_from_slice(&u32be(0));
+        buf.extend_from_slice(&u32be(2)); // table_size: whole tree = 2 hunks
+        buf.extend_from_slice(&u32be(0)); // first_hunk
+        buf.extend_from_slice(&u32be(0)); // last_hunk (root is hunk 0 only)
+        buf.extend_from_slice(&u32be(6)); // hunk 0 size: 6 longwords
+
+        buf.extend_from_slice(&u32be(0x3E9)); // HUNK_CODE
+        buf.extend_from_slice(&u32be(6));
+        buf.extend_from_slice(&u32be(0)); // oh_Jump (not executed by this test)
+        buf.extend_from_slice(&u32be(0x0000_ABCD)); // oh_Magic
+        buf.extend_from_slice(&u32be(0)); // oh_FileHandle (loader-filled)
+        buf.extend_from_slice(&u32be(0)); // oh_OVTab (loader-filled)
+        buf.extend_from_slice(&u32be(0)); // oh_Segments (loader-filled)
+        buf.extend_from_slice(&u32be(0)); // oh_GV (loader-filled)
+        buf.extend_from_slice(&u32be(0x3F2)); // HUNK_END
+
+        buf.extend_from_slice(&u32be(0x3F5)); // HUNK_OVERLAY
+        buf.extend_from_slice(&u32be(0)); // l = 0 -> table is 1 longword
+        buf.extend_from_slice(&u32be(1)); // od = 1 (no ordinates/symtab)
+
+        let node_offset = buf.len();
+        buf.extend_from_slice(&u32be(0x3F3)); // HUNK_HEADER (node)
+        buf.extend_from_slice(&u32be(0));
+        buf.extend_from_slice(&u32be(2)); // table_size
+        buf.extend_from_slice(&u32be(1)); // first_hunk
+        buf.extend_from_slice(&u32be(1)); // last_hunk
+        buf.extend_from_slice(&u32be(1)); // hunk 1 size: 1 longword
+
+        buf.extend_from_slice(&u32be(0x3E9)); // HUNK_CODE
+        buf.extend_from_slice(&u32be(1));
+        buf.extend_from_slice(&u32be(0)); // addend placeholder
+        buf.extend_from_slice(&u32be(0x3EC)); // HUNK_RELOC32
+        buf.extend_from_slice(&u32be(1)); // one offset
+        buf.extend_from_slice(&u32be(0)); // target hunk 0 (root, an ancestor)
+        buf.extend_from_slice(&u32be(0)); // offset 0
+        buf.extend_from_slice(&u32be(0)); // terminate reloc groups
+        buf.extend_from_slice(&u32be(0x3F6)); // HUNK_BREAK
+
+        (buf, node_offset)
+    }
+
     // --- build_seglist unit tests (host-side, no CPU) ---
 
     #[test]
@@ -907,6 +1392,95 @@ mod tests {
             free_before,
             "UnLoadSeg should free everything LoadSeg allocated"
         );
+    }
+
+    // --- Overlay executables: DosState::load_seg / load_overlay_node ---
+
+    #[test]
+    fn load_seg_overlay_root_patches_header_and_loads_node_on_demand() {
+        let tmp = TempDir::new("loadseg-overlay");
+        let (bytes, node_offset) = overlay_root_and_one_node_file();
+        fs::write(tmp.path().join("prog"), &bytes).unwrap();
+
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let root_bptr = dos
+            .load_seg(&mut heap, &mut mem, "SYS:prog")
+            .expect("overlay root should LoadSeg");
+        assert_ne!(root_bptr, 0);
+
+        let alloc_addrs = dos.seglists.get(&root_bptr).unwrap().clone();
+        assert_eq!(alloc_addrs.len(), 1, "root node has one hunk");
+        let hunk0_payload = alloc_addrs[0] + SEG_HEADER_SIZE;
+
+        assert_eq!(
+            mem.read_u32(hunk0_payload + 4),
+            0x0000_ABCD,
+            "oh_Magic must be left untouched by the loader"
+        );
+        let fh_bptr = mem.read_u32(hunk0_payload + 8);
+        let ovtab_addr = mem.read_u32(hunk0_payload + 0xc);
+        let segments_bptr = mem.read_u32(hunk0_payload + 0x10);
+        assert_ne!(fh_bptr, 0, "oh_FileHandle should be loader-patched");
+        assert_ne!(ovtab_addr, 0, "oh_OVTab should be loader-patched");
+        assert_ne!(segments_bptr, 0, "oh_Segments should be loader-patched");
+
+        // oh_OVTab's payload is the raw HUNK_OVERLAY table verbatim: [od=1].
+        assert_eq!(mem.read_u32(ovtab_addr), 1);
+
+        let segments_addr = addr_from_bptr(segments_bptr);
+        assert_ne!(
+            mem.read_u32(segments_addr),
+            0,
+            "slot 0 (root, already loaded) should be populated"
+        );
+        assert_eq!(
+            mem.read_u32(segments_addr + 4),
+            0,
+            "slot 1 (node, not yet loaded) should still be zero"
+        );
+
+        // Simulate the overlay manager: Seek fh to the node's file
+        // offset, then LoadSeg(NULL, table, fh) -- the exact D1=0/D2/D3
+        // convention confirmed against a real overlay manager's
+        // disassembly (see the module docs).
+        let fh_addr = addr_from_bptr(fh_bptr);
+        dos.seek(fh_addr, node_offset as i32, OFFSET_BEGINNING)
+            .expect("seek to the node's HUNK_HEADER should succeed");
+        let node_bptr = dos
+            .load_overlay_node(&mut heap, &mut mem, segments_bptr, fh_bptr)
+            .expect("overlay node should load");
+        assert_ne!(node_bptr, 0);
+
+        assert_eq!(
+            mem.read_u32(segments_addr + 4),
+            node_bptr,
+            "the global segment table's slot 1 should now hold the node's own BPTR"
+        );
+
+        // The node's RELOC32 (offset 0, target hunk 0) should have
+        // resolved against the *root's* payload address -- a
+        // cross-node relocation against an already-resident ancestor
+        // hunk, the whole point of the shared global segment table.
+        let node_payload = addr_from_bptr(node_bptr) + NEXT_SEG_OFFSET;
+        assert_eq!(
+            mem.read_u32(node_payload),
+            hunk0_payload,
+            "reloc against ancestor hunk 0 should resolve to its payload address"
+        );
+    }
+
+    #[test]
+    fn load_overlay_node_unknown_table_fails_with_object_not_found() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let err = dos
+            .load_overlay_node(&mut heap, &mut mem, 0x1234, 0x5678)
+            .unwrap_err();
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
     }
 
     #[test]
