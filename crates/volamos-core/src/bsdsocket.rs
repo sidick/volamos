@@ -59,22 +59,23 @@
 //! (`SO_ERROR` in particular has real BSD "read consumes the pending
 //! error" semantics, via `socket2`'s own `take_error`), and real
 //! `select()`-shaped multiplexing via `WaitSelect` (Unix-only -- see
-//! "WaitSelect: real poll(2), not a busy-loop" below). Deliberately
-//! **not yet implemented** (calling these traps as an ordinary
+//! "WaitSelect: real poll(2), not a busy-loop" below).
+//! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket`/`getnetbyname`/
+//! `getnetbyaddr` are all registered (so a caller that unconditionally
+//! tries any of them doesn't crash the whole run on an unhandled-call
+//! trap) but never back a real result: `ObtainSocket`/`ReleaseSocket`/
+//! `ReleaseCopyOfSocket` always honestly fail with `EOPNOTSUPP` (see
+//! [`release_socket_handler`]'s doc comment for why a real cross-process
+//! handoff isn't possible here); `getnetbyname`/`getnetbyaddr` always
+//! return `NULL` (see [`getnetbyname_handler`]'s doc comment for why the
+//! real `/etc/networks` database isn't worth wiring up). `IoctlSocket`
+//! implements `FIONBIO` (see "Blocking by default" below) and
+//! `FIONREAD` (Unix-only, a real `ioctl(2)` on the underlying host
+//! socket -- no portable `socket2` equivalent) -- `FIOASYNC` is still
+//! genuinely unimplemented (calling it traps as an ordinary
 //! unknown-call, same as any other library's unimplemented LVO in this
-//! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why
-//! this table only lists what's implemented, not the full ABI):
-//! `getnetbyname`/`getnetbyaddr` (the `/etc/networks` network-name
-//! database -- rarer than the services/protocols databases above, no
-//! corpus binary or conformance test needs it yet).
-//! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket` *are* registered
-//! (so a caller that unconditionally tries them doesn't crash the whole
-//! run) but always honestly fail with `EOPNOTSUPP` -- see
-//! [`release_socket_handler`]'s doc comment for why a real handoff isn't
-//! possible here. `IoctlSocket` implements `FIONBIO` (see "Blocking by
-//! default" below) and `FIONREAD` (Unix-only, a real `ioctl(2)` on the
-//! underlying host socket -- no portable `socket2` equivalent) --
-//! `FIOASYNC` is still unimplemented (no real corpus binary or
+//! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why this
+//! table only lists what's implemented, not the full ABI; no real
 //! conformance test needs it).
 //!
 //! # Blocking by default
@@ -2244,6 +2245,33 @@ fn gethostbyaddr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
+/// `getnetbyname(name)`/`getnetbyaddr(net, type)`. `D0` = always `NULL`
+/// -- registered (so a caller that unconditionally tries either doesn't
+/// crash the whole run on an unhandled-call trap) but not backed by a
+/// real network-name database lookup. Real `libc` exposes `getnetbyname`
+/// /`getnetbyaddr` (the `/etc/networks` database), but they're
+/// deliberately not wired up here: `/etc/networks` is rarely populated
+/// on a modern host (this project's own dev machine has no meaningful
+/// entries beyond `localnet`), so a real lookup would mostly report
+/// "not found" anyway and add libc surface for a database no real
+/// corpus binary or conformance test actually depends on having
+/// populated -- an honest `NULL`, matching the "genuinely not found"
+/// outcome a caller must already handle, without pretending to search
+/// something this runtime can't meaningfully back. `getnetbyname`'s own
+/// real host counterpart could be added later if a real target needs
+/// it (matching [`getservbyname_handler`]'s own real-libc pattern), but
+/// nothing in this codebase's corpus has yet.
+fn getnetbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
+/// See [`getnetbyname_handler`]'s doc.
+fn getnetbyaddr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
 /// Shared `struct servent` builder for [`getservbyname_handler`]/
 /// [`getservbyport_handler`] -- same "free the previous call's blocks,
 /// build a fresh result" pattern as [`build_hostent`], separate result
@@ -2998,6 +3026,8 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("inet_network", inet_network_handler::<C>);
     reg!("gethostbyname", gethostbyname_handler::<C>);
     reg!("gethostbyaddr", gethostbyaddr_handler::<C>);
+    reg!("getnetbyname", getnetbyname_handler::<C>);
+    reg!("getnetbyaddr", getnetbyaddr_handler::<C>);
     reg!("getservbyname", getservbyname_handler::<C>);
     reg!("getservbyport", getservbyport_handler::<C>);
     reg!("getprotobyname", getprotobyname_handler::<C>);
@@ -5313,6 +5343,45 @@ mod tests {
             (mem.read_u8(recv_buf), mem.read_u8(recv_buf + 1)),
             (b'h', b'i'),
             "MSG_PEEK must not have consumed the bytes -- the real recv() sees them too"
+        );
+    }
+
+    #[test]
+    fn end_to_end_getnetbyname_and_getnetbyaddr_honestly_return_null_without_crashing() {
+        let name_addr: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, name_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // getnetbyname -> D0 (== 0, not checked
+        // separately -- getnetbyaddr's own D0 result below is this
+        // test's final assertion, and both share one handler shape)
+
+        push_move_imm_d(&mut words, 0, 0x7f00_0001);
+        push_move_imm_d(&mut words, 1, AF_INET as u32);
+        words.extend_from_slice(&jsr_disp16_a6(-228)); // getnetbyaddr -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, b"loopback");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "getnetbyaddr should honestly report NULL rather than crashing"
         );
     }
 }

@@ -274,6 +274,18 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         private: false,
     },
     LvoEntry {
+        name: "getnetbyname",
+        lvo: -222,
+        args: &[ArgReg::A(AddressRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "getnetbyaddr",
+        lvo: -228,
+        args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
+        private: false,
+    },
+    LvoEntry {
         name: "getservbyname",
         lvo: -234,
         args: &[ArgReg::A(AddressRegister(0)), ArgReg::A(AddressRegister(1))],
