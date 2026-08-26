@@ -41,14 +41,14 @@
 //! Implements `socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
 //! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
-//! `inet_addr`/`gethostbyname` -- real outbound and inbound TCP, plus
-//! UDP, real error reporting through the documented `Errno()`/
-//! `SetErrnoPtr()` mechanism, and real forward DNS lookups via the
-//! host's own resolver (see "DNS: a real, blocking host lookup" below).
-//! Deliberately **not yet implemented** (calling these traps as an
-//! ordinary unknown-call, same as any other library's unimplemented LVO
-//! in this codebase -- see [`crate::lvos::bsdsocket`]'s module docs for
-//! why this table only lists what's implemented, not the full ABI):
+//! `inet_addr`/`gethostbyname`/`IoctlSocket` -- real outbound and
+//! inbound TCP, plus UDP, real error reporting through the documented
+//! `Errno()`/`SetErrnoPtr()` mechanism, and real forward DNS lookups via
+//! the host's own resolver (see "DNS: a real, blocking host lookup"
+//! below). Deliberately **not yet implemented** (calling these traps as
+//! an ordinary unknown-call, same as any other library's unimplemented
+//! LVO in this codebase -- see [`crate::lvos::bsdsocket`]'s module docs
+//! for why this table only lists what's implemented, not the full ABI):
 //! `setsockopt`/`getsockopt` (real option roundtrip storage, no
 //! consumer needing it yet), `WaitSelect`/`SetSocketSignals` (real
 //! `select()`-shaped multiplexing needs deciding whether to integrate
@@ -60,6 +60,30 @@
 //! `ObtainSocket`/`ReleaseSocket` (fd-sharing across processes -- this
 //! runtime doesn't have that among its own processes to begin with),
 //! `sendmsg`/`recvmsg`/`vsyslog`/`SocketBaseTagList`/`GetSocketEvents`.
+//!
+//! # Blocking by default
+//!
+//! Every socket [`socket_handler`]/[`accept_handler`] hand back starts
+//! in the OS default **blocking** mode -- the real BSD/AmigaOS default
+//! -- not forced non-blocking. This module's first slice got this
+//! backwards (every socket was unconditionally
+//! `set_nonblocking(true)`'d, with no way to opt out at all): found
+//! running a real, unmodified consumer (MicroPython's Amiga port,
+//! `ports/amiga/modsocket.c`), whose own `connect()` wrapper has no
+//! `EINPROGRESS` handling whatsoever -- it assumes a synchronous
+//! `connect()`, and only ever asks for non-blocking mode explicitly via
+//! `IoctlSocket(fd, FIONBIO, ...)` (gated behind Python's
+//! `settimeout()`/`setblocking()`, which a caller that never touches
+//! either never triggers). Forcing every socket non-blocking regardless
+//! made every simple, default-mode socket program's very first
+//! `connect()` fail with a spurious `EINPROGRESS` it had no way to
+//! recover from. [`ioctl_socket_handler`] implements the one `IoctlSocket`
+//! command (`FIONBIO`) real socket code actually needs to opt into
+//! non-blocking mode explicitly; a blocking `connect`/`accept`/`send`/
+//! `recv` on a socket that hasn't asked for that just blocks the host
+//! thread until the real I/O completes -- the same "trust the host,
+//! real blocking calls are fine" posture `gethostbyname` already uses,
+//! not a shortcut.
 //!
 //! # Errno: real BSD numbering, not the host's own
 //!
@@ -166,6 +190,13 @@ pub const EIO_: i32 = 5;
 // as ordinary errno values instead of a separate mechanism.
 pub const HOST_NOT_FOUND: i32 = 1;
 pub const TRY_AGAIN: i32 = 2;
+
+/// `FIONBIO` -- `_IOW('f', 126, LONG)` per a real Roadshow
+/// `<sys/filio.h>`/`<sys/ioccom.h>` (re-derived: `IOC_IN (0x80000000) |
+/// (sizeof(LONG)=4 << 16) | ('f'=0x66 << 8) | 126`), the one
+/// `IoctlSocket` command this backend implements -- see
+/// [`ioctl_socket_handler`].
+const FIONBIO: u32 = 0x8004_667E;
 
 /// Maps a [`std::io::Error`] from a `socket2` call to the fixed BSD
 /// `errno` numbering `bsdsocket.library` documents -- see the module
@@ -358,11 +389,9 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
             return Ok(());
         }
     };
-    if let Err(e) = socket.set_nonblocking(true) {
-        let code = translate_errno(&e);
-        fail(ctx, code);
-        return Ok(());
-    }
+    // Blocking by default -- the real BSD/AmigaOS default (see the
+    // module docs' "Blocking by default" section). Non-blocking mode is
+    // only entered via an explicit IoctlSocket(fd, FIONBIO, ...) call.
 
     let id = ctx.bsdsocket.next_id;
     ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
@@ -444,8 +473,13 @@ fn listen_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 
 /// `accept(sock, addr, addrlen)`. `D0` = a new fd for the accepted
 /// connection, or `-1` with `Errno()` set (`EAGAIN` when nothing is
-/// waiting -- this backend is always non-blocking; see the module docs'
-/// note on `WaitSelect` for how a guest would wait for readiness).
+/// waiting, on a listening socket the guest explicitly put into
+/// non-blocking mode via `IoctlSocket(fd, FIONBIO, ...)` -- see the
+/// module docs' "Blocking by default" section; a plain blocking `accept`
+/// just blocks the host thread until a connection arrives, matching real
+/// semantics). The accepted socket itself is left in the OS default
+/// blocking mode too (real BSD `accept()` never forces non-blocking on
+/// the accepted socket regardless of the listener's own mode).
 /// `addr`/`addrlen`: if `addr` is non-`NULL`, the peer's address is
 /// written there.
 fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -463,12 +497,6 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     };
     match result {
         Ok((accepted, peer)) => {
-            if let Err(e) = accepted.set_nonblocking(true) {
-                let code = translate_errno(&e);
-                ctx.bsdsocket.set_errno(ctx.mem, code);
-                ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
-                return Ok(());
-            }
             if addr_ptr != 0
                 && let Some(peer) = peer.as_socket_ipv4()
             {
@@ -713,6 +741,40 @@ fn shutdown_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     };
 
     let Some(result) = with_socket(ctx, fd, |socket| socket.shutdown(direction)) else {
+        return Ok(());
+    };
+    match result {
+        Ok(()) => {
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+        Err(e) => {
+            let code = translate_errno(&e);
+            ctx.bsdsocket.set_errno(ctx.mem, code);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        }
+    }
+    Ok(())
+}
+
+/// `IoctlSocket(sock, req, argp)`. `D0` = `0`, or `-1` with `Errno()`
+/// set. Only `FIONBIO` (set/clear non-blocking mode) is implemented --
+/// see the module docs' "Blocking by default" section; `argp` points to
+/// a `LONG`, `0` = blocking, nonzero = non-blocking. Any other `req` is
+/// `EOPNOTSUPP`.
+fn ioctl_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let req = ctx.cpu.data_register(DataRegister(1));
+    let argp = ctx.cpu.address_register(AddressRegister(0));
+
+    if req != FIONBIO {
+        ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+    let nonblocking = ctx.mem.read_u32(argp) != 0;
+
+    let Some(result) = with_socket(ctx, fd, |socket| socket.set_nonblocking(nonblocking)) else {
         return Ok(());
     };
     match result {
@@ -997,6 +1059,7 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("sendto", sendto_handler::<C>);
     reg!("recvfrom", recvfrom_handler::<C>);
     reg!("shutdown", shutdown_handler::<C>);
+    reg!("IoctlSocket", ioctl_socket_handler::<C>);
     reg!("getsockname", getsockname_handler::<C>);
     reg!("getpeername", getpeername_handler::<C>);
     reg!("CloseSocket", close_socket_handler::<C>);
@@ -1427,5 +1490,61 @@ mod tests {
                 .any(|d| d.starts_with("accept") && d.contains("failed")),
             "expected an accept-failed detail among {details:?}"
         );
+    }
+
+    #[test]
+    fn end_to_end_ioctlsocket_fionbio_succeeds() {
+        let nonblock_flag: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (IoctlSocket's D0 argument)
+        push_move_imm_d(&mut words, 1, FIONBIO);
+        push_move_imm_a(&mut words, 0, nonblock_flag);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IoctlSocket() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(nonblock_flag, 1);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "IoctlSocket(FIONBIO) should succeed");
+    }
+
+    #[test]
+    fn end_to_end_ioctlsocket_unsupported_command_fails_with_eopnotsupp() {
+        let arg: u32 = 0x1_9000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd
+        push_move_imm_d(&mut words, 1, 0xDEAD_BEEF); // a bogus ioctl command
+        push_move_imm_a(&mut words, 0, arg);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IoctlSocket() -> D0 = -1
+        words.extend_from_slice(&jsr_disp16_a6(-162)); // Errno() -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, EOPNOTSUPP);
     }
 }

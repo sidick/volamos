@@ -131,6 +131,16 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         private: false,
     },
     LvoEntry {
+        name: "IoctlSocket",
+        lvo: -114,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::D(DataRegister(1)),
+            ArgReg::A(AddressRegister(0)),
+        ],
+        private: false,
+    },
+    LvoEntry {
         name: "getsockname",
         lvo: -102,
         args: &[
