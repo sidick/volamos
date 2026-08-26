@@ -186,6 +186,12 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         args: &[ArgReg::A(AddressRegister(0))],
         private: false,
     },
+    LvoEntry {
+        name: "gethostbyname",
+        lvo: -210,
+        args: &[ArgReg::A(AddressRegister(0))],
+        private: false,
+    },
 ];
 
 #[cfg(test)]

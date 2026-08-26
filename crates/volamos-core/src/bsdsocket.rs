@@ -41,8 +41,10 @@
 //! Implements `socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
 //! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
-//! `inet_addr` -- real outbound and inbound TCP, plus UDP, real error
-//! reporting through the documented `Errno()`/`SetErrnoPtr()` mechanism.
+//! `inet_addr`/`gethostbyname` -- real outbound and inbound TCP, plus
+//! UDP, real error reporting through the documented `Errno()`/
+//! `SetErrnoPtr()` mechanism, and real forward DNS lookups via the
+//! host's own resolver (see "DNS: a real, blocking host lookup" below).
 //! Deliberately **not yet implemented** (calling these traps as an
 //! ordinary unknown-call, same as any other library's unimplemented LVO
 //! in this codebase -- see [`crate::lvos::bsdsocket`]'s module docs for
@@ -51,8 +53,10 @@
 //! consumer needing it yet), `WaitSelect`/`SetSocketSignals` (real
 //! `select()`-shaped multiplexing needs deciding whether to integrate
 //! with `crate::exectask`'s signal model or just poll -- a real design
-//! choice, not a quick add), `gethostbyname`/`gethostbyaddr`/DNS (needs
-//! either a real resolver call or a hand-rolled DNS client), `Dup2Socket`/
+//! choice, not a quick add), `gethostbyaddr` (reverse/PTR lookup --
+//! `std::net` has no portable reverse-DNS primitive; Copperline's own
+//! `hostsocket-plugin` hit the identical wall and stayed a stub for the
+//! same reason, see that crate's module docs), `Dup2Socket`/
 //! `ObtainSocket`/`ReleaseSocket` (fd-sharing across processes -- this
 //! runtime doesn't have that among its own processes to begin with),
 //! `sendmsg`/`recvmsg`/`vsyslog`/`SocketBaseTagList`/`GetSocketEvents`.
@@ -70,10 +74,49 @@
 //! errno at all, a deliberate simplification versus Copperline's more
 //! thorough platform-specific table; expand this if a real corpus binary
 //! needs a specific errno this doesn't yet produce.
+//!
+//! # DNS: a real, blocking host lookup
+//!
+//! `gethostbyname` resolves via `(name, 0u16).to_socket_addrs()` --
+//! `std::net`'s standard, portable way to invoke the host OS's own
+//! resolver (`getaddrinfo` under the hood), the same "trust the host" spirit
+//! as everything else in this module. Unlike Copperline's own
+//! `hostsocket-plugin` (which needs a `resolve_start`/`resolve_poll`
+//! background-thread-plus-non-blocking-poll dance specifically because a
+//! WASM plugin can't block its host's emulation thread), this runtime has
+//! no such constraint -- a library call handler already runs synchronously
+//! on the guest's own call boundary, so a plain blocking call here is
+//! consistent with how every other host I/O in this codebase already
+//! works (`Open`, `Seek`, ...), not a shortcut.
+//!
+//! Only `AF_INET` (IPv4) results are surfaced, matching this module's
+//! `AF_INET`-only scope elsewhere; a name that resolves to IPv6-only
+//! addresses reports as not found. Real `<netdb.h>` documents lookup
+//! failures via a separate `extern int h_errno` global "left" by
+//! `gethostbyname`/`gethostbyaddr` -- but no LVO in the real
+//! `bsdsocket_lib.fd` ever sets one via a registered pointer the way
+//! `SetErrnoPtr` does for plain `errno`, meaning on real AmigaOS this
+//! value is read back through the *same* `Errno()` channel this module
+//! already implements (a real, if slightly surprising, historical
+//! AmigaOS quirk, not a simplification here) -- so a failed
+//! `gethostbyname` reports one of `<netdb.h>`'s own `HOST_NOT_FOUND`/
+//! `TRY_AGAIN`/`NO_DATA` codes through [`BsdSocketState::set_errno`],
+//! exactly like every other failing call in this module.
+//!
+//! The returned `struct hostent` (real Roadshow `<netdb.h>` layout: five
+//! 4-byte fields, `h_name`/`h_aliases`/`h_addrtype`/`h_length`/
+//! `h_addr_list`, 20 bytes) and everything it points to live on the
+//! guest heap and are rebuilt fresh on every call -- real
+//! `gethostbyname`'s own documented contract is a reused, overwritten-
+//! by-the-next-call static buffer, not a caller-freed allocation (there
+//! is no `FreeHostent`-style LVO in the real ABI), so
+//! [`BsdSocketState::hostent_allocs`] frees the *previous* call's
+//! blocks at the start of the next one rather than ever handing
+//! ownership to the guest.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
@@ -102,6 +145,12 @@ pub const ENOTCONN: i32 = 57;
 pub const ETIMEDOUT: i32 = 60;
 pub const ECONNREFUSED: i32 = 61;
 pub const EIO_: i32 = 5;
+
+// --- <netdb.h>'s h_errno codes -- see the module docs' "DNS" section
+// for why these travel through the same Errno()/SetErrnoPtr() channel
+// as ordinary errno values instead of a separate mechanism.
+pub const HOST_NOT_FOUND: i32 = 1;
+pub const TRY_AGAIN: i32 = 2;
 
 /// Maps a [`std::io::Error`] from a `socket2` call to the fixed BSD
 /// `errno` numbering `bsdsocket.library` documents -- see the module
@@ -164,6 +213,13 @@ pub struct BsdSocketState {
     /// (matching real `Inet_NtoA`'s own "static buffer, valid until the
     /// next call" contract) -- allocated lazily on first use.
     ntoa_buf: Option<u32>,
+    /// Every guest-heap allocation [`gethostbyname_handler`] built for
+    /// the *previous* successful call -- the `struct hostent`, the name
+    /// copy, the aliases array, the address-pointer array, and each
+    /// address block -- freed at the start of the next call rather than
+    /// ever being freed by the guest (see the module docs' "DNS"
+    /// section for why). Empty until the first successful lookup.
+    hostent_allocs: Vec<u32>,
 }
 
 impl BsdSocketState {
@@ -174,6 +230,7 @@ impl BsdSocketState {
             last_errno: 0,
             errno_ptr: None,
             ntoa_buf: None,
+            hostent_allocs: Vec::new(),
         }
     }
 
@@ -764,6 +821,94 @@ fn inet_addr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// `gethostbyname(name)`. `D0` = a `struct hostent*` (`AF_INET` results
+/// only), or `NULL` with `Errno()` set to a `<netdb.h>` `h_errno` code
+/// (`HOST_NOT_FOUND`/`TRY_AGAIN`) -- see the module docs' "DNS" section
+/// for the resolution mechanism, the error-reporting quirk, and the
+/// reused-buffer lifetime.
+fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let name_bytes = crate::guestmem::read_c_string(ctx.mem, name_ptr);
+    let name = String::from_utf8_lossy(&name_bytes).into_owned();
+
+    // Free the previous call's blocks before doing anything else -- see
+    // BsdSocketState::hostent_allocs' doc.
+    for addr in std::mem::take(&mut ctx.bsdsocket.hostent_allocs) {
+        let _ = ctx.heap.free(addr);
+    }
+
+    let fail = |ctx: &mut HandlerContext<'_, C>, code: i32| {
+        ctx.bsdsocket.set_errno(ctx.mem, code);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+    };
+
+    // A real, blocking host resolver call -- see the module docs.
+    let addrs: Vec<Ipv4Addr> = match (name.as_str(), 0u16).to_socket_addrs() {
+        Ok(iter) => iter
+            .filter_map(|sa| match sa {
+                std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                std::net::SocketAddr::V6(_) => None,
+            })
+            .take(8)
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if addrs.is_empty() {
+        fail(ctx, HOST_NOT_FOUND);
+        return Ok(());
+    }
+
+    let mut allocs = Vec::new();
+    let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
+        let addr = ctx
+            .heap
+            .alloc(size.max(4))
+            .map_err(|e| DispatchError::HandlerFailed {
+                library: "bsdsocket.library".to_string(),
+                lvo: -210,
+                handler_name: "gethostbyname".to_string(),
+                message: format!("gethostbyname: guest heap allocation failed: {e}"),
+            })?;
+        allocs.push(addr);
+        Ok(addr)
+    };
+
+    let name_buf = alloc(ctx, name_bytes.len() as u32 + 1)?;
+    crate::guestmem::write_c_string(ctx.mem, name_buf, &name_bytes);
+
+    let aliases_arr = alloc(ctx, 4)?; // just a NULL terminator: no alias data available
+    ctx.mem.write_u32(aliases_arr, 0);
+
+    let mut addr_block_addrs = Vec::with_capacity(addrs.len());
+    for ip in &addrs {
+        let block = alloc(ctx, 4)?;
+        ctx.mem.write_u32(block, u32::from(*ip));
+        addr_block_addrs.push(block);
+    }
+
+    let addr_list_arr = alloc(ctx, (addrs.len() as u32 + 1) * 4)?;
+    for (i, &block) in addr_block_addrs.iter().enumerate() {
+        ctx.mem
+            .write_u32(addr_list_arr.wrapping_add(i as u32 * 4), block);
+    }
+    ctx.mem.write_u32(
+        addr_list_arr.wrapping_add(addr_block_addrs.len() as u32 * 4),
+        0,
+    );
+
+    let hostent = alloc(ctx, 20)?;
+    ctx.mem.write_u32(hostent, name_buf); // h_name
+    ctx.mem.write_u32(hostent.wrapping_add(4), aliases_arr); // h_aliases
+    ctx.mem.write_u32(hostent.wrapping_add(8), AF_INET as u32); // h_addrtype
+    ctx.mem.write_u32(hostent.wrapping_add(12), 4); // h_length
+    ctx.mem.write_u32(hostent.wrapping_add(16), addr_list_arr); // h_addr_list
+
+    ctx.bsdsocket.hostent_allocs = allocs;
+    ctx.bsdsocket.set_errno(ctx.mem, 0);
+    ctx.cpu.set_data_register(DataRegister(0), hostent);
+    Ok(())
+}
+
 /// Registers this module's `bsdsocket.library` handlers, looked up by
 /// name through [`BSDSOCKET_LVOS`]. **Not** called from
 /// [`crate::dispatch::Runtime::new`] -- see the module docs' "Opt-in,
@@ -806,6 +951,7 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("SetErrnoPtr", set_errno_ptr_handler::<C>);
     reg!("Inet_NtoA", inet_ntoa_handler::<C>);
     reg!("inet_addr", inet_addr_handler::<C>);
+    reg!("gethostbyname", gethostbyname_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1043,5 +1189,88 @@ mod tests {
             0,
             "the OS should have assigned a real ephemeral port"
         );
+    }
+
+    #[test]
+    fn end_to_end_gethostbyname_resolves_localhost_via_the_real_host_resolver() {
+        let name_addr: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, name_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-210)); // gethostbyname -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, b"localhost");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let hostent = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(hostent, 0, "localhost should always resolve");
+
+        let mem = rt.memory();
+        assert_eq!(mem.read_u32(hostent + 8), AF_INET as u32, "h_addrtype");
+        assert_eq!(mem.read_u32(hostent + 12), 4, "h_length");
+        let addr_list = mem.read_u32(hostent + 16);
+        let first_addr_ptr = mem.read_u32(addr_list);
+        assert_ne!(first_addr_ptr, 0, "h_addr_list[0] should be non-NULL");
+        let ip = Ipv4Addr::from(mem.read_u32(first_addr_ptr));
+        assert!(
+            ip.is_loopback(),
+            "localhost should resolve to a loopback address, got {ip}"
+        );
+        assert_eq!(
+            mem.read_u32(addr_list.wrapping_add(4)),
+            0,
+            "h_addr_list should be NULL-terminated"
+        );
+
+        let name_ptr = mem.read_u32(hostent);
+        assert_eq!(crate::guestmem::read_c_string(mem, name_ptr), b"localhost");
+    }
+
+    #[test]
+    fn end_to_end_gethostbyname_unresolvable_name_fails_with_host_not_found() {
+        let name_addr: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, name_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-210)); // gethostbyname -> D0
+        words.extend_from_slice(&jsr_disp16_a6(-162)); // Errno() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        // .invalid is a reserved TLD (RFC 2606) guaranteed to never
+        // resolve, avoiding real-network flakiness in this test.
+        crate::guestmem::write_c_string(&mut mem, name_addr, b"this-name-does-not-exist.invalid");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, HOST_NOT_FOUND);
     }
 }
