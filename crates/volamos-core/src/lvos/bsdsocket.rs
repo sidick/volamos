@@ -240,6 +240,52 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         private: false,
     },
     LvoEntry {
+        name: "gethostbyaddr",
+        lvo: -216,
+        args: &[
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::D(DataRegister(0)),
+            ArgReg::D(DataRegister(1)),
+        ],
+        private: false,
+    },
+    LvoEntry {
+        name: "getservbyname",
+        lvo: -234,
+        args: &[ArgReg::A(AddressRegister(0)), ArgReg::A(AddressRegister(1))],
+        private: false,
+    },
+    LvoEntry {
+        name: "getservbyport",
+        lvo: -240,
+        args: &[ArgReg::D(DataRegister(0)), ArgReg::A(AddressRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "getprotobyname",
+        lvo: -246,
+        args: &[ArgReg::A(AddressRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "getprotobynumber",
+        lvo: -252,
+        args: &[ArgReg::D(DataRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "gethostname",
+        lvo: -282,
+        args: &[ArgReg::A(AddressRegister(0)), ArgReg::D(DataRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "gethostid",
+        lvo: -288,
+        args: &[],
+        private: false,
+    },
+    LvoEntry {
         name: "SocketBaseTagList",
         lvo: -294,
         args: &[ArgReg::A(AddressRegister(0))],

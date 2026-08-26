@@ -43,10 +43,13 @@
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
 //! `inet_addr`/`gethostbyname`/`IoctlSocket`/`setsockopt`/`getsockopt`/
 //! `SocketBaseTagList`/`WaitSelect`/`Dup2Socket`/`vsyslog`/
-//! `GetSocketEvents`/`SetSocketSignals` -- real outbound and inbound TCP,
-//! plus UDP, real error reporting through the documented `Errno()`/
-//! `SetErrnoPtr()` mechanism, real forward DNS lookups via the host's
-//! own resolver (see "DNS: a real, blocking host lookup" below), the
+//! `GetSocketEvents`/`SetSocketSignals`/`gethostbyaddr`/`getservbyname`/
+//! `getservbyport`/`getprotobyname`/`getprotobynumber`/`gethostname`/
+//! `gethostid` -- real outbound and inbound TCP, plus UDP, real error
+//! reporting through the documented `Errno()`/`SetErrnoPtr()` mechanism,
+//! real forward *and* reverse DNS lookups, and real services/protocols
+//! database lookups, all via the host's own resolver/libc (see "DNS: a
+//! real, blocking host lookup" below), the
 //! socket option set a real conformance suite (`bsdsocktest`'s own
 //! `sockopt` test category) actually exercises: `SO_REUSEADDR`/
 //! `SO_KEEPALIVE`/`SO_LINGER`/`SO_SNDBUF`/`SO_RCVBUF`/`SO_SNDTIMEO`/
@@ -60,10 +63,9 @@
 //! unknown-call, same as any other library's unimplemented LVO in this
 //! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why
 //! this table only lists what's implemented, not the full ABI):
-//! `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no
-//! portable reverse-DNS primitive; Copperline's own `hostsocket-plugin`
-//! hit the identical wall and stayed a stub for the same reason, see that
-//! crate's module docs), `sendmsg`/`recvmsg`.
+//! `sendmsg`/`recvmsg`, `getnetbyname`/`getnetbyaddr` (the `/etc/networks`
+//! network-name database -- rarer than the services/protocols databases
+//! above, no corpus binary or conformance test needs it yet).
 //! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket` *are* registered
 //! (so a caller that unconditionally tries them doesn't crash the whole
 //! run) but always honestly fail with `EOPNOTSUPP` -- see
@@ -445,13 +447,26 @@ pub struct BsdSocketState {
     /// (matching real `Inet_NtoA`'s own "static buffer, valid until the
     /// next call" contract) -- allocated lazily on first use.
     ntoa_buf: Option<u32>,
-    /// Every guest-heap allocation [`gethostbyname_handler`] built for
-    /// the *previous* successful call -- the `struct hostent`, the name
-    /// copy, the aliases array, the address-pointer array, and each
-    /// address block -- freed at the start of the next call rather than
-    /// ever being freed by the guest (see the module docs' "DNS"
-    /// section for why). Empty until the first successful lookup.
+    /// Every guest-heap allocation [`build_hostent`] built for the
+    /// *previous* successful [`gethostbyname_handler`] or
+    /// [`gethostbyaddr_handler`] call (whichever ran last -- both share
+    /// this one slot, matching real `bsdsocket.library`'s own single
+    /// static result buffer) -- the `struct hostent`, the name copy, the
+    /// aliases array, the address-pointer array, and each address block
+    /// -- freed at the start of the next call rather than ever being
+    /// freed by the guest (see the module docs' "DNS" section for why).
+    /// Empty until the first successful lookup.
     hostent_allocs: Vec<u32>,
+    /// Same lifetime pattern as [`Self::hostent_allocs`], but for
+    /// [`getservbyname_handler`]/[`getservbyport_handler`]'s `struct
+    /// servent*` result -- a separate static buffer from `hostent`,
+    /// matching real `bsdsocket.library`'s own per-function-family
+    /// static results.
+    servent_allocs: Vec<u32>,
+    /// Same lifetime pattern as [`Self::hostent_allocs`], but for
+    /// [`getprotobyname_handler`]/[`getprotobynumber_handler`]'s
+    /// `struct protoent*` result.
+    protoent_allocs: Vec<u32>,
     /// Guest heap address of a small, lazily-allocated buffer holding
     /// this library's version/release identifier string, returned by
     /// `SocketBaseTagList`'s `SBTC_RELEASESTRPTR` query -- see
@@ -506,6 +521,8 @@ impl BsdSocketState {
             herrno_ptr: None,
             ntoa_buf: None,
             hostent_allocs: Vec::new(),
+            servent_allocs: Vec::new(),
+            protoent_allocs: Vec::new(),
             release_str_buf: None,
             last_herrno: 0,
             sigeventmask: 0,
@@ -1743,6 +1760,74 @@ fn inet_addr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// Shared `struct hostent` builder for [`gethostbyname_handler`] and
+/// [`gethostbyaddr_handler`]'s identical result shape (one name, no
+/// aliases, one or more `AF_INET` addresses): frees the *previous*
+/// call's blocks first (either function's -- see
+/// [`BsdSocketState::hostent_allocs`]' doc, which now covers both),
+/// allocates a fresh `h_name`/`h_aliases` (empty)/`h_addr_list`/
+/// `hostent`, and records the new allocations for the next call (from
+/// either function) to free.
+fn build_hostent<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name_bytes: &[u8],
+    addrs: &[Ipv4Addr],
+    lvo: i32,
+    handler_name: &str,
+) -> Result<u32, DispatchError> {
+    for addr in std::mem::take(&mut ctx.bsdsocket.hostent_allocs) {
+        let _ = ctx.heap.free(addr);
+    }
+
+    let mut allocs = Vec::new();
+    let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
+        let addr = ctx
+            .heap
+            .alloc(size.max(4))
+            .map_err(|e| DispatchError::HandlerFailed {
+                library: "bsdsocket.library".to_string(),
+                lvo,
+                handler_name: handler_name.to_string(),
+                message: format!("{handler_name}: guest heap allocation failed: {e}"),
+            })?;
+        allocs.push(addr);
+        Ok(addr)
+    };
+
+    let name_buf = alloc(ctx, name_bytes.len() as u32 + 1)?;
+    crate::guestmem::write_c_string(ctx.mem, name_buf, name_bytes);
+
+    let aliases_arr = alloc(ctx, 4)?; // just a NULL terminator: no alias data available
+    ctx.mem.write_u32(aliases_arr, 0);
+
+    let mut addr_block_addrs = Vec::with_capacity(addrs.len());
+    for ip in addrs {
+        let block = alloc(ctx, 4)?;
+        ctx.mem.write_u32(block, u32::from(*ip));
+        addr_block_addrs.push(block);
+    }
+
+    let addr_list_arr = alloc(ctx, (addrs.len() as u32 + 1) * 4)?;
+    for (i, &block) in addr_block_addrs.iter().enumerate() {
+        ctx.mem
+            .write_u32(addr_list_arr.wrapping_add(i as u32 * 4), block);
+    }
+    ctx.mem.write_u32(
+        addr_list_arr.wrapping_add(addr_block_addrs.len() as u32 * 4),
+        0,
+    );
+
+    let hostent = alloc(ctx, 20)?;
+    ctx.mem.write_u32(hostent, name_buf); // h_name
+    ctx.mem.write_u32(hostent.wrapping_add(4), aliases_arr); // h_aliases
+    ctx.mem.write_u32(hostent.wrapping_add(8), AF_INET as u32); // h_addrtype
+    ctx.mem.write_u32(hostent.wrapping_add(12), 4); // h_length
+    ctx.mem.write_u32(hostent.wrapping_add(16), addr_list_arr); // h_addr_list
+
+    ctx.bsdsocket.hostent_allocs = allocs;
+    Ok(hostent)
+}
+
 /// `gethostbyname(name)`. `D0` = a `struct hostent*` (`AF_INET` results
 /// only), or `NULL` with `Errno()` set to a `<netdb.h>` `h_errno` code
 /// (`HOST_NOT_FOUND`/`TRY_AGAIN`) -- see the module docs' "DNS" section
@@ -1752,12 +1837,6 @@ fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     let name_ptr = ctx.cpu.address_register(AddressRegister(0));
     let name_bytes = crate::guestmem::read_c_string(ctx.mem, name_ptr);
     let name = String::from_utf8_lossy(&name_bytes).into_owned();
-
-    // Free the previous call's blocks before doing anything else -- see
-    // BsdSocketState::hostent_allocs' doc.
-    for addr in std::mem::take(&mut ctx.bsdsocket.hostent_allocs) {
-        let _ = ctx.heap.free(addr);
-    }
 
     // A real gethostbyname failure reports through h_errno, not the
     // ordinary errno channel -- see BsdSocketState::set_herrno's doc.
@@ -1782,6 +1861,125 @@ fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
         return Ok(());
     }
 
+    let hostent = build_hostent(ctx, &name_bytes, &addrs, -210, "gethostbyname")?;
+    ctx.bsdsocket.set_errno(ctx.mem, 0);
+    ctx.cpu.set_data_register(DataRegister(0), hostent);
+    Ok(())
+}
+
+/// `gethostbyaddr(addr, len, type)`. `D0` = a `struct hostent*` (same
+/// shape as [`gethostbyname_handler`]'s, single-address, no aliases),
+/// or `NULL` with `Errno()` set to a `<netdb.h>` `h_errno` code
+/// (`HOST_NOT_FOUND`) -- same error-reporting channel and shared result
+/// buffer as `gethostbyname` (see [`BsdSocketState::hostent_allocs`]).
+/// `addr` (`A0`) is a real `struct in_addr*` (4 raw address bytes, *not*
+/// a string -- unlike `inet_addr`'s `STRPTR`), `len` (`D0`) must be `4`,
+/// `type` (`D1`) must be `AF_INET`; anything else fails with
+/// `HOST_NOT_FOUND`, matching `gethostbyname`'s own "nothing resolved"
+/// outcome for an equally nonsensical request.
+///
+/// A real, blocking reverse-DNS (PTR) lookup via the host's own
+/// resolver -- `std::net` has no portable reverse-DNS primitive (the
+/// same wall Copperline's own `hostsocket-plugin` hit for its
+/// `gethostbyaddr`, see that crate's module docs), but `libc::
+/// getnameinfo` (POSIX, already available via the `libc` dependency) is
+/// exactly the real OS resolver call every real reverse-DNS client
+/// (including AmigaOS's own bsdsocket.library, on real hardware) is
+/// built on, so this is no less "real" than `gethostbyname`'s own
+/// `ToSocketAddrs`-based forward lookup -- just a different libc entry
+/// point for the reverse direction. `NI_NAMEREQD` is passed so a
+/// address with no PTR record fails outright instead of `getnameinfo`
+/// silently falling back to the numeric address string as if it were a
+/// resolved name.
+#[cfg(unix)]
+fn gethostbyaddr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let addr_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let len = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let type_ = ctx.cpu.data_register(DataRegister(1)) as i32;
+
+    let fail = |ctx: &mut HandlerContext<'_, C>, code: i32| {
+        ctx.bsdsocket.set_herrno(ctx.mem, code);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+    };
+
+    if type_ != AF_INET || len < 4 || addr_ptr == 0 {
+        fail(ctx, HOST_NOT_FOUND);
+        return Ok(());
+    }
+    let octets = [
+        ctx.mem.read_u8(addr_ptr),
+        ctx.mem.read_u8(addr_ptr.wrapping_add(1)),
+        ctx.mem.read_u8(addr_ptr.wrapping_add(2)),
+        ctx.mem.read_u8(addr_ptr.wrapping_add(3)),
+    ];
+    let orig_addr = Ipv4Addr::from(octets);
+
+    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    sa.sin_family = libc::AF_INET as libc::sa_family_t;
+    sa.sin_addr.s_addr = u32::from(orig_addr).to_be();
+    let mut host_buf = [0 as libc::c_char; libc::NI_MAXHOST as usize];
+    let rc = unsafe {
+        libc::getnameinfo(
+            (&raw const sa).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            host_buf.as_mut_ptr(),
+            host_buf.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if rc != 0 {
+        fail(ctx, HOST_NOT_FOUND);
+        return Ok(());
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(host_buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+
+    let hostent = build_hostent(ctx, name.as_bytes(), &[orig_addr], -216, "gethostbyaddr")?;
+    ctx.bsdsocket.set_errno(ctx.mem, 0);
+    ctx.cpu.set_data_register(DataRegister(0), hostent);
+    Ok(())
+}
+
+/// See [`gethostbyaddr_handler`]'s doc for the Unix version's real
+/// implementation -- this runtime's own Windows support is unverified
+/// at runtime (see the module docs' "WaitSelect" section for the same
+/// caveat on that LVO), so this honestly reports "not supported" rather
+/// than guessing at a `GetNameInfo`-based implementation nobody has run.
+#[cfg(not(unix))]
+fn gethostbyaddr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.bsdsocket.set_herrno(ctx.mem, HOST_NOT_FOUND);
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
+/// Shared `struct servent` builder for [`getservbyname_handler`]/
+/// [`getservbyport_handler`] -- same "free the previous call's blocks,
+/// build a fresh result" pattern as [`build_hostent`], separate result
+/// buffer (see [`BsdSocketState::servent_allocs`]). `s_aliases` is
+/// always a bare `NULL` terminator: the real host `getservbyname`/
+/// `getservbyport` calls this wraps do return an alias list, but no
+/// real corpus binary or conformance test reads it (matching
+/// `build_hostent`'s own "no alias data available" `h_aliases`), so
+/// it's not copied across. `port` is the *plain* (host-endianness- and
+/// libc-transform-independent) port number, e.g. `80` for HTTP -- see
+/// [`getservbyname_handler`]'s doc for why callers must decode the raw
+/// host `libc::servent::s_port` value before passing it here, not pass
+/// it through untouched.
+#[cfg(unix)]
+fn build_servent<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name_bytes: &[u8],
+    port: u16,
+    proto_bytes: &[u8],
+    lvo: i32,
+    handler_name: &str,
+) -> Result<u32, DispatchError> {
+    for addr in std::mem::take(&mut ctx.bsdsocket.servent_allocs) {
+        let _ = ctx.heap.free(addr);
+    }
     let mut allocs = Vec::new();
     let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
         let addr = ctx
@@ -1789,47 +1987,280 @@ fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
             .alloc(size.max(4))
             .map_err(|e| DispatchError::HandlerFailed {
                 library: "bsdsocket.library".to_string(),
-                lvo: -210,
-                handler_name: "gethostbyname".to_string(),
-                message: format!("gethostbyname: guest heap allocation failed: {e}"),
+                lvo,
+                handler_name: handler_name.to_string(),
+                message: format!("{handler_name}: guest heap allocation failed: {e}"),
             })?;
         allocs.push(addr);
         Ok(addr)
     };
 
     let name_buf = alloc(ctx, name_bytes.len() as u32 + 1)?;
-    crate::guestmem::write_c_string(ctx.mem, name_buf, &name_bytes);
+    crate::guestmem::write_c_string(ctx.mem, name_buf, name_bytes);
+    let aliases_arr = alloc(ctx, 4)?;
+    ctx.mem.write_u32(aliases_arr, 0);
+    let proto_buf = alloc(ctx, proto_bytes.len() as u32 + 1)?;
+    crate::guestmem::write_c_string(ctx.mem, proto_buf, proto_bytes);
 
-    let aliases_arr = alloc(ctx, 4)?; // just a NULL terminator: no alias data available
+    let servent = alloc(ctx, 16)?;
+    ctx.mem.write_u32(servent, name_buf); // s_name
+    ctx.mem.write_u32(servent.wrapping_add(4), aliases_arr); // s_aliases
+    ctx.mem.write_u32(servent.wrapping_add(8), port as u32); // s_port (plain value)
+    ctx.mem.write_u32(servent.wrapping_add(12), proto_buf); // s_proto
+
+    ctx.bsdsocket.servent_allocs = allocs;
+    Ok(servent)
+}
+
+/// `getservbyname(name, proto)`. `D0` = a `struct servent*`, or `NULL`
+/// if the host's own services database has no such entry (real,
+/// documented "just returns NULL" contract -- no `h_errno`/`Errno()`
+/// code is defined for this family of lookups). A real, blocking
+/// lookup via the host's own `libc::getservbyname` -- the exact same
+/// "trust the real OS resolver" posture `gethostbyname`/`gethostbyaddr`
+/// already use, just a different libc entry point (the services
+/// database, not DNS).
+///
+/// # `s_port`'s byte order
+///
+/// Real `libc::servent::s_port` holds the port in network byte order,
+/// packed into a native-width `int` by ordinary C assignment (i.e. its
+/// *numeric value*, not its raw memory bytes, equals what `htons()`
+/// produced on the host) -- so on this project's little-endian
+/// development host, `getservbyname("http", ...)`'s raw `s_port` is
+/// `20480` (`0x5000`), not `80`. `m68k` is big-endian, so a real m68k
+/// C compiler's `ntohs()` is a no-op there -- the guest just reads
+/// `s_port`'s numeric value directly, so writing the *raw host* value
+/// into guest memory would hand the guest `20480` instead of `80`.
+/// `u16::from_be(raw_value as u16)` decodes the raw host value back to
+/// the plain port number first (found the hard way: `bsdsocktest`'s
+/// `getservbyname(): "http"/"tcp" -> port 80` test failing with the
+/// wrong port, not a crash -- an easy bug to miss without a real
+/// conformance run to catch it, since a synthetic same-host round-trip
+/// test would have the identical mismatch on both sides and still
+/// "pass").
+#[cfg(unix)]
+fn getservbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let proto_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let name_bytes = crate::guestmem::read_c_string(ctx.mem, name_ptr);
+    let proto_bytes = crate::guestmem::read_c_string(ctx.mem, proto_ptr);
+    let name_c = std::ffi::CString::new(name_bytes.clone()).unwrap_or_default();
+    let proto_c = std::ffi::CString::new(proto_bytes.clone()).unwrap_or_default();
+
+    let raw = unsafe { libc::getservbyname(name_c.as_ptr(), proto_c.as_ptr()) };
+    if raw.is_null() {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+    let port = u16::from_be(unsafe { (*raw).s_port } as u16);
+    let servent = build_servent(ctx, &name_bytes, port, &proto_bytes, -234, "getservbyname")?;
+    ctx.cpu.set_data_register(DataRegister(0), servent);
+    Ok(())
+}
+
+/// `getservbyport(port, proto)`. `D0` = a `struct servent*`, or `NULL`.
+/// `port` (`D0`) arrives from the guest as a *plain* port number (see
+/// [`getservbyname_handler`]'s doc: the guest's own `htons()` is a
+/// no-op on big-endian `m68k`, so `bsdsocktest`'s `getservbyport(htons
+/// (21), ...)` call hands this backend `21` directly, unchanged) --
+/// `.to_be()` re-encodes it into the network-order-as-native-int
+/// representation the *host's* `libc::getservbyport` itself expects
+/// (the mirror-image conversion of `getservbyname_handler`'s own
+/// `u16::from_be` on the way out). Same real, blocking host lookup
+/// otherwise.
+#[cfg(unix)]
+fn getservbyport_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let port = ctx.cpu.data_register(DataRegister(0)) as u16;
+    let host_port = port.to_be() as libc::c_int;
+    let proto_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let proto_bytes = crate::guestmem::read_c_string(ctx.mem, proto_ptr);
+    let proto_c = std::ffi::CString::new(proto_bytes.clone()).unwrap_or_default();
+
+    let raw = unsafe { libc::getservbyport(host_port, proto_c.as_ptr()) };
+    if raw.is_null() {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+    let (name_bytes, real_port) = unsafe {
+        (
+            std::ffi::CStr::from_ptr((*raw).s_name).to_bytes().to_vec(),
+            u16::from_be((*raw).s_port as u16),
+        )
+    };
+    let servent = build_servent(
+        ctx,
+        &name_bytes,
+        real_port,
+        &proto_bytes,
+        -240,
+        "getservbyport",
+    )?;
+    ctx.cpu.set_data_register(DataRegister(0), servent);
+    Ok(())
+}
+
+/// Shared `struct protoent` builder for [`getprotobyname_handler`]/
+/// [`getprotobynumber_handler`] -- same pattern as [`build_servent`],
+/// separate result buffer (see [`BsdSocketState::protoent_allocs`]).
+#[cfg(unix)]
+fn build_protoent<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name_bytes: &[u8],
+    proto: i32,
+    lvo: i32,
+    handler_name: &str,
+) -> Result<u32, DispatchError> {
+    for addr in std::mem::take(&mut ctx.bsdsocket.protoent_allocs) {
+        let _ = ctx.heap.free(addr);
+    }
+    let mut allocs = Vec::new();
+    let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
+        let addr = ctx
+            .heap
+            .alloc(size.max(4))
+            .map_err(|e| DispatchError::HandlerFailed {
+                library: "bsdsocket.library".to_string(),
+                lvo,
+                handler_name: handler_name.to_string(),
+                message: format!("{handler_name}: guest heap allocation failed: {e}"),
+            })?;
+        allocs.push(addr);
+        Ok(addr)
+    };
+
+    let name_buf = alloc(ctx, name_bytes.len() as u32 + 1)?;
+    crate::guestmem::write_c_string(ctx.mem, name_buf, name_bytes);
+    let aliases_arr = alloc(ctx, 4)?;
     ctx.mem.write_u32(aliases_arr, 0);
 
-    let mut addr_block_addrs = Vec::with_capacity(addrs.len());
-    for ip in &addrs {
-        let block = alloc(ctx, 4)?;
-        ctx.mem.write_u32(block, u32::from(*ip));
-        addr_block_addrs.push(block);
+    let protoent = alloc(ctx, 12)?;
+    ctx.mem.write_u32(protoent, name_buf); // p_name
+    ctx.mem.write_u32(protoent.wrapping_add(4), aliases_arr); // p_aliases
+    ctx.mem.write_u32(protoent.wrapping_add(8), proto as u32); // p_proto
+
+    ctx.bsdsocket.protoent_allocs = allocs;
+    Ok(protoent)
+}
+
+/// `getprotobyname(name)`. `D0` = a `struct protoent*`, or `NULL`. Same
+/// real, blocking host lookup posture as [`getservbyname_handler`], via
+/// `libc::getprotobyname`.
+#[cfg(unix)]
+fn getprotobyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let name_bytes = crate::guestmem::read_c_string(ctx.mem, name_ptr);
+    let name_c = std::ffi::CString::new(name_bytes.clone()).unwrap_or_default();
+
+    let raw = unsafe { libc::getprotobyname(name_c.as_ptr()) };
+    if raw.is_null() {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
     }
+    let proto = unsafe { (*raw).p_proto };
+    let protoent = build_protoent(ctx, &name_bytes, proto, -246, "getprotobyname")?;
+    ctx.cpu.set_data_register(DataRegister(0), protoent);
+    Ok(())
+}
 
-    let addr_list_arr = alloc(ctx, (addrs.len() as u32 + 1) * 4)?;
-    for (i, &block) in addr_block_addrs.iter().enumerate() {
-        ctx.mem
-            .write_u32(addr_list_arr.wrapping_add(i as u32 * 4), block);
+/// `getprotobynumber(proto)`. `D0` = a `struct protoent*`, or `NULL`.
+/// Same real, blocking host lookup posture, via
+/// `libc::getprotobynumber`.
+#[cfg(unix)]
+fn getprotobynumber_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let proto = ctx.cpu.data_register(DataRegister(0)) as libc::c_int;
+    let raw = unsafe { libc::getprotobynumber(proto) };
+    if raw.is_null() {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
     }
-    ctx.mem.write_u32(
-        addr_list_arr.wrapping_add(addr_block_addrs.len() as u32 * 4),
-        0,
-    );
+    let name_bytes = unsafe { std::ffi::CStr::from_ptr((*raw).p_name).to_bytes().to_vec() };
+    let protoent = build_protoent(ctx, &name_bytes, proto, -252, "getprotobynumber")?;
+    ctx.cpu.set_data_register(DataRegister(0), protoent);
+    Ok(())
+}
 
-    let hostent = alloc(ctx, 20)?;
-    ctx.mem.write_u32(hostent, name_buf); // h_name
-    ctx.mem.write_u32(hostent.wrapping_add(4), aliases_arr); // h_aliases
-    ctx.mem.write_u32(hostent.wrapping_add(8), AF_INET as u32); // h_addrtype
-    ctx.mem.write_u32(hostent.wrapping_add(12), 4); // h_length
-    ctx.mem.write_u32(hostent.wrapping_add(16), addr_list_arr); // h_addr_list
+/// `gethostname(name, namelen)`. `D0` = `0` on success, or `-1` with
+/// `Errno()` set. A real host `libc::gethostname` call, truncated to
+/// fit `namelen` the same way a real kernel truncates it (real BSD
+/// `gethostname` silently truncates rather than failing when the
+/// buffer is too small -- `bsdsocktest`'s own small-buffer test
+/// tolerates either outcome, but truncating is the more real one).
+#[cfg(unix)]
+fn gethostname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let namelen = ctx.cpu.data_register(DataRegister(0)) as i32;
 
-    ctx.bsdsocket.hostent_allocs = allocs;
+    if namelen <= 0 {
+        ctx.bsdsocket.set_errno(ctx.mem, EINVAL);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+    let mut buf = vec![0u8; namelen as usize];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        let code = translate_errno(&std::io::Error::last_os_error());
+        ctx.bsdsocket.set_errno(ctx.mem, code);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+    // Real gethostname NUL-terminates within namelen; a real host libc
+    // call already did that, but ensure it here too in case the host's
+    // name is exactly namelen bytes with no room left for the NUL (some
+    // platforms don't guarantee truncation leaves room for it).
+    buf[namelen as usize - 1] = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        ctx.mem.write_u8(name_ptr.wrapping_add(i as u32), b);
+    }
     ctx.bsdsocket.set_errno(ctx.mem, 0);
-    ctx.cpu.set_data_register(DataRegister(0), hostent);
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
+/// `gethostid()`. `D0` = a real, non-zero host-identifying value, via
+/// `libc::gethostid` -- the same real machine identifier real
+/// `bsdsocket.library` also just forwards from the host TCP/IP stack's
+/// own idea of it.
+#[cfg(unix)]
+fn gethostid_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let id = unsafe { libc::gethostid() };
+    ctx.cpu.set_data_register(DataRegister(0), id as u32);
+    Ok(())
+}
+
+/// See the Unix versions' own docs -- this runtime's own Windows
+/// support is unverified at runtime, so these honestly report "not
+/// found"/"not supported" rather than guessing at Winsock equivalents
+/// nobody has run.
+#[cfg(not(unix))]
+fn getservbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+#[cfg(not(unix))]
+fn getservbyport_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+#[cfg(not(unix))]
+fn getprotobyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+#[cfg(not(unix))]
+fn getprotobynumber_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+#[cfg(not(unix))]
+fn gethostname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+    ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+    Ok(())
+}
+#[cfg(not(unix))]
+fn gethostid_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
     Ok(())
 }
 
@@ -1842,19 +2273,27 @@ fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// pairs, `TAG_DONE`-terminated, with `TAG_IGNORE`/`TAG_MORE`/
 /// `TAG_SKIP` control tags honored.
 ///
-/// Only three base tag codes are implemented, matching what a real
-/// conformance suite (`bsdsocktest`'s `testutil.c`) actually calls at
-/// startup, before running a single test:
+/// Tag codes implemented, matching what a real conformance suite
+/// (`bsdsocktest`'s `testutil.c` and its `signals`/`misc` categories)
+/// actually calls:
 ///
-/// - `SBTC_ERRNOLONGPTR`/`SBTC_HERRNOLONGPTR` (`SET` only, by value or
-///   by reference -- see [`BsdSocketState::errno_ptr`]/[`herrno_ptr`]):
+/// - `SBTC_ERRNOLONGPTR`/`SBTC_HERRNOLONGPTR` (`SET` and `GET`, by value
+///   or by reference -- see [`BsdSocketState::errno_ptr`]/[`herrno_ptr`]):
 ///   the modern, tag-based equivalent of `SetErrnoPtr`, but for `errno`
-///   and the *separate* `h_errno` channel respectively. `GET` on either
-///   is a documented no-op (`ti_Data` left untouched) -- matching real
-///   Roadshow's own behavior, which `bsdsocktest`'s bundled
-///   `docs/COMPATIBILITY.md` records as a known, harmless deviation
-///   ("Roadshow supports SET but not readback of the registered errno
-///   pointer"), not a bug to fix.
+///   and the *separate* `h_errno` channel respectively. `GET` lazily
+///   allocates a real, live-updating storage location on first use (see
+///   the match arms below) -- deliberately *not* replicating real
+///   Roadshow's own documented bug here (`bsdsocktest`'s bundled
+///   `docs/COMPATIBILITY.md`: "Roadshow supports SET but not readback of
+///   the registered errno pointer"): that's an incidental defect in one
+///   vendor's implementation, not part of `SocketBaseTagList`'s own
+///   documented contract, so there's no reason to deliberately reproduce
+///   it here the way this codebase reproduces genuine AmigaOS API
+///   behavior elsewhere.
+/// - `SBTC_BREAKMASK`/`SBTC_SIGEVENTMASK` (`SET`/`GET`): plain
+///   round-trip storage, shared with [`set_socket_signals_handler`]'s
+///   older `int_mask`/`io_mask` parameters.
+/// - `SBTC_DTABLESIZE` (`SET`/`GET`): see [`BsdSocketState::dtablesize`].
 /// - `SBTC_RELEASESTRPTR` (`GET` by reference only): writes the address
 ///   of this library's own version-identifier string into `*ti_Data`.
 ///
@@ -2264,6 +2703,13 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("Inet_NtoA", inet_ntoa_handler::<C>);
     reg!("inet_addr", inet_addr_handler::<C>);
     reg!("gethostbyname", gethostbyname_handler::<C>);
+    reg!("gethostbyaddr", gethostbyaddr_handler::<C>);
+    reg!("getservbyname", getservbyname_handler::<C>);
+    reg!("getservbyport", getservbyport_handler::<C>);
+    reg!("getprotobyname", getprotobyname_handler::<C>);
+    reg!("getprotobynumber", getprotobynumber_handler::<C>);
+    reg!("gethostname", gethostname_handler::<C>);
+    reg!("gethostid", gethostid_handler::<C>);
     reg!("SocketBaseTagList", socket_base_tag_list_handler::<C>);
     reg!("Dup2Socket", dup2_socket_handler::<C>);
     reg!("vsyslog", vsyslog_handler::<C>);
@@ -2611,6 +3057,105 @@ mod tests {
             rt.memory().read_u32(herrno_addr),
             HOST_NOT_FOUND as u32,
             "h_errno should report HOST_NOT_FOUND through its registered pointer"
+        );
+    }
+
+    #[test]
+    fn end_to_end_gethostbyaddr_resolves_loopback_via_the_real_host_resolver() {
+        let addr_buf: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, addr_buf);
+        push_move_imm_d(&mut words, 0, 4); // len
+        push_move_imm_d(&mut words, 1, AF_INET as u32); // type
+        words.extend_from_slice(&jsr_disp16_a6(-216)); // gethostbyaddr -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(addr_buf, u32::from(Ipv4Addr::LOCALHOST));
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let hostent = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(
+            hostent, 0,
+            "127.0.0.1 should always have some real PTR record on a real host"
+        );
+
+        let mem = rt.memory();
+        assert_eq!(mem.read_u32(hostent + 8), AF_INET as u32, "h_addrtype");
+        assert_eq!(mem.read_u32(hostent + 12), 4, "h_length");
+        let addr_list = mem.read_u32(hostent + 16);
+        let first_addr_ptr = mem.read_u32(addr_list);
+        assert_eq!(
+            mem.read_u32(first_addr_ptr),
+            u32::from(Ipv4Addr::LOCALHOST),
+            "h_addr_list[0] should echo back the original queried address"
+        );
+        let name_ptr = mem.read_u32(hostent);
+        let name = crate::guestmem::read_c_string(mem, name_ptr);
+        assert!(
+            !name.is_empty(),
+            "a real resolved PTR name should be non-empty"
+        );
+    }
+
+    #[test]
+    fn end_to_end_gethostbyaddr_rejects_a_non_af_inet_type_with_host_not_found() {
+        let addr_buf: u32 = 0x1_8000;
+        let herrno_addr: u32 = 0x1_8100;
+        let tags_addr: u32 = 0x1_8200;
+
+        const SBTM_SETVAL_HERRNOLONGPTR: u32 = TAG_USER | (SBTC_HERRNOLONGPTR << 1) | SBTF_SET;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // register h_errno mirror
+
+        push_move_imm_a(&mut words, 0, addr_buf);
+        push_move_imm_d(&mut words, 0, 4);
+        push_move_imm_d(&mut words, 1, 99); // an unsupported address family
+        words.extend_from_slice(&jsr_disp16_a6(-216)); // gethostbyaddr -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(addr_buf, u32::from(Ipv4Addr::LOCALHOST));
+        mem.write_u32(tags_addr, SBTM_SETVAL_HERRNOLONGPTR);
+        mem.write_u32(tags_addr.wrapping_add(4), herrno_addr);
+        mem.write_u32(tags_addr.wrapping_add(8), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "gethostbyaddr should return NULL on failure");
+        assert_eq!(
+            rt.memory().read_u32(herrno_addr),
+            HOST_NOT_FOUND as u32,
+            "h_errno should report HOST_NOT_FOUND for an unsupported address family"
         );
     }
 
@@ -3858,5 +4403,159 @@ mod tests {
 
         assert_eq!(rt.memory().read_u32(out1), 0x1000);
         assert_eq!(rt.memory().read_u32(out2), 0x2000);
+    }
+
+    #[test]
+    fn end_to_end_getservbyname_http_tcp_resolves_to_port_80() {
+        let name_addr: u32 = 0x1_8000;
+        let proto_addr: u32 = 0x1_8100;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, name_addr);
+        push_move_imm_a(&mut words, 1, proto_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-234)); // getservbyname -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, b"http");
+        crate::guestmem::write_c_string(&mut mem, proto_addr, b"tcp");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let servent = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(
+            servent, 0,
+            "\"http\"/\"tcp\" should be a real, well-known service on any real host"
+        );
+        // s_port holds the plain port number (m68k's own ntohs() is a
+        // no-op there -- see getservbyname_handler's doc for the real
+        // byte-order bug this guards against), so no decode needed here.
+        assert_eq!(rt.memory().read_u32(servent + 8), 80);
+    }
+
+    #[test]
+    fn end_to_end_getservbyport_21_tcp_resolves_to_ftp() {
+        let proto_addr: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        // A real m68k caller's own htons(21) is a no-op (m68k is
+        // big-endian) -- this backend receives the plain port number 21
+        // directly, matching what getservbyport_handler's own doc says
+        // to expect.
+        push_move_imm_d(&mut words, 0, 21);
+        push_move_imm_a(&mut words, 0, proto_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-240)); // getservbyport -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, proto_addr, b"tcp");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let servent = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(
+            servent, 0,
+            "port 21/\"tcp\" should be a real, well-known service on any real host"
+        );
+        let name_ptr = rt.memory().read_u32(servent);
+        let name = crate::guestmem::read_c_string(rt.memory(), name_ptr);
+        assert_eq!(name.to_ascii_lowercase(), b"ftp");
+    }
+
+    #[test]
+    fn end_to_end_getprotobyname_tcp_resolves_to_protocol_6() {
+        let name_addr: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, name_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-246)); // getprotobyname -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, b"tcp");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let protoent = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(protoent, 0, "\"tcp\" should be a real, well-known protocol");
+        assert_eq!(rt.memory().read_u32(protoent + 8), 6, "p_proto");
+    }
+
+    #[test]
+    fn end_to_end_gethostname_retrieves_a_real_non_empty_name() {
+        let buf: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, buf);
+        push_move_imm_d(&mut words, 0, 256);
+        words.extend_from_slice(&jsr_disp16_a6(-282)); // gethostname -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "gethostname should succeed on any real host");
+        let name = crate::guestmem::read_c_string(rt.memory(), buf);
+        assert!(
+            !name.is_empty(),
+            "a real host always has a non-empty hostname"
+        );
+    }
+
+    #[test]
+    fn end_to_end_gethostid_runs_and_returns_the_real_host_value() {
+        // Not asserted non-zero: a real host's own gethostid() (this
+        // backend's own `libc::gethostid` passthrough) legitimately
+        // returns 0 on a machine that never had one configured (true on
+        // this project's own macOS dev host) -- this test only confirms
+        // the real host call round-trips into D0 without crashing.
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        words.extend_from_slice(&jsr_disp16_a6(-288)); // gethostid -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let host_id = unsafe { libc::gethostid() } as i32;
+        assert_eq!(
+            code, host_id,
+            "should mirror the real host's own gethostid()"
+        );
     }
 }
