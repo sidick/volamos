@@ -46,7 +46,7 @@
 //! `GetSocketEvents`/`SetSocketSignals`/`gethostbyaddr`/`getservbyname`/
 //! `getservbyport`/`getprotobyname`/`getprotobynumber`/`gethostname`/
 //! `gethostid`/`sendmsg`/`recvmsg`/`Inet_LnaOf`/`Inet_NetOf`/
-//! `Inet_MakeAddr` -- real outbound and inbound TCP, plus UDP, real error
+//! `Inet_MakeAddr`/`inet_network` -- real outbound and inbound TCP, plus UDP, real error
 //! reporting through the documented `Errno()`/`SetErrnoPtr()` mechanism,
 //! real forward *and* reverse DNS lookups, and real services/protocols
 //! database lookups, all via the host's own resolver/libc (see "DNS: a
@@ -71,9 +71,11 @@
 //! (so a caller that unconditionally tries them doesn't crash the whole
 //! run) but always honestly fail with `EOPNOTSUPP` -- see
 //! [`release_socket_handler`]'s doc comment for why a real handoff isn't
-//! possible here. `IoctlSocket` itself only implements `FIONBIO`
-//! (see "Blocking by default" below) -- `FIONREAD`/`FIOASYNC` are
-//! unimplemented too (no portable `socket2` equivalent for either).
+//! possible here. `IoctlSocket` implements `FIONBIO` (see "Blocking by
+//! default" below) and `FIONREAD` (Unix-only, a real `ioctl(2)` on the
+//! underlying host socket -- no portable `socket2` equivalent) --
+//! `FIOASYNC` is still unimplemented (no real corpus binary or
+//! conformance test needs it).
 //!
 //! # Blocking by default
 //!
@@ -276,6 +278,18 @@ pub const TRY_AGAIN: i32 = 2;
 /// [`ioctl_socket_handler`].
 const FIONBIO: u32 = 0x8004_667E;
 
+/// `FIONREAD` -- `_IOR('f', 127, LONG)` (`IOC_OUT (0x40000000) |
+/// (sizeof(LONG)=4 << 16) | ('f'=0x66 << 8) | 127`), the other real
+/// `IoctlSocket` command this backend implements -- "how many bytes are
+/// available to read right now" -- see [`ioctl_socket_handler`].
+const FIONREAD: u32 = 0x4004_667F;
+
+/// `MSG_PEEK` -- a real `<sys/socket.h>` (Roadshow) value, not
+/// invented. The only `recv`/`recvfrom` flag this backend interprets
+/// (see [`recv_handler`]) -- every other `MSG_*` flag is accepted but
+/// silently ignored.
+const MSG_PEEK: i32 = 0x2;
+
 // --- SocketBaseTagList tag encoding -- a real `<libraries/bsdsocket.h>`
 // (Roadshow) / `<utility/tagitem.h>` (`TAG_USER`), not invented. See
 // [`socket_base_tag_list_handler`]'s doc for the bit layout these
@@ -427,9 +441,23 @@ pub struct BsdSocketState {
     /// Guest address `SetErrnoPtr` asked to also mirror `last_errno`
     /// into on every update (real `bsdsocket.library`'s way of keeping a
     /// C runtime's global `errno` variable in sync without a per-call
-    /// round trip) -- `None` until a guest calls `SetErrnoPtr`. Only the
-    /// 4-byte (`LONG`) size is supported; see [`Self::set_errno`].
+    /// round trip) -- `None` until a guest calls `SetErrnoPtr`. See
+    /// [`Self::errno_ptr_size`] for the variable's real size, and
+    /// [`Self::set_errno`] for how that size is honored.
     errno_ptr: Option<u32>,
+    /// The size, in bytes, of the variable [`Self::errno_ptr`] points
+    /// at -- `1` (`BYTE`), `2` (`WORD`), or `4` (`LONG`, the default).
+    /// Real `SetErrnoPtr`'s own second argument (`SocketBaseTagList`'s
+    /// `SBTC_ERRNOLONGPTR` tag always implies `4`, matching its own
+    /// name). Only the low `errno_ptr_size` bytes of the guest variable
+    /// are written -- confirmed against `bsdsocktest`'s own
+    /// `SetErrnoPtr(): 1-byte variable`/`2-byte variable` tests, which
+    /// register a real `BYTE`/`WORD` C local and only check it becomes
+    /// non-zero (not an exact value), so this doesn't need to reproduce
+    /// any particular truncation/sign-extension convention beyond
+    /// "the low N bytes of the real error code, big-endian, like every
+    /// other multi-byte value this runtime writes to guest memory."
+    errno_ptr_size: u8,
     /// Guest address [`SocketBaseTagList`]'s `SBTC_HERRNOLONGPTR` tag (or
     /// [`set_herrno_ptr_handler`]-equivalent) asked to mirror `h_errno`
     /// into -- the *separate* variable real `gethostbyname`/
@@ -519,6 +547,7 @@ impl BsdSocketState {
             next_id: 1,
             last_errno: 0,
             errno_ptr: None,
+            errno_ptr_size: 4,
             herrno_ptr: None,
             ntoa_buf: None,
             hostent_allocs: Vec::new(),
@@ -543,7 +572,11 @@ impl BsdSocketState {
     fn set_errno(&mut self, mem: &mut dyn AddressSpace, code: i32) {
         self.last_errno = code;
         if let Some(ptr) = self.errno_ptr {
-            mem.write_u32(ptr, code as u32);
+            match self.errno_ptr_size {
+                1 => mem.write_u8(ptr, code as u8),
+                2 => mem.write_u16(ptr, code as u16),
+                _ => mem.write_u32(ptr, code as u32),
+            }
         }
     }
 
@@ -896,14 +929,28 @@ fn send_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
 }
 
 /// `recv(sock, buf, len, flags)`. `D0` = bytes received (`0` at EOF), or
-/// `-1` with `Errno()` set (`EAGAIN` if it would block).
+/// `-1` with `Errno()` set (`EAGAIN` if it would block). `MSG_PEEK`
+/// (the only flag this backend interprets) reads via `socket2::Socket::
+/// peek` instead of a real consuming read -- a genuine host `recv(2,
+/// MSG_PEEK)`, not a synthetic re-buffer, so a subsequent ordinary
+/// `recv` on the same socket sees the same bytes again, exactly like
+/// real `MSG_PEEK`. Every other flag (`MSG_OOB`/`MSG_WAITALL`/...) is
+/// silently ignored, same posture as `send`'s own unconsulted `flags`.
 fn recv_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
     let buf_ptr = ctx.cpu.address_register(AddressRegister(0));
     let len = ctx.cpu.data_register(DataRegister(1));
+    let flags = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let peek = flags & MSG_PEEK != 0;
 
     let mut buf = vec![0u8; len as usize];
-    let Some(result) = with_socket(ctx, fd, |socket| socket.read(&mut buf)) else {
+    let Some(result) = with_socket(ctx, fd, |socket| {
+        if peek {
+            socket.peek(as_uninit_slice(&mut buf))
+        } else {
+            socket.read(&mut buf)
+        }
+    }) else {
         return Ok(());
     };
     match result {
@@ -1364,36 +1411,69 @@ fn shutdown_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 }
 
 /// `IoctlSocket(sock, req, argp)`. `D0` = `0`, or `-1` with `Errno()`
-/// set. Only `FIONBIO` (set/clear non-blocking mode) is implemented --
-/// see the module docs' "Blocking by default" section; `argp` points to
-/// a `LONG`, `0` = blocking, nonzero = non-blocking. Any other `req` is
+/// set. `FIONBIO` (set/clear non-blocking mode; `argp` points to a
+/// `LONG`, `0` = blocking, nonzero = non-blocking -- see the module
+/// docs' "Blocking by default" section) and `FIONREAD` (writes the
+/// number of bytes currently available to read into `*argp`, Unix-only
+/// via a real `ioctl(2)` on the underlying host socket -- no portable
+/// `socket2` equivalent) are implemented. Any other `req` is
 /// `EOPNOTSUPP`.
 fn ioctl_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
     let req = ctx.cpu.data_register(DataRegister(1));
     let argp = ctx.cpu.address_register(AddressRegister(0));
 
-    if req != FIONBIO {
-        ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
-        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+    if req == FIONBIO {
+        let nonblocking = ctx.mem.read_u32(argp) != 0;
+        let Some(result) = with_socket(ctx, fd, |socket| socket.set_nonblocking(nonblocking))
+        else {
+            return Ok(());
+        };
+        match result {
+            Ok(()) => {
+                ctx.bsdsocket.set_errno(ctx.mem, 0);
+                ctx.cpu.set_data_register(DataRegister(0), 0);
+            }
+            Err(e) => {
+                let code = translate_errno(&e);
+                ctx.bsdsocket.set_errno(ctx.mem, code);
+                ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            }
+        }
         return Ok(());
     }
-    let nonblocking = ctx.mem.read_u32(argp) != 0;
 
-    let Some(result) = with_socket(ctx, fd, |socket| socket.set_nonblocking(nonblocking)) else {
+    #[cfg(unix)]
+    if req == FIONREAD {
+        use std::os::unix::io::AsRawFd;
+        let Some(result) = with_socket(ctx, fd, |socket| {
+            let mut n: libc::c_int = 0;
+            let rc = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut n) };
+            if rc == 0 {
+                Ok(n)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }) else {
+            return Ok(());
+        };
+        match result {
+            Ok(n) => {
+                ctx.mem.write_u32(argp, n as u32);
+                ctx.bsdsocket.set_errno(ctx.mem, 0);
+                ctx.cpu.set_data_register(DataRegister(0), 0);
+            }
+            Err(e) => {
+                let code = translate_errno(&e);
+                ctx.bsdsocket.set_errno(ctx.mem, code);
+                ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            }
+        }
         return Ok(());
-    };
-    match result {
-        Ok(()) => {
-            ctx.bsdsocket.set_errno(ctx.mem, 0);
-            ctx.cpu.set_data_register(DataRegister(0), 0);
-        }
-        Err(e) => {
-            let code = translate_errno(&e);
-            ctx.bsdsocket.set_errno(ctx.mem, code);
-            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
-        }
     }
+
+    ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+    ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
     Ok(())
 }
 
@@ -1813,13 +1893,20 @@ fn errno_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     Ok(())
 }
 
-/// `SetErrnoPtr(errno_ptr, size)`. No return value. Only a 4-byte
-/// (`LONG`) mirror is supported -- real `bsdsocket.library` also allows
-/// 1/2-byte sizes for very old C runtimes, not needed by anything this
-/// runtime targets (see the module docs' KS/WB 3.1 scope).
+/// `SetErrnoPtr(errno_ptr, size)`. No return value. `size` (`D0`) is
+/// `1` (`BYTE`)/`2` (`WORD`)/`4` (`LONG`) -- real `bsdsocket.library`
+/// allows all three, for C runtimes whose own `errno` variable isn't
+/// necessarily a full `LONG` (see [`BsdSocketState::errno_ptr_size`]).
+/// Any other size falls back to `4`, matching real `SetErrnoPtr`'s own
+/// "unrecognized size defaults to `LONG`" behavior.
 fn set_errno_ptr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ptr = ctx.cpu.address_register(AddressRegister(0));
+    let size = ctx.cpu.data_register(DataRegister(0));
     ctx.bsdsocket.errno_ptr = if ptr == 0 { None } else { Some(ptr) };
+    ctx.bsdsocket.errno_ptr_size = match size {
+        1 | 2 => size as u8,
+        _ => 4,
+    };
     Ok(())
 }
 
@@ -1869,6 +1956,19 @@ fn inet_addr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     };
     ctx.cpu.set_data_register(DataRegister(0), result);
     Ok(())
+}
+
+/// `inet_network(cp)`. `D0` = the parsed dotted-decimal address, or
+/// `-1` (`INADDR_NONE`) if `cp` doesn't parse. Real BSD documents
+/// `inet_network`'s result as host byte order (as opposed to
+/// `inet_addr`'s network byte order) -- on a little-endian host those
+/// would genuinely differ, but `m68k` is big-endian, so host order and
+/// network order are the same bit pattern here: this is exactly
+/// [`inet_addr_handler`]'s own parse, confirmed identical against
+/// `bsdsocktest`'s own worked example (`"10.0.0.0"` -> `0x0a000000`,
+/// the same value `inet_addr` would also produce for it).
+fn inet_network_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    inet_addr_handler(ctx)
 }
 
 // --- Inet_LnaOf/Inet_NetOf/Inet_MakeAddr: classic 4.3BSD classful
@@ -2533,6 +2633,7 @@ fn socket_base_tag_list_handler<C: Cpu>(
                         ti_data
                     };
                     ctx.bsdsocket.errno_ptr = if ptr == 0 { None } else { Some(ptr) };
+                    ctx.bsdsocket.errno_ptr_size = 4; // the "LONG" in ERRNOLONGPTR
                 }
                 (SBTC_ERRNOLONGPTR, false) if by_ref => {
                     // Real bsdsocket.library always has a valid internal
@@ -2894,6 +2995,7 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("Inet_LnaOf", inet_lnaof_handler::<C>);
     reg!("Inet_NetOf", inet_netof_handler::<C>);
     reg!("Inet_MakeAddr", inet_makeaddr_handler::<C>);
+    reg!("inet_network", inet_network_handler::<C>);
     reg!("gethostbyname", gethostbyname_handler::<C>);
     reg!("gethostbyaddr", gethostbyaddr_handler::<C>);
     reg!("getservbyname", getservbyname_handler::<C>);
@@ -4970,6 +5072,247 @@ mod tests {
             mem.read_u32(recv_msg + 24),
             0,
             "msg_flags should be cleared"
+        );
+    }
+
+    #[test]
+    fn end_to_end_inet_network_parses_dotted_decimal() {
+        let cp_addr: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, cp_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-204)); // inet_network -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, cp_addr, b"10.0.0.0");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_eq!(code, 0x0a00_0000);
+    }
+
+    #[test]
+    fn end_to_end_set_errno_ptr_honors_byte_and_word_sizes() {
+        let byte_out: u32 = 0x1_8000;
+        let word_out: u32 = 0x1_8100;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, byte_out);
+        push_move_imm_d(&mut words, 0, 1); // size = 1 (BYTE)
+        words.extend_from_slice(&jsr_disp16_a6(-168)); // SetErrnoPtr(&byte_out, 1)
+        push_move_imm_d(&mut words, 0, 999); // an fd that was never opened
+        words.extend_from_slice(&jsr_disp16_a6(-120)); // CloseSocket(999) -- fails, sets errno
+
+        push_move_imm_a(&mut words, 0, word_out);
+        push_move_imm_d(&mut words, 0, 2); // size = 2 (WORD)
+        words.extend_from_slice(&jsr_disp16_a6(-168)); // SetErrnoPtr(&word_out, 2)
+        push_move_imm_d(&mut words, 0, 999);
+        words.extend_from_slice(&jsr_disp16_a6(-120)); // CloseSocket(999) again
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u8(byte_out, 0);
+        mem.write_u16(word_out, 0);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        assert_ne!(
+            rt.memory().read_u8(byte_out),
+            0,
+            "a 1-byte SetErrnoPtr variable should be mirrored on failure"
+        );
+        assert_ne!(
+            rt.memory().read_u16(word_out),
+            0,
+            "a 2-byte SetErrnoPtr variable should be mirrored on failure"
+        );
+    }
+
+    #[test]
+    fn end_to_end_ioctlsocket_fionread_reports_real_pending_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            stream.write_all(b"hello world").expect("write_all");
+        });
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let nbytes_buf: u32 = 0x1_8100;
+        let readfds: u32 = 0x1_8200;
+        let timeout_buf: u32 = 0x1_8300;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0
+
+        // A real, blocking WaitSelect on the socket's own readfds --
+        // guarantees the peer's real write() has actually landed before
+        // FIONREAD is queried, without any misplaced host-side sleep
+        // (a host `std::thread::sleep` between instruction-builder calls
+        // only delays *building* the guest program, not the guest's own
+        // execution, since the whole program runs as a single atomic
+        // rt.run() call).
+        push_move_imm_d(&mut words, 0, 2); // nfds = fd(1) + 1
+        push_move_imm_a(&mut words, 0, readfds);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, timeout_buf);
+        push_move_imm_d(&mut words, 1, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect()
+
+        push_move_imm_d(&mut words, 0, 1); // fd
+        push_move_imm_d(&mut words, 1, FIONREAD);
+        push_move_imm_a(&mut words, 0, nbytes_buf);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IoctlSocket() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        mem.write_u32(readfds, 0b10); // FD_SET(1, &readfds)
+        for i in 4..FD_SET_BYTES {
+            mem.write_u8(readfds.wrapping_add(i), 0);
+        }
+        write_timeval(
+            &mut mem,
+            timeout_buf,
+            Some(std::time::Duration::from_secs(2)),
+        );
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        accept_thread.join().unwrap();
+
+        assert_eq!(code, 0, "IoctlSocket(FIONREAD) should succeed");
+        assert_eq!(
+            rt.memory().read_u32(nbytes_buf),
+            11,
+            "should report the real 11 pending bytes (\"hello world\")"
+        );
+    }
+
+    #[test]
+    fn end_to_end_recv_msg_peek_does_not_consume() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.write_all(b"hi").expect("write_all");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let peek_buf: u32 = 0x1_8100;
+        let recv_buf: u32 = 0x1_8200;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0
+
+        push_move_imm_d(&mut words, 0, 1); // fd
+        push_move_imm_a(&mut words, 0, peek_buf);
+        push_move_imm_d(&mut words, 1, 2); // len
+        push_move_imm_d(&mut words, 2, MSG_PEEK as u32); // flags
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // recv(MSG_PEEK) -> D0
+
+        push_move_imm_d(&mut words, 0, 1);
+        push_move_imm_a(&mut words, 0, recv_buf);
+        push_move_imm_d(&mut words, 1, 2);
+        push_move_imm_d(&mut words, 2, 0); // flags = 0 (ordinary consuming recv)
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // recv() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        accept_thread.join().unwrap();
+
+        assert_eq!(
+            code, 2,
+            "the ordinary recv() after peeking should still see both bytes"
+        );
+        let mem = rt.memory();
+        assert_eq!(mem.read_u8(peek_buf), b'h');
+        assert_eq!(mem.read_u8(peek_buf + 1), b'i');
+        assert_eq!(
+            (mem.read_u8(recv_buf), mem.read_u8(recv_buf + 1)),
+            (b'h', b'i'),
+            "MSG_PEEK must not have consumed the bytes -- the real recv() sees them too"
         );
     }
 }
