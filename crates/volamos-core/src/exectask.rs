@@ -686,8 +686,18 @@ fn set_except_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 /// exhausted). Returns the allocated bit number in `D0`, or `-1` if the
 /// specific bit requested was already allocated (or, for "any", if
 /// every bit is allocated).
+///
+/// `signalNum` is a real `BYTE` parameter (`clib/exec_protos.h`): only
+/// `D0`'s low byte is meaningful, the upper three bytes are whatever a
+/// real C compiler's calling convention happened to leave there (never
+/// guaranteed sign-extended). Reading the full 32-bit `D0` as `requested`
+/// treated `AllocSignal(-1)` as `255` instead of `-1` whenever a real
+/// compiler didn't happen to zero those upper bytes -- caught via a real
+/// conformance suite (`bsdsocktest`'s own `alloc_signal()`/`AllocSignal
+/// (-1)` wrapper, real SAS/C-compiled) failing every single signal
+/// allocation, even the very first one on a freshly booted task.
 fn alloc_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    let requested = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let requested = (ctx.cpu.data_register(DataRegister(0)) as u8) as i8 as i32;
     let task = ctx.current_task;
     let alloc = ctx.mem.read_u32(task + TC_SIGALLOC);
 
@@ -715,9 +725,11 @@ fn alloc_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 /// `FreeSignal` (LVO -336): `D0` = signal number to free, or `-1`
 /// (a documented no-op -- real `FreeSignal(-1)` does nothing). Out-of-
 /// range values (not `-1` and not `0..32`) are also treated as a no-op
-/// rather than an error, since there's no bit to clear.
+/// rather than an error, since there's no bit to clear. Same real `BYTE`
+/// parameter caveat as [`alloc_signal_handler`] -- only `D0`'s low byte
+/// is meaningful.
 fn free_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    let signal_num = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let signal_num = (ctx.cpu.data_register(DataRegister(0)) as u8) as i8 as i32;
     if !(0..32).contains(&signal_num) {
         return Ok(());
     }
@@ -1690,6 +1702,34 @@ mod tests {
         assert_eq!(
             code, 31,
             "AllocSignal(-1) should hand out the highest free bit first"
+        );
+    }
+
+    /// Regression test for a real bug: a `BYTE` parameter like
+    /// `AllocSignal`'s `signalNum` only guarantees `D0`'s low byte is
+    /// meaningful -- a real compiler is not obligated to sign-extend the
+    /// upper three bytes when passing `-1`. This reproduces exactly that
+    /// real-world shape (`D0 = 0x000000FF`, not `0xFFFFFFFF`) -- what a
+    /// real SAS/C-compiled `AllocSignal(-1)` call left in `D0`, caught
+    /// via `bsdsocktest`'s own `alloc_signal()` wrapper failing every
+    /// single allocation, even the very first one on a freshly booted
+    /// task.
+    #[test]
+    fn alloc_signal_minus_one_as_a_plain_byte_still_means_any() {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = 0x000000FF -- byte -1, NOT sign-extended
+        words.push(0x0000);
+        words.push(0x00FF);
+        words.extend_from_slice(&jsr_disp16_a6(-330)); // AllocSignal(-1)
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 31,
+            "a byte-only -1 (0x000000FF) must still mean \"any free bit\", not \"bit 255\""
         );
     }
 

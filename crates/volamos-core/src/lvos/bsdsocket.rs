@@ -291,6 +291,22 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
         private: false,
     },
+    LvoEntry {
+        name: "GetSocketEvents",
+        lvo: -300,
+        args: &[ArgReg::A(AddressRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "SetSocketSignals",
+        lvo: -132,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::D(DataRegister(1)),
+            ArgReg::D(DataRegister(2)),
+        ],
+        private: false,
+    },
 ];
 
 #[cfg(test)]

@@ -42,7 +42,8 @@
 //! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
 //! `inet_addr`/`gethostbyname`/`IoctlSocket`/`setsockopt`/`getsockopt`/
-//! `SocketBaseTagList`/`WaitSelect`/`Dup2Socket`/`vsyslog` -- real outbound and inbound TCP,
+//! `SocketBaseTagList`/`WaitSelect`/`Dup2Socket`/`vsyslog`/
+//! `GetSocketEvents`/`SetSocketSignals` -- real outbound and inbound TCP,
 //! plus UDP, real error reporting through the documented `Errno()`/
 //! `SetErrnoPtr()` mechanism, real forward DNS lookups via the host's
 //! own resolver (see "DNS: a real, blocking host lookup" below), the
@@ -59,12 +60,10 @@
 //! unknown-call, same as any other library's unimplemented LVO in this
 //! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why
 //! this table only lists what's implemented, not the full ABI):
-//! `SetSocketSignals` (a simpler, older sibling of `WaitSelect`'s own
-//! signal-mask parameter -- no corpus binary or conformance test needs
-//! it yet), `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no
+//! `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no
 //! portable reverse-DNS primitive; Copperline's own `hostsocket-plugin`
 //! hit the identical wall and stayed a stub for the same reason, see that
-//! crate's module docs), `sendmsg`/`recvmsg`/`GetSocketEvents`.
+//! crate's module docs), `sendmsg`/`recvmsg`.
 //! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket` *are* registered
 //! (so a caller that unconditionally tries them doesn't crash the whole
 //! run) but always honestly fail with `EOPNOTSUPP` -- see
@@ -131,6 +130,34 @@
 //! own task model -- not a missing feature, just a state this
 //! architecture can't produce. `crate::exectask::TC_SIGRECVD` is the
 //! same field `SetSignal`/`Wait`/`Signal` already maintain.
+//!
+//! # `SO_EVENTMASK`/`GetSocketEvents`: real per-socket event detection
+//!
+//! `SO_EVENTMASK` ([`setsockopt_handler`]/[`getsockopt_handler`]) arms a
+//! set of `FD_*` bits (`FD_READ`/`FD_WRITE`/`FD_ACCEPT`/`FD_CLOSE`/
+//! `FD_ERROR` -- real `<libraries/bsdsocket.h>` values) on one socket;
+//! `SocketBaseTagList`'s `SBTC_SIGEVENTMASK` tag arms an Exec signal bit
+//! to raise whenever any armed event fires on any socket;
+//! `GetSocketEvents` drains one pending `(fd, bits)` pair at a time,
+//! round-robin across sockets that have one. There is no dedicated
+//! "check for events" call in the real API -- real programs discover
+//! events by calling `WaitSelect` (often with every `fd_set` `NULL` and
+//! only the signal armed, since the events themselves aren't in any
+//! `fd_set`), so [`wait_select_poll`] is where detection actually
+//! happens: every event-armed socket rides along in the very same real
+//! `poll(2)` call as the caller's own explicit `fd_set` interests
+//! (a *single* `poll(2)` covers both, so a real event unblocks a
+//! `WaitSelect(0, NULL, NULL, NULL, &tv, &sigmask)` call early exactly
+//! like real hardware) -- see that function's own doc comment for the
+//! `poll(2)`-revents-to-`FD_*`-bits classification, including how a
+//! listening socket's `POLLIN` becomes `FD_ACCEPT` instead of `FD_READ`,
+//! and how `FD_CLOSE` is disambiguated from real pending data via a
+//! zero-consuming `peek`. Deliberately does not attempt `FD_CONNECT`
+//! detection (see that function's doc for why treating an already-
+//! writable connected socket as "connect just completed" would misfire
+//! on every call) -- `bsdsocktest`'s own `FD_CONNECT` test tolerates
+//! this, since a synchronous/fast loopback `connect()` returning `0`
+//! directly is one of its explicitly documented-acceptable outcomes.
 //!
 //! # Errno: real BSD numbering, not the host's own
 //!
@@ -257,9 +284,38 @@ const TAG_SKIP: u32 = 3;
 const TAG_USER: u32 = 0x8000_0000;
 const SBTF_REF: u32 = 0x8000;
 const SBTF_SET: u32 = 1;
+const SBTC_BREAKMASK: u32 = 1;
+const SBTC_SIGEVENTMASK: u32 = 4;
+const SBTC_DTABLESIZE: u32 = 8;
 const SBTC_ERRNOLONGPTR: u32 = 24;
 const SBTC_HERRNOLONGPTR: u32 = 25;
 const SBTC_RELEASESTRPTR: u32 = 29;
+
+// --- GetSocketEvents()/SO_EVENTMASK event bits -- a real
+// <libraries/bsdsocket.h> (Roadshow) value set, not invented. See
+// [`wait_select_poll`]'s event-synthesis pass and
+// [`get_socket_events_handler`].
+const FD_ACCEPT: u32 = 0x01;
+const FD_CONNECT: u32 = 0x02;
+#[allow(dead_code)] // listed for completeness against the real header; no
+// portable way to detect true OOB-data-pending short of a peek this
+// backend doesn't yet perform for FD_OOB specifically (see the module
+// docs -- FD_OOB/MSG_OOB share the same unimplemented-OOB gap as
+// WaitSelect's own exceptfds).
+const FD_OOB: u32 = 0x04;
+const FD_READ: u32 = 0x08;
+const FD_WRITE: u32 = 0x10;
+const FD_ERROR: u32 = 0x20;
+const FD_CLOSE: u32 = 0x40;
+
+/// `SO_EVENTMASK` -- a real `<sys/socket.h>` (Roadshow) value, not
+/// invented. Purely internal bookkeeping (which `FD_*` bits arm an event
+/// on this socket) -- unlike every other `setsockopt`/`getsockopt`
+/// option this module implements, it has no underlying real host socket
+/// option to translate to/from, so [`setsockopt_handler`]/
+/// [`getsockopt_handler`] special-case it before ever reaching their
+/// normal `socket2`-backed dispatch.
+const SO_EVENTMASK: i32 = 0x2001;
 
 /// Maps a [`std::io::Error`] from a `socket2` call to the fixed BSD
 /// `errno` numbering `bsdsocket.library` documents -- see the module
@@ -328,6 +384,30 @@ const MAX_OPEN_SOCKETS: usize = 64;
 /// where `socket2` doesn't already provide them cheaply.
 struct SocketEntry {
     socket: Socket,
+    /// `SO_EVENTMASK`'s armed `FD_*` bits (see [`wait_select_poll`]'s
+    /// event-synthesis pass) -- `0` (the default) means "no events
+    /// armed", matching every socket's real default.
+    event_mask: u32,
+    /// `FD_*` bits [`wait_select_poll`] has detected as real and not yet
+    /// handed back by [`get_socket_events_handler`] -- the queue that
+    /// function drains.
+    pending_events: u32,
+    /// Whether `listen()` was ever called on this socket -- distinguishes
+    /// "readable" (`FD_READ`, real data) from "a connection is waiting"
+    /// (`FD_ACCEPT`) when interpreting a `POLLIN` result, since both look
+    /// identical at the `poll(2)` level.
+    is_listener: bool,
+}
+
+impl SocketEntry {
+    fn new(socket: Socket) -> Self {
+        SocketEntry {
+            socket,
+            event_mask: 0,
+            pending_events: 0,
+            is_listener: false,
+        }
+    }
 }
 
 /// Host-side `bsdsocket.library` state: the open-socket handle table and
@@ -377,7 +457,44 @@ pub struct BsdSocketState {
     /// `SocketBaseTagList`'s `SBTC_RELEASESTRPTR` query -- see
     /// [`socket_base_tag_list_handler`].
     release_str_buf: Option<u32>,
+    /// The last `h_errno`-shaped code any DNS handler here recorded --
+    /// mirrors [`Self::last_errno`]'s own role, but for the separate
+    /// `h_errno` channel, used as the initial value a lazily-allocated
+    /// [`Self::herrno_ptr`] starts with (see
+    /// [`socket_base_tag_list_handler`]'s `SBTC_HERRNOLONGPTR` GET
+    /// branch).
+    last_herrno: i32,
+    /// `SBTC_SIGEVENTMASK`'s current value: the Exec signal bit(s)
+    /// [`wait_select_poll`]'s event-synthesis pass raises when it detects
+    /// a real, armed `SO_EVENTMASK` event on any socket. `0` (the
+    /// default) means no signal is armed for events at all.
+    sigeventmask: u32,
+    /// `SBTC_BREAKMASK`'s current value -- plain round-trip storage (no
+    /// handler here currently *acts* on it; nothing in this backend
+    /// synthesizes its own Ctrl-C delivery independent of the guest's own
+    /// task signal state). Defaults to `SIGBREAKF_CTRL_C` (bit 12),
+    /// matching real `bsdsocket.library`'s own default.
+    breakmask: u32,
+    /// `SBTC_DTABLESIZE`'s current value -- what [`getdtablesize_handler`]
+    /// returns and [`socket_handler`]'s own `MAX_OPEN_SOCKETS`-shaped
+    /// admission check now consults instead of the fixed constant, so a
+    /// guest that raises it via `SocketBaseTagList` really can open more
+    /// sockets afterward. Starts at [`MAX_OPEN_SOCKETS`]; capped growth
+    /// (see [`socket_base_tag_list_handler`]'s `SBTC_DTABLESIZE` SET
+    /// branch) against unbounded guest-driven allocation.
+    dtablesize: u32,
+    /// [`get_socket_events_handler`]'s round-robin cursor: the last fd
+    /// handed back, so consecutive calls with multiple sockets pending
+    /// visit them in rotation rather than always returning the
+    /// lowest-numbered one (real documented `GetSocketEvents` behavior --
+    /// confirmed against `bsdsocktest`'s own round-robin test). `-1`
+    /// (never yet returned anything) sorts before every real fd.
+    event_cursor: i32,
 }
+
+/// `SIGBREAKF_CTRL_C` (bit 12) -- `exec/exec.h`'s standard Ctrl-C signal
+/// bit, and real `bsdsocket.library`'s own default `SBTC_BREAKMASK`.
+const SIGBREAKF_CTRL_C: u32 = 1 << 12;
 
 impl BsdSocketState {
     pub fn new() -> Self {
@@ -390,6 +507,11 @@ impl BsdSocketState {
             ntoa_buf: None,
             hostent_allocs: Vec::new(),
             release_str_buf: None,
+            last_herrno: 0,
+            sigeventmask: 0,
+            breakmask: SIGBREAKF_CTRL_C,
+            dtablesize: MAX_OPEN_SOCKETS as u32,
+            event_cursor: -1,
         }
     }
 
@@ -417,6 +539,7 @@ impl BsdSocketState {
     /// own registered mirror, since nothing here reads it back the way
     /// `Errno()` does for plain errno.
     fn set_herrno(&mut self, mem: &mut dyn AddressSpace, code: i32) {
+        self.last_herrno = code;
         if let Some(ptr) = self.herrno_ptr {
             mem.write_u32(ptr, code as u32);
         }
@@ -492,7 +615,7 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
     };
 
-    if ctx.bsdsocket.sockets.len() >= MAX_OPEN_SOCKETS {
+    if ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize {
         fail(ctx, EMFILE);
         return Ok(());
     }
@@ -522,7 +645,7 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 
     let id = ctx.bsdsocket.next_id;
     ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
-    ctx.bsdsocket.sockets.insert(id, SocketEntry { socket });
+    ctx.bsdsocket.sockets.insert(id, SocketEntry::new(socket));
     ctx.bsdsocket.set_errno(ctx.mem, 0);
     ctx.cpu.set_data_register(DataRegister(0), id as u32);
     Ok(())
@@ -586,6 +709,9 @@ fn listen_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     };
     match result {
         Ok(()) => {
+            if let Some(entry) = ctx.bsdsocket.sockets.get_mut(&fd) {
+                entry.is_listener = true;
+            }
             ctx.bsdsocket.set_errno(ctx.mem, 0);
             ctx.cpu.set_data_register(DataRegister(0), 0);
         }
@@ -613,7 +739,7 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
     let addr_ptr = ctx.cpu.address_register(AddressRegister(0));
 
-    if ctx.bsdsocket.sockets.len() >= MAX_OPEN_SOCKETS {
+    if ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize {
         ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         return Ok(());
@@ -631,9 +757,7 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
             }
             let id = ctx.bsdsocket.next_id;
             ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
-            ctx.bsdsocket
-                .sockets
-                .insert(id, SocketEntry { socket: accepted });
+            ctx.bsdsocket.sockets.insert(id, SocketEntry::new(accepted));
             ctx.bsdsocket.set_errno(ctx.mem, 0);
             ctx.cpu.set_data_register(DataRegister(0), id as u32);
             if let Some(peer) = peer.as_socket_ipv4() {
@@ -885,6 +1009,25 @@ fn setsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     let optname = ctx.cpu.data_register(DataRegister(2)) as i32;
     let optval_ptr = ctx.cpu.address_register(AddressRegister(0));
 
+    // SO_EVENTMASK has no underlying real host socket option -- it's
+    // purely this backend's own bookkeeping for which FD_* bits
+    // wait_select_poll's event-synthesis pass should watch for on this
+    // socket -- so it's handled directly against BsdSocketState instead
+    // of falling into the socket2-backed Apply dispatch below.
+    if level == SOL_SOCKET && optname == SO_EVENTMASK {
+        let mask = ctx.mem.read_u32(optval_ptr);
+        let Some(entry) = ctx.bsdsocket.sockets.get_mut(&fd) else {
+            ctx.bsdsocket.set_errno(ctx.mem, EBADF);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            return Ok(());
+        };
+        entry.event_mask = mask;
+        entry.pending_events &= mask; // dropping newly-disarmed bits
+        ctx.bsdsocket.set_errno(ctx.mem, 0);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+
     enum Apply {
         Bool(bool),
         Size(usize),
@@ -962,6 +1105,18 @@ fn getsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     let level = ctx.cpu.data_register(DataRegister(1)) as i32;
     let optname = ctx.cpu.data_register(DataRegister(2)) as i32;
     let optval_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    if level == SOL_SOCKET && optname == SO_EVENTMASK {
+        let Some(entry) = ctx.bsdsocket.sockets.get(&fd) else {
+            ctx.bsdsocket.set_errno(ctx.mem, EBADF);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            return Ok(());
+        };
+        ctx.mem.write_u32(optval_ptr, entry.event_mask);
+        ctx.bsdsocket.set_errno(ctx.mem, 0);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
 
     if !matches!(
         (level, optname),
@@ -1184,13 +1339,15 @@ fn close_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     Ok(())
 }
 
-/// `getdtablesize()`. `D0` = [`MAX_OPEN_SOCKETS`] -- the real cap this
-/// backend enforces, matching real `getdtablesize`'s "the largest fd
-/// value plus one this process could ever have" contract closely enough
-/// for a caller sizing an `fd_set`-like structure.
+/// `getdtablesize()`. `D0` = [`BsdSocketState::dtablesize`] (starts at
+/// [`MAX_OPEN_SOCKETS`], raisable via `SocketBaseTagList(SBTC_DTABLESIZE)`
+/// -- see [`socket_base_tag_list_handler`]) -- the real cap this backend
+/// enforces, matching real `getdtablesize`'s "the largest fd value plus
+/// one this process could ever have" contract closely enough for a
+/// caller sizing an `fd_set`-like structure.
 fn getdtablesize_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.cpu
-        .set_data_register(DataRegister(0), MAX_OPEN_SOCKETS as u32);
+        .set_data_register(DataRegister(0), ctx.bsdsocket.dtablesize);
     Ok(())
 }
 
@@ -1344,6 +1501,39 @@ fn wait_select_poll<C: Cpu>(
         })
         .collect();
 
+    // Every SO_EVENTMASK-armed socket rides along in the same real
+    // poll(2) call, regardless of nfds/the caller's own fd_sets -- real
+    // GetSocketEvents-driven callers call WaitSelect(0, NULL, NULL, NULL,
+    // &tv, &sigmask) exactly like this (see the module docs' "SO_
+    // EVENTMASK/GetSocketEvents" section), so event detection can't be
+    // gated on the caller having also listed the fd explicitly.
+    let event_fds: Vec<i32> = ctx
+        .bsdsocket
+        .sockets
+        .iter()
+        .filter(|(_, e)| e.event_mask != 0)
+        .map(|(&fd, _)| fd)
+        .collect();
+    let event_pollfds: Vec<libc::pollfd> = event_fds
+        .iter()
+        .map(|&fd| {
+            let entry = &ctx.bsdsocket.sockets[&fd];
+            let mut events = 0;
+            if entry.event_mask & (FD_READ | FD_ACCEPT | FD_CLOSE) != 0 {
+                events |= libc::POLLIN;
+            }
+            if entry.event_mask & (FD_WRITE | FD_CONNECT) != 0 {
+                events |= libc::POLLOUT;
+            }
+            libc::pollfd {
+                fd: entry.socket.as_raw_fd(),
+                events,
+                revents: 0,
+            }
+        })
+        .collect();
+    pollfds.extend(event_pollfds);
+
     let timeout_ms: i32 = if timeout_ptr == 0 {
         -1
     } else {
@@ -1395,6 +1585,72 @@ fn wait_select_poll<C: Cpu>(
             fd_set_add(ctx.mem, exceptfds_ptr, interest.fd);
             count += 1;
         }
+    }
+
+    // Classify each event-armed socket's real poll(2) result into FD_*
+    // bits (see the module docs' "SO_EVENTMASK/GetSocketEvents" section
+    // for the full rationale) and queue newly-detected ones onto
+    // pending_events, for get_socket_events_handler to drain later.
+    // Deliberately does NOT attempt FD_CONNECT: a connected TCP socket's
+    // send buffer is essentially always POLLOUT-ready, so treating that
+    // as "connect just completed" would fire on every single WaitSelect
+    // call rather than once -- a real caller either sees its own
+    // synchronous connect() return 0 (no event needed) or hits a
+    // fast-completing loopback non-blocking connect the same way; both
+    // are documented-acceptable outcomes bsdsocktest's own FD_CONNECT
+    // test tolerates.
+    let mut any_new_event = false;
+    for (i, &fd) in event_fds.iter().enumerate() {
+        let revents = pollfds[interests.len() + i].revents;
+        let Some(entry) = ctx.bsdsocket.sockets.get(&fd) else {
+            continue;
+        };
+        let armed = entry.event_mask;
+        let is_listener = entry.is_listener;
+        let mut new_bits = 0u32;
+        if revents & libc::POLLIN != 0 {
+            if is_listener {
+                if armed & FD_ACCEPT != 0 {
+                    new_bits |= FD_ACCEPT;
+                }
+            } else if armed & FD_READ != 0 {
+                new_bits |= FD_READ;
+            } else if armed & FD_CLOSE != 0 {
+                // POLLIN alone doesn't distinguish "real data arrived"
+                // from "peer closed" (EOF also reads as readable) --
+                // only relevant when FD_READ isn't also armed (if it
+                // were, the branch above already claims this readiness
+                // as FD_READ, matching real FD_READ's own "readable,
+                // including at EOF" definition). Disambiguate with a
+                // real zero-consuming peek: 0 bytes back means EOF.
+                let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+                if matches!(entry.socket.peek(&mut buf), Ok(0)) {
+                    new_bits |= FD_CLOSE;
+                }
+            }
+        }
+        if revents & libc::POLLHUP != 0 && armed & FD_CLOSE != 0 {
+            new_bits |= FD_CLOSE;
+        }
+        if revents & libc::POLLOUT != 0 && !is_listener && armed & FD_WRITE != 0 {
+            new_bits |= FD_WRITE;
+        }
+        if revents & libc::POLLERR != 0 && armed & FD_ERROR != 0 {
+            new_bits |= FD_ERROR;
+        }
+        if new_bits != 0 {
+            if let Some(entry) = ctx.bsdsocket.sockets.get_mut(&fd) {
+                entry.pending_events |= new_bits;
+            }
+            any_new_event = true;
+        }
+    }
+    if any_new_event && ctx.bsdsocket.sigeventmask != 0 {
+        let recvd = ctx.mem.read_u32(ctx.current_task + exectask::TC_SIGRECVD);
+        ctx.mem.write_u32(
+            ctx.current_task + exectask::TC_SIGRECVD,
+            recvd | ctx.bsdsocket.sigeventmask,
+        );
     }
 
     ctx.bsdsocket.set_errno(ctx.mem, 0);
@@ -1650,6 +1906,36 @@ fn socket_base_tag_list_handler<C: Cpu>(
                     };
                     ctx.bsdsocket.errno_ptr = if ptr == 0 { None } else { Some(ptr) };
                 }
+                (SBTC_ERRNOLONGPTR, false) if by_ref => {
+                    // Real bsdsocket.library always has a valid internal
+                    // errno storage location, even before a caller ever
+                    // calls SetErrnoPtr/sets this tag explicitly -- a
+                    // caller is entitled to fetch it and read/write it
+                    // directly from then on. Lazily allocate one on first
+                    // GET and adopt it as errno_ptr, so it starts
+                    // reflecting live updates from the very next
+                    // set_errno call.
+                    let ptr = match ctx.bsdsocket.errno_ptr {
+                        Some(ptr) => ptr,
+                        None => {
+                            let addr =
+                                ctx.heap
+                                    .alloc(4)
+                                    .map_err(|e| DispatchError::HandlerFailed {
+                                        library: "bsdsocket.library".to_string(),
+                                        lvo: -294,
+                                        handler_name: "SocketBaseTagList".to_string(),
+                                        message: format!(
+                                            "SocketBaseTagList: guest heap allocation failed: {e}"
+                                        ),
+                                    })?;
+                            ctx.mem.write_u32(addr, ctx.bsdsocket.last_errno as u32);
+                            ctx.bsdsocket.errno_ptr = Some(addr);
+                            addr
+                        }
+                    };
+                    ctx.mem.write_u32(ti_data, ptr);
+                }
                 (SBTC_HERRNOLONGPTR, true) => {
                     let ptr = if by_ref {
                         ctx.mem.read_u32(ti_data)
@@ -1657,6 +1943,70 @@ fn socket_base_tag_list_handler<C: Cpu>(
                         ti_data
                     };
                     ctx.bsdsocket.herrno_ptr = if ptr == 0 { None } else { Some(ptr) };
+                }
+                (SBTC_HERRNOLONGPTR, false) if by_ref => {
+                    // Same lazy-adoption pattern as SBTC_ERRNOLONGPTR's
+                    // GET above, for the separate h_errno channel.
+                    let ptr = match ctx.bsdsocket.herrno_ptr {
+                        Some(ptr) => ptr,
+                        None => {
+                            let addr =
+                                ctx.heap
+                                    .alloc(4)
+                                    .map_err(|e| DispatchError::HandlerFailed {
+                                        library: "bsdsocket.library".to_string(),
+                                        lvo: -294,
+                                        handler_name: "SocketBaseTagList".to_string(),
+                                        message: format!(
+                                            "SocketBaseTagList: guest heap allocation failed: {e}"
+                                        ),
+                                    })?;
+                            ctx.mem.write_u32(addr, ctx.bsdsocket.last_herrno as u32);
+                            ctx.bsdsocket.herrno_ptr = Some(addr);
+                            addr
+                        }
+                    };
+                    ctx.mem.write_u32(ti_data, ptr);
+                }
+                (SBTC_BREAKMASK, true) => {
+                    ctx.bsdsocket.breakmask = if by_ref {
+                        ctx.mem.read_u32(ti_data)
+                    } else {
+                        ti_data
+                    };
+                }
+                (SBTC_BREAKMASK, false) if by_ref => {
+                    ctx.mem.write_u32(ti_data, ctx.bsdsocket.breakmask);
+                }
+                (SBTC_SIGEVENTMASK, true) => {
+                    ctx.bsdsocket.sigeventmask = if by_ref {
+                        ctx.mem.read_u32(ti_data)
+                    } else {
+                        ti_data
+                    };
+                }
+                (SBTC_SIGEVENTMASK, false) if by_ref => {
+                    ctx.mem.write_u32(ti_data, ctx.bsdsocket.sigeventmask);
+                }
+                (SBTC_DTABLESIZE, true) => {
+                    let requested = if by_ref {
+                        ctx.mem.read_u32(ti_data)
+                    } else {
+                        ti_data
+                    };
+                    // A real caller can only ever grow this (see
+                    // bsdsocktest's own "may not reduce" comment); clamp
+                    // against unbounded guest-driven HashMap growth the
+                    // same way MAX_OPEN_SOCKETS already bounds it, one
+                    // sane ceiling for a backend with no real OS-level fd
+                    // table to actually expand.
+                    ctx.bsdsocket.dtablesize = requested
+                        .max(MAX_OPEN_SOCKETS as u32)
+                        .min(4096)
+                        .max(ctx.bsdsocket.dtablesize);
+                }
+                (SBTC_DTABLESIZE, false) if by_ref => {
+                    ctx.mem.write_u32(ti_data, ctx.bsdsocket.dtablesize);
                 }
                 (SBTC_RELEASESTRPTR, false) if by_ref => {
                     let buf = match ctx.bsdsocket.release_str_buf {
@@ -1746,9 +2096,7 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         }
         new_fd
     };
-    ctx.bsdsocket
-        .sockets
-        .insert(id, SocketEntry { socket: dup });
+    ctx.bsdsocket.sockets.insert(id, SocketEntry::new(dup));
     ctx.bsdsocket.set_errno(ctx.mem, 0);
     ctx.cpu.set_data_register(DataRegister(0), id as u32);
     Ok(())
@@ -1796,6 +2144,81 @@ fn vsyslog_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let (rendered, _) = crate::execfmt::render_format(ctx.mem, &fmt, args_ptr);
     let text = String::from_utf8_lossy(&rendered);
     *ctx.call_detail = Some(format!("vsyslog(pri={pri}): {text}"));
+    Ok(())
+}
+
+/// `GetSocketEvents(ULONG *event_ptr)`. `D0` = the fd of one socket with
+/// a real, armed `SO_EVENTMASK` event pending (see [`wait_select_poll`]'s
+/// event-synthesis pass, which is what actually detects and queues these
+/// onto [`SocketEntry::pending_events`]), with `*event_ptr` set to that
+/// socket's consumed `FD_*` bits -- or `-1` (leaving `*event_ptr`
+/// untouched) if nothing is pending. Retrieval consumes the event (real
+/// documented behavior: a second immediate call sees nothing for that
+/// fd until it becomes ready again). When more than one socket has a
+/// pending event, scans in fd order starting just after
+/// [`BsdSocketState::event_cursor`] (wrapping back to the lowest fd) --
+/// real `GetSocketEvents` is documented to round-robin across sockets
+/// with pending events rather than always favoring the same one,
+/// confirmed against `bsdsocktest`'s own round-robin test.
+fn get_socket_events_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let event_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    let mut candidates: Vec<i32> = ctx
+        .bsdsocket
+        .sockets
+        .iter()
+        .filter(|(_, e)| e.pending_events != 0)
+        .map(|(&fd, _)| fd)
+        .collect();
+    candidates.sort_unstable();
+    let cursor = ctx.bsdsocket.event_cursor;
+    let next = candidates
+        .iter()
+        .find(|&&fd| fd > cursor)
+        .or_else(|| candidates.first())
+        .copied();
+
+    match next {
+        Some(fd) => {
+            let entry = ctx
+                .bsdsocket
+                .sockets
+                .get_mut(&fd)
+                .expect("fd came from this same sockets map");
+            let events = entry.pending_events;
+            entry.pending_events = 0;
+            ctx.bsdsocket.event_cursor = fd;
+            ctx.mem.write_u32(event_ptr, events);
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), fd as u32);
+        }
+        None => {
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        }
+    }
+    Ok(())
+}
+
+/// `SetSocketSignals(int_mask, io_mask, urgent_mask)`. No return value.
+/// A simpler, older predecessor of `SocketBaseTagList`'s
+/// `SBTC_BREAKMASK`/`SBTC_SIGEVENTMASK` tags (same real historical
+/// relationship as `SetErrnoPtr` to `SBTC_ERRNOLONGPTR`) -- `int_mask`
+/// and `io_mask` map onto exactly those same two pieces of state
+/// ([`BsdSocketState::breakmask`]/[`BsdSocketState::sigeventmask`]), so
+/// setting either one here is immediately visible through the newer
+/// API too, and vice versa. `urgent_mask` (a signal for OOB data across
+/// any socket) is accepted but not wired to real delivery -- this
+/// backend doesn't detect OOB data at all yet (see the module docs'
+/// `FD_OOB` note in the `SO_EVENTMASK`/`GetSocketEvents` section, the
+/// same gap `WaitSelect`'s own `exceptfds` has).
+fn set_socket_signals_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let int_mask = ctx.cpu.data_register(DataRegister(0));
+    let io_mask = ctx.cpu.data_register(DataRegister(1));
+    ctx.bsdsocket.breakmask = int_mask;
+    ctx.bsdsocket.sigeventmask = io_mask;
     Ok(())
 }
 
@@ -1847,6 +2270,8 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("ObtainSocket", release_socket_handler::<C>);
     reg!("ReleaseSocket", release_socket_handler::<C>);
     reg!("ReleaseCopyOfSocket", release_socket_handler::<C>);
+    reg!("GetSocketEvents", get_socket_events_handler::<C>);
+    reg!("SetSocketSignals", set_socket_signals_handler::<C>);
 }
 
 #[cfg(test)]
@@ -2964,5 +3389,474 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, EOPNOTSUPP);
+    }
+
+    #[test]
+    fn end_to_end_socket_base_tags_get_lazily_allocates_errno_and_herrno_pointers() {
+        let errno_out: u32 = 0x1_8000;
+        let herrno_out: u32 = 0x1_8100;
+        let tags_addr: u32 = 0x1_8200;
+
+        const SBTM_GETREF_ERRNOLONGPTR: u32 = TAG_USER | SBTF_REF | (SBTC_ERRNOLONGPTR << 1);
+        const SBTM_GETREF_HERRNOLONGPTR: u32 = TAG_USER | SBTF_REF | (SBTC_HERRNOLONGPTR << 1);
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // SocketBaseTagList() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(tags_addr, SBTM_GETREF_ERRNOLONGPTR);
+        mem.write_u32(tags_addr.wrapping_add(4), errno_out);
+        mem.write_u32(tags_addr.wrapping_add(8), SBTM_GETREF_HERRNOLONGPTR);
+        mem.write_u32(tags_addr.wrapping_add(12), herrno_out);
+        mem.write_u32(tags_addr.wrapping_add(16), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        assert_ne!(
+            rt.memory().read_u32(errno_out),
+            0,
+            "SBTC_ERRNOLONGPTR GET should hand back a real, valid pointer"
+        );
+        assert_ne!(
+            rt.memory().read_u32(herrno_out),
+            0,
+            "SBTC_HERRNOLONGPTR GET should hand back a real, valid pointer"
+        );
+    }
+
+    #[test]
+    fn end_to_end_socket_base_tags_dtablesize_round_trips_and_raises_getdtablesize() {
+        let before_out: u32 = 0x1_8000;
+        let after_out: u32 = 0x1_8100;
+        let tags1: u32 = 0x1_8200;
+        let tags2: u32 = 0x1_8300;
+
+        const SBTM_GETREF_DTABLESIZE: u32 = TAG_USER | SBTF_REF | (SBTC_DTABLESIZE << 1);
+        const SBTM_SETVAL_DTABLESIZE: u32 = TAG_USER | (SBTC_DTABLESIZE << 1) | SBTF_SET;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags1);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // GET before
+        push_move_imm_a(&mut words, 0, tags2);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // SET 128, then GET after
+        words.extend_from_slice(&jsr_disp16_a6(-138)); // getdtablesize() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(tags1, SBTM_GETREF_DTABLESIZE);
+        mem.write_u32(tags1.wrapping_add(4), before_out);
+        mem.write_u32(tags1.wrapping_add(8), TAG_DONE);
+        mem.write_u32(tags2, SBTM_SETVAL_DTABLESIZE);
+        mem.write_u32(tags2.wrapping_add(4), 128);
+        mem.write_u32(tags2.wrapping_add(8), SBTM_GETREF_DTABLESIZE);
+        mem.write_u32(tags2.wrapping_add(12), after_out);
+        mem.write_u32(tags2.wrapping_add(16), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+
+        assert!(rt.memory().read_u32(before_out) >= MAX_OPEN_SOCKETS as u32);
+        assert!(rt.memory().read_u32(after_out) >= 128);
+        assert!(
+            code >= 128,
+            "getdtablesize() should reflect the SBTC_DTABLESIZE change, got {code}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_socket_base_tags_sigeventmask_and_breakmask_round_trip() {
+        let out1: u32 = 0x1_8000;
+        let out2: u32 = 0x1_8100;
+        let tags: u32 = 0x1_8200;
+
+        const SBTM_SETVAL_SIGEVENTMASK: u32 = TAG_USER | (SBTC_SIGEVENTMASK << 1) | SBTF_SET;
+        const SBTM_GETREF_SIGEVENTMASK: u32 = TAG_USER | SBTF_REF | (SBTC_SIGEVENTMASK << 1);
+        const SBTM_SETVAL_BREAKMASK: u32 = TAG_USER | (SBTC_BREAKMASK << 1) | SBTF_SET;
+        const SBTM_GETREF_BREAKMASK: u32 = TAG_USER | SBTF_REF | (SBTC_BREAKMASK << 1);
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags);
+        words.extend_from_slice(&jsr_disp16_a6(-294));
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(tags, SBTM_SETVAL_SIGEVENTMASK);
+        mem.write_u32(tags.wrapping_add(4), 0x10000);
+        mem.write_u32(tags.wrapping_add(8), SBTM_GETREF_SIGEVENTMASK);
+        mem.write_u32(tags.wrapping_add(12), out1);
+        mem.write_u32(tags.wrapping_add(16), SBTM_SETVAL_BREAKMASK);
+        mem.write_u32(tags.wrapping_add(20), 0x20000);
+        mem.write_u32(tags.wrapping_add(24), SBTM_GETREF_BREAKMASK);
+        mem.write_u32(tags.wrapping_add(28), out2);
+        mem.write_u32(tags.wrapping_add(32), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        assert_eq!(rt.memory().read_u32(out1), 0x10000);
+        assert_eq!(rt.memory().read_u32(out2), 0x20000);
+    }
+
+    #[test]
+    fn end_to_end_so_eventmask_fd_read_fires_and_is_consumed_by_getsocketevents() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            stream.write_all(b"hi").expect("write_all");
+        });
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let eventmask_buf: u32 = 0x1_8100;
+        let sigmask_buf: u32 = 0x1_8200;
+        let timeout_buf: u32 = 0x1_8300;
+        let tags_buf: u32 = 0x1_8400;
+        let evmask_out: u32 = 0x1_8500;
+        const USER_SIGNAL_BIT: u32 = 0x0001_0000;
+        const SBTM_SETVAL_SIGEVENTMASK: u32 = TAG_USER | (SBTC_SIGEVENTMASK << 1) | SBTF_SET;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_buf);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // SocketBaseTagList: arm SIGEVENTMASK
+
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0
+
+        push_move_imm_d(&mut words, 0, 1); // fd
+        push_move_imm_d(&mut words, 1, SOL_SOCKET as u32);
+        push_move_imm_d(&mut words, 2, SO_EVENTMASK as u32);
+        push_move_imm_a(&mut words, 0, eventmask_buf);
+        push_move_imm_d(&mut words, 3, 4);
+        words.extend_from_slice(&jsr_disp16_a6(-90)); // setsockopt(fd, SO_EVENTMASK, FD_READ)
+
+        push_move_imm_d(&mut words, 0, 0); // nfds = 0
+        push_move_imm_a(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, timeout_buf);
+        push_move_imm_d(&mut words, 1, sigmask_buf);
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect()
+
+        push_move_imm_a(&mut words, 0, evmask_out);
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // GetSocketEvents() -> D0 (fd), *evmask_out = bits
+
+        push_move_imm_a(&mut words, 0, evmask_out.wrapping_add(4));
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // GetSocketEvents() again -> D0 (should be -1)
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        mem.write_u32(eventmask_buf, FD_READ);
+        mem.write_u32(sigmask_buf, USER_SIGNAL_BIT);
+        write_timeval(
+            &mut mem,
+            timeout_buf,
+            Some(std::time::Duration::from_secs(2)),
+        );
+        mem.write_u32(tags_buf, SBTM_SETVAL_SIGEVENTMASK);
+        mem.write_u32(tags_buf.wrapping_add(4), USER_SIGNAL_BIT);
+        mem.write_u32(tags_buf.wrapping_add(8), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        accept_thread.join().unwrap();
+
+        assert_ne!(
+            rt.memory().read_u32(evmask_out) & FD_READ,
+            0,
+            "the first GetSocketEvents() call should report FD_READ"
+        );
+        assert_eq!(
+            code, -1,
+            "a second GetSocketEvents() call should see the event already consumed"
+        );
+        assert_eq!(
+            rt.memory().read_u32(evmask_out.wrapping_add(4)),
+            0,
+            "no data was written for the second (nothing pending) call"
+        );
+    }
+
+    #[test]
+    fn end_to_end_so_eventmask_fd_accept_fires_on_listener() {
+        let sockaddr_buf: u32 = 0x1_8000;
+        let eventmask_buf: u32 = 0x1_8100;
+        let sigmask_buf: u32 = 0x1_8200;
+        let timeout_buf: u32 = 0x1_8300;
+        let tags_buf: u32 = 0x1_8400;
+        let evmask_out: u32 = 0x1_8500;
+        const USER_SIGNAL_BIT: u32 = 0x0001_0000;
+        const SBTM_SETVAL_SIGEVENTMASK: u32 = TAG_USER | (SBTC_SIGEVENTMASK << 1) | SBTF_SET;
+        let port = 58245u16;
+
+        let connect_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect")
+        });
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_buf);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // arm SIGEVENTMASK
+
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // bind() -- overwrites D0 with 0
+        push_move_imm_d(&mut words, 0, 1); // D0 = fd (1, the only socket) -- reload after bind()
+        push_move_imm_d(&mut words, 1, 1);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // listen()
+
+        push_move_imm_d(&mut words, 0, 1);
+        push_move_imm_d(&mut words, 1, SOL_SOCKET as u32);
+        push_move_imm_d(&mut words, 2, SO_EVENTMASK as u32);
+        push_move_imm_a(&mut words, 0, eventmask_buf);
+        push_move_imm_d(&mut words, 3, 4);
+        words.extend_from_slice(&jsr_disp16_a6(-90)); // setsockopt(fd, SO_EVENTMASK, FD_ACCEPT)
+
+        push_move_imm_d(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, timeout_buf);
+        push_move_imm_d(&mut words, 1, sigmask_buf);
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect()
+
+        push_move_imm_a(&mut words, 0, evmask_out);
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // GetSocketEvents() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        mem.write_u32(eventmask_buf, FD_ACCEPT);
+        mem.write_u32(sigmask_buf, USER_SIGNAL_BIT);
+        write_timeval(
+            &mut mem,
+            timeout_buf,
+            Some(std::time::Duration::from_secs(2)),
+        );
+        mem.write_u32(tags_buf, SBTM_SETVAL_SIGEVENTMASK);
+        mem.write_u32(tags_buf.wrapping_add(4), USER_SIGNAL_BIT);
+        mem.write_u32(tags_buf.wrapping_add(8), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let _ = connect_thread.join().unwrap();
+
+        assert_eq!(
+            code, 1,
+            "GetSocketEvents should report the listener's own fd"
+        );
+        assert_ne!(
+            rt.memory().read_u32(evmask_out) & FD_ACCEPT,
+            0,
+            "FD_ACCEPT should be among the reported bits"
+        );
+    }
+
+    #[test]
+    fn end_to_end_so_eventmask_no_spurious_events_on_idle_socket() {
+        let timeout_buf: u32 = 0x1_8100;
+        let eventmask_buf: u32 = 0x1_8200;
+        let tags_buf: u32 = 0x1_8300;
+        let evmask_out: u32 = 0x1_8400;
+        const USER_SIGNAL_BIT: u32 = 0x0001_0000;
+        const SBTM_SETVAL_SIGEVENTMASK: u32 = TAG_USER | (SBTC_SIGEVENTMASK << 1) | SBTF_SET;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_buf);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // arm SIGEVENTMASK
+
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1), never connected
+
+        push_move_imm_d(&mut words, 0, 1);
+        push_move_imm_d(&mut words, 1, SOL_SOCKET as u32);
+        push_move_imm_d(&mut words, 2, SO_EVENTMASK as u32);
+        push_move_imm_a(&mut words, 0, eventmask_buf);
+        push_move_imm_d(&mut words, 3, 4);
+        words.extend_from_slice(&jsr_disp16_a6(-90)); // setsockopt: arm FD_READ|FD_WRITE|FD_CONNECT
+
+        push_move_imm_d(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, timeout_buf);
+        push_move_imm_d(&mut words, 1, 0); // no signal mask -- checking pure poll behavior
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect(), 100ms
+
+        push_move_imm_a(&mut words, 0, evmask_out);
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // GetSocketEvents() -> D0 (expect -1)
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(eventmask_buf, FD_READ | FD_WRITE | FD_CONNECT);
+        write_timeval(
+            &mut mem,
+            timeout_buf,
+            Some(std::time::Duration::from_millis(100)),
+        );
+        mem.write_u32(tags_buf, SBTM_SETVAL_SIGEVENTMASK);
+        mem.write_u32(tags_buf.wrapping_add(4), USER_SIGNAL_BIT);
+        mem.write_u32(tags_buf.wrapping_add(8), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let task = rt.current_task();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+
+        assert_eq!(
+            code, -1,
+            "no event should ever fire on a never-connected socket"
+        );
+        assert_eq!(
+            rt.memory().read_u32(task + exectask::TC_SIGRECVD) & USER_SIGNAL_BIT,
+            0,
+            "no spurious signal should be delivered either"
+        );
+    }
+
+    #[test]
+    fn end_to_end_set_socket_signals_shares_state_with_socket_base_tags() {
+        let out1: u32 = 0x1_8000;
+        let out2: u32 = 0x1_8100;
+        let tags: u32 = 0x1_8200;
+
+        const SBTM_GETREF_BREAKMASK: u32 = TAG_USER | SBTF_REF | (SBTC_BREAKMASK << 1);
+        const SBTM_GETREF_SIGEVENTMASK: u32 = TAG_USER | SBTF_REF | (SBTC_SIGEVENTMASK << 1);
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 0x1000); // int_mask
+        push_move_imm_d(&mut words, 1, 0x2000); // io_mask
+        push_move_imm_d(&mut words, 2, 0); // urgent_mask
+        words.extend_from_slice(&jsr_disp16_a6(-132)); // SetSocketSignals()
+
+        push_move_imm_a(&mut words, 0, tags);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // SocketBaseTagList: read both back
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(tags, SBTM_GETREF_BREAKMASK);
+        mem.write_u32(tags.wrapping_add(4), out1);
+        mem.write_u32(tags.wrapping_add(8), SBTM_GETREF_SIGEVENTMASK);
+        mem.write_u32(tags.wrapping_add(12), out2);
+        mem.write_u32(tags.wrapping_add(16), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        assert_eq!(rt.memory().read_u32(out1), 0x1000);
+        assert_eq!(rt.memory().read_u32(out2), 0x2000);
     }
 }
