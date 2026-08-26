@@ -45,7 +45,8 @@
 //! `SocketBaseTagList`/`WaitSelect`/`Dup2Socket`/`vsyslog`/
 //! `GetSocketEvents`/`SetSocketSignals`/`gethostbyaddr`/`getservbyname`/
 //! `getservbyport`/`getprotobyname`/`getprotobynumber`/`gethostname`/
-//! `gethostid` -- real outbound and inbound TCP, plus UDP, real error
+//! `gethostid`/`sendmsg`/`recvmsg`/`Inet_LnaOf`/`Inet_NetOf`/
+//! `Inet_MakeAddr` -- real outbound and inbound TCP, plus UDP, real error
 //! reporting through the documented `Errno()`/`SetErrnoPtr()` mechanism,
 //! real forward *and* reverse DNS lookups, and real services/protocols
 //! database lookups, all via the host's own resolver/libc (see "DNS: a
@@ -63,9 +64,9 @@
 //! unknown-call, same as any other library's unimplemented LVO in this
 //! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why
 //! this table only lists what's implemented, not the full ABI):
-//! `sendmsg`/`recvmsg`, `getnetbyname`/`getnetbyaddr` (the `/etc/networks`
-//! network-name database -- rarer than the services/protocols databases
-//! above, no corpus binary or conformance test needs it yet).
+//! `getnetbyname`/`getnetbyaddr` (the `/etc/networks` network-name
+//! database -- rarer than the services/protocols databases above, no
+//! corpus binary or conformance test needs it yet).
 //! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket` *are* registered
 //! (so a caller that unconditionally tries them doesn't crash the whole
 //! run) but always honestly fail with `EOPNOTSUPP` -- see
@@ -992,6 +993,116 @@ fn recvfrom_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     Ok(())
 }
 
+// --- sendmsg/recvmsg: real `struct msghdr`/`struct iovec` scatter-
+// gather -- a real `<sys/socket.h>`/`<sys/uio.h>` (Roadshow) layout, not
+// invented. `msg_name`/`msg_namelen` (addressed send, e.g. UDP) and
+// `msg_control`/`msg_controllen` (ancillary data) are read but not
+// acted on -- no real corpus binary or conformance test exercises
+// either yet (`bsdsocktest`'s own sendmsg/recvmsg tests both zero the
+// whole struct via `memset` and only ever set `msg_iov`/`msg_iovlen`,
+// i.e. a connected-socket, no-ancillary-data scatter/gather send/recv,
+// same shape `send`/`recv` already cover, just split across multiple
+// buffers). `msg_flags` (recvmsg's own output field) is always left
+// `0` -- no `MSG_TRUNC` detection, since that only matters for a
+// datagram recv into a too-small buffer, which isn't the tested shape
+// either.
+
+/// `struct iovec` size (`iov_base`/`iov_len`, 4 bytes each -- no
+/// padding on `m68k`).
+const IOVEC_SIZE: u32 = 8;
+
+/// Reads `msg_iov`/`msg_iovlen` from a `struct msghdr` at `msg_ptr`
+/// (offsets `8`/`12` -- see this section's own doc for the full field
+/// layout) as a list of `(base, len)` pairs.
+fn read_iovecs(mem: &dyn AddressSpace, msg_ptr: u32) -> Vec<(u32, u32)> {
+    let iov_ptr = mem.read_u32(msg_ptr.wrapping_add(8));
+    let iov_len = mem.read_u32(msg_ptr.wrapping_add(12));
+    (0..iov_len)
+        .map(|i| {
+            let entry = iov_ptr.wrapping_add(i * IOVEC_SIZE);
+            (mem.read_u32(entry), mem.read_u32(entry.wrapping_add(4)))
+        })
+        .collect()
+}
+
+/// `sendmsg(sock, msg, flags)`. `D0` = number of bytes sent, or `-1`
+/// with `Errno()` set. Gathers every `iovec`'s bytes (in order) into
+/// one buffer and sends it as a single real `send(2)` call -- see this
+/// section's own doc for why `msg_name`/`msg_control` aren't consulted.
+fn sendmsg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let msg_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    let mut buf = Vec::new();
+    for (base, len) in read_iovecs(ctx.mem, msg_ptr) {
+        for i in 0..len {
+            buf.push(ctx.mem.read_u8(base.wrapping_add(i)));
+        }
+    }
+
+    let Some(result) = with_socket(ctx, fd, |socket| socket.send(&buf)) else {
+        return Ok(());
+    };
+    match result {
+        Ok(n) => {
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), n as u32);
+        }
+        Err(e) => {
+            let code = translate_errno(&e);
+            ctx.bsdsocket.set_errno(ctx.mem, code);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        }
+    }
+    Ok(())
+}
+
+/// `recvmsg(sock, msg, flags)`. `D0` = number of bytes received, or
+/// `-1` with `Errno()` set. Receives into one buffer sized to the sum
+/// of every `iovec`'s length, then scatters the real bytes received
+/// back across the `iovec`s in order (a short read only fills as many
+/// `iovec`s -- and as much of the final one -- as the byte count
+/// covers, matching real scatter semantics). `msg_flags` is always
+/// written `0` -- see this section's own doc.
+fn recvmsg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let msg_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    let iovecs = read_iovecs(ctx.mem, msg_ptr);
+    let total_len: u32 = iovecs.iter().map(|&(_, len)| len).sum();
+    let mut buf = vec![0u8; total_len as usize];
+
+    let Some(result) = with_socket(ctx, fd, |socket| socket.recv(as_uninit_slice(&mut buf))) else {
+        return Ok(());
+    };
+    match result {
+        Ok(n) => {
+            let mut remaining = n;
+            let mut src = 0usize;
+            for (base, len) in iovecs {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(len as usize);
+                for i in 0..take {
+                    ctx.mem.write_u8(base.wrapping_add(i as u32), buf[src + i]);
+                }
+                src += take;
+                remaining -= take;
+            }
+            ctx.mem.write_u32(msg_ptr.wrapping_add(24), 0); // msg_flags
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), n as u32);
+        }
+        Err(e) => {
+            let code = translate_errno(&e);
+            ctx.bsdsocket.set_errno(ctx.mem, code);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        }
+    }
+    Ok(())
+}
+
 /// Reads a real AmigaOS `struct timeval` (`<devices/timer.h>`'s
 /// `tv_secs`/`tv_micro` naming, 4 bytes each -- see the module docs'
 /// "Blocking by default" section's sibling note on this same AmigaOS-
@@ -1757,6 +1868,84 @@ fn inet_addr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
         Err(_) => 0xFFFF_FFFF,
     };
     ctx.cpu.set_data_register(DataRegister(0), result);
+    Ok(())
+}
+
+// --- Inet_LnaOf/Inet_NetOf/Inet_MakeAddr: classic 4.3BSD classful
+// address splitting -- real `IN_CLASSA`/`IN_CLASSB`/`IN_CLASSC` masks
+// (`<netinet/in.h>`), independently confirmed against `bsdsocktest`'s
+// own worked example (`10.1.2.3` -> net `0x0a`, host `0x010203`). None
+// of these three need an explicit `ntohl`/`htonl` byte-swap: `m68k` is
+// big-endian, so real network byte order and the guest's own native
+// register value already coincide -- the `in_addr_t` these functions
+// take/return is exactly the plain 32-bit value `D0`/`D1` already hold,
+// no different from any other address-arithmetic LVO here.
+
+const IN_CLASSA_NET: u32 = 0xFF00_0000;
+const IN_CLASSA_NSHIFT: u32 = 24;
+const IN_CLASSA_HOST: u32 = 0x00FF_FFFF;
+const IN_CLASSB_NET: u32 = 0xFFFF_0000;
+const IN_CLASSB_NSHIFT: u32 = 16;
+const IN_CLASSB_HOST: u32 = 0x0000_FFFF;
+const IN_CLASSC_NET: u32 = 0xFFFF_FF00;
+const IN_CLASSC_NSHIFT: u32 = 8;
+const IN_CLASSC_HOST: u32 = 0x0000_00FF;
+
+fn is_classa(addr: u32) -> bool {
+    addr & 0x8000_0000 == 0
+}
+fn is_classb(addr: u32) -> bool {
+    addr & 0xC000_0000 == 0x8000_0000
+}
+
+/// `Inet_LnaOf(in)`. `D0` = the host (local network address) portion of
+/// `in`, per whichever class (A/B/C) `in` falls into.
+fn inet_lnaof_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let addr = ctx.cpu.data_register(DataRegister(0));
+    let host = if is_classa(addr) {
+        addr & IN_CLASSA_HOST
+    } else if is_classb(addr) {
+        addr & IN_CLASSB_HOST
+    } else {
+        addr & IN_CLASSC_HOST
+    };
+    ctx.cpu.set_data_register(DataRegister(0), host);
+    Ok(())
+}
+
+/// `Inet_NetOf(in)`. `D0` = the network portion of `in`, per whichever
+/// class (A/B/C) `in` falls into.
+fn inet_netof_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let addr = ctx.cpu.data_register(DataRegister(0));
+    let net = if is_classa(addr) {
+        (addr & IN_CLASSA_NET) >> IN_CLASSA_NSHIFT
+    } else if is_classb(addr) {
+        (addr & IN_CLASSB_NET) >> IN_CLASSB_NSHIFT
+    } else {
+        (addr & IN_CLASSC_NET) >> IN_CLASSC_NSHIFT
+    };
+    ctx.cpu.set_data_register(DataRegister(0), net);
+    Ok(())
+}
+
+/// `Inet_MakeAddr(net, host)`. `D0` = the combined address, choosing
+/// class A/B/C shape by `net`'s own magnitude (real 4.3BSD
+/// `inet_makeaddr`'s documented rule -- not `host`'s), matching
+/// [`inet_netof_handler`]/[`inet_lnaof_handler`]'s own split the other
+/// way, confirmed round-tripping against `bsdsocktest`'s own test.
+fn inet_makeaddr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let net = ctx.cpu.data_register(DataRegister(0));
+    let host = ctx.cpu.data_register(DataRegister(1));
+    let addr = if net < 128 {
+        (net << IN_CLASSA_NSHIFT) | (host & IN_CLASSA_HOST)
+    } else if net < 65536 {
+        (net << IN_CLASSB_NSHIFT) | (host & IN_CLASSB_HOST)
+    } else if net < 16_777_216 {
+        (net << IN_CLASSC_NSHIFT) | (host & IN_CLASSC_HOST)
+    } else {
+        net
+    };
+    ctx.cpu.set_data_register(DataRegister(0), addr);
     Ok(())
 }
 
@@ -2702,6 +2891,9 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("SetErrnoPtr", set_errno_ptr_handler::<C>);
     reg!("Inet_NtoA", inet_ntoa_handler::<C>);
     reg!("inet_addr", inet_addr_handler::<C>);
+    reg!("Inet_LnaOf", inet_lnaof_handler::<C>);
+    reg!("Inet_NetOf", inet_netof_handler::<C>);
+    reg!("Inet_MakeAddr", inet_makeaddr_handler::<C>);
     reg!("gethostbyname", gethostbyname_handler::<C>);
     reg!("gethostbyaddr", gethostbyaddr_handler::<C>);
     reg!("getservbyname", getservbyname_handler::<C>);
@@ -2712,6 +2904,8 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("gethostid", gethostid_handler::<C>);
     reg!("SocketBaseTagList", socket_base_tag_list_handler::<C>);
     reg!("Dup2Socket", dup2_socket_handler::<C>);
+    reg!("sendmsg", sendmsg_handler::<C>);
+    reg!("recvmsg", recvmsg_handler::<C>);
     reg!("vsyslog", vsyslog_handler::<C>);
     reg!("ObtainSocket", release_socket_handler::<C>);
     reg!("ReleaseSocket", release_socket_handler::<C>);
@@ -4556,6 +4750,226 @@ mod tests {
         assert_eq!(
             code, host_id,
             "should mirror the real host's own gethostid()"
+        );
+    }
+
+    #[test]
+    fn end_to_end_inet_lnaof_netof_makeaddr_round_trip_class_a() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 0x0a01_0203); // 10.1.2.3
+        words.extend_from_slice(&jsr_disp16_a6(-186)); // Inet_LnaOf -> D0
+        words.push(move_d0_to_d(3)); // D3 = host part
+
+        push_move_imm_d(&mut words, 0, 0x0a01_0203);
+        words.extend_from_slice(&jsr_disp16_a6(-192)); // Inet_NetOf -> D0
+        words.push(move_d0_to_d(4)); // D4 = net part
+
+        const MOVE_D4_TO_D0: u16 = 0x2004;
+        const MOVE_D3_TO_D1: u16 = 0x2203;
+        words.push(MOVE_D4_TO_D0);
+        words.push(MOVE_D3_TO_D1);
+        words.extend_from_slice(&jsr_disp16_a6(-198)); // Inet_MakeAddr(net, host) -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_eq!(
+            code, 0x0a01_0203,
+            "Inet_MakeAddr(NetOf(x), LnaOf(x)) should round-trip to x"
+        );
+    }
+
+    #[test]
+    fn end_to_end_inet_lnaof_extracts_class_a_host_part() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 0x0a01_0203); // 10.1.2.3
+        words.extend_from_slice(&jsr_disp16_a6(-186)); // Inet_LnaOf -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_eq!(code, 0x01_0203);
+    }
+
+    #[test]
+    fn end_to_end_inet_netof_extracts_class_a_net_part() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 0x0a01_0203); // 10.1.2.3
+        words.extend_from_slice(&jsr_disp16_a6(-192)); // Inet_NetOf -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_eq!(code, 0x0a);
+    }
+
+    #[test]
+    fn end_to_end_sendmsg_recvmsg_scatter_gather_round_trip() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 100];
+            stream.read_exact(&mut buf).expect("read_exact");
+            buf
+        });
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let send_data: u32 = 0x1_8100; // 100 bytes
+        let send_msg: u32 = 0x1_8200; // struct msghdr (28 bytes)
+        let send_iov: u32 = 0x1_8300; // 3 iovec entries (50+30+20 = 100)
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0
+
+        push_move_imm_d(&mut words, 0, 1); // fd
+        push_move_imm_a(&mut words, 0, send_msg);
+        push_move_imm_d(&mut words, 1, 0); // flags
+        words.extend_from_slice(&jsr_disp16_a6(-270)); // sendmsg() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        let pattern: Vec<u8> = (0..100).map(|i| (i * 3 + 7) as u8).collect();
+        for (i, &b) in pattern.iter().enumerate() {
+            mem.write_u8(send_data + i as u32, b);
+        }
+        // struct msghdr: msg_name=0, msg_namelen=0, msg_iov, msg_iovlen=3,
+        // msg_control=0, msg_controllen=0, msg_flags=0
+        mem.write_u32(send_msg, 0);
+        mem.write_u32(send_msg + 4, 0);
+        mem.write_u32(send_msg + 8, send_iov);
+        mem.write_u32(send_msg + 12, 3);
+        mem.write_u32(send_msg + 16, 0);
+        mem.write_u32(send_msg + 20, 0);
+        mem.write_u32(send_msg + 24, 0);
+        // 3 iovecs: 50 + 30 + 20 = 100 bytes, into the same send_data buffer
+        mem.write_u32(send_iov, send_data);
+        mem.write_u32(send_iov + 4, 50);
+        mem.write_u32(send_iov + 8, send_data + 50);
+        mem.write_u32(send_iov + 12, 30);
+        mem.write_u32(send_iov + 16, send_data + 80);
+        mem.write_u32(send_iov + 20, 20);
+
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let received = accept_thread.join().unwrap();
+
+        assert_eq!(code, 100, "sendmsg() should report all 100 bytes sent");
+        assert_eq!(
+            received.to_vec(),
+            pattern,
+            "the real host peer should see the gathered bytes, in order"
+        );
+    }
+
+    #[test]
+    fn end_to_end_recvmsg_scatters_across_multiple_iovecs() {
+        let sender = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = sender.local_addr().unwrap().port();
+        let pattern: Vec<u8> = (0..100).map(|i| (i * 5 + 3) as u8).collect();
+        let pattern_for_thread = pattern.clone();
+        let send_thread = std::thread::spawn(move || {
+            let (mut stream, _) = sender.accept().expect("accept");
+            stream.write_all(&pattern_for_thread).expect("write_all");
+        });
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let recv_data: u32 = 0x1_8100; // 100 bytes, scattered across 3 iovecs
+        let recv_msg: u32 = 0x1_8200;
+        let recv_iov: u32 = 0x1_8300;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0
+
+        push_move_imm_d(&mut words, 0, 1); // fd
+        push_move_imm_a(&mut words, 0, recv_msg);
+        push_move_imm_d(&mut words, 1, 0); // flags
+        words.extend_from_slice(&jsr_disp16_a6(-276)); // recvmsg() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        mem.write_u32(recv_msg, 0);
+        mem.write_u32(recv_msg + 4, 0);
+        mem.write_u32(recv_msg + 8, recv_iov);
+        mem.write_u32(recv_msg + 12, 3);
+        mem.write_u32(recv_msg + 16, 0);
+        mem.write_u32(recv_msg + 20, 0);
+        mem.write_u32(recv_msg + 24, 0xDEAD_BEEF); // should be overwritten with 0
+        mem.write_u32(recv_iov, recv_data);
+        mem.write_u32(recv_iov + 4, 50);
+        mem.write_u32(recv_iov + 8, recv_data + 50);
+        mem.write_u32(recv_iov + 12, 30);
+        mem.write_u32(recv_iov + 16, recv_data + 80);
+        mem.write_u32(recv_iov + 20, 20);
+
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        send_thread.join().unwrap();
+
+        assert_eq!(code, 100, "recvmsg() should report all 100 bytes received");
+        let mem = rt.memory();
+        let scattered: Vec<u8> = (0..100).map(|i| mem.read_u8(recv_data + i)).collect();
+        assert_eq!(
+            scattered, pattern,
+            "bytes should land in guest memory in the same order, across iovec boundaries"
+        );
+        assert_eq!(
+            mem.read_u32(recv_msg + 24),
+            0,
+            "msg_flags should be cleared"
         );
     }
 }

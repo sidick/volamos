@@ -234,6 +234,24 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         private: false,
     },
     LvoEntry {
+        name: "Inet_LnaOf",
+        lvo: -186,
+        args: &[ArgReg::D(DataRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "Inet_NetOf",
+        lvo: -192,
+        args: &[ArgReg::D(DataRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "Inet_MakeAddr",
+        lvo: -198,
+        args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
+        private: false,
+    },
+    LvoEntry {
         name: "gethostbyname",
         lvo: -210,
         args: &[ArgReg::A(AddressRegister(0))],
@@ -305,6 +323,26 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         name: "Dup2Socket",
         lvo: -264,
         args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
+        private: false,
+    },
+    LvoEntry {
+        name: "sendmsg",
+        lvo: -270,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::D(DataRegister(1)),
+        ],
+        private: false,
+    },
+    LvoEntry {
+        name: "recvmsg",
+        lvo: -276,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::D(DataRegister(1)),
+        ],
         private: false,
     },
     // ObtainSocket/ReleaseSocket/ReleaseCopyOfSocket hand a socket's
