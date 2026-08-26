@@ -35,6 +35,20 @@
 //! branch -- an inherent limitation of a headless stub, not something
 //! this runtime can resolve without a real display.
 //!
+//! # `GetScreenData`: honestly reports "no such screen"
+//!
+//! Real `GetScreenData` copies a `struct Screen`'s data into the
+//! caller's buffer, opening the requested standard screen (e.g.
+//! `WBENCHSCREEN`) first if it isn't already open. With no display,
+//! there's no screen to open or copy from -- but unlike
+//! `AutoRequest`/`EasyRequestArgs` above, this one has a documented,
+//! legitimate failure return (`FALSE`, "if standard screen of Type
+//! 'type' could not be opened", per the Autodoc's own `RESULT` section)
+//! that real callers already check, so this runtime doesn't need to
+//! fake success at all: it always returns `FALSE` and leaves the
+//! caller's buffer untouched, exactly the outcome a real machine gives
+//! when the requested screen genuinely can't be opened.
+//!
 //! # `CurrentTime`: the one genuinely real function here
 //!
 //! Unlike the requester functions, `CurrentTime` has an honest, correct
@@ -109,6 +123,16 @@ fn easy_request_args_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
     Ok(())
 }
 
+/// `GetScreenData` (`A0` = buffer, `D0` = buffer size, `D1` = screen
+/// type, `A1` = screen -- all ignored, see the module docs). `D0` =
+/// `FALSE` unconditionally (the documented "standard screen could not
+/// be opened" outcome); the buffer is left untouched, matching real
+/// `GetScreenData`'s own behavior on that failure path.
+fn get_screen_data_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
 /// `CurrentTime` (`A0` = `ULONG*` seconds out-param, `A1` = `ULONG*`
 /// micros out-param). No return value. See the module docs.
 fn current_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -148,6 +172,7 @@ pub fn register_intuition_handlers<C: Cpu + 'static>(
     reg!("DisplayAlert", display_alert_handler::<C>);
     reg!("AutoRequest", auto_request_handler::<C>);
     reg!("EasyRequestArgs", easy_request_args_handler::<C>);
+    reg!("GetScreenData", get_screen_data_handler::<C>);
     reg!("CurrentTime", current_time_handler::<C>);
 }
 
@@ -225,6 +250,18 @@ mod tests {
         let mut full = movea_intuition_base_to_a6().to_vec();
         full.extend_from_slice(&jsr_disp16_a6(-588));
         full.push(RTS);
+        let mut rt = runtime_with_program(&full);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn end_to_end_get_screen_data_always_returns_false() {
+        let words = [RTS];
+        let mut full = movea_intuition_base_to_a6().to_vec();
+        full.extend_from_slice(&jsr_disp16_a6(-426));
+        full.extend_from_slice(&words);
         let mut rt = runtime_with_program(&full);
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
