@@ -2357,7 +2357,8 @@ impl<C: Cpu + 'static> Runtime<C> {
         let bptr = self
             .dos
             .load_seg_from_host_path(&mut self.heap, &mut self.mem, host_path)?;
-        let entry = crate::guestmem::addr_from_bptr(bptr).wrapping_add(crate::dosseg::NEXT_SEG_OFFSET);
+        let entry =
+            crate::guestmem::addr_from_bptr(bptr).wrapping_add(crate::dosseg::NEXT_SEG_OFFSET);
         self.cpu.set_pc(entry);
         Ok(())
     }

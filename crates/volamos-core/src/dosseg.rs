@@ -216,12 +216,12 @@ use std::path::PathBuf;
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::ERROR_OBJECT_NOT_FOUND;
+#[cfg(test)]
+use crate::dosfile::OFFSET_BEGINNING;
 use crate::dosfile::{
     DosState, ERROR_FILE_NOT_OBJECT, ERROR_NO_FREE_STORE, MODE_OLDFILE, OFFSET_CURRENT,
     map_io_error, map_vfs_error,
 };
-#[cfg(test)]
-use crate::dosfile::OFFSET_BEGINNING;
 use crate::guestmem::{GuestHeap, GuestHeapError, addr_from_bptr, bptr_from_addr, read_c_string};
 use crate::loader::{self, HunkFile};
 use crate::lvos::dos::DOS_LVOS;

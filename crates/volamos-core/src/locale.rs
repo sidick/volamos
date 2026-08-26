@@ -50,6 +50,24 @@
 //! runtime's established bug-catching posture); `CloseLocale(NULL)` is
 //! a documented-legal no-op, same convention as every other free-half-
 //! of-a-pair call in this runtime.
+//!
+//! # `OpenCatalogA`/`GetCatalogStr`/`CloseCatalog`: always "use the built-in strings"
+//!
+//! Real `OpenCatalog` searches `PROGDIR:Catalogs/<language>/` and
+//! `LOCALE:Catalogs/<language>/` on disk for a translated message
+//! catalog, but its own Autodoc is explicit that returning `NULL`
+//! ("use the application's built-in strings instead") is a normal,
+//! documented, non-error outcome -- not a failure a caller need treat
+//! specially -- and that `GetCatalogStr` already falls back to its
+//! caller-supplied `defaultString` whenever the catalog is `NULL`. Since
+//! this runtime has no catalog files to search for at all (matching this
+//! module's broader "not a full locale/catalog system" scope above),
+//! always taking that exact, already-real fallback path is the honest
+//! behavior, not an approximation: it's indistinguishable from a real
+//! machine that simply doesn't have a given application's catalog
+//! installed, which is the overwhelmingly common case in practice.
+//! `CloseCatalog(NULL)` is separately documented as "a valid parameter
+//! and is simply ignored," so no state needs tracking here at all.
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, HandlerContext, LibraryTable};
@@ -248,6 +266,37 @@ is_class_handler!(is_space_handler, is_space);
 is_class_handler!(is_upper_handler, is_upper);
 is_class_handler!(is_xdigit_handler, |c: u8| c.is_ascii_hexdigit());
 
+/// `OpenCatalogA` (`A0` = `struct Locale*`, `A1` = name `CString*`, `A2`
+/// = `struct TagItem*` tag list -- all ignored, see the module docs).
+/// `D0` = `NULL`, always -- a real, spec-documented non-error outcome,
+/// not an approximation (see the module docs). `IoErr()` is set to `0`
+/// ("no error"), matching the Autodoc's own guidance for how a caller
+/// distinguishes this from a real failure.
+fn open_catalog_a_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.dos.set_io_err(0);
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
+/// `CloseCatalog` (`A0` = `struct Catalog*`, ignored). No return value --
+/// every catalog this runtime ever hands out is `NULL`, and `NULL` is
+/// documented as a valid, ignored parameter (see the module docs).
+fn close_catalog_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// `GetCatalogStr` (`A0` = `struct Catalog*`, ignored, `D0` = string
+/// number, ignored, `A1` = `defaultString` `CString*`). `D0` =
+/// `defaultString` verbatim -- the exact, already-real fallback real
+/// `GetCatalogStr` documents for "the catalog parameter is NULL", which
+/// is the only case this runtime's catalog is ever in (see the module
+/// docs).
+fn get_catalog_str_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let default_string = ctx.cpu.address_register(AddressRegister(1));
+    ctx.cpu.set_data_register(DataRegister(0), default_string);
+    Ok(())
+}
+
 /// `StrnCmp` (`A0` = `struct Locale*`, ignored, `A1`/`A2` = two
 /// `CString*`s, `D0` = length, `D1` = comparison type). `D0` = `0` if
 /// equal, negative if `string1 < string2`, positive if `string1 >
@@ -334,13 +383,16 @@ pub fn register_locale_handlers<C: Cpu + 'static>(
     reg!("IsUpper", is_upper_handler::<C>);
     reg!("IsXDigit", is_xdigit_handler::<C>);
     reg!("StrnCmp", strn_cmp_handler::<C>);
+    reg!("OpenCatalogA", open_catalog_a_handler::<C>);
+    reg!("CloseCatalog", close_catalog_handler::<C>);
+    reg!("GetCatalogStr", get_catalog_str_handler::<C>);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
-    use crate::dispatch::{LOCALE_LIBRARY_BASE, Runtime, StartConfig};
+    use crate::dispatch::{DOS_LIBRARY_BASE, LOCALE_LIBRARY_BASE, Runtime, StartConfig};
     use crate::memory::FlatMemory;
 
     #[test]
@@ -515,6 +567,85 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code as u32, b'A' as u32);
+    }
+
+    #[test]
+    fn end_to_end_open_catalog_always_returns_null_and_ioerr_zero() {
+        let mut words = vec![
+            move_imm_to_a(0), // A0 = NULL locale
+            0,
+            0,
+            move_imm_to_a(1), // A1 = name (ignored)
+            0,
+            0,
+            move_imm_to_a(2), // A2 = tags (ignored)
+            0,
+            0,
+        ];
+        words.extend_from_slice(&jsr_disp16_a6(-150)); // OpenCatalogA -> D0 = NULL
+        words.push(move_imm_to_a(6)); // A6 = dos.library base, for IoErr()
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-132)); // IoErr(a6) -> D0 = 0
+        words.push(RTS);
+
+        let mut full = movea_locale_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut rt = runtime_with_program(&full);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "OpenCatalogA's NULL result must report IoErr() == 0"
+        );
+    }
+
+    #[test]
+    fn end_to_end_get_catalog_str_returns_default_string_and_close_catalog_is_a_no_op() {
+        let default_addr: u32 = 0x1_8000;
+
+        let mut words = vec![
+            move_imm_to_a(0), // A0 = NULL catalog
+            0,
+            0,
+            move_imm_to_d(0), // D0 = string number (ignored)
+            0,
+            42,
+            move_imm_to_a(1), // A1 = defaultString
+            (default_addr >> 16) as u16,
+            default_addr as u16,
+        ];
+        words.extend_from_slice(&jsr_disp16_a6(-72)); // GetCatalogStr -> D0 = defaultString
+        words.push(move_imm_to_a(0)); // A0 = NULL catalog
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // CloseCatalog(NULL): must not fail
+        words.push(RTS);
+
+        let mut full = movea_locale_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, default_addr, b"built-in string");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32, default_addr,
+            "GetCatalogStr should return defaultString verbatim"
+        );
     }
 
     #[test]
