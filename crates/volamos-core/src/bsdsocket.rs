@@ -42,27 +42,28 @@
 //! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
 //! `inet_addr`/`gethostbyname`/`IoctlSocket`/`setsockopt`/`getsockopt`/
-//! `SocketBaseTagList` -- real outbound and inbound TCP, plus UDP, real
-//! error reporting through the documented `Errno()`/`SetErrnoPtr()`
-//! mechanism, real forward DNS lookups via the host's own resolver (see
-//! "DNS: a real, blocking host lookup" below), and the socket option
-//! set a real conformance suite (`bsdsocktest`'s own `sockopt` test
-//! category) actually exercises: `SO_REUSEADDR`/`SO_KEEPALIVE`/
-//! `SO_LINGER`/`SO_SNDBUF`/`SO_RCVBUF`/`SO_SNDTIMEO`/`SO_RCVTIMEO`/
-//! `SO_ERROR`/`SO_TYPE`/`TCP_NODELAY` -- all real `socket2` calls
-//! against the host socket, not roundtrip-only storage (`SO_ERROR` in
-//! particular has real BSD "read consumes the pending error" semantics,
-//! via `socket2`'s own `take_error`). Deliberately **not yet
-//! implemented** (calling these traps as an ordinary unknown-call, same
-//! as any other library's unimplemented LVO in this codebase -- see
-//! [`crate::lvos::bsdsocket`]'s module docs for why this table only
-//! lists what's implemented, not the full ABI): `WaitSelect`/
-//! `SetSocketSignals` (real `select()`-shaped multiplexing needs
-//! deciding whether to integrate with `crate::exectask`'s signal model
-//! or just poll -- a real design choice, not a quick add),
-//! `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no portable
-//! reverse-DNS primitive; Copperline's own `hostsocket-plugin` hit the
-//! identical wall and stayed a stub for the same reason, see that
+//! `SocketBaseTagList`/`WaitSelect` -- real outbound and inbound TCP,
+//! plus UDP, real error reporting through the documented `Errno()`/
+//! `SetErrnoPtr()` mechanism, real forward DNS lookups via the host's
+//! own resolver (see "DNS: a real, blocking host lookup" below), the
+//! socket option set a real conformance suite (`bsdsocktest`'s own
+//! `sockopt` test category) actually exercises: `SO_REUSEADDR`/
+//! `SO_KEEPALIVE`/`SO_LINGER`/`SO_SNDBUF`/`SO_RCVBUF`/`SO_SNDTIMEO`/
+//! `SO_RCVTIMEO`/`SO_ERROR`/`SO_TYPE`/`TCP_NODELAY` -- all real
+//! `socket2` calls against the host socket, not roundtrip-only storage
+//! (`SO_ERROR` in particular has real BSD "read consumes the pending
+//! error" semantics, via `socket2`'s own `take_error`), and real
+//! `select()`-shaped multiplexing via `WaitSelect` (Unix-only -- see
+//! "WaitSelect: real poll(2), not a busy-loop" below). Deliberately
+//! **not yet implemented** (calling these traps as an ordinary
+//! unknown-call, same as any other library's unimplemented LVO in this
+//! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why
+//! this table only lists what's implemented, not the full ABI):
+//! `SetSocketSignals` (a simpler, older sibling of `WaitSelect`'s own
+//! signal-mask parameter -- no corpus binary or conformance test needs
+//! it yet), `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no
+//! portable reverse-DNS primitive; Copperline's own `hostsocket-plugin`
+//! hit the identical wall and stayed a stub for the same reason, see that
 //! crate's module docs), `Dup2Socket`/`ObtainSocket`/`ReleaseSocket`
 //! (fd-sharing across processes -- this runtime doesn't have that among
 //! its own processes to begin with), `sendmsg`/`recvmsg`/`vsyslog`/
@@ -93,6 +94,41 @@
 //! thread until the real I/O completes -- the same "trust the host,
 //! real blocking calls are fine" posture `gethostbyname` already uses,
 //! not a shortcut.
+//!
+//! # `WaitSelect`: real `poll(2)`, not a busy-loop
+//!
+//! [`wait_select_handler`] translates a real AmigaOS `WaitSelect` call
+//! (BSD `select()` plus an Exec signal mask -- a real Roadshow Autodoc,
+//! see that function's own doc for the exact contract) directly onto a
+//! real `libc::poll(2)` call against the underlying host file
+//! descriptors (`socket2::Socket::as_raw_fd`) -- Unix only (`#[cfg(unix)]`;
+//! this runtime's own Windows support is unverified at runtime already,
+//! see `docs/plan.md`'s notes, so `WaitSelect` on Windows returns
+//! `EOPNOTSUPP` rather than a guess). This is the same "trust the host"
+//! posture every other blocking call in this module already takes
+//! (`connect`, `gethostbyname`, ...): the host kernel's own `poll(2)`
+//! already solves "is this fd ready" correctly for every socket state
+//! this backend can produce (a listening socket's `POLLIN` meaning "a
+//! connection is pending `accept()`", a connecting socket's `POLLOUT`
+//! meaning "the handshake finished", ...), so there's no reason to
+//! reimplement any of that by hand.
+//!
+//! **The `signals` parameter, and why this runtime doesn't need to poll
+//! for it mid-wait**: real `WaitSelect` also races the file-descriptor
+//! wait against an Exec signal mask, waking on whichever happens first.
+//! Because this runtime is single-tasking and non-preemptive -- no other
+//! guest code can run concurrently to `Signal()` the waiting task while
+//! `WaitSelect` is blocked inside a single host `poll(2)` call -- a
+//! signal can only ever already be pending *before* the call starts,
+//! never arrive *during* it. So [`wait_select_handler`] checks
+//! `tc_SigRecvd` against the requested mask exactly once, up front:
+//! matching real semantics either way ("no socket ready" + "a signal was
+//! already pending" `=>` return `0` without ever calling `poll(2)` at
+//! all) but skipping the "wake immediately if a signal arrives mid-wait"
+//! case, since that case is structurally unreachable in this runtime's
+//! own task model -- not a missing feature, just a state this
+//! architecture can't produce. `crate::exectask::TC_SIGRECVD` is the
+//! same field `SetSignal`/`Wait`/`Signal` already maintain.
 //!
 //! # Errno: real BSD numbering, not the host's own
 //!
@@ -170,6 +206,7 @@ use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, HandlerContext, LibraryTable};
+use crate::exectask;
 use crate::lvos::bsdsocket::BSDSOCKET_LVOS;
 use crate::memory::AddressSpace;
 
@@ -1155,6 +1192,233 @@ fn getdtablesize_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
+// --- WaitSelect: real fd_set <-> guest memory, real poll(2) ---
+
+/// `sizeof(fd_set)`: `FD_SETSIZE` (256) bits, packed into 32-bit words
+/// (`fd_mask`) -- a real `<sys/socket.h>` layout (confirmed against a
+/// real Roadshow NDK), 8 longwords = 32 bytes.
+const FD_SET_BYTES: u32 = 32;
+
+/// Whether `fd` is a member of the `fd_set` at `addr` (`FD_ISSET`'s own
+/// semantics, translated to guest memory).
+fn fd_set_test(mem: &dyn AddressSpace, addr: u32, fd: i32) -> bool {
+    if !(0..256).contains(&fd) {
+        return false;
+    }
+    let word = mem.read_u32(addr.wrapping_add((fd as u32 / 32) * 4));
+    word & (1 << (fd as u32 % 32)) != 0
+}
+
+/// Zeroes an `fd_set` at `addr` (`FD_ZERO`).
+fn fd_set_zero(mem: &mut dyn AddressSpace, addr: u32) {
+    for i in 0..FD_SET_BYTES {
+        mem.write_u8(addr.wrapping_add(i), 0);
+    }
+}
+
+/// Adds `fd` to the `fd_set` at `addr` (`FD_SET`).
+fn fd_set_add(mem: &mut dyn AddressSpace, addr: u32, fd: i32) {
+    let word_addr = addr.wrapping_add((fd as u32 / 32) * 4);
+    let word = mem.read_u32(word_addr);
+    mem.write_u32(word_addr, word | (1 << (fd as u32 % 32)));
+}
+
+/// `WaitSelect(nfds, readfds, writefds, exceptfds, timeout, signals)`.
+/// `D0` = the number of ready descriptors (summed across all three
+/// sets -- a descriptor ready for both reading and writing counts
+/// twice, matching real `select()`'s own return-value convention), `0`
+/// if the timeout elapsed with nothing ready, or `-1` with `Errno()`
+/// set (`EINTR` if a requested signal was already pending -- see the
+/// module docs' "WaitSelect" section). On error, the descriptor sets
+/// are left unmodified, matching the real documented contract; on
+/// success, each non-`NULL` set is replaced with the subset of ready
+/// descriptors (real `FD_ZERO`-then-`FD_SET` semantics), even if that
+/// subset is empty.
+///
+/// `nfds` (`D0`) is the "highest descriptor plus one" bound real
+/// `select()` uses -- descriptors `0..nfds` are examined. `timeout`
+/// (`A3`) is a real AmigaOS `struct timeval*` (`NULL` = block
+/// indefinitely, `{0,0}` = a zero-wait poll). `signals` (`D1`... wait,
+/// `A3`... see the LVO table -- `signals` is actually the register-list
+/// oddity here: `D1`, per the real Autodoc's own SYNOPSIS, since Exec
+/// signal masks are conventionally `D`-register arguments even this
+/// deep into an otherwise `A`-register-heavy call) is a `ULONG*`
+/// user-signal mask, in/out: on input, which signals to also wait on;
+/// on output, which of those were actually pending (see the module
+/// docs for why this runtime only ever checks that once, up front).
+fn wait_select_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let nfds = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let readfds_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let writefds_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let exceptfds_ptr = ctx.cpu.address_register(AddressRegister(2));
+    let timeout_ptr = ctx.cpu.address_register(AddressRegister(3));
+    let signals_ptr = ctx.cpu.data_register(DataRegister(1));
+
+    // The signal-mask check -- see the module docs for why this only
+    // ever needs to happen once, before any polling.
+    if signals_ptr != 0 {
+        let requested = ctx.mem.read_u32(signals_ptr);
+        if requested != 0 {
+            let recvd = ctx.mem.read_u32(ctx.current_task + exectask::TC_SIGRECVD);
+            let matched = recvd & requested;
+            if matched != 0 {
+                ctx.mem
+                    .write_u32(ctx.current_task + exectask::TC_SIGRECVD, recvd & !matched);
+                ctx.mem.write_u32(signals_ptr, matched);
+                ctx.bsdsocket.set_errno(ctx.mem, 0);
+                ctx.cpu.set_data_register(DataRegister(0), 0);
+                return Ok(());
+            }
+        }
+    }
+
+    wait_select_poll(
+        ctx,
+        nfds,
+        readfds_ptr,
+        writefds_ptr,
+        exceptfds_ptr,
+        timeout_ptr,
+        signals_ptr,
+    )
+}
+
+#[cfg(unix)]
+fn wait_select_poll<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    nfds: i32,
+    readfds_ptr: u32,
+    writefds_ptr: u32,
+    exceptfds_ptr: u32,
+    timeout_ptr: u32,
+    signals_ptr: u32,
+) -> Result<(), DispatchError> {
+    use std::os::unix::io::AsRawFd;
+
+    // Which of our own fds are of interest, and in which set(s).
+    struct Interest {
+        fd: i32,
+        read: bool,
+        write: bool,
+        except: bool,
+    }
+    let mut interests: Vec<Interest> = Vec::new();
+    for fd in 0..nfds {
+        if !ctx.bsdsocket.sockets.contains_key(&fd) {
+            continue;
+        }
+        let read = readfds_ptr != 0 && fd_set_test(ctx.mem, readfds_ptr, fd);
+        let write = writefds_ptr != 0 && fd_set_test(ctx.mem, writefds_ptr, fd);
+        let except = exceptfds_ptr != 0 && fd_set_test(ctx.mem, exceptfds_ptr, fd);
+        if read || write || except {
+            interests.push(Interest {
+                fd,
+                read,
+                write,
+                except,
+            });
+        }
+    }
+
+    let mut pollfds: Vec<libc::pollfd> = interests
+        .iter()
+        .map(|i| {
+            let raw_fd = ctx.bsdsocket.sockets[&i.fd].socket.as_raw_fd();
+            let mut events = 0;
+            if i.read {
+                events |= libc::POLLIN;
+            }
+            if i.write {
+                events |= libc::POLLOUT;
+            }
+            if i.except {
+                events |= libc::POLLPRI;
+            }
+            libc::pollfd {
+                fd: raw_fd,
+                events,
+                revents: 0,
+            }
+        })
+        .collect();
+
+    let timeout_ms: i32 = if timeout_ptr == 0 {
+        -1
+    } else {
+        let d = read_timeval(ctx.mem, timeout_ptr);
+        d.as_millis().min(i32::MAX as u128) as i32
+    };
+
+    let ready = unsafe {
+        libc::poll(
+            pollfds.as_mut_ptr(),
+            pollfds.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    };
+
+    if signals_ptr != 0 {
+        ctx.mem.write_u32(signals_ptr, 0);
+    }
+
+    if ready < 0 {
+        let code = translate_errno(&std::io::Error::last_os_error());
+        ctx.bsdsocket.set_errno(ctx.mem, code);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+
+    if readfds_ptr != 0 {
+        fd_set_zero(ctx.mem, readfds_ptr);
+    }
+    if writefds_ptr != 0 {
+        fd_set_zero(ctx.mem, writefds_ptr);
+    }
+    if exceptfds_ptr != 0 {
+        fd_set_zero(ctx.mem, exceptfds_ptr);
+    }
+
+    let mut count = 0u32;
+    for (interest, pfd) in interests.iter().zip(pollfds.iter()) {
+        let revents = pfd.revents;
+        if interest.read && revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            fd_set_add(ctx.mem, readfds_ptr, interest.fd);
+            count += 1;
+        }
+        if interest.write && revents & (libc::POLLOUT | libc::POLLERR) != 0 {
+            fd_set_add(ctx.mem, writefds_ptr, interest.fd);
+            count += 1;
+        }
+        if interest.except && revents & libc::POLLPRI != 0 {
+            fd_set_add(ctx.mem, exceptfds_ptr, interest.fd);
+            count += 1;
+        }
+    }
+
+    ctx.bsdsocket.set_errno(ctx.mem, 0);
+    ctx.cpu.set_data_register(DataRegister(0), count);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn wait_select_poll<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    _nfds: i32,
+    _readfds_ptr: u32,
+    _writefds_ptr: u32,
+    _exceptfds_ptr: u32,
+    _timeout_ptr: u32,
+    _signals_ptr: u32,
+) -> Result<(), DispatchError> {
+    // See the module docs' "WaitSelect" section: this runtime's own
+    // Windows support is unverified at runtime, so this honestly
+    // reports "not supported" rather than guessing at a WSAPoll-based
+    // implementation nobody has run.
+    ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+    ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+    Ok(())
+}
+
 /// `Errno()`. `D0` = the last error code any handler here set (`0` if
 /// the last call succeeded, or if no call has been made yet).
 fn errno_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -1474,6 +1738,7 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("getpeername", getpeername_handler::<C>);
     reg!("CloseSocket", close_socket_handler::<C>);
     reg!("getdtablesize", getdtablesize_handler::<C>);
+    reg!("WaitSelect", wait_select_handler::<C>);
     reg!("Errno", errno_handler::<C>);
     reg!("SetErrnoPtr", set_errno_ptr_handler::<C>);
     reg!("Inet_NtoA", inet_ntoa_handler::<C>);
@@ -2225,5 +2490,211 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0, "getsockopt should succeed");
         check(rt.memory());
+    }
+
+    #[test]
+    fn end_to_end_waitselect_detects_real_udp_readiness() {
+        // A fixed port (not ephemeral) so a background host thread can
+        // be started *before* the guest program runs -- the whole
+        // socket()/bind()/WaitSelect() sequence executes as a single,
+        // uninterruptible rt.run() call, so there's no host-side point
+        // between "the port is known" and "WaitSelect blocks" to send
+        // from. The sender sleeps briefly, then sends, landing the real
+        // datagram while WaitSelect's real (2s) poll(2) timeout is
+        // still open.
+        let port = 58234;
+        let sockaddr_buf: u32 = 0x1_8000;
+        let readfds: u32 = 0x1_8100;
+        let timeout_buf: u32 = 0x1_8200;
+
+        let sender_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+            sender.send_to(b"hi", ("127.0.0.1", port)).expect("send_to");
+        });
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_DGRAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (always 1, first socket)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // bind(fd, 127.0.0.1:port, 16)
+
+        push_move_imm_d(&mut words, 0, 2); // nfds = fd(1) + 1
+        push_move_imm_a(&mut words, 0, readfds);
+        push_move_imm_a(&mut words, 1, 0); // writefds = NULL
+        push_move_imm_a(&mut words, 2, 0); // exceptfds = NULL
+        push_move_imm_a(&mut words, 3, timeout_buf);
+        push_move_imm_d(&mut words, 1, 0); // signals = NULL
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        mem.write_u32(readfds, 0b10); // FD_SET(1, &readfds)
+        for i in 4..FD_SET_BYTES {
+            mem.write_u8(readfds.wrapping_add(i), 0);
+        }
+        write_timeval(
+            &mut mem,
+            timeout_buf,
+            Some(std::time::Duration::from_secs(2)),
+        );
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        sender_thread.join().unwrap();
+
+        assert!(
+            code >= 1,
+            "expected at least one ready descriptor, got {code}"
+        );
+        assert!(
+            fd_set_test(rt.memory(), readfds, 1),
+            "fd 1 should be marked ready in readfds"
+        );
+    }
+
+    #[test]
+    fn end_to_end_waitselect_timeout_returns_zero_when_idle() {
+        let sockaddr_buf: u32 = 0x1_8000;
+        let readfds: u32 = 0x1_8100;
+        let timeout_buf: u32 = 0x1_8200;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // bind(fd, 127.0.0.1:0, 16)
+        push_move_imm_d(&mut words, 1, 1);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // listen(fd, 1)
+
+        push_move_imm_d(&mut words, 0, 2);
+        push_move_imm_a(&mut words, 0, readfds);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, timeout_buf);
+        push_move_imm_d(&mut words, 1, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        );
+        mem.write_u32(readfds, 0b10);
+        for i in 4..FD_SET_BYTES {
+            mem.write_u8(readfds.wrapping_add(i), 0);
+        }
+        // A short, real timeout -- nothing will ever connect, so this
+        // should genuinely elapse and return 0 (not hang the test).
+        write_timeval(
+            &mut mem,
+            timeout_buf,
+            Some(std::time::Duration::from_millis(100)),
+        );
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "idle listener should time out with 0 ready");
+    }
+
+    #[test]
+    fn end_to_end_waitselect_returns_immediately_for_an_already_pending_signal() {
+        use crate::dispatch::EXEC_LIBRARY_BASE;
+
+        let signals_buf: u32 = 0x1_8000;
+        const USER_SIGNAL_BIT: u32 = 0x0001_0000; // bit 16, first non-system-reserved bit
+
+        let mut words: Vec<u16> = Vec::new();
+        // SetSignal(USER_SIGNAL_BIT, USER_SIGNAL_BIT) via exec.library --
+        // marks the signal as already pending before WaitSelect runs.
+        words.push(move_imm_to_a(6));
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        push_move_imm_d(&mut words, 0, USER_SIGNAL_BIT);
+        push_move_imm_d(&mut words, 1, USER_SIGNAL_BIT);
+        words.extend_from_slice(&jsr_disp16_a6(-306)); // SetSignal()
+
+        words.extend_from_slice(&movea_bsdsocket_base_to_a6());
+        push_move_imm_d(&mut words, 0, 0); // nfds = 0 (no sockets to check)
+        push_move_imm_a(&mut words, 0, 0);
+        push_move_imm_a(&mut words, 1, 0);
+        push_move_imm_a(&mut words, 2, 0);
+        push_move_imm_a(&mut words, 3, 0); // timeout = NULL (would block forever if reached)
+        push_move_imm_d(&mut words, 1, signals_buf); // D1 = &signals
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // WaitSelect() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(signals_buf, USER_SIGNAL_BIT); // requested mask
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let task = rt.current_task();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "an already-pending requested signal returns 0 immediately"
+        );
+        assert_eq!(
+            rt.memory().read_u32(signals_buf),
+            USER_SIGNAL_BIT,
+            "the matched signal bits should be reported back"
+        );
+        assert_eq!(
+            rt.memory().read_u32(task + exectask::TC_SIGRECVD) & USER_SIGNAL_BIT,
+            0,
+            "the matched signal should be consumed (cleared) from tc_SigRecvd"
+        );
     }
 }

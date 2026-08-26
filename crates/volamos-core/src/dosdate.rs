@@ -62,11 +62,10 @@ const UNIX_TO_AMIGA_EPOCH_DAYS: i64 = 8 * 365 + 2;
 /// [`crate::dosdatestr`]'s `DateToStr`, for its `DTF_SUBST`
 /// "Today"/"Tomorrow"/"Yesterday" substitution.
 pub(crate) fn now_as_datestamp() -> (i32, i32, i32) {
-    let unix_secs = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let amiga_secs = unix_secs - UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+        .unwrap_or_default();
+    let amiga_secs = now.as_secs() as i64 - UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
     if amiga_secs < 0 {
         return (0, 0, 0);
     }
@@ -74,7 +73,19 @@ pub(crate) fn now_as_datestamp() -> (i32, i32, i32) {
     let secs_of_day = amiga_secs % 86_400;
     let minute = secs_of_day / 60;
     let secs_of_minute = secs_of_day % 60;
-    let tick = secs_of_minute * i64::from(TICKS_PER_SECOND);
+    // Sub-second precision (the fractional tick within the current
+    // second) matters beyond DateStamp's own 1/50s granularity: this
+    // same (days, minute, tick) triple backs `GetSysTime`'s `tv_micro`
+    // (see `host_time_secs_micro` in `crate::exectask`) and
+    // `ReadEClock`'s absolute tick count, both of which real callers use
+    // for sub-second elapsed-time measurement (e.g. `WaitSelect`'s
+    // conformance-suite timeout tests). Dropping the fractional second
+    // here (as an earlier version did, via `.as_secs()` alone) made
+    // `tick` always an exact multiple of `TICKS_PER_SECOND`, silently
+    // pinning `tv_micro` to 0 forever -- a real bug, not a rounding
+    // nicety.
+    let tick =
+        secs_of_minute * i64::from(TICKS_PER_SECOND) + i64::from(now.subsec_nanos()) / 20_000_000;
     (days as i32, minute as i32, tick as i32)
 }
 
@@ -155,6 +166,39 @@ mod tests {
         assert!(
             (0..3000).contains(&tick),
             "tick-of-minute out of range: {tick}"
+        );
+    }
+
+    /// Regression test for a real bug: an earlier version derived `tick`
+    /// from `SystemTime::now().duration_since(UNIX_EPOCH).as_secs()`
+    /// alone, discarding the sub-second component before ever computing
+    /// `tick` -- so `tick` was always an exact multiple of
+    /// `TICKS_PER_SECOND` and `GetSysTime`'s `tv_micro` (derived from
+    /// `tick % TICKS_PER_SECOND`, see `crate::exectask::
+    /// host_time_secs_micro`) was permanently pinned to 0. That broke
+    /// every real caller measuring sub-second elapsed time via
+    /// `GetSysTime` (found via `bsdsocktest`'s `WaitSelect(): all NULL
+    /// fdsets + timeout = delay` test reporting a genuine 250ms host
+    /// delay as `elapsed: 0ms`). Two samples ~100ms apart, straddling a
+    /// whole-second boundary or not, must show *some* sub-tick movement
+    /// unless caught in the 1-in-50 chance both land on the exact same
+    /// tick.
+    #[test]
+    fn now_as_datestamp_has_real_sub_second_precision() {
+        let mut saw_change = false;
+        for _ in 0..20 {
+            let (_, _, tick_before) = now_as_datestamp();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let (_, _, tick_after) = now_as_datestamp();
+            if tick_before != tick_after {
+                saw_change = true;
+                break;
+            }
+        }
+        assert!(
+            saw_change,
+            "tick never advanced across 20 samples 30ms apart -- \
+             sub-second precision is broken"
         );
     }
 

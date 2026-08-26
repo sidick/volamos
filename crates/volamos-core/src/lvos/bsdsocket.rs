@@ -197,6 +197,19 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         private: false,
     },
     LvoEntry {
+        name: "WaitSelect",
+        lvo: -126,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::A(AddressRegister(1)),
+            ArgReg::A(AddressRegister(2)),
+            ArgReg::A(AddressRegister(3)),
+            ArgReg::D(DataRegister(1)),
+        ],
+        private: false,
+    },
+    LvoEntry {
         name: "Errno",
         lvo: -162,
         args: &[],
