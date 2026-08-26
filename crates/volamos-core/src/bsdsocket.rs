@@ -42,7 +42,7 @@
 //! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
 //! `inet_addr`/`gethostbyname`/`IoctlSocket`/`setsockopt`/`getsockopt`/
-//! `SocketBaseTagList`/`WaitSelect` -- real outbound and inbound TCP,
+//! `SocketBaseTagList`/`WaitSelect`/`Dup2Socket`/`vsyslog` -- real outbound and inbound TCP,
 //! plus UDP, real error reporting through the documented `Errno()`/
 //! `SetErrnoPtr()` mechanism, real forward DNS lookups via the host's
 //! own resolver (see "DNS: a real, blocking host lookup" below), the
@@ -64,10 +64,12 @@
 //! it yet), `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no
 //! portable reverse-DNS primitive; Copperline's own `hostsocket-plugin`
 //! hit the identical wall and stayed a stub for the same reason, see that
-//! crate's module docs), `Dup2Socket`/`ObtainSocket`/`ReleaseSocket`
-//! (fd-sharing across processes -- this runtime doesn't have that among
-//! its own processes to begin with), `sendmsg`/`recvmsg`/`vsyslog`/
-//! `GetSocketEvents`. `IoctlSocket` itself only implements `FIONBIO`
+//! crate's module docs), `sendmsg`/`recvmsg`/`GetSocketEvents`.
+//! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket` *are* registered
+//! (so a caller that unconditionally tries them doesn't crash the whole
+//! run) but always honestly fail with `EOPNOTSUPP` -- see
+//! [`release_socket_handler`]'s doc comment for why a real handoff isn't
+//! possible here. `IoctlSocket` itself only implements `FIONBIO`
 //! (see "Blocking by default" below) -- `FIONREAD`/`FIOASYNC` are
 //! unimplemented too (no portable `socket2` equivalent for either).
 //!
@@ -1702,6 +1704,101 @@ fn socket_base_tag_list_handler<C: Cpu>(
 /// [`crate::dispatch::Runtime::new`] -- see the module docs' "Opt-in,
 /// not always-on" section; call sites go through [`crate::dispatch::
 /// Runtime::enable_bsdsocket`] instead.
+/// `Dup2Socket(old_socket, new_socket)`. `D0` = the new descriptor
+/// number, or `-1` with `Errno()` set (`EBADF`, `old_socket` not open).
+/// `new_socket == -1` means "pick any free descriptor" (real `dup()`
+/// semantics); a non-negative `new_socket` means "duplicate onto
+/// exactly this descriptor number" (real `dup2()` semantics, closing
+/// whatever was already open there first). Since this backend's fd
+/// numbers are its own namespace (not real host fds -- see the module
+/// docs), honoring an arbitrary caller-requested target is always
+/// possible, unlike a real `dup2()`'s host-fd-table constraints.
+/// Duplicated via [`Socket::try_clone`], a real `dup()` of the
+/// underlying host socket -- both descriptors refer to the same
+/// underlying connection/buffer afterward, exactly like real
+/// `Dup2Socket`.
+fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let old_fd = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let new_fd = ctx.cpu.data_register(DataRegister(1)) as i32;
+
+    let Some(entry) = ctx.bsdsocket.sockets.get(&old_fd) else {
+        ctx.bsdsocket.set_errno(ctx.mem, EBADF);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    };
+    let dup = match entry.socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            let code = translate_errno(&e);
+            ctx.bsdsocket.set_errno(ctx.mem, code);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            return Ok(());
+        }
+    };
+
+    let id = if new_fd < 0 {
+        let id = ctx.bsdsocket.next_id;
+        ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
+        id
+    } else {
+        if new_fd >= ctx.bsdsocket.next_id {
+            ctx.bsdsocket.next_id = new_fd.wrapping_add(1).max(1);
+        }
+        new_fd
+    };
+    ctx.bsdsocket
+        .sockets
+        .insert(id, SocketEntry { socket: dup });
+    ctx.bsdsocket.set_errno(ctx.mem, 0);
+    ctx.cpu.set_data_register(DataRegister(0), id as u32);
+    Ok(())
+}
+
+/// `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket`: real
+/// AmigaOS hands a socket between *processes* by a small integer ID
+/// (the classic use: a listening daemon passes an accepted connection
+/// to a freshly-launched child process, which calls `ObtainSocket` with
+/// the ID its parent got back from `ReleaseSocket`/
+/// `ReleaseCopyOfSocket`). This runtime models exactly one guest task
+/// with no second process to ever hand a socket to, so there is no
+/// honest way to implement the handoff itself -- but real callers
+/// (confirmed by `bsdsocktest`'s own `transfer` category) probe for
+/// support by calling `ReleaseSocket` and gracefully skipping if it
+/// fails, so registering these as a clean, immediate `EOPNOTSUPP`
+/// (rather than leaving the LVO unregistered, which crashes the whole
+/// run on the "unhandled library call" trap) is the correct behavior:
+/// a real caller sees "not supported here" and moves on.
+fn release_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+    ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+    Ok(())
+}
+
+/// `vsyslog(pri, msg, args)`. No return value. Formats `msg` against
+/// the `args` array using the same real `RawDoFmt`-style C-`printf`
+/// directive syntax (`%s`/`%d`/`%ld`/`%u`/`%x`/`%c`/`%%`, one 4-byte
+/// array slot consumed per directive) that [`crate::execfmt::
+/// render_format`] already implements for `dos.library`'s `VPrintf`/
+/// `VFPrintf` -- the same "manually-built argument array standing in
+/// for varargs" convention `bsdsocktest`'s own `vsyslog` test uses
+/// (`ULONG args[1]; args[0] = (ULONG)"test"; vsyslog(pri, "%s", args)`).
+/// There is no real host syslog daemon this runtime could forward to,
+/// so the rendered message is surfaced the same honest way this
+/// module's other "meaningful event" logging already is -- via
+/// `call_detail` (visible under `--snoop`/`--verbose`) -- rather than
+/// silently discarded.
+fn vsyslog_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let pri = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let msg_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let args_ptr = ctx.cpu.address_register(AddressRegister(1));
+
+    let fmt = crate::guestmem::read_c_string(ctx.mem, msg_ptr);
+    let (rendered, _) = crate::execfmt::render_format(ctx.mem, &fmt, args_ptr);
+    let text = String::from_utf8_lossy(&rendered);
+    *ctx.call_detail = Some(format!("vsyslog(pri={pri}): {text}"));
+    Ok(())
+}
+
 pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -1745,6 +1842,11 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("inet_addr", inet_addr_handler::<C>);
     reg!("gethostbyname", gethostbyname_handler::<C>);
     reg!("SocketBaseTagList", socket_base_tag_list_handler::<C>);
+    reg!("Dup2Socket", dup2_socket_handler::<C>);
+    reg!("vsyslog", vsyslog_handler::<C>);
+    reg!("ObtainSocket", release_socket_handler::<C>);
+    reg!("ReleaseSocket", release_socket_handler::<C>);
+    reg!("ReleaseCopyOfSocket", release_socket_handler::<C>);
 }
 
 #[cfg(test)]
@@ -2696,5 +2798,171 @@ mod tests {
             0,
             "the matched signal should be consumed (cleared) from tc_SigRecvd"
         );
+    }
+
+    #[test]
+    fn end_to_end_dup2socket_new_descriptor_can_send_and_recv() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = listener.local_addr().unwrap().port();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.write_all(b"hi").expect("write_all");
+        });
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let recv_buf: u32 = 0x1_8100;
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0 (== 0, ok)
+
+        push_move_imm_d(&mut words, 0, 1); // old_socket = fd(1), the only socket
+        push_move_imm_d(&mut words, 1, 0xFFFF_FFFF); // new_socket = -1 (pick any free fd)
+        words.extend_from_slice(&jsr_disp16_a6(-264)); // Dup2Socket() -> D0 = dup fd
+        words.push(move_d0_to_d(3)); // D3 = dup fd
+
+        const MOVE_D3_TO_D0: u16 = 0x2003;
+        words.push(MOVE_D3_TO_D0);
+        push_move_imm_a(&mut words, 0, recv_buf);
+        push_move_imm_d(&mut words, 1, 2);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // recv(dup fd, buf, 2, 0) -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        accept_thread.join().unwrap();
+
+        assert_eq!(
+            code, 2,
+            "recv() on the duplicated descriptor should see the real 2 bytes"
+        );
+        assert_eq!(rt.memory().read_u8(recv_buf), b'h');
+        assert_eq!(rt.memory().read_u8(recv_buf + 1), b'i');
+    }
+
+    #[test]
+    fn end_to_end_dup2socket_specific_target_is_honored() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (1)
+
+        push_move_imm_d(&mut words, 0, 1); // old_socket = fd(1)
+        push_move_imm_d(&mut words, 1, 50); // new_socket = 50 (explicit target)
+        words.extend_from_slice(&jsr_disp16_a6(-264)); // Dup2Socket() -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 50, "an explicit target fd should be honored exactly");
+    }
+
+    #[test]
+    fn end_to_end_dup2socket_unknown_descriptor_fails_with_ebadf() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 99); // old_socket = never opened
+        push_move_imm_d(&mut words, 1, 0xFFFF_FFFF);
+        words.extend_from_slice(&jsr_disp16_a6(-264)); // Dup2Socket() -> D0 (== -1)
+        words.extend_from_slice(&jsr_disp16_a6(-162)); // Errno() -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, EBADF);
+    }
+
+    #[test]
+    fn end_to_end_vsyslog_formats_message_and_reports_via_call_detail() {
+        let msg_buf: u32 = 0x1_8000;
+        let str_buf: u32 = 0x1_8100;
+        let args_buf: u32 = 0x1_8200;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 6); // pri = LOG_INFO
+        push_move_imm_a(&mut words, 0, msg_buf); // msg = "%s"
+        push_move_imm_a(&mut words, 1, args_buf); // args
+        words.extend_from_slice(&jsr_disp16_a6(-258)); // vsyslog()
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        for (i, b) in b"%s\0".iter().enumerate() {
+            mem.write_u8(msg_buf + i as u32, *b);
+        }
+        for (i, b) in b"canary\0".iter().enumerate() {
+            mem.write_u8(str_buf + i as u32, *b);
+        }
+        mem.write_u32(args_buf, str_buf);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+
+        let mut details = Vec::new();
+        let mut trace = |event: &crate::dispatch::TraceEvent| {
+            if let Some(detail) = &event.detail {
+                details.push(detail.clone());
+            }
+        };
+        let mut out = Vec::new();
+        rt.run(&mut out, Some(&mut trace))
+            .expect("run should succeed");
+
+        assert!(
+            details.iter().any(|d| d == "vsyslog(pri=6): canary"),
+            "expected a vsyslog detail among {details:?}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_release_socket_family_honestly_fails_without_crashing() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, 1); // sock
+        push_move_imm_d(&mut words, 1, 42); // id
+        words.extend_from_slice(&jsr_disp16_a6(-150)); // ReleaseSocket() -> D0 (== -1)
+        words.extend_from_slice(&jsr_disp16_a6(-162)); // Errno() -> D0
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, EOPNOTSUPP);
     }
 }

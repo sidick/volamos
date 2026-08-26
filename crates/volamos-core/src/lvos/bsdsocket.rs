@@ -245,6 +245,52 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         args: &[ArgReg::A(AddressRegister(0))],
         private: false,
     },
+    LvoEntry {
+        name: "vsyslog",
+        lvo: -258,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::A(AddressRegister(1)),
+        ],
+        private: false,
+    },
+    LvoEntry {
+        name: "Dup2Socket",
+        lvo: -264,
+        args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
+        private: false,
+    },
+    // ObtainSocket/ReleaseSocket/ReleaseCopyOfSocket hand a socket's
+    // ownership between *processes* by a small integer ID (real use:
+    // pass a listening socket to a child process). This runtime models
+    // a single guest task with no other process to hand a socket to, so
+    // these are registered (avoiding an unhandled-call crash for any
+    // caller that unconditionally tries them) but honestly always fail
+    // -- see `release_socket_handler`'s doc comment.
+    LvoEntry {
+        name: "ObtainSocket",
+        lvo: -144,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::D(DataRegister(1)),
+            ArgReg::D(DataRegister(2)),
+            ArgReg::D(DataRegister(3)),
+        ],
+        private: false,
+    },
+    LvoEntry {
+        name: "ReleaseSocket",
+        lvo: -150,
+        args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
+        private: false,
+    },
+    LvoEntry {
+        name: "ReleaseCopyOfSocket",
+        lvo: -156,
+        args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
+        private: false,
+    },
 ];
 
 #[cfg(test)]
