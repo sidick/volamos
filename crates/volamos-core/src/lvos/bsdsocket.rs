@@ -125,6 +125,30 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
         private: false,
     },
     LvoEntry {
+        name: "setsockopt",
+        lvo: -90,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::D(DataRegister(1)),
+            ArgReg::D(DataRegister(2)),
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::D(DataRegister(3)),
+        ],
+        private: false,
+    },
+    LvoEntry {
+        name: "getsockopt",
+        lvo: -96,
+        args: &[
+            ArgReg::D(DataRegister(0)),
+            ArgReg::D(DataRegister(1)),
+            ArgReg::D(DataRegister(2)),
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::A(AddressRegister(1)),
+        ],
+        private: false,
+    },
+    LvoEntry {
         name: "shutdown",
         lvo: -84,
         args: &[ArgReg::D(DataRegister(0)), ArgReg::D(DataRegister(1))],
@@ -199,6 +223,12 @@ pub static BSDSOCKET_LVOS: &[LvoEntry] = &[
     LvoEntry {
         name: "gethostbyname",
         lvo: -210,
+        args: &[ArgReg::A(AddressRegister(0))],
+        private: false,
+    },
+    LvoEntry {
+        name: "SocketBaseTagList",
+        lvo: -294,
         args: &[ArgReg::A(AddressRegister(0))],
         private: false,
     },

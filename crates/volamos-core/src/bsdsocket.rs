@@ -41,25 +41,34 @@
 //! Implements `socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
 //! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
 //! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
-//! `inet_addr`/`gethostbyname`/`IoctlSocket` -- real outbound and
-//! inbound TCP, plus UDP, real error reporting through the documented
-//! `Errno()`/`SetErrnoPtr()` mechanism, and real forward DNS lookups via
-//! the host's own resolver (see "DNS: a real, blocking host lookup"
-//! below). Deliberately **not yet implemented** (calling these traps as
-//! an ordinary unknown-call, same as any other library's unimplemented
-//! LVO in this codebase -- see [`crate::lvos::bsdsocket`]'s module docs
-//! for why this table only lists what's implemented, not the full ABI):
-//! `setsockopt`/`getsockopt` (real option roundtrip storage, no
-//! consumer needing it yet), `WaitSelect`/`SetSocketSignals` (real
-//! `select()`-shaped multiplexing needs deciding whether to integrate
-//! with `crate::exectask`'s signal model or just poll -- a real design
-//! choice, not a quick add), `gethostbyaddr` (reverse/PTR lookup --
-//! `std::net` has no portable reverse-DNS primitive; Copperline's own
-//! `hostsocket-plugin` hit the identical wall and stayed a stub for the
-//! same reason, see that crate's module docs), `Dup2Socket`/
-//! `ObtainSocket`/`ReleaseSocket` (fd-sharing across processes -- this
-//! runtime doesn't have that among its own processes to begin with),
-//! `sendmsg`/`recvmsg`/`vsyslog`/`SocketBaseTagList`/`GetSocketEvents`.
+//! `inet_addr`/`gethostbyname`/`IoctlSocket`/`setsockopt`/`getsockopt`/
+//! `SocketBaseTagList` -- real outbound and inbound TCP, plus UDP, real
+//! error reporting through the documented `Errno()`/`SetErrnoPtr()`
+//! mechanism, real forward DNS lookups via the host's own resolver (see
+//! "DNS: a real, blocking host lookup" below), and the socket option
+//! set a real conformance suite (`bsdsocktest`'s own `sockopt` test
+//! category) actually exercises: `SO_REUSEADDR`/`SO_KEEPALIVE`/
+//! `SO_LINGER`/`SO_SNDBUF`/`SO_RCVBUF`/`SO_SNDTIMEO`/`SO_RCVTIMEO`/
+//! `SO_ERROR`/`SO_TYPE`/`TCP_NODELAY` -- all real `socket2` calls
+//! against the host socket, not roundtrip-only storage (`SO_ERROR` in
+//! particular has real BSD "read consumes the pending error" semantics,
+//! via `socket2`'s own `take_error`). Deliberately **not yet
+//! implemented** (calling these traps as an ordinary unknown-call, same
+//! as any other library's unimplemented LVO in this codebase -- see
+//! [`crate::lvos::bsdsocket`]'s module docs for why this table only
+//! lists what's implemented, not the full ABI): `WaitSelect`/
+//! `SetSocketSignals` (real `select()`-shaped multiplexing needs
+//! deciding whether to integrate with `crate::exectask`'s signal model
+//! or just poll -- a real design choice, not a quick add),
+//! `gethostbyaddr` (reverse/PTR lookup -- `std::net` has no portable
+//! reverse-DNS primitive; Copperline's own `hostsocket-plugin` hit the
+//! identical wall and stayed a stub for the same reason, see that
+//! crate's module docs), `Dup2Socket`/`ObtainSocket`/`ReleaseSocket`
+//! (fd-sharing across processes -- this runtime doesn't have that among
+//! its own processes to begin with), `sendmsg`/`recvmsg`/`vsyslog`/
+//! `GetSocketEvents`. `IoctlSocket` itself only implements `FIONBIO`
+//! (see "Blocking by default" below) -- `FIONREAD`/`FIOASYNC` are
+//! unimplemented too (no portable `socket2` equivalent for either).
 //!
 //! # Blocking by default
 //!
@@ -198,15 +207,41 @@ pub const TRY_AGAIN: i32 = 2;
 /// [`ioctl_socket_handler`].
 const FIONBIO: u32 = 0x8004_667E;
 
+// --- SocketBaseTagList tag encoding -- a real `<libraries/bsdsocket.h>`
+// (Roadshow) / `<utility/tagitem.h>` (`TAG_USER`), not invented. See
+// [`socket_base_tag_list_handler`]'s doc for the bit layout these
+// combine into.
+const TAG_DONE: u32 = 0;
+const TAG_IGNORE: u32 = 1;
+const TAG_MORE: u32 = 2;
+const TAG_SKIP: u32 = 3;
+const TAG_USER: u32 = 0x8000_0000;
+const SBTF_REF: u32 = 0x8000;
+const SBTF_SET: u32 = 1;
+const SBTC_ERRNOLONGPTR: u32 = 24;
+const SBTC_HERRNOLONGPTR: u32 = 25;
+const SBTC_RELEASESTRPTR: u32 = 29;
+
 /// Maps a [`std::io::Error`] from a `socket2` call to the fixed BSD
 /// `errno` numbering `bsdsocket.library` documents -- see the module
 /// docs' "Errno" section for why this doesn't inspect the host's raw OS
 /// errno.
 fn translate_errno(e: &std::io::Error) -> i32 {
     use std::io::ErrorKind::*;
-    if is_connect_in_progress(e) {
-        return EINPROGRESS;
-    }
+    // NOT is_connect_in_progress(e) here: that check treats any
+    // WouldBlock-kind error as "connect still in progress" (a heuristic
+    // only valid for connect() itself, whose non-blocking "not done yet"
+    // signal can surface as either ErrorKind -- see that function's own
+    // doc), but accept()/send()/recv()'s own genuine EAGAIN/EWOULDBLOCK
+    // is *also* WouldBlock-kind. Calling it here made every one of
+    // those wrongly report EINPROGRESS instead of EAGAIN -- a real
+    // regression this module briefly shipped, caught by a real
+    // conformance suite (bsdsocktest's "accept(): EWOULDBLOCK when
+    // non-blocking, no pending" test) rather than by this module's own
+    // (all-synthetic, until then) test coverage. connect_handler already
+    // checks is_connect_in_progress itself, in its own dedicated match
+    // arm, before ever falling through to this function -- it doesn't
+    // need this function to also know about it.
     match e.kind() {
         WouldBlock => EAGAIN,
         ConnectionRefused => ECONNREFUSED,
@@ -227,6 +262,22 @@ fn translate_errno(e: &std::io::Error) -> i32 {
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+
+// --- setsockopt/getsockopt levels and option names -- real
+// <sys/socket.h>/<netinet/tcp.h> values from a real Roadshow NDK, not
+// invented. See [`setsockopt_handler`]/[`getsockopt_handler`].
+const SOL_SOCKET: i32 = 0xFFFF;
+const IPPROTO_TCP: i32 = 6;
+const SO_REUSEADDR: i32 = 0x0004;
+const SO_KEEPALIVE: i32 = 0x0008;
+const SO_LINGER: i32 = 0x0080;
+const SO_SNDBUF: i32 = 0x1001;
+const SO_RCVBUF: i32 = 0x1002;
+const SO_SNDTIMEO: i32 = 0x1005;
+const SO_RCVTIMEO: i32 = 0x1006;
+const SO_ERROR: i32 = 0x1007;
+const SO_TYPE: i32 = 0x1008;
+const TCP_NODELAY: i32 = 0x01;
 
 /// A cap on concurrently open sockets -- a plain sanity bound against
 /// runaway guest socket creation, same reasoning (and the same value) as
@@ -257,6 +308,19 @@ pub struct BsdSocketState {
     /// round trip) -- `None` until a guest calls `SetErrnoPtr`. Only the
     /// 4-byte (`LONG`) size is supported; see [`Self::set_errno`].
     errno_ptr: Option<u32>,
+    /// Guest address [`SocketBaseTagList`]'s `SBTC_HERRNOLONGPTR` tag (or
+    /// [`set_herrno_ptr_handler`]-equivalent) asked to mirror `h_errno`
+    /// into -- the *separate* variable real `gethostbyname`/
+    /// `gethostbyaddr` failures report through (see the module docs'
+    /// "DNS" section: this runtime originally, wrongly, folded DNS
+    /// failures into the same channel as [`Self::errno_ptr`]; real
+    /// `bsdsocket.library` keeps them distinct, confirmed against a real
+    /// conformance suite -- `bsdsocktest`'s own `testutil.c` registers
+    /// both pointers separately and reads them back independently).
+    /// `None` until a guest registers one.
+    ///
+    /// [`SocketBaseTagList`]: socket_base_tag_list_handler
+    herrno_ptr: Option<u32>,
     /// Guest heap address of a small scratch buffer [`inet_ntoa_handler`]
     /// reuses across calls for its dotted-decimal string result
     /// (matching real `Inet_NtoA`'s own "static buffer, valid until the
@@ -269,6 +333,11 @@ pub struct BsdSocketState {
     /// ever being freed by the guest (see the module docs' "DNS"
     /// section for why). Empty until the first successful lookup.
     hostent_allocs: Vec<u32>,
+    /// Guest heap address of a small, lazily-allocated buffer holding
+    /// this library's version/release identifier string, returned by
+    /// `SocketBaseTagList`'s `SBTC_RELEASESTRPTR` query -- see
+    /// [`socket_base_tag_list_handler`].
+    release_str_buf: Option<u32>,
 }
 
 impl BsdSocketState {
@@ -278,19 +347,38 @@ impl BsdSocketState {
             next_id: 1,
             last_errno: 0,
             errno_ptr: None,
+            herrno_ptr: None,
             ntoa_buf: None,
             hostent_allocs: Vec::new(),
+            release_str_buf: None,
         }
     }
 
     /// Records `code` as the current `Errno()` value, and mirrors it into
     /// guest memory at [`Self::errno_ptr`] if one was set via
-    /// `SetErrnoPtr`. Called by every fallible handler on both success
-    /// (`code = 0`) and failure, matching real `bsdsocket.library`'s own
-    /// "every call sets errno, not just failing ones" behavior.
+    /// `SetErrnoPtr`/`SocketBaseTagList(SBTC_ERRNOLONGPTR)`. Called by
+    /// every fallible handler on both success (`code = 0`) and failure,
+    /// matching real `bsdsocket.library`'s own "every call sets errno,
+    /// not just failing ones" behavior. Does *not* touch
+    /// [`Self::herrno_ptr`] -- see [`Self::set_herrno`].
     fn set_errno(&mut self, mem: &mut dyn AddressSpace, code: i32) {
         self.last_errno = code;
         if let Some(ptr) = self.errno_ptr {
+            mem.write_u32(ptr, code as u32);
+        }
+    }
+
+    /// Mirrors `code` into guest memory at [`Self::herrno_ptr`] if one
+    /// was registered via `SocketBaseTagList(SBTC_HERRNOLONGPTR)` -- the
+    /// separate `h_errno` channel real `gethostbyname`/`gethostbyaddr`
+    /// failures report through, distinct from [`Self::set_errno`] (see
+    /// the module docs' "DNS" section). A no-op if no pointer was ever
+    /// registered -- unlike `errno`, real `h_errno` has no host-visible
+    /// "current value" this runtime tracks independently of a caller's
+    /// own registered mirror, since nothing here reads it back the way
+    /// `Errno()` does for plain errno.
+    fn set_herrno(&mut self, mem: &mut dyn AddressSpace, code: i32) {
+        if let Some(ptr) = self.herrno_ptr {
             mem.write_u32(ptr, code as u32);
         }
     }
@@ -724,6 +812,202 @@ fn recvfrom_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     Ok(())
 }
 
+/// Reads a real AmigaOS `struct timeval` (`<devices/timer.h>`'s
+/// `tv_secs`/`tv_micro` naming, 4 bytes each -- see the module docs'
+/// "Blocking by default" section's sibling note on this same AmigaOS-
+/// vs-POSIX field-naming gotcha for `WaitSelect`) at `addr` as a
+/// [`std::time::Duration`].
+fn read_timeval(mem: &dyn AddressSpace, addr: u32) -> std::time::Duration {
+    let secs = mem.read_u32(addr);
+    let micros = mem.read_u32(addr.wrapping_add(4));
+    std::time::Duration::new(secs as u64, micros.wrapping_mul(1000))
+}
+
+/// Writes a [`std::time::Duration`] (or `None`, meaning "no timeout",
+/// written as all-zero) as a real AmigaOS `struct timeval` at `addr`.
+fn write_timeval(mem: &mut dyn AddressSpace, addr: u32, d: Option<std::time::Duration>) {
+    let d = d.unwrap_or_default();
+    mem.write_u32(addr, d.as_secs() as u32);
+    mem.write_u32(addr.wrapping_add(4), d.subsec_micros());
+}
+
+/// `setsockopt(sock, level, optname, optval, optlen)`. `D0` = `0`, or
+/// `-1` with `Errno()` set (`ENOPROTOOPT`-shaped as `EOPNOTSUPP` for an
+/// option this backend doesn't implement -- see the module docs'
+/// "setsockopt/getsockopt" section for the exact set covered, chosen to
+/// match what a real conformance suite's own `sockopt` test category
+/// actually exercises). `optval` is read from guest memory *before* the
+/// underlying `socket2` call, matching every other handler's "read
+/// whatever's needed from `ctx.mem` first, since `with_socket`'s
+/// closure only gets the `Socket` itself" convention.
+fn setsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let level = ctx.cpu.data_register(DataRegister(1)) as i32;
+    let optname = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let optval_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    enum Apply {
+        Bool(bool),
+        Size(usize),
+        Linger(Option<std::time::Duration>),
+        RecvTimeout(Option<std::time::Duration>),
+        SendTimeout(Option<std::time::Duration>),
+        Nodelay(bool),
+        Unsupported,
+    }
+
+    let apply = match (level, optname) {
+        (SOL_SOCKET, SO_REUSEADDR) => Apply::Bool(ctx.mem.read_u32(optval_ptr) != 0),
+        (SOL_SOCKET, SO_KEEPALIVE) => Apply::Bool(ctx.mem.read_u32(optval_ptr) != 0),
+        (SOL_SOCKET, SO_SNDBUF) => Apply::Size(ctx.mem.read_u32(optval_ptr) as usize),
+        (SOL_SOCKET, SO_RCVBUF) => Apply::Size(ctx.mem.read_u32(optval_ptr) as usize),
+        (SOL_SOCKET, SO_LINGER) => {
+            let onoff = ctx.mem.read_u32(optval_ptr) != 0;
+            let secs = ctx.mem.read_u32(optval_ptr.wrapping_add(4));
+            Apply::Linger(onoff.then(|| std::time::Duration::from_secs(secs as u64)))
+        }
+        (SOL_SOCKET, SO_RCVTIMEO) => {
+            let d = read_timeval(ctx.mem, optval_ptr);
+            Apply::RecvTimeout((!d.is_zero()).then_some(d))
+        }
+        (SOL_SOCKET, SO_SNDTIMEO) => {
+            let d = read_timeval(ctx.mem, optval_ptr);
+            Apply::SendTimeout((!d.is_zero()).then_some(d))
+        }
+        (IPPROTO_TCP, TCP_NODELAY) => Apply::Nodelay(ctx.mem.read_u32(optval_ptr) != 0),
+        _ => Apply::Unsupported,
+    };
+    if matches!(apply, Apply::Unsupported) {
+        ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+
+    let Some(result) = with_socket(ctx, fd, |socket| match apply {
+        Apply::Bool(v) if optname == SO_REUSEADDR => socket.set_reuse_address(v),
+        Apply::Bool(v) => socket.set_keepalive(v),
+        Apply::Size(v) if optname == SO_SNDBUF => socket.set_send_buffer_size(v),
+        Apply::Size(v) => socket.set_recv_buffer_size(v),
+        Apply::Linger(v) => socket.set_linger(v),
+        Apply::RecvTimeout(v) => socket.set_read_timeout(v),
+        Apply::SendTimeout(v) => socket.set_write_timeout(v),
+        Apply::Nodelay(v) => socket.set_nodelay(v),
+        Apply::Unsupported => unreachable!("filtered out above"),
+    }) else {
+        return Ok(());
+    };
+    match result {
+        Ok(()) => {
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+        Err(e) => {
+            let code = translate_errno(&e);
+            ctx.bsdsocket.set_errno(ctx.mem, code);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        }
+    }
+    Ok(())
+}
+
+/// `getsockopt(sock, level, optname, optval, optlen)`. `D0` = `0`, or
+/// `-1` with `Errno()` set. `optlen` (`A1`) is read but never updated
+/// (every option this backend implements has a fixed, known size the
+/// caller already knows) -- see [`setsockopt_handler`]'s doc for the
+/// exact option set and its provenance. `SO_ERROR` is real BSD
+/// "read-and-clear" semantics: querying it consumes the socket's
+/// pending error (via `socket2`'s own `take_error`), matching a real
+/// kernel's own behavior, not just a value roundtrip.
+fn getsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
+    let level = ctx.cpu.data_register(DataRegister(1)) as i32;
+    let optname = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let optval_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    if !matches!(
+        (level, optname),
+        (SOL_SOCKET, SO_REUSEADDR)
+            | (SOL_SOCKET, SO_KEEPALIVE)
+            | (SOL_SOCKET, SO_SNDBUF)
+            | (SOL_SOCKET, SO_RCVBUF)
+            | (SOL_SOCKET, SO_LINGER)
+            | (SOL_SOCKET, SO_RCVTIMEO)
+            | (SOL_SOCKET, SO_SNDTIMEO)
+            | (SOL_SOCKET, SO_ERROR)
+            | (SOL_SOCKET, SO_TYPE)
+            | (IPPROTO_TCP, TCP_NODELAY)
+    ) {
+        ctx.bsdsocket.set_errno(ctx.mem, EOPNOTSUPP);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+
+    let Some(entry) = ctx.bsdsocket.sockets.get(&fd) else {
+        ctx.bsdsocket.set_errno(ctx.mem, EBADF);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    };
+    let socket = &entry.socket;
+
+    let result: std::io::Result<()> = (|| {
+        match (level, optname) {
+            (SOL_SOCKET, SO_REUSEADDR) => ctx
+                .mem
+                .write_u32(optval_ptr, socket.reuse_address()? as u32),
+            (SOL_SOCKET, SO_KEEPALIVE) => ctx.mem.write_u32(optval_ptr, socket.keepalive()? as u32),
+            (SOL_SOCKET, SO_SNDBUF) => ctx
+                .mem
+                .write_u32(optval_ptr, socket.send_buffer_size()? as u32),
+            (SOL_SOCKET, SO_RCVBUF) => ctx
+                .mem
+                .write_u32(optval_ptr, socket.recv_buffer_size()? as u32),
+            (SOL_SOCKET, SO_LINGER) => {
+                let linger = socket.linger()?;
+                ctx.mem.write_u32(optval_ptr, linger.is_some() as u32);
+                ctx.mem.write_u32(
+                    optval_ptr.wrapping_add(4),
+                    linger.unwrap_or_default().as_secs() as u32,
+                );
+            }
+            (SOL_SOCKET, SO_RCVTIMEO) => write_timeval(ctx.mem, optval_ptr, socket.read_timeout()?),
+            (SOL_SOCKET, SO_SNDTIMEO) => {
+                write_timeval(ctx.mem, optval_ptr, socket.write_timeout()?)
+            }
+            (SOL_SOCKET, SO_ERROR) => {
+                let code = match socket.take_error()? {
+                    Some(e) => translate_errno(&e),
+                    None => 0,
+                };
+                ctx.mem.write_u32(optval_ptr, code as u32);
+            }
+            (SOL_SOCKET, SO_TYPE) => {
+                let t = if socket.r#type()? == Type::DGRAM {
+                    SOCK_DGRAM
+                } else {
+                    SOCK_STREAM
+                };
+                ctx.mem.write_u32(optval_ptr, t as u32);
+            }
+            (IPPROTO_TCP, TCP_NODELAY) => ctx.mem.write_u32(optval_ptr, socket.nodelay()? as u32),
+            _ => unreachable!("filtered out above"),
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            ctx.bsdsocket.set_errno(ctx.mem, 0);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+        Err(e) => {
+            let code = translate_errno(&e);
+            ctx.bsdsocket.set_errno(ctx.mem, code);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        }
+    }
+    Ok(())
+}
+
 /// `shutdown(sock, how)`. `D0` = `0`, or `-1` with `Errno()` set.
 fn shutdown_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     use std::net::Shutdown;
@@ -953,8 +1237,10 @@ fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
         let _ = ctx.heap.free(addr);
     }
 
+    // A real gethostbyname failure reports through h_errno, not the
+    // ordinary errno channel -- see BsdSocketState::set_herrno's doc.
     let fail = |ctx: &mut HandlerContext<'_, C>, code: i32| {
-        ctx.bsdsocket.set_errno(ctx.mem, code);
+        ctx.bsdsocket.set_herrno(ctx.mem, code);
         ctx.cpu.set_data_register(DataRegister(0), 0);
     };
 
@@ -1025,6 +1311,128 @@ fn gethostbyname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
+/// `SocketBaseTagList(tags)`. `D0` = `0` on success, or (real
+/// `SocketBaseTagList`'s own documented `RESULT` contract, a real
+/// Roadshow Autodoc, not invented) the positive 1-based index of the
+/// first tag that genuinely failed -- always `0` here today, since
+/// nothing this handler recognizes has a failing case yet (see below).
+/// `tags` is a standard AmigaOS `TagItem` array: `{ti_Tag, ti_Data}`
+/// pairs, `TAG_DONE`-terminated, with `TAG_IGNORE`/`TAG_MORE`/
+/// `TAG_SKIP` control tags honored.
+///
+/// Only three base tag codes are implemented, matching what a real
+/// conformance suite (`bsdsocktest`'s `testutil.c`) actually calls at
+/// startup, before running a single test:
+///
+/// - `SBTC_ERRNOLONGPTR`/`SBTC_HERRNOLONGPTR` (`SET` only, by value or
+///   by reference -- see [`BsdSocketState::errno_ptr`]/[`herrno_ptr`]):
+///   the modern, tag-based equivalent of `SetErrnoPtr`, but for `errno`
+///   and the *separate* `h_errno` channel respectively. `GET` on either
+///   is a documented no-op (`ti_Data` left untouched) -- matching real
+///   Roadshow's own behavior, which `bsdsocktest`'s bundled
+///   `docs/COMPATIBILITY.md` records as a known, harmless deviation
+///   ("Roadshow supports SET but not readback of the registered errno
+///   pointer"), not a bug to fix.
+/// - `SBTC_RELEASESTRPTR` (`GET` by reference only): writes the address
+///   of this library's own version-identifier string into `*ti_Data`.
+///
+/// Every other tag code is silently accepted as a no-op (not a failure)
+/// -- the whole point of AmigaOS tag lists is forward/backward
+/// tolerance: a caller passing a tag this backend doesn't recognize
+/// (an extension a newer/different real stack supports) shouldn't fail
+/// the entire call over it, only over a tag that's recognized but
+/// genuinely invalid (this backend has none of those yet).
+///
+/// [`herrno_ptr`]: BsdSocketState::herrno_ptr
+fn socket_base_tag_list_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let mut tags_ptr = ctx.cpu.address_register(AddressRegister(0));
+
+    loop {
+        let ti_tag = ctx.mem.read_u32(tags_ptr);
+        let ti_data = ctx.mem.read_u32(tags_ptr.wrapping_add(4));
+
+        match ti_tag {
+            TAG_DONE => break,
+            TAG_IGNORE => {
+                tags_ptr = tags_ptr.wrapping_add(8);
+                continue;
+            }
+            TAG_MORE => {
+                tags_ptr = ti_data;
+                continue;
+            }
+            TAG_SKIP => {
+                tags_ptr = tags_ptr.wrapping_add(8).wrapping_add(ti_data * 8);
+                continue;
+            }
+            _ => {}
+        }
+
+        if ti_tag & TAG_USER != 0 {
+            let code = (ti_tag >> 1) & 0x3FFF;
+            let by_ref = ti_tag & SBTF_REF != 0;
+            let is_set = ti_tag & SBTF_SET != 0;
+
+            match (code, is_set) {
+                (SBTC_ERRNOLONGPTR, true) => {
+                    let ptr = if by_ref {
+                        ctx.mem.read_u32(ti_data)
+                    } else {
+                        ti_data
+                    };
+                    ctx.bsdsocket.errno_ptr = if ptr == 0 { None } else { Some(ptr) };
+                }
+                (SBTC_HERRNOLONGPTR, true) => {
+                    let ptr = if by_ref {
+                        ctx.mem.read_u32(ti_data)
+                    } else {
+                        ti_data
+                    };
+                    ctx.bsdsocket.herrno_ptr = if ptr == 0 { None } else { Some(ptr) };
+                }
+                (SBTC_RELEASESTRPTR, false) if by_ref => {
+                    let buf = match ctx.bsdsocket.release_str_buf {
+                        Some(addr) => addr,
+                        None => {
+                            let addr =
+                                ctx.heap
+                                    .alloc(32)
+                                    .map_err(|e| DispatchError::HandlerFailed {
+                                        library: "bsdsocket.library".to_string(),
+                                        lvo: -294,
+                                        handler_name: "SocketBaseTagList".to_string(),
+                                        message: format!(
+                                            "SocketBaseTagList: guest heap allocation failed: {e}"
+                                        ),
+                                    })?;
+                            crate::guestmem::write_c_string(
+                                ctx.mem,
+                                addr,
+                                b"volamos bsdsocket.library (host passthrough)",
+                            );
+                            ctx.bsdsocket.release_str_buf = Some(addr);
+                            addr
+                        }
+                    };
+                    ctx.mem.write_u32(ti_data, buf);
+                }
+                // Every other recognized-vs-unrecognized combination
+                // (a GET on a SET-only tag, or a tag code this backend
+                // doesn't implement at all) is a documented or
+                // deliberate no-op -- see this function's own doc.
+                _ => {}
+            }
+        }
+
+        tags_ptr = tags_ptr.wrapping_add(8);
+    }
+
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    Ok(())
+}
+
 /// Registers this module's `bsdsocket.library` handlers, looked up by
 /// name through [`BSDSOCKET_LVOS`]. **Not** called from
 /// [`crate::dispatch::Runtime::new`] -- see the module docs' "Opt-in,
@@ -1059,6 +1467,8 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("sendto", sendto_handler::<C>);
     reg!("recvfrom", recvfrom_handler::<C>);
     reg!("shutdown", shutdown_handler::<C>);
+    reg!("setsockopt", setsockopt_handler::<C>);
+    reg!("getsockopt", getsockopt_handler::<C>);
     reg!("IoctlSocket", ioctl_socket_handler::<C>);
     reg!("getsockname", getsockname_handler::<C>);
     reg!("getpeername", getpeername_handler::<C>);
@@ -1069,6 +1479,7 @@ pub fn register_bsdsocket_handlers<C: Cpu + 'static>(
     reg!("Inet_NtoA", inet_ntoa_handler::<C>);
     reg!("inet_addr", inet_addr_handler::<C>);
     reg!("gethostbyname", gethostbyname_handler::<C>);
+    reg!("SocketBaseTagList", socket_base_tag_list_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1361,11 +1772,22 @@ mod tests {
     #[test]
     fn end_to_end_gethostbyname_unresolvable_name_fails_with_host_not_found() {
         let name_addr: u32 = 0x1_8000;
+        let herrno_addr: u32 = 0x1_8100;
+        let tags_addr: u32 = 0x1_8200;
+
+        // SocketBaseTagList(SBTM_SETVAL(SBTC_HERRNOLONGPTR), &herrno, TAG_DONE)
+        // -- register a real h_errno mirror first, since a failed
+        // gethostbyname reports through *that* channel, not Errno()
+        // (see BsdSocketState::set_herrno's doc; confirmed against a
+        // real bsdsocktest conformance run, which registers exactly
+        // this tag before running a single test).
+        const SBTM_SETVAL_HERRNOLONGPTR: u32 = TAG_USER | (SBTC_HERRNOLONGPTR << 1) | SBTF_SET;
 
         let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // SocketBaseTagList() -> D0
         push_move_imm_a(&mut words, 0, name_addr);
         words.extend_from_slice(&jsr_disp16_a6(-210)); // gethostbyname -> D0
-        words.extend_from_slice(&jsr_disp16_a6(-162)); // Errno() -> D0
         words.push(RTS);
 
         let mut mem = FlatMemory::new(0x2_0000);
@@ -1374,6 +1796,10 @@ mod tests {
         // .invalid is a reserved TLD (RFC 2606) guaranteed to never
         // resolve, avoiding real-network flakiness in this test.
         crate::guestmem::write_c_string(&mut mem, name_addr, b"this-name-does-not-exist.invalid");
+        mem.write_u32(tags_addr, SBTM_SETVAL_HERRNOLONGPTR);
+        mem.write_u32(tags_addr.wrapping_add(4), herrno_addr);
+        mem.write_u32(tags_addr.wrapping_add(8), TAG_DONE);
+        mem.write_u32(herrno_addr, 0xDEAD_BEEF); // sentinel: must be overwritten
         let load_end = entry + 0x400;
         let mut rt = Runtime::new(
             M68kCpu::new(),
@@ -1388,7 +1814,12 @@ mod tests {
         rt.enable_bsdsocket();
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
-        assert_eq!(code, HOST_NOT_FOUND);
+        assert_eq!(code, 0, "gethostbyname should return NULL on failure");
+        assert_eq!(
+            rt.memory().read_u32(herrno_addr),
+            HOST_NOT_FOUND as u32,
+            "h_errno should report HOST_NOT_FOUND through its registered pointer"
+        );
     }
 
     #[test]
@@ -1493,6 +1924,74 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_accept_on_a_nonblocking_listener_with_nothing_pending_is_eagain_not_einprogress()
+    {
+        // A real regression test: translate_errno once wrongly routed
+        // every WouldBlock-kind error (not just connect()'s own
+        // "still connecting" signal) through is_connect_in_progress,
+        // making this exact scenario report EINPROGRESS(36) instead of
+        // the correct EAGAIN(35) -- caught by a real conformance suite
+        // (bsdsocktest's "accept(): EWOULDBLOCK when non-blocking, no
+        // pending" test), not by this module's own prior (synthetic
+        // failure-only) accept coverage. See translate_errno's own doc.
+        let sockaddr_buf: u32 = 0x1_8000;
+        let nonblock_flag: u32 = 0x1_8100;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd
+        words.push(move_d0_to_d(3)); // D3 = fd
+
+        const MOVE_D3_TO_D0: u16 = 0x2003;
+        words.push(MOVE_D3_TO_D0);
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // bind(fd, 127.0.0.1:0, 16)
+
+        words.push(MOVE_D3_TO_D0);
+        push_move_imm_d(&mut words, 1, 5);
+        words.extend_from_slice(&jsr_disp16_a6(-42)); // listen(fd, 5)
+
+        words.push(MOVE_D3_TO_D0);
+        push_move_imm_d(&mut words, 1, FIONBIO);
+        push_move_imm_a(&mut words, 0, nonblock_flag);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IoctlSocket(fd, FIONBIO, &1)
+
+        words.push(MOVE_D3_TO_D0);
+        push_move_imm_a(&mut words, 0, 0); // addr = NULL
+        words.extend_from_slice(&jsr_disp16_a6(-48)); // accept(fd, NULL, NULL) -> D0
+        words.extend_from_slice(&jsr_disp16_a6(-162)); // Errno() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        );
+        mem.write_u32(nonblock_flag, 1);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, EAGAIN, "must be EAGAIN/EWOULDBLOCK, not EINPROGRESS");
+    }
+
+    #[test]
     fn end_to_end_ioctlsocket_fionbio_succeeds() {
         let nonblock_flag: u32 = 0x1_8000;
 
@@ -1546,5 +2045,185 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, EOPNOTSUPP);
+    }
+
+    #[test]
+    fn end_to_end_socket_base_tag_list_registers_errno_ptr_and_returns_release_string() {
+        let errno_addr: u32 = 0x1_8000;
+        let release_ptr_out: u32 = 0x1_8100;
+        let tags_addr: u32 = 0x1_8200;
+
+        const SBTM_SETVAL_ERRNOLONGPTR: u32 = TAG_USER | (SBTC_ERRNOLONGPTR << 1) | SBTF_SET;
+        const SBTM_GETREF_RELEASESTRPTR: u32 = TAG_USER | SBTF_REF | (SBTC_RELEASESTRPTR << 1);
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_a(&mut words, 0, tags_addr);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // SocketBaseTagList() -> D0
+
+        // A subsequent failing call (CloseSocket on an unknown fd)
+        // should now mirror its errno through the registered pointer.
+        push_move_imm_d(&mut words, 0, 999);
+        words.extend_from_slice(&jsr_disp16_a6(-120)); // CloseSocket(999) -> D0 = -1
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        // tags[0] = SETVAL(ERRNOLONGPTR), &errno_addr
+        mem.write_u32(tags_addr, SBTM_SETVAL_ERRNOLONGPTR);
+        mem.write_u32(tags_addr.wrapping_add(4), errno_addr);
+        // tags[1] = GETREF(RELEASESTRPTR), &release_ptr_out
+        mem.write_u32(tags_addr.wrapping_add(8), SBTM_GETREF_RELEASESTRPTR);
+        mem.write_u32(tags_addr.wrapping_add(12), release_ptr_out);
+        // tags[2] = TAG_DONE
+        mem.write_u32(tags_addr.wrapping_add(16), TAG_DONE);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -1, "CloseSocket on an unknown fd should still fail");
+        assert_eq!(
+            rt.memory().read_u32(errno_addr),
+            EBADF as u32,
+            "SocketBaseTagList's SBTC_ERRNOLONGPTR registration should mirror errno"
+        );
+
+        let release_ptr = rt.memory().read_u32(release_ptr_out);
+        assert_ne!(
+            release_ptr, 0,
+            "SBTC_RELEASESTRPTR should report a real string"
+        );
+        let release_str = crate::guestmem::read_c_string(rt.memory(), release_ptr);
+        assert!(!release_str.is_empty());
+    }
+
+    #[test]
+    fn end_to_end_setsockopt_so_reuseaddr_round_trips_through_getsockopt() {
+        let optval: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd
+        words.push(move_d0_to_d(4)); // D4 = fd (D3 is setsockopt's own optlen argument)
+
+        const MOVE_D4_TO_D0: u16 = 0x2004; // move.l D4,D0
+
+        // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval(=1), 4)
+        words.push(MOVE_D4_TO_D0);
+        push_move_imm_d(&mut words, 1, SOL_SOCKET as u32);
+        push_move_imm_d(&mut words, 2, SO_REUSEADDR as u32);
+        push_move_imm_a(&mut words, 0, optval);
+        push_move_imm_d(&mut words, 3, 4);
+        words.extend_from_slice(&jsr_disp16_a6(-90)); // setsockopt() -> D0
+
+        // getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, &optlen)
+        words.push(MOVE_D4_TO_D0);
+        push_move_imm_d(&mut words, 1, SOL_SOCKET as u32);
+        push_move_imm_d(&mut words, 2, SO_REUSEADDR as u32);
+        push_move_imm_a(&mut words, 0, optval);
+        push_move_imm_a(&mut words, 1, optval); // optlen ptr, unused by this backend
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // getsockopt() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(optval, 1); // enable SO_REUSEADDR
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "getsockopt should succeed");
+        assert_eq!(
+            rt.memory().read_u32(optval),
+            1,
+            "SO_REUSEADDR should read back as enabled"
+        );
+    }
+
+    #[test]
+    fn end_to_end_getsockopt_so_error_reports_no_error_on_a_healthy_socket() {
+        // A blocking connect() (this backend's default -- see the
+        // module docs' "Blocking by default" section) reports a failed
+        // connection attempt directly through its own return value, not
+        // through a separately-pending SO_ERROR (that distinction only
+        // applies to a non-blocking connect's later-discovered failure,
+        // real BSD semantics this test doesn't need real network
+        // failure timing to exercise): a fresh, never-connected socket
+        // should simply report "no pending error" (0), deterministically.
+        let optval: u32 = 0x1_8000;
+
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (getsockopt's D0 argument)
+        push_move_imm_d(&mut words, 1, SOL_SOCKET as u32);
+        push_move_imm_d(&mut words, 2, SO_ERROR as u32);
+        push_move_imm_a(&mut words, 0, optval);
+        push_move_imm_a(&mut words, 1, optval);
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // getsockopt(SO_ERROR) -> D0
+        words.push(RTS);
+
+        mem_write_optval_and_run(&mut words, optval, 0xDEAD_BEEF, |mem| {
+            assert_eq!(
+                mem.read_u32(optval),
+                0,
+                "a fresh socket should report no pending error"
+            );
+        });
+    }
+
+    /// Shared tail for the two option-round-trip tests above: loads
+    /// `words`, seeds `optval` with a sentinel, runs to completion, and
+    /// hands the caller the guest memory to inspect.
+    fn mem_write_optval_and_run(
+        words: &mut [u16],
+        optval: u32,
+        sentinel: u32,
+        check: impl FnOnce(&FlatMemory),
+    ) {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, words);
+        mem.write_u32(optval, sentinel);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "getsockopt should succeed");
+        check(rt.memory());
     }
 }
