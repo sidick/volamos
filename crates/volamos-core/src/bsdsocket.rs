@@ -113,6 +113,21 @@
 //! [`BsdSocketState::hostent_allocs`] frees the *previous* call's
 //! blocks at the start of the next one rather than ever handing
 //! ownership to the guest.
+//!
+//! # SnoopDos-style logging: `connect`/`accept` set `call_detail`
+//!
+//! [`connect_handler`]/[`accept_handler`] set [`HandlerContext::
+//! call_detail`] on every *meaningful* outcome (a completed or
+//! in-progress outbound connection, an accepted inbound one, or a real
+//! failure), printed by the CLI's `-s`/`--snoop` flag exactly like every
+//! other resource-opening call already does (`OpenLibrary`/`Open`, see
+//! [`crate::dispatch::open_library_common`]'s doc) -- no separate
+//! logging mechanism, just this module joining the existing convention.
+//! `accept`'s `EAGAIN` ("nothing waiting yet") is deliberately *not*
+//! logged: it's the overwhelmingly common outcome of a guest's own
+//! accept-loop polling, and logging it would be noise, not a real event
+//! -- the same "meaningful events only" posture `--snoop`'s own module
+//! doc already promises.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -158,6 +173,9 @@ pub const TRY_AGAIN: i32 = 2;
 /// errno.
 fn translate_errno(e: &std::io::Error) -> i32 {
     use std::io::ErrorKind::*;
+    if is_connect_in_progress(e) {
+        return EINPROGRESS;
+    }
     match e.kind() {
         WouldBlock => EAGAIN,
         ConnectionRefused => ECONNREFUSED,
@@ -463,11 +481,24 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
                 .insert(id, SocketEntry { socket: accepted });
             ctx.bsdsocket.set_errno(ctx.mem, 0);
             ctx.cpu.set_data_register(DataRegister(0), id as u32);
+            if let Some(peer) = peer.as_socket_ipv4() {
+                *ctx.call_detail = Some(format!("accept <- {peer} -> ok (fd {id}, was fd {fd})"));
+            }
+        }
+        // EAGAIN ("nothing waiting yet") is the overwhelmingly common
+        // outcome of a guest's own accept-loop polling -- not logged,
+        // same "meaningful events only" posture the module docs'
+        // SnoopDos-style logging already has for everything else (see
+        // crate::dispatch's OpenLibrary/Open call_detail precedent).
+        Err(e) if translate_errno(&e) == EAGAIN => {
+            ctx.bsdsocket.set_errno(ctx.mem, EAGAIN);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         }
         Err(e) => {
             let code = translate_errno(&e);
             ctx.bsdsocket.set_errno(ctx.mem, code);
             ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            *ctx.call_detail = Some(format!("accept (fd {fd}) -> failed (errno {code})"));
         }
     }
     Ok(())
@@ -493,26 +524,49 @@ fn connect_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
         Ok(()) => {
             ctx.bsdsocket.set_errno(ctx.mem, 0);
             ctx.cpu.set_data_register(DataRegister(0), 0);
+            *ctx.call_detail = Some(format!("connect -> {sa} (fd {fd}) -> ok"));
         }
         Err(e) if is_connect_in_progress(&e) => {
             ctx.bsdsocket.set_errno(ctx.mem, EINPROGRESS);
             ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            *ctx.call_detail = Some(format!("connect -> {sa} (fd {fd}) -> in progress"));
         }
         Err(e) => {
             let code = translate_errno(&e);
             ctx.bsdsocket.set_errno(ctx.mem, code);
             ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            *ctx.call_detail = Some(format!(
+                "connect -> {sa} (fd {fd}) -> failed (errno {code})"
+            ));
         }
     }
     Ok(())
 }
 
 /// Whether a non-blocking `connect()`'s error just means "still in
-/// progress" (`EINPROGRESS`/`EALREADY` on Unix, `WSAEWOULDBLOCK` on
-/// Windows -- `std::io::Error::kind()` maps all of these to
-/// [`std::io::ErrorKind::WouldBlock`]).
+/// progress" (`EINPROGRESS` on Unix, `WSAEWOULDBLOCK`/`WSAEINPROGRESS`
+/// on Windows) -- checked against the *raw* OS error code, not
+/// `std::io::Error::kind()`: this runtime once wrongly assumed
+/// `ErrorKind::WouldBlock` covered it, but empirically (a real
+/// non-blocking loopback `connect()` during development)
+/// `EINPROGRESS`'s kind is `ErrorKind::InProgress` -- a *different*,
+/// still-unstable-to-match `std` variant on this toolchain (rustc
+/// 1.97), not `WouldBlock` at all. `WouldBlock` is still checked too, in
+/// case some platform reports it that way instead.
 fn is_connect_in_progress(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(code) if code == libc::EINPROGRESS => true,
+        // WSAEWOULDBLOCK / WSAEINPROGRESS -- stable, well-known Windows
+        // Sockets error codes; hardcoded rather than pulled from a
+        // crate since `libc` doesn't cover WinSock-specific numbering.
+        #[cfg(windows)]
+        Some(10035) | Some(10036) => true,
+        _ => false,
+    }
 }
 
 /// `send(sock, buf, len, flags)`. `D0` = bytes sent, or `-1` with
@@ -1272,5 +1326,106 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, HOST_NOT_FOUND);
+    }
+
+    #[test]
+    fn snoop_detail_reports_a_real_outbound_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real listener");
+        let port = listener.local_addr().unwrap().port();
+        // Accept in the background so the connect completes rather than
+        // just sitting in the OS's SYN queue -- either way connect()
+        // itself would report the same detail, but a real accepted peer
+        // makes this test's outcome unambiguous.
+        let accept_thread = std::thread::spawn(move || listener.accept());
+
+        let sockaddr_buf: u32 = 0x1_8000;
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd (connect's D0 argument, already in place)
+        push_move_imm_a(&mut words, 0, sockaddr_buf);
+        push_move_imm_d(&mut words, 1, 16);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // connect() -> D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_sockaddr_in(
+            &mut mem,
+            sockaddr_buf,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        );
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_bsdsocket();
+
+        let mut details = Vec::new();
+        let mut trace = |event: &crate::dispatch::TraceEvent| {
+            if let Some(detail) = &event.detail {
+                details.push(detail.clone());
+            }
+        };
+        let mut out = Vec::new();
+        rt.run(&mut out, Some(&mut trace))
+            .expect("run should succeed");
+        let _ = accept_thread.join();
+
+        let connect_detail = details
+            .iter()
+            .find(|d| d.starts_with("connect ->"))
+            .unwrap_or_else(|| panic!("no connect detail among {details:?}"));
+        assert!(
+            connect_detail.contains(&format!("127.0.0.1:{port}")),
+            "{connect_detail:?}"
+        );
+        assert!(
+            connect_detail.ends_with("-> ok") || connect_detail.ends_with("-> in progress"),
+            "{connect_detail:?}"
+        );
+    }
+
+    #[test]
+    fn snoop_detail_omits_accept_eagain_but_reports_a_real_failure() {
+        let mut words = movea_bsdsocket_base_to_a6().to_vec();
+        push_move_imm_d(&mut words, 0, AF_INET as u32);
+        push_move_imm_d(&mut words, 1, SOCK_STREAM as u32);
+        push_move_imm_d(&mut words, 2, 0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // socket() -> D0 = fd
+        words.push(move_d0_to_d(0)); // D0 = fd (accept's D0 argument)
+        push_move_imm_a(&mut words, 0, 0); // addr = NULL, don't care
+        words.extend_from_slice(&jsr_disp16_a6(-48)); // accept() on an
+        // unbound, unconnected socket -- a real, immediate host error
+        // (not EAGAIN), exercising the "real failure" detail branch.
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut details = Vec::new();
+        let mut trace = |event: &crate::dispatch::TraceEvent| {
+            if let Some(detail) = &event.detail {
+                details.push(detail.clone());
+            }
+        };
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, Some(&mut trace))
+            .expect("run should succeed");
+        assert_eq!(code, -1);
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with("accept") && d.contains("failed")),
+            "expected an accept-failed detail among {details:?}"
+        );
     }
 }

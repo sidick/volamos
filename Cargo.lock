@@ -453,6 +453,7 @@ dependencies = [
 name = "volamos-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "m68k",
  "socket2",
 ]
