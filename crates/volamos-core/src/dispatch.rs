@@ -60,6 +60,7 @@ use std::fmt;
 use std::io::Write;
 
 use crate::backend::{TRAP_TABLE_BASE, TRAP_TABLE_END};
+use crate::bsdsocket::BsdSocketState;
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapKind};
 use crate::dosfile::DosState;
 use crate::exectask;
@@ -364,6 +365,18 @@ pub const LOCALE_LIBRARY_BASE: u32 = 0x1DB0;
 /// [`write_library_node`]'s `struct Library` header.
 pub const INTUITION_LIBRARY_BASE: u32 = 0x2060;
 
+/// `bsdsocket.library` base address -- same chunked layout idea as
+/// [`MATHTRANS_LIBRARY_BASE`], in the `0x2200`..`0x2400` chunk (right
+/// after [`INTUITION_LIBRARY_BASE`]'s double-size chunk, which ends at
+/// `0x2200`). Deepest implemented LVO: `inet_addr` at `-180` (see
+/// `crate::lvos::bsdsocket`'s table) -- well within the standard `0x1B0`
+/// (432 byte) headroom a normal-size chunk provides. Unlike every other
+/// real-library base above, this one is **not** registered
+/// unconditionally by [`Runtime::new`] -- see [`crate::bsdsocket`]'s
+/// module docs ("Opt-in, not always-on") and [`Runtime::
+/// enable_bsdsocket`].
+pub const BSDSOCKET_LIBRARY_BASE: u32 = 0x23B0;
+
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
 /// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
@@ -634,6 +647,14 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// sequence (see the library/device-loading plan's L3) run as
     /// ordinary guest code instead of needing CPU-reentrancy machinery.
     pub continuations: &'a mut ContinuationStack<C>,
+    /// Host-side `bsdsocket.library` state (the open-socket handle table
+    /// and `Errno()`/`SetErrnoPtr()` bookkeeping) -- see
+    /// [`crate::bsdsocket`]'s module docs. Always present (a plain,
+    /// empty [`BsdSocketState`] if [`Runtime::enable_bsdsocket`] was
+    /// never called) so this struct's shape doesn't change based on
+    /// whether networking is enabled; only the *library* is
+    /// conditionally registered, not this field.
+    pub bsdsocket: &'a mut BsdSocketState,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -1784,6 +1805,11 @@ pub struct Runtime<C: Cpu> {
     /// (rather than inside `registry`) for the aliasing/generics reasons
     /// documented there.
     continuations: ContinuationStack<C>,
+    /// Host-side `bsdsocket.library` state -- see
+    /// [`HandlerContext::bsdsocket`]'s doc for why this field always
+    /// exists regardless of whether [`Self::enable_bsdsocket`] was ever
+    /// called.
+    bsdsocket: BsdSocketState,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -2263,6 +2289,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             dos,
             task,
             continuations: ContinuationStack::new(),
+            bsdsocket: BsdSocketState::new(),
         }
     }
 
@@ -2281,6 +2308,29 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// `IoErr`/`SetIoErr` work either way.
     pub fn set_vfs(&mut self, vfs: Vfs) {
         self.dos.vfs = Some(vfs);
+    }
+
+    /// Registers `bsdsocket.library` as a real, `OpenLibrary`-able
+    /// library on [`BSDSOCKET_LIBRARY_BASE`] -- see [`crate::bsdsocket`]'s
+    /// module docs for why this isn't done unconditionally by
+    /// [`Runtime::new`] (real host network access is a meaningfully
+    /// different trust boundary than everything else this runtime
+    /// implements by default, so it needs the same kind of explicit
+    /// opt-in [`Self::set_vfs`] already requires for filesystem access --
+    /// a CLI should only call this behind its own explicit flag). Without
+    /// calling this, `OpenLibrary("bsdsocket.library", 0)` behaves
+    /// exactly like it does for any other library this runtime doesn't
+    /// implement: not found (matching a real bare KS/WB 3.1 system with
+    /// no TCP/IP stack installed).
+    pub fn enable_bsdsocket(&mut self) {
+        crate::bsdsocket::register_bsdsocket_handlers(
+            &mut self.table,
+            &mut self.mem,
+            BSDSOCKET_LIBRARY_BASE,
+        );
+        write_library_node(&mut self.mem, BSDSOCKET_LIBRARY_BASE);
+        self.registry
+            .register_real("bsdsocket.library", BSDSOCKET_LIBRARY_BASE);
     }
 
     /// Populates `PROGDIR:` (issue #17): if `host_dir` (the launched
@@ -2495,6 +2545,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         current_task: self.task,
                         call_detail: &mut call_detail,
                         continuations: &mut self.continuations,
+                        bsdsocket: &mut self.bsdsocket,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {

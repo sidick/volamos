@@ -49,6 +49,15 @@ pub(crate) struct Overrides {
     pub(crate) cpu_type: Option<CpuType>,
     pub(crate) fpu: Option<bool>,
     pub(crate) jit: Option<bool>,
+    /// `--net`: enables `bsdsocket.library` (real host network access for
+    /// the guest). Deliberately **not** a recognized `~/.volamos`/
+    /// `.volamos` config key (see `crate::config`'s module doc and
+    /// `volamos_core::bsdsocket`'s "Opt-in, not always-on" section) --
+    /// granting real network access is a different trust boundary than
+    /// every other config-file-controllable setting, so it must be typed
+    /// explicitly on the command line every time, not silently inherited
+    /// from a config file the invoker may not even remember exists.
+    pub(crate) net: Option<bool>,
 }
 
 /// Parses a `true`/`false` value (case-insensitive), for the `FPU`/
@@ -136,6 +145,11 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         cpu_type: higher.cpu_type.or(lower.cpu_type),
         fpu: higher.fpu.or(lower.fpu),
         jit: higher.jit.or(lower.jit),
+        // net is deliberately CLI-only (see Overrides::net's doc) -- a
+        // config file layer's `net` is always None, so this is really
+        // just "the CLI's own value passes through unchanged", not a
+        // real merge.
+        net: higher.net.or(lower.net),
     }
 }
 

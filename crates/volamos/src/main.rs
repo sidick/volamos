@@ -111,6 +111,7 @@ struct Options {
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
+    net: bool,
 }
 
 impl Options {
@@ -130,7 +131,7 @@ fn print_usage(program_name: &str) {
         "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] [--jit|--no-jit] <program> [args...]"
+         [--fpu|--no-fpu] [--jit|--no-jit] [--net] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -187,6 +188,10 @@ fn print_usage(program_name: &str) {
         "                            reference); every library-call trap boundary is identical"
     );
     eprintln!("                            either way");
+    eprintln!("  --net                     enable bsdsocket.library: real host network access for");
+    eprintln!("                            the guest (socket/connect/send/recv/... via real host");
+    eprintln!("                            sockets). Off by default and CLI-only -- not settable");
+    eprintln!("                            via ~/.volamos/.volamos");
     eprintln!();
     eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
     eprintln!();
@@ -429,6 +434,7 @@ fn parse_args_raw(
             "--no-fpu" => overrides.fpu = Some(false),
             "--jit" => overrides.jit = Some(true),
             "--no-jit" => overrides.jit = Some(false),
+            "--net" => overrides.net = Some(true),
             _ => program = Some(arg),
         }
     }
@@ -456,6 +462,7 @@ fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String
         cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
         fpu: overrides.fpu.unwrap_or(false),
         jit: overrides.jit.unwrap_or(false),
+        net: overrides.net.unwrap_or(false),
     }
 }
 
@@ -588,6 +595,7 @@ fn run_nested_program(
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
+    net: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
         return -1;
@@ -625,6 +633,9 @@ fn run_nested_program(
     if let Some(dir) = host_path.parent() {
         runtime.set_program_dir(dir);
     }
+    if net {
+        runtime.enable_bsdsocket();
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -650,6 +661,9 @@ fn build_runtime_with_vfs(
     }
     if let Some(dir) = std::path::Path::new(&opts.program).parent() {
         runtime.set_program_dir(dir);
+    }
+    if opts.net {
+        runtime.enable_bsdsocket();
     }
     Ok(runtime)
 }
@@ -721,6 +735,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
     let nested_jit = opts.jit;
+    let nested_net = opts.net;
     runtime.set_system_runner(move |req| {
         run_nested_program(
             &req.resolved_program_host_path,
@@ -732,6 +747,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_cpu_type,
             nested_fpu,
             nested_jit,
+            nested_net,
         )
     });
 
