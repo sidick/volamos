@@ -2911,16 +2911,113 @@ gap audit** -- every tier (cheap `AllocateTagItems`/`FreeTagItems`/
 `locale.library`/`intuition.library`) from the original plan is now
 implemented, tested, and documented.
 
+## `intuition.library` default screen + `OpenWindow`/`CloseWindow` (2026-08-27)
+
+Extended the thin stub above with a minimal-but-real `Screen`/`Window`
+model, at Simon's request: "we don't even really need window support
+for most things, just the actual screen, then stub out openwindow etc,
+but allow apps to get details and get a virtual lock on a screen." A
+single always-available default public screen (`"Workbench"`,
+640x200x1, `WBENCHSCREEN`), lazily allocated on first use
+(`intuition::ensure_default_screen`, mirroring `OpenLibrary`'s
+lazily-created fake libraries), backs `GetScreenData` (now honestly
+copies real `Width`/`Height`/`Flags`/etc. instead of always returning
+`FALSE`), `LockPubScreen` (returns the real screen for `NULL` or
+`"Workbench"`, honestly `NULL` for any other name -- no other screen
+exists), and `UnlockPubScreen` (no-op, no lock-count tracking).
+
+`OpenWindow`/`CloseWindow` go one step further: `OpenWindow` returns a
+real `struct Window` with correctly wired `WScreen` (the default
+screen, or the caller's own if given), `RPort` (a fresh `RastPort`
+pointed at the screen's `BitMap`), and `UserPort`/`WindowPort` (a real
+no-op `struct MsgPort`, reusing `crate::execlist::init_msg_port_fields`
+-- it will simply never receive an `IntuiMessage`, there being no user
+input to report). Nothing is ever rendered or drawn; a program that
+only *holds onto* its window handle (passes it around, queries its
+geometry, polls its empty `UserPort`) works, one that expects to
+actually see pixels or receive real IDCMP events does not -- the same
+class of limitation `AutoRequest`/`EasyRequestArgs` already have.
+`OpenScreen`/`CloseScreen` stay deliberately unregistered: almost
+every guest program that touches Intuition just wants the one screen
+that's always there, not to create its own.
+
+All new struct byte offsets (`SCR_*`/`WIN_*`/`VP_*`/`RP_*`/`BM_*`/
+`NW_*`) are hand-computed from the NDK 3.2 headers
+(`intuition/screens.h`, `intuition/intuition.h`, `graphics/view.h`,
+`graphics/rastport.h`, `graphics/gfx.h`) using m68k's word (not long)
+struct alignment, same provenance discipline as `doslock.rs`'s
+`FL_*`/`FIB_*` consts. Two deliberate, documented approximations:
+`Screen`'s embedded `Layer_Info` is a generously-sized opaque zeroed
+blob (nothing reads its fields -- there's no `layers.library` here),
+and `Window`'s private tail past `MoreFlags` isn't reproduced at all
+(per the header's own "Intuition Private, DO NOT USE" comment).
+`IntuitionState` (the default screen's guest address) threads through
+`HandlerContext` exactly like `BsdSocketState` already does.
+
+Verified: 6 new/rewritten end-to-end tests (`GetScreenData` real
+copy, `LockPubScreen` default-screen hit and unknown-name miss,
+`OpenWindow`/`CloseWindow` round-trip, `OpenWindow`'s
+`WScreen`/`RPort`/`UserPort` wiring). Full `cargo test --all` (666
+passed), `cargo clippy --all-targets`, `cargo build --workspace`
+clean.
+
+## `graphics.library` `OpenFont`/`CloseFont`, topaz 8 only (2026-08-27)
+
+Extended the screen/window work above with a fake-but-honest `OpenFont`,
+at Simon's request, scoped tightly to "only for topaz 8" -- the one
+font this runtime can make a genuinely correct claim about. Topaz 8
+(the built-in 8x8 fixed-pitch ROM font) has fixed, well-documented
+historical metrics, unlike a screen's pixel geometry (plausible but
+unverifiable without real hardware); `OpenFont({ta_Name: "topaz.font",
+ta_YSize: 8, ...})` now returns a real `struct TextFont` with genuinely
+correct `tf_XSize`/`tf_Baseline`/`tf_BoldSmear`/`tf_LoChar`/`tf_HiChar`
+(`8`/`6`/`1`/`0`/`255`) -- `tf_CharData` stays `NULL` (no glyph bitmap
+data, matching the default screen's `BitMap.Planes[]`). Any other name
+or `ta_YSize` fails with `NULL`, the same outcome a real machine gives
+for a disk font that isn't installed. `CloseFont` frees the `TextFont`
+and its name string. No `TextLength`/`TextExtent`/`SetFont` or any
+other function -- deliberately out of scope for this pass.
+
+`graphics.library` previously had **zero** LVOs registered at all (a
+generic `STANDARD_WORKBENCH_LIBRARIES` fake-succeed-then-unhandled
+library) -- promoting it to a real library (own base, own dispatch
+table, `registry.register_real`) needed a first-ever
+`crates/volamos-core/src/lvos/graphics.rs`, generated with
+`tools/gen_lvos.py` against AROS's `rom/graphics/graphics.conf`
+(commit `05c3f84db3844f8b68b9d2c3ea264a42700c4ae0`, `--start-bias 24`,
+same "standard 4-slot preamble" reasoning as `intuition.library`).
+Cross-checked `OpenFont`/`CloseFont`'s generated offsets (`-72`/`-78`)
+against the NDK's own `lvo/graphics_lib.i` before trusting them -- both
+matched exactly. `GRAPHICS_LIBRARY_BASE` (`0x2400`) is a new standard
+512-byte chunk right after `BSDSOCKET_LIBRARY_BASE`'s, `TRAP_TABLE_SIZE`
+grown from `0x2400` to `0x2600` to fit it (same "grow by one chunk"
+pattern every real-library addition here has followed).
+
+`struct TextAttr`/`struct TextFont` byte offsets are hand-computed from
+`<graphics/text.h>` (plus `<exec/ports.h>`'s `struct Message` for the
+embedded `tf_Message`) using m68k word alignment, same discipline as
+`crate::intuition`'s `SCR_*`/`WIN_*` consts -- no existing struct
+layout to build on, this is graphics.library's first.
+
+Verified: 4 new end-to-end tests (topaz-8 real metrics, wrong-name
+failure, wrong-size failure, open/close round-trip) plus the generated
+table's own LVO sanity test. Full `cargo test --all` (671 passed),
+`cargo clippy --all-targets`, `cargo fmt --all` clean.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
-.app bundle generation. Also fixed non-goals: real windowing/GUI (no
-`Screen`/`Window`/`Gadget` model, no display), no custom-chip access,
-no cross-process IPC/message-port bridging — console tools only.
-(Amended 2026-08-19: `crate::intuition` is a real but deliberately
-thin exception — four headless-safe stub calls, matching vamos's own
-same-scoped coverage, not a real GUI implementation; see that
-module's own docs.)
+.app bundle generation. Also fixed non-goals: real rendering/display
+(no pixels ever drawn, no custom-chip access), real IDCMP input (no
+user to generate it), no cross-process IPC/message-port bridging —
+console tools only. (Amended 2026-08-19: `crate::intuition` is a real
+but deliberately thin exception — four headless-safe stub calls,
+matching vamos's own same-scoped coverage, not a real GUI
+implementation; see that module's own docs. Amended again 2026-08-27:
+`crate::intuition` now also models one always-open default `Screen`
+and `OpenWindow`/`CloseWindow`-created `Window`s honestly, still with
+no display behind them — see that module's own docs and this file's
+2026-08-27 dated entry above.)
 
 ## CLARIFYING QUESTIONS (open as of start of Phase 2)
 

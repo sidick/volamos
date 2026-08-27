@@ -43,6 +43,7 @@ pub mod execlist;
 pub mod execmem;
 pub mod execsem;
 pub mod exectask;
+pub mod graphics;
 pub mod guestmem;
 pub mod intuition;
 pub mod loader;

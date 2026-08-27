@@ -377,6 +377,16 @@ pub const INTUITION_LIBRARY_BASE: u32 = 0x2060;
 /// enable_bsdsocket`].
 pub const BSDSOCKET_LIBRARY_BASE: u32 = 0x23B0;
 
+/// `graphics.library` base address -- same chunked layout idea as
+/// [`BSDSOCKET_LIBRARY_BASE`], in the `0x2400`..`0x2600` chunk (right
+/// after it). Deepest implemented LVO: `CloseFont` at `-78` (see
+/// `crate::lvos::graphics`'s table) -- well within the standard `0x1B0`
+/// (432 byte) headroom a normal-size chunk provides. Only `OpenFont`/
+/// `CloseFont` have handlers registered (see `crate::graphics`'s module
+/// docs for why this library stays otherwise deliberately unimplemented
+/// -- no real rendering, no `layers.library`).
+pub const GRAPHICS_LIBRARY_BASE: u32 = 0x2400;
+
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
 /// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
@@ -655,6 +665,10 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// whether networking is enabled; only the *library* is
     /// conditionally registered, not this field.
     pub bsdsocket: &'a mut BsdSocketState,
+    /// Host-side `intuition.library` state (T-screen): the always-open
+    /// default (`"Workbench"`) public screen's guest address, lazily
+    /// allocated on first use -- see [`crate::intuition`]'s module docs.
+    pub intuition: &'a mut crate::intuition::IntuitionState,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -1810,6 +1824,9 @@ pub struct Runtime<C: Cpu> {
     /// exists regardless of whether [`Self::enable_bsdsocket`] was ever
     /// called.
     bsdsocket: BsdSocketState,
+    /// Host-side `intuition.library` state -- see
+    /// [`HandlerContext::intuition`]'s doc.
+    intuition: crate::intuition::IntuitionState,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -2065,6 +2082,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // crate::intuition's module docs.
         crate::intuition::register_intuition_handlers(&mut table, &mut mem);
 
+        // graphics.library: OpenFont/CloseFont only, and only for the
+        // built-in topaz.font at 8pt -- see crate::graphics's module
+        // docs.
+        crate::graphics::register_graphics_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -2170,6 +2192,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("mathffp.library", MATHFFP_LIBRARY_BASE);
         registry.register_real("locale.library", LOCALE_LIBRARY_BASE);
         registry.register_real("intuition.library", INTUITION_LIBRARY_BASE);
+        registry.register_real("graphics.library", GRAPHICS_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using
@@ -2290,6 +2313,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             task,
             continuations: ContinuationStack::new(),
             bsdsocket: BsdSocketState::new(),
+            intuition: crate::intuition::IntuitionState::new(),
         }
     }
 
@@ -2546,6 +2570,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         call_detail: &mut call_detail,
                         continuations: &mut self.continuations,
                         bsdsocket: &mut self.bsdsocket,
+                        intuition: &mut self.intuition,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
