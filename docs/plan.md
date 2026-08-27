@@ -3004,6 +3004,32 @@ failure, wrong-size failure, open/close round-trip) plus the generated
 table's own LVO sanity test. Full `cargo test --all` (671 passed),
 `cargo clippy --all-targets`, `cargo fmt --all` clean.
 
+**Same-day fix -- `GRAPHICS_LIBRARY_BASE` chunk-overlap bug (the
+`docs/known-issues.md` `OpenWindow` illegal-opcode crash)**: the first
+version of this work placed `GRAPHICS_LIBRARY_BASE` at `0x2400` -- the
+chunk *start*, not the established chunk-plus-`0x1B0` base position --
+so `OpenFont`(-72)/`CloseFont`(-78)'s trap words landed at
+`0x23B8`/`0x23B2`, inside `bsdsocket.library`'s positive-offset `struct
+Library` header. Under `--net`, `enable_bsdsocket`'s
+`write_library_node(0x23B0)` zeroed its header and erased both trap
+words (plus the region's `UNKNOWN_SLOT` prefill), so a guest's
+`OpenFont` call executed the zeroed header bytes as instructions
+(`0x0000` = a legal `ORI.B`, silently sliding 4 bytes at a time) until
+the first illegally-decoding word: `lib_Revision` = 10 = `0x000A` at
+`0x23C6` -- exactly the known-issues note's mystery `Illegal { opcode:
+10 } at 0x000023c6`. The note's stack-corruption theory was wrong, and
+its "ruled out: unregistered LVO" reasoning missed that the trapped PC
+*slides away* from the call site rather than stopping at `base - N`.
+Fixed by moving the base to `0x25B0`; re-running the note's exact
+`AExplorer --net` repro now shows the previously-invisible
+`graphics.library(-72) -> OpenFont` dispatching cleanly right after
+`OpenWindow`, with the run ending at an honest, *named* unhandled-call
+diagnostic instead: `graphics.library/SetFont (-66)`, the real next
+gap. Debugging lesson: a trap landing at a *positive* offset from some
+library's base is a sign the CPU executed its way into a `struct
+Library` header, and the first suspect should be whatever zeroed that
+header's prefilled trap words.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS

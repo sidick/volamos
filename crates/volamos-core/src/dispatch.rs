@@ -379,13 +379,22 @@ pub const BSDSOCKET_LIBRARY_BASE: u32 = 0x23B0;
 
 /// `graphics.library` base address -- same chunked layout idea as
 /// [`BSDSOCKET_LIBRARY_BASE`], in the `0x2400`..`0x2600` chunk (right
-/// after it). Deepest implemented LVO: `CloseFont` at `-78` (see
-/// `crate::lvos::graphics`'s table) -- well within the standard `0x1B0`
-/// (432 byte) headroom a normal-size chunk provides. Only `OpenFont`/
-/// `CloseFont` have handlers registered (see `crate::graphics`'s module
-/// docs for why this library stays otherwise deliberately unimplemented
-/// -- no real rendering, no `layers.library`).
-pub const GRAPHICS_LIBRARY_BASE: u32 = 0x2400;
+/// after it), base at the chunk's usual `+0x1B0` so its negative LVO
+/// slots stay inside its *own* chunk. (The first version of this
+/// constant sat at the chunk *start*, `0x2400` -- which put
+/// `OpenFont`(-72)/`CloseFont`(-78)'s trap words at `0x23B8`/`0x23B2`,
+/// inside `bsdsocket.library`'s positive-offset `struct Library`
+/// header; `enable_bsdsocket`'s `write_library_node` then zeroed them,
+/// turning every graphics call under `--net` into a silent
+/// execute-through-zeros slide -- see `docs/plan.md`'s 2026-08-27
+/// unregistered-LVO-trap entry for the full incident.) Deepest
+/// implemented LVO: `CloseFont` at `-78` (see `crate::lvos::graphics`'s
+/// table) -- well within the standard `0x1B0` (432 byte) headroom. Only
+/// `OpenFont`/`CloseFont` have handlers registered (see
+/// `crate::graphics`'s module docs for why this library stays otherwise
+/// deliberately unimplemented -- no real rendering, no
+/// `layers.library`).
+pub const GRAPHICS_LIBRARY_BASE: u32 = 0x25B0;
 
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
