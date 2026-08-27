@@ -88,6 +88,11 @@ const TF_CHARKERN: u32 = 48;
 // itself is allocated elsewhere (the guest's own, or
 // `crate::intuition::open_window_handler`'s).
 
+const RP_FGPEN: u32 = 25;
+const RP_BGPEN: u32 = 26;
+const RP_DRAWMODE: u32 = 28;
+const RP_CP_X: u32 = 36;
+const RP_CP_Y: u32 = 38;
 const RP_FONT: u32 = 52;
 const RP_ALGOSTYLE: u32 = 56;
 const RP_TXFLAGS: u32 = 57;
@@ -254,6 +259,125 @@ fn set_font_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     Ok(())
 }
 
+// ---- Rendering state setters + pretend-succeed render calls -----------
+//
+// The state setters (`SetAPen`/`SetBPen`/`SetDrMd`/`Move`) store their
+// values honestly into the caller's RastPort -- pure field updates a
+// guest can read back consistently, exactly what the real functions do
+// minus the hardware side effects. The render calls (`Draw`/`Text`/
+// `RectFill`/`SetRast`) pretend to succeed without drawing anything --
+// there are no pixels here to draw into (`BitMap.Planes[]` is
+// all-`NULL`, see `crate::intuition`) -- but still perform their
+// documented *state* side effects (`Draw`/`Text` advance the pen
+// position) so a guest doing incremental layout math stays consistent.
+// `Text`'s advance and `TextLength`'s return are genuinely correct, not
+// pretend, for this runtime's fixed-width topaz 8: width is exactly
+// `count * (TxWidth + TxSpacing)`. `WaitTOF`/`WaitBlit` return
+// immediately -- with no display beam or blitter, "done" is the honest
+// answer.
+
+/// `SetAPen` (`A1` = rp, `D0` = pen). Stores `FgPen`.
+fn set_a_pen_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let pen = ctx.cpu.data_register(crate::cpu::DataRegister(0));
+    ctx.mem.write_u8(rp + RP_FGPEN, pen as u8);
+    Ok(())
+}
+
+/// `SetBPen` (`A1` = rp, `D0` = pen). Stores `BgPen`.
+fn set_b_pen_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let pen = ctx.cpu.data_register(crate::cpu::DataRegister(0));
+    ctx.mem.write_u8(rp + RP_BGPEN, pen as u8);
+    Ok(())
+}
+
+/// `SetDrMd` (`A1` = rp, `D0` = drawing mode). Stores `DrawMode`.
+fn set_dr_md_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let mode = ctx.cpu.data_register(crate::cpu::DataRegister(0));
+    ctx.mem.write_u8(rp + RP_DRAWMODE, mode as u8);
+    Ok(())
+}
+
+/// `Move` (`A1` = rp, `D0` = x, `D1` = y). Stores the pen position
+/// (`cp_x`/`cp_y`) -- the real function's entire effect.
+fn move_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let x = ctx.cpu.data_register(crate::cpu::DataRegister(0));
+    let y = ctx.cpu.data_register(crate::cpu::DataRegister(1));
+    ctx.mem.write_u16(rp + RP_CP_X, x as u16);
+    ctx.mem.write_u16(rp + RP_CP_Y, y as u16);
+    Ok(())
+}
+
+/// `Draw` (`A1` = rp, `D0` = x, `D1` = y). No line is drawn (nothing
+/// to draw into); the pen position still moves to the endpoint, real
+/// `Draw`'s documented state side effect.
+fn draw_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    move_handler(ctx)
+}
+
+/// `Text` (`A1` = rp, `A0` = string, `D0` = count). Nothing is
+/// rendered; the pen position still advances by the text's width --
+/// genuinely correct for fixed-width topaz 8: `count * (TxWidth +
+/// TxSpacing)`. `D0` = `0` (the classic return).
+fn text_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let count = ctx.cpu.data_register(crate::cpu::DataRegister(0)) & 0xFFFF;
+    let advance = text_pixel_width(ctx.mem, rp, count);
+    let cp_x = ctx.mem.read_u16(rp + RP_CP_X);
+    ctx.mem
+        .write_u16(rp + RP_CP_X, cp_x.wrapping_add(advance as u16));
+    ctx.cpu.set_data_register(crate::cpu::DataRegister(0), 0);
+    Ok(())
+}
+
+/// `TextLength` (`A1` = rp, `A0` = string, `D0` = count). `D0` = the
+/// text's pixel width -- genuinely correct for a fixed-width font, see
+/// [`text_handler`].
+fn text_length_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let count = ctx.cpu.data_register(crate::cpu::DataRegister(0)) & 0xFFFF;
+    let width = text_pixel_width(ctx.mem, rp, count);
+    ctx.cpu
+        .set_data_register(crate::cpu::DataRegister(0), width);
+    Ok(())
+}
+
+/// `count * (TxWidth + TxSpacing)` off the RastPort's current text
+/// attributes -- exact for any fixed-width font (the only kind
+/// [`open_font_handler`] hands out).
+fn text_pixel_width<M: AddressSpace>(mem: &M, rp: u32, count: u32) -> u32 {
+    let tx_width = mem.read_u16(rp + RP_TXWIDTH) as u32;
+    let tx_spacing = mem.read_u16(rp + RP_TXSPACING) as i16 as i32;
+    count.wrapping_mul((tx_width as i32 + tx_spacing).max(0) as u32)
+}
+
+/// `RectFill` (`A1` = rp, `D0`-`D3` = corners). Pretends to succeed;
+/// nothing to fill. No state side effects (real `RectFill` doesn't
+/// move the pen).
+fn rect_fill_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// `SetRast` (`A1` = rp, `D0` = pen). Pretends to succeed; nothing to
+/// clear.
+fn set_rast_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// `WaitTOF` (no args). Returns immediately -- no display beam to wait
+/// on.
+fn wait_tof_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// `WaitBlit` (no args). Returns immediately -- no blitter.
+fn wait_blit_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
 /// Registers this module's `graphics.library` handlers, looked up by
 /// name through [`GRAPHICS_LVOS`], following
 /// [`crate::intuition::register_intuition_handlers`]'s registration
@@ -282,6 +406,17 @@ pub fn register_graphics_handlers<C: Cpu + 'static>(
     reg!("OpenFont", open_font_handler::<C>);
     reg!("CloseFont", close_font_handler::<C>);
     reg!("SetFont", set_font_handler::<C>);
+    reg!("SetAPen", set_a_pen_handler::<C>);
+    reg!("SetBPen", set_b_pen_handler::<C>);
+    reg!("SetDrMd", set_dr_md_handler::<C>);
+    reg!("Move", move_handler::<C>);
+    reg!("Draw", draw_handler::<C>);
+    reg!("Text", text_handler::<C>);
+    reg!("TextLength", text_length_handler::<C>);
+    reg!("RectFill", rect_fill_handler::<C>);
+    reg!("SetRast", set_rast_handler::<C>);
+    reg!("WaitTOF", wait_tof_handler::<C>);
+    reg!("WaitBlit", wait_blit_handler::<C>);
 }
 
 #[cfg(test)]
@@ -441,6 +576,92 @@ mod tests {
             rt.memory().read_u32(rp_addr + RP_FONT),
             0,
             "NULL SetFont should leave the RastPort untouched"
+        );
+    }
+
+    fn move_imm_to_d(n: u16) -> u16 {
+        0x203C | (n << 9)
+    }
+
+    #[test]
+    fn end_to_end_pen_mode_and_position_setters_store_into_rastport() {
+        let ta_addr: u32 = 0x1_8100;
+        let rp_addr: u32 = 0x1_8200;
+        let mut words = vec![
+            move_imm_to_a(1), // A1 = &RastPort (kept across all calls)
+            (rp_addr >> 16) as u16,
+            rp_addr as u16,
+            move_imm_to_d(0), // D0 = pen 3
+            0,
+            3,
+        ];
+        words.extend_from_slice(&jsr_disp16_a6(-342)); // SetAPen
+        words.extend_from_slice(&[move_imm_to_d(0), 0, 1]);
+        words.extend_from_slice(&jsr_disp16_a6(-348)); // SetBPen
+        words.extend_from_slice(&[move_imm_to_d(0), 0, 2]);
+        words.extend_from_slice(&jsr_disp16_a6(-354)); // SetDrMd (COMPLEMENT)
+        words.extend_from_slice(&[
+            move_imm_to_d(0), // D0 = x 100
+            0,
+            100,
+            move_imm_to_d(1), // D1 = y 50
+            0,
+            50,
+        ]);
+        words.extend_from_slice(&jsr_disp16_a6(-240)); // Move
+        words.extend_from_slice(&[
+            move_imm_to_d(0), // D0 = x 200
+            0,
+            200,
+            move_imm_to_d(1), // D1 = y 80
+            0,
+            80,
+        ]);
+        words.extend_from_slice(&jsr_disp16_a6(-246)); // Draw
+        words.push(RTS);
+        let mut rt = runtime_with_program_and_text_attr(b"topaz.font", 8, &words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(rt.memory().read_u8(rp_addr + RP_FGPEN), 3);
+        assert_eq!(rt.memory().read_u8(rp_addr + RP_BGPEN), 1);
+        assert_eq!(rt.memory().read_u8(rp_addr + RP_DRAWMODE), 2);
+        // Draw moved the pen to its endpoint, past Move's position.
+        assert_eq!(rt.memory().read_u16(rp_addr + RP_CP_X), 200);
+        assert_eq!(rt.memory().read_u16(rp_addr + RP_CP_Y), 80);
+    }
+
+    #[test]
+    fn end_to_end_text_length_and_text_advance_use_real_topaz_width() {
+        let ta_addr: u32 = 0x1_8100;
+        let rp_addr: u32 = 0x1_8200;
+        let mut words = vec![move_imm_to_a(0), (ta_addr >> 16) as u16, ta_addr as u16];
+        words.extend_from_slice(&jsr_disp16_a6(-72)); // OpenFont -> D0
+        words.push(0x2040); // MOVEA.L D0,A0 (the font)
+        words.extend_from_slice(&[
+            move_imm_to_a(1), // A1 = &RastPort
+            (rp_addr >> 16) as u16,
+            rp_addr as u16,
+        ]);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // SetFont
+        // Text(rp, str, 5): string pointer doesn't matter for width
+        // math (fixed-width font), reuse the TextAttr address.
+        words.extend_from_slice(&[
+            move_imm_to_d(0), // D0 = count 5
+            0,
+            5,
+        ]);
+        words.extend_from_slice(&jsr_disp16_a6(-60)); // Text
+        words.extend_from_slice(&[move_imm_to_d(0), 0, 5]);
+        words.extend_from_slice(&jsr_disp16_a6(-54)); // TextLength -> D0
+        words.push(RTS);
+        let mut rt = runtime_with_program_and_text_attr(b"topaz.font", 8, &words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 40, "TextLength(5 chars) should be 5 * 8 pixels");
+        assert_eq!(
+            rt.memory().read_u16(rp_addr + RP_CP_X),
+            40,
+            "Text should advance cp_x by the rendered width"
         );
     }
 

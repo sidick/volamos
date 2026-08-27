@@ -3045,6 +3045,26 @@ the start of its actual render sequence (pen state, then presumably
 later rather than chased one call at a time. 2 new tests (metrics
 copy, `NULL` no-op); full suite 673 passed, clippy/fmt clean.
 
+**Render-call batch, same day (Simon: "fine pretending to succeed
+with those")**: `SetAPen`/`SetBPen`/`SetDrMd`/`Move` store honestly
+into the RastPort (`FgPen`/`BgPen`/`DrawMode`/`cp_x`/`cp_y` -- pure
+field updates, the real functions' entire visible effect minus
+pixels); `Draw` draws nothing but still moves the pen to its endpoint
+(its documented state side effect); `Text` renders nothing but
+advances `cp_x` by the text's width, and `TextLength` returns that
+width -- both *genuinely correct*, not pretend, for fixed-width topaz
+8 (`count * (TxWidth + TxSpacing)`); `RectFill`/`SetRast` pretend to
+succeed with no side effects; `WaitTOF`/`WaitBlit` return immediately
+(no beam, no blitter -- "done" is the honest answer). With these,
+AExplorer runs its **entire lifecycle**: draws its full window UI
+(Move/Text pairs), closes it, then `socket`/`setsockopt`/`bind`/
+`listen`/`WaitSelect` -- the graphics gap-chain is closed and the
+remaining AExplorer blocker moved to bsdsocket behavior (`WaitSelect`
+returns something it treats as fatal -> error window -> clean
+teardown), a separate investigation. 2 new tests (setter round-trip
+incl. `Draw`'s pen move; `Text`/`TextLength` width math); full suite
+675 passed, clippy/fmt clean.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
