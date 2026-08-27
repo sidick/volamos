@@ -1,7 +1,10 @@
-//! `graphics.library`: `OpenFont`/`CloseFont` only, and only for the
-//! one font this runtime can honestly claim to know everything about --
-//! the built-in ROM font `"topaz.font"` at 8pt ("topaz 8"). Every other
-//! `graphics.library` function (rendering, blitting, custom screens,
+//! `graphics.library`: `OpenFont`/`CloseFont`/`SetFont` only, and only
+//! for the one font this runtime can honestly claim to know everything
+//! about -- the built-in ROM font `"topaz.font"` at 8pt ("topaz 8").
+//! (`SetFont` itself is font-agnostic -- a pure RastPort field update,
+//! see [`set_font_handler`] -- but the only font `OpenFont` will ever
+//! hand a guest here is topaz 8.) Every other `graphics.library`
+//! function (rendering, blitting, custom screens,
 //! any other font/size) stays unregistered/unhandled: this runtime
 //! never draws anything (see `crate::intuition`'s module docs for the
 //! default-screen/window model this shares a `RastPort`/`BitMap` shape
@@ -78,6 +81,20 @@ const TF_MODULO: u32 = 38;
 const TF_CHARLOC: u32 = 40;
 const TF_CHARSPACE: u32 = 44;
 const TF_CHARKERN: u32 = 48;
+
+// ---- struct RastPort (graphics/rastport.h), SetFont's target ----------
+//
+// Only the text-attribute fields SetFont touches -- the RastPort
+// itself is allocated elsewhere (the guest's own, or
+// `crate::intuition::open_window_handler`'s).
+
+const RP_FONT: u32 = 52;
+const RP_ALGOSTYLE: u32 = 56;
+const RP_TXFLAGS: u32 = 57;
+const RP_TXHEIGHT: u32 = 58;
+const RP_TXWIDTH: u32 = 60;
+const RP_TXBASELINE: u32 = 62;
+const RP_TXSPACING: u32 = 64;
 
 // ---- struct Message (exec/ports.h), embedded as tf_Message ------------
 
@@ -205,6 +222,38 @@ fn close_font_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
+/// `SetFont` (`A1` = `struct RastPort*`, `A0` = `struct TextFont*`).
+/// Stores the font in `rp_Font` and copies its metrics into the
+/// RastPort's text attributes (`TxHeight`/`TxWidth`/`TxBaseline` from
+/// `tf_YSize`/`tf_XSize`/`tf_Baseline`, `TxSpacing` = 0), clearing any
+/// previous soft style (`AlgoStyle`/`TxFlags` = 0) -- exactly the
+/// real function's documented effect ("sets the font in the RastPort
+/// ... and updates the text attributes to reflect that change. This
+/// function clears the effect of any previous soft styles", per the
+/// Autodoc). No return value. A pure struct-field update -- nothing to
+/// render, so nothing here is faked. A `NULL` font is a no-op (the
+/// Autodoc explicitly discourages `SetFont(rp, 0)` and documents it as
+/// broken on real releases; failing quietly beats emulating "spurious
+/// low memory accesses").
+fn set_font_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let rp = ctx.cpu.address_register(AddressRegister(1));
+    let font = ctx.cpu.address_register(AddressRegister(0));
+    if font == 0 {
+        return Ok(());
+    }
+    let y_size = ctx.mem.read_u16(font + TF_YSIZE);
+    let x_size = ctx.mem.read_u16(font + TF_XSIZE);
+    let baseline = ctx.mem.read_u16(font + TF_BASELINE);
+    ctx.mem.write_u32(rp + RP_FONT, font);
+    ctx.mem.write_u8(rp + RP_ALGOSTYLE, 0);
+    ctx.mem.write_u8(rp + RP_TXFLAGS, 0);
+    ctx.mem.write_u16(rp + RP_TXHEIGHT, y_size);
+    ctx.mem.write_u16(rp + RP_TXWIDTH, x_size);
+    ctx.mem.write_u16(rp + RP_TXBASELINE, baseline);
+    ctx.mem.write_u16(rp + RP_TXSPACING, 0);
+    Ok(())
+}
+
 /// Registers this module's `graphics.library` handlers, looked up by
 /// name through [`GRAPHICS_LVOS`], following
 /// [`crate::intuition::register_intuition_handlers`]'s registration
@@ -232,6 +281,7 @@ pub fn register_graphics_handlers<C: Cpu + 'static>(
     }
     reg!("OpenFont", open_font_handler::<C>);
     reg!("CloseFont", close_font_handler::<C>);
+    reg!("SetFont", set_font_handler::<C>);
 }
 
 #[cfg(test)]
@@ -342,6 +392,56 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn end_to_end_set_font_copies_metrics_into_rastport() {
+        let ta_addr: u32 = 0x1_8100;
+        let rp_addr: u32 = 0x1_8200;
+        let mut words = vec![move_imm_to_a(0), (ta_addr >> 16) as u16, ta_addr as u16];
+        words.extend_from_slice(&jsr_disp16_a6(-72)); // OpenFont -> D0
+        words.push(0x2040); // MOVEA.L D0,A0 (the font)
+        words.extend_from_slice(&[
+            move_imm_to_a(1), // A1 = &RastPort
+            (rp_addr >> 16) as u16,
+            rp_addr as u16,
+        ]);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // SetFont
+        words.push(RTS);
+        let mut rt = runtime_with_program_and_text_attr(b"topaz.font", 8, &words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let font = rt.memory().read_u32(rp_addr + RP_FONT);
+        assert_ne!(font, 0, "rp_Font should hold the opened TextFont");
+        assert_eq!(rt.memory().read_u16(rp_addr + RP_TXHEIGHT), 8);
+        assert_eq!(rt.memory().read_u16(rp_addr + RP_TXWIDTH), 8);
+        assert_eq!(rt.memory().read_u16(rp_addr + RP_TXBASELINE), 6);
+        assert_eq!(rt.memory().read_u16(rp_addr + RP_TXSPACING), 0);
+        assert_eq!(rt.memory().read_u16(font + TF_YSIZE), 8);
+    }
+
+    #[test]
+    fn end_to_end_set_font_null_font_is_a_no_op() {
+        let ta_addr: u32 = 0x1_8100;
+        let rp_addr: u32 = 0x1_8200;
+        let mut words = vec![
+            move_imm_to_a(0), // A0 = NULL font
+            0,
+            0,
+            move_imm_to_a(1), // A1 = &RastPort
+            (rp_addr >> 16) as u16,
+            rp_addr as u16,
+        ];
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // SetFont
+        words.push(RTS);
+        let mut rt = runtime_with_program_and_text_attr(b"topaz.font", 8, &words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            rt.memory().read_u32(rp_addr + RP_FONT),
+            0,
+            "NULL SetFont should leave the RastPort untouched"
+        );
     }
 
     #[test]

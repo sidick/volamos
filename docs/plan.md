@@ -3030,6 +3030,21 @@ library's base is a sign the CPU executed its way into a `struct
 Library` header, and the first suspect should be whatever zeroed that
 header's prefilled trap words.
 
+**Follow-up, same day -- `SetFont`**: the diagnostic above named the
+next gap precisely, and it's the cheapest kind: `SetFont` is a pure
+RastPort field update (`rp_Font` + `TxHeight`/`TxWidth`/`TxBaseline`
+from the font's own metrics, `TxSpacing`/`AlgoStyle`/`TxFlags`
+cleared, per the Autodoc's "clears the effect of any previous soft
+styles"), nothing rendered, so nothing faked. `NULL` font is a quiet
+no-op (the Autodoc documents `SetFont(rp, 0)` as discouraged and
+broken on real releases). New `RP_FONT`/`RP_TX*` offset consts from
+`<graphics/rastport.h>`, same derivation discipline. AExplorer now
+gets through `OpenFont` -> `SetFont` and stops at `SetAPen` (-342) --
+the start of its actual render sequence (pen state, then presumably
+`Move`/`Text`/`RectFill`), a scope decision deliberately left for
+later rather than chased one call at a time. 2 new tests (metrics
+copy, `NULL` no-op); full suite 673 passed, clippy/fmt clean.
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
