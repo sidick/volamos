@@ -557,7 +557,6 @@ mod tests {
 
     #[test]
     fn end_to_end_set_font_null_font_is_a_no_op() {
-        let ta_addr: u32 = 0x1_8100;
         let rp_addr: u32 = 0x1_8200;
         let mut words = vec![
             move_imm_to_a(0), // A0 = NULL font
@@ -585,7 +584,6 @@ mod tests {
 
     #[test]
     fn end_to_end_pen_mode_and_position_setters_store_into_rastport() {
-        let ta_addr: u32 = 0x1_8100;
         let rp_addr: u32 = 0x1_8200;
         let mut words = vec![
             move_imm_to_a(1), // A1 = &RastPort (kept across all calls)
