@@ -516,10 +516,43 @@ fn supervisor_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
-/// Registers `RawDoFmt`/`Supervisor` onto [`EXEC_LIBRARY_BASE`], looked
-/// up by name through [`EXEC_LVOS`]. Called from
-/// [`crate::dispatch::Runtime::new`] alongside the other `exec.library`
-/// registrations.
+/// `RawPutChar` (LVO -516, `D0` = character): the ROM's low-level debug
+/// output primitive -- on real hardware it writes one byte to the
+/// built-in serial port (9600 baud), and it's what `kprintf`-style
+/// debugging macros build their output on. The established API-level-
+/// emulation convention (vamos does the same) is to map serial debug
+/// output to host **stderr** -- deliberately not `ctx.out`, which is the
+/// guest's *stdout* (`Output()`): a real machine keeps debug chatter on
+/// a separate wire from console output, and mixing them would corrupt
+/// output-comparison tests against the real-Kickstart oracle.
+fn raw_put_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ch = ctx.cpu.data_register(DataRegister(0)) as u8;
+    use std::io::Write as _;
+    let _ = std::io::stderr().write_all(&[ch]);
+    Ok(())
+}
+
+/// `RawIOInit` (LVO -504, no args): initializes the debug serial port's
+/// baud rate on real hardware. Nothing to initialize here -- stderr is
+/// always ready.
+fn raw_io_init_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// `RawMayGetChar` (LVO -510, no args): polls the debug serial port for
+/// an input character, `D0` = the character or `-1` for none. This
+/// runtime has no debug serial input; "no character available" is the
+/// honest, documented answer every call.
+fn raw_may_get_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+    Ok(())
+}
+
+/// Registers `RawDoFmt`/`Supervisor` (and the `RawIOInit`/
+/// `RawMayGetChar`/`RawPutChar` debug-serial trio) onto
+/// [`EXEC_LIBRARY_BASE`], looked up by name through [`EXEC_LVOS`].
+/// Called from [`crate::dispatch::Runtime::new`] alongside the other
+/// `exec.library` registrations.
 pub fn register_execfmt_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -544,6 +577,36 @@ pub fn register_execfmt_handlers<C: Cpu + 'static>(
             supervisor_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("Supervisor should be in EXEC_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            EXEC_LIBRARY_BASE,
+            EXEC_LVOS,
+            "exec.library",
+            "RawPutChar",
+            raw_put_char_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("RawPutChar should be in EXEC_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            EXEC_LIBRARY_BASE,
+            EXEC_LVOS,
+            "exec.library",
+            "RawIOInit",
+            raw_io_init_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("RawIOInit should be in EXEC_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            EXEC_LIBRARY_BASE,
+            EXEC_LVOS,
+            "exec.library",
+            "RawMayGetChar",
+            raw_may_get_char_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("RawMayGetChar should be in EXEC_LVOS: {e}"));
 }
 
 #[cfg(test)]
@@ -572,6 +635,25 @@ mod tests {
     }
     const RTS: u16 = 0x4E75;
     const STUFF_CHAR: [u16; 2] = [0x16C0, 0x4E75]; // move.b d0,(a3)+ ; rts
+
+    #[test]
+    fn end_to_end_debug_serial_trio_dispatches_and_reports_no_input() {
+        // RawIOInit, RawPutChar('X') (lands on host stderr -- not
+        // asserted here, the harness only captures the guest's stdout),
+        // then RawMayGetChar, whose documented no-character -1 becomes
+        // the exit code.
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.extend_from_slice(&jsr_disp16_a6(-504)); // RawIOInit
+        words.extend_from_slice(&[move_imm_to_d(0), 0, b'X' as u16]);
+        words.extend_from_slice(&jsr_disp16_a6(-516)); // RawPutChar
+        words.extend_from_slice(&jsr_disp16_a6(-510)); // RawMayGetChar
+        words.push(RTS);
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -1, "RawMayGetChar should report no input pending");
+        assert!(out.is_empty(), "debug output must not leak into stdout");
+    }
 
     fn runtime_with_program(words: &[u16]) -> Runtime<M68kCpu> {
         let mut mem = FlatMemory::new(0x2_0000);
