@@ -819,6 +819,46 @@ fn check_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     Ok(())
 }
 
+/// `exec.library`'s `AddTask` (LVO -282): `A1` = `struct Task*`, `A2` =
+/// initial PC, `A3` = final PC. Pretends to succeed: `D0` = the task
+/// pointer (the V36+ success return), but the task is **never
+/// scheduled** -- this runtime is single-tasking by design (see the
+/// module docs), so the new task's code never runs. That's the honest
+/// least-wrong answer for the observed real-world use (the `DiskSpeed`
+/// benchmark's CPU-availability counter task: a background task that
+/// increments a shared counter while the main task does disk I/O -- an
+/// unscheduled task simply reads as 0% CPU available, a cosmetic
+/// wrong-number, not a hang or crash). A guest that genuinely *blocks*
+/// on its new task doing something will hit `Wait`'s existing
+/// fail-loudly path rather than deadlock silently.
+fn add_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let task = ctx.cpu.address_register(AddressRegister(1));
+    ctx.cpu.set_data_register(DataRegister(0), task);
+    Ok(())
+}
+
+/// `exec.library`'s `RemTask` (LVO -288): `A1` = `struct Task*` (or
+/// `NULL` for self). Removing a task [`add_task_handler`] never
+/// scheduled is a no-op. `NULL`/self-removal would mean the *main*
+/// program removing itself -- a real exit path this runtime doesn't
+/// model through `RemTask`; fail loudly rather than pretend the
+/// program is gone while continuing to run it.
+fn rem_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let task = ctx.cpu.address_register(AddressRegister(1));
+    if task == 0 || task == ctx.current_task {
+        return Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -288,
+            handler_name: "RemTask".to_string(),
+            message: "RemTask(NULL/self): the running program asked to remove itself -- this \
+                      single-tasking runtime has no scheduler to return to; a real machine \
+                      would end the task here"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// `exec.library`'s `StackSwap` (LVO -732): `A0` = pointer to a guest
 /// `struct StackSwapStruct`. See the module docs' "`StackSwap`" section
 /// for the full explanation, including why this handler pushes the
@@ -1278,6 +1318,8 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("AllocSignal", alloc_signal_handler::<C>);
     reg_exec!("FreeSignal", free_signal_handler::<C>);
     reg_exec!("StackSwap", stack_swap_handler::<C>);
+    reg_exec!("AddTask", add_task_handler::<C>);
+    reg_exec!("RemTask", rem_task_handler::<C>);
     reg_exec!("Forbid", forbid_handler::<C>);
     reg_exec!("Permit", permit_handler::<C>);
     reg_exec!("OpenDevice", open_device_handler::<C>);

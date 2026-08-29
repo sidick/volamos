@@ -300,6 +300,26 @@ fn unlock_dos_list_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     Ok(())
 }
 
+/// `AddBuffers` (`D1` = filesystem name `CString*`, ignored -- one
+/// host-backed VFS, no per-device caches; `D2` = buffer delta, may be
+/// negative). Pretends to succeed: there is no real cache to size, but
+/// the call's guest-visible contract is fully honorable -- `D0` =
+/// `DOSTRUE`, `IoErr()` = the (tracked, adjusted) buffer count, exactly
+/// the V36+ Autodoc's documented success outcome ("If it succeeds, the
+/// number of current buffers is returned in IoErr()"). A guest doing
+/// add-then-restore bookkeeping (the real `DiskSpeed` benchmark's
+/// pattern, which is what surfaced this gap) sees consistent, stable
+/// numbers. The count never drops below 1 -- a real filesystem keeps a
+/// minimum working set regardless of how negative the delta goes.
+fn add_buffers_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let delta = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let count = ctx.dos.fs_buffers.saturating_add(delta).max(1);
+    ctx.dos.fs_buffers = count;
+    ctx.dos.set_io_err(count);
+    ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF); // DOSTRUE
+    Ok(())
+}
+
 /// Registers `LockDosList`/`NextDosEntry`/`UnLockDosList` onto
 /// [`DOS_LIBRARY_BASE`], looked up by name through [`DOS_LVOS`]. Called
 /// from [`crate::dispatch::Runtime::new`] alongside the other
@@ -348,6 +368,16 @@ pub fn register_dosdevlist_handlers<C: Cpu + 'static>(
             unlock_dos_list_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("UnLockDosList should be in DOS_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            DOS_LIBRARY_BASE,
+            DOS_LVOS,
+            "dos.library",
+            "AddBuffers",
+            add_buffers_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("AddBuffers should be in DOS_LVOS: {e}"));
 }
 
 #[cfg(test)]

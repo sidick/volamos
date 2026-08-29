@@ -456,6 +456,11 @@ pub struct DosState {
     /// `DoPkt` uses this (in reverse) to tell which volume a packet's
     /// destination `port` identifies.
     pub(crate) volume_task_ids: HashMap<String, u32>,
+    /// The pretend filesystem cache-buffer count `AddBuffers` reports
+    /// (see `crate::dosdevlist::add_buffers_handler`) -- one global
+    /// count, not per-device (this runtime's VFS has no real cache to
+    /// size). Starts at a plausible FFS default.
+    pub(crate) fs_buffers: i32,
 }
 
 impl DosState {
@@ -490,6 +495,7 @@ impl DosState {
             last_getc: HashMap::new(),
             dos_list_active: Vec::new(),
             volume_task_ids: HashMap::new(),
+            fs_buffers: 30,
         }
     }
 

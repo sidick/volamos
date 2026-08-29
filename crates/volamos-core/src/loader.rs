@@ -97,9 +97,14 @@ const HUNK_BREAK: u32 = 0x3F6;
 
 /// Mask for the memory-flag bits (`MEMF_CHIP`/`MEMF_FAST`/extended-flag
 /// marker) that can be packed into the top bits of a hunk-size longword in
-/// `HUNK_HEADER`. We don't act on the flags (no chip/fast distinction in
-/// this emulator's flat address space) but we do need to mask them off to
-/// recover the real size in longwords.
+/// `HUNK_HEADER` **and** of a `HUNK_CODE`/`HUNK_DATA`/`HUNK_BSS` type
+/// longword in the file body (same encoding both places: bit 30 =
+/// chip, bit 31 = fast, both = an extra longword of memory attributes
+/// follows). We don't act on the flags (no chip/fast distinction in
+/// this emulator's flat address space) but we do need to mask them off
+/// to recover the real size/type -- found via the real `DiskSpeed` 4.2
+/// benchmark, whose data hunk is marked `MEMF_CHIP` (`0x400003EA`) for
+/// its trackdisk I/O buffers.
 const HUNK_SIZE_FLAGS_MASK: u32 = 0xC000_0000;
 
 /// Errors that can occur while parsing or loading a hunk executable.
@@ -456,7 +461,17 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
     let mut hunks = Vec::with_capacity(n_sizes);
     for (i, &reserved_size) in declared_sizes.iter().enumerate() {
         let hunk_index = first_hunk + i;
-        let body_type = r.read_u32()?;
+        let raw_body_type = r.read_u32()?;
+        // Memory-flag bits (see HUNK_SIZE_FLAGS_MASK's doc) apply to
+        // body type words too; both bits set means an extra longword of
+        // memory attributes follows the type word -- consume and ignore
+        // it (this runtime has one flat memory type).
+        let body_type = raw_body_type & !HUNK_SIZE_FLAGS_MASK;
+        if raw_body_type & HUNK_SIZE_FLAGS_MASK == HUNK_SIZE_FLAGS_MASK
+            && matches!(body_type, HUNK_CODE | HUNK_DATA | HUNK_BSS)
+        {
+            r.read_u32()?;
+        }
         let (kind, data) = match body_type {
             HUNK_CODE | HUNK_DATA => {
                 let n_longwords = r.read_u32()? as usize;
@@ -490,7 +505,11 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
 
         let mut relocs = Vec::new();
         loop {
-            let block_type = r.read_u32()?;
+            // Mask memory-flag bits here too: the "next hunk's body type"
+            // put-back case below can see a flagged CODE/DATA/BSS word
+            // (unread_u32 rewinds, so the outer loop re-reads the raw
+            // word and does its own masking/extra-longword handling).
+            let block_type = r.read_u32()? & !HUNK_SIZE_FLAGS_MASK;
             match block_type {
                 HUNK_RELOC32 => loop {
                     let count = r.read_u32()?;

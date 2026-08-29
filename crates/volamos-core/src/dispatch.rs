@@ -175,6 +175,11 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "intuition.library",
     "graphics.library",
     "gadtools.library",
+    // ROM-resident on every real Kickstart (graphics.library's own
+    // clipping companion) -- found via the real DiskSpeed 4.2
+    // benchmark, which opens it for its GUI. No LVOs registered; calls
+    // into it hit the fake-library diagnostic path.
+    "layers.library",
 ];
 
 /// Guest address of the exit sentinel: the last word inside the reserved

@@ -3065,6 +3065,50 @@ teardown), a separate investigation. 2 new tests (setter round-trip
 incl. `Draw`'s pen move; `Text`/`TextLength` width math); full suite
 675 passed, clippy/fmt clean.
 
+## DiskSpeed 4.2 end-to-end: chip-mem hunk flags, AddBuffers, AddTask/RemTask (2026-08-29)
+
+New corpus binary at Simon's request: MKSoft `DiskSpeed` 4.2 (1992,
+`~/src/emulator_disk_speed/bootvol/C/DiskSpeed`). Three real gaps
+closed, each surfaced in sequence by the previous fix:
+
+**Loader: memory-flag bits on body hunk-type words.** The header size
+table already masked `MEMF_CHIP`/`MEMF_FAST` bits (30/31), but the
+`HUNK_CODE`/`HUNK_DATA`/`HUNK_BSS` type longwords *in the file body*
+carry the same encoding (both bits set = an extra memory-attributes
+longword follows) and weren't masked -- DiskSpeed's data hunk is
+`0x400003EA` (`HUNK_DATA` + chip, for its trackdisk I/O buffers) and
+failed to load at all. Masked in both `parse_node` read sites (body
+type + the block-scan loop's put-back path).
+
+**`layers.library` joins `STANDARD_WORKBENCH_LIBRARIES`** -- it's
+ROM-resident on every real Kickstart, and DiskSpeed opens it for its
+GUI; the open must succeed even with no LVOs registered.
+
+**`dos.library/AddBuffers`** (in `dosdevlist.rs`): pretend-succeed
+with a tracked global count (`DosState::fs_buffers`, starts 30, delta
+applied, min 1) -- `D0` = `DOSTRUE`, `IoErr()` = count, the documented
+V36+ contract. **`exec.library/AddTask`/`RemTask`** (in
+`exectask.rs`): `AddTask` returns the task pointer but never schedules
+it (single-tasking runtime); DiskSpeed's CPU-availability counter task
+therefore never counts, and DiskSpeed's own calibration *detects*
+that and cleanly disables its CPU metric ("No CPU Speed Rating") --
+graceful degradation, not a crash. `RemTask` is a no-op for
+never-scheduled tasks, fails loudly for `NULL`/self.
+
+Result: `DiskSpeed FAST LONG` runs the complete benchmark suite
+end-to-end (all four buffer sizes, create/write/read results,
+honestly measuring the host-backed VFS). Two non-obvious repro
+gotchas, recorded for future sessions: DiskSpeed with **no arguments
+selects no tests** (its pre-ReadArgs parser needs `ALL` or specific
+switches -- an argless run doing calibration then exiting 0 is
+*correct*), and its test directory is named `" DiskSpeed Test
+Directory "` with a **leading and trailing space** (a leftover from a
+crashed run makes the next run fail with "Could not create test
+directory"; `rm` the exact name). Known cosmetic gap: `Device:` /
+`Buffers:` line shows `<information unavailable>` (DiskSpeed can't
+name the current dir's device -- same "Mounted disks" cosmetic
+family as the Info command's gap).
+
 ## Out of scope for all phases (separate future proposals, unchanged)
 
 GUI tier via AROS library ports; ARexx port bridging; native macOS
