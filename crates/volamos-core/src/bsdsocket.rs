@@ -415,6 +415,17 @@ struct SocketEntry {
     /// (`FD_ACCEPT`) when interpreting a `POLLIN` result, since both look
     /// identical at the `poll(2)` level.
     is_listener: bool,
+    /// Whether a connection was ever established on this socket
+    /// (`connect()` succeeded or began in-progress, or the socket came
+    /// from `accept()`). Gates [`wait_select_poll`]'s connection-
+    /// lifecycle event classification (`FD_WRITE`, `POLLHUP`-derived
+    /// `FD_CLOSE`): Linux's `poll(2)` reports a never-connected TCP
+    /// socket as `POLLOUT|POLLHUP` where BSD/macOS reports nothing, and
+    /// the real Amiga bsdsocket stack is BSD-derived -- treating those
+    /// as events would fire `FD_WRITE` spuriously on sockets no
+    /// connection ever touched (caught by CI's Linux runners on a test
+    /// that passed on macOS).
+    connected: bool,
 }
 
 impl SocketEntry {
@@ -424,6 +435,7 @@ impl SocketEntry {
             event_mask: 0,
             pending_events: 0,
             is_listener: false,
+            connected: false,
         }
     }
 }
@@ -809,7 +821,9 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
             }
             let id = ctx.bsdsocket.next_id;
             ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
-            ctx.bsdsocket.sockets.insert(id, SocketEntry::new(accepted));
+            let mut entry = SocketEntry::new(accepted);
+            entry.connected = true;
+            ctx.bsdsocket.sockets.insert(id, entry);
             ctx.bsdsocket.set_errno(ctx.mem, 0);
             ctx.cpu.set_data_register(DataRegister(0), id as u32);
             if let Some(peer) = peer.as_socket_ipv4() {
@@ -853,11 +867,17 @@ fn connect_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     };
     match result {
         Ok(()) => {
+            if let Some(entry) = ctx.bsdsocket.sockets.get_mut(&fd) {
+                entry.connected = true;
+            }
             ctx.bsdsocket.set_errno(ctx.mem, 0);
             ctx.cpu.set_data_register(DataRegister(0), 0);
             *ctx.call_detail = Some(format!("connect -> {sa} (fd {fd}) -> ok"));
         }
         Err(e) if is_connect_in_progress(&e) => {
+            if let Some(entry) = ctx.bsdsocket.sockets.get_mut(&fd) {
+                entry.connected = true;
+            }
             ctx.bsdsocket.set_errno(ctx.mem, EINPROGRESS);
             ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
             *ctx.call_detail = Some(format!("connect -> {sa} (fd {fd}) -> in progress"));
@@ -1816,6 +1836,7 @@ fn wait_select_poll<C: Cpu>(
         };
         let armed = entry.event_mask;
         let is_listener = entry.is_listener;
+        let connected = entry.connected;
         let mut new_bits = 0u32;
         if revents & libc::POLLIN != 0 {
             if is_listener {
@@ -1838,10 +1859,13 @@ fn wait_select_poll<C: Cpu>(
                 }
             }
         }
-        if revents & libc::POLLHUP != 0 && armed & FD_CLOSE != 0 {
+        // POLLHUP/POLLOUT are connection-lifecycle signals: gate them on
+        // a connection ever having existed (see SocketEntry::connected's
+        // doc -- Linux reports both on never-connected TCP sockets).
+        if revents & libc::POLLHUP != 0 && connected && armed & FD_CLOSE != 0 {
             new_bits |= FD_CLOSE;
         }
-        if revents & libc::POLLOUT != 0 && !is_listener && armed & FD_WRITE != 0 {
+        if revents & libc::POLLOUT != 0 && !is_listener && connected && armed & FD_WRITE != 0 {
             new_bits |= FD_WRITE;
         }
         if revents & libc::POLLERR != 0 && armed & FD_ERROR != 0 {
@@ -2833,6 +2857,8 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         return Ok(());
     };
+    let src_listener = entry.is_listener;
+    let src_connected = entry.connected;
     let dup = match entry.socket.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -2853,7 +2879,13 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         }
         new_fd
     };
-    ctx.bsdsocket.sockets.insert(id, SocketEntry::new(dup));
+    // A dup shares the underlying connection's state -- carry the
+    // lifecycle flags over so event classification treats it like the
+    // original (see SocketEntry::connected's doc).
+    let mut dup_entry = SocketEntry::new(dup);
+    dup_entry.is_listener = src_listener;
+    dup_entry.connected = src_connected;
+    ctx.bsdsocket.sockets.insert(id, dup_entry);
     ctx.bsdsocket.set_errno(ctx.mem, 0);
     ctx.cpu.set_data_register(DataRegister(0), id as u32);
     Ok(())
@@ -3986,6 +4018,14 @@ mod tests {
         push_move_imm_a(&mut words, 0, sockaddr_buf);
         push_move_imm_d(&mut words, 1, 16);
         words.extend_from_slice(&jsr_disp16_a6(-36)); // bind(fd, 127.0.0.1:0, 16)
+        // bind() returned 0 in D0, clobbering the fd -- reload it (the
+        // first socket of a fresh runtime is always fd 1) so listen()
+        // targets the real socket. Without this the socket stays
+        // bound-but-not-listening, which Linux's poll(2) reports as
+        // POLLHUP ("unconnected TCP socket") and macOS reports as
+        // nothing -- a latent bug this test had that only CI's Linux
+        // runners caught.
+        push_move_imm_d(&mut words, 0, 1);
         push_move_imm_d(&mut words, 1, 1);
         words.extend_from_slice(&jsr_disp16_a6(-42)); // listen(fd, 1)
 
