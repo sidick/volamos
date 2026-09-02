@@ -18,7 +18,7 @@ m68k = { version = "=0.11.6", features = ["jit"] }
 # `crate::bsdsocket`'s module docs): real, non-blocking BSD sockets via a
 # cross-platform API, the same crate Copperline's own host-socket backend
 # (`crates/hostsocket-plugin` in its repo) uses for the identical purpose.
-socket2 = "0.5"
+socket2 = "0.6"
 # Only for its per-platform EINPROGRESS/WSAEWOULDBLOCK constants (see
 # `crate::bsdsocket::is_connect_in_progress`) -- `std::io::ErrorKind::
 # InProgress` is still unstable on this toolchain (rustc 1.97), so a
