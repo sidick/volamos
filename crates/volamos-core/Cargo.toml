@@ -13,7 +13,7 @@ description = "Core library for volamos: CPU/memory abstractions and AmigaOS lib
 # feature) so `--jit` is a single binary's runtime choice, matching every
 # other CPU-shape flag (`--cpu`, `--fpu`) -- see `backend.rs`'s
 # `M68kCpu::run` override and the CLI's `--jit`/`--no-jit` flags.
-m68k = { version = "=0.11.6", features = ["jit"] }
+m68k = { version = "=0.12.1", features = ["jit"] }
 # `bsdsocket.library`'s host-socket-passthrough backend (see
 # `crate::bsdsocket`'s module docs): real, non-blocking BSD sockets via a
 # cross-platform API, the same crate Copperline's own host-socket backend
