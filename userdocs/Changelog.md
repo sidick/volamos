@@ -1,9 +1,23 @@
 # Changelog
 
-volamos has not had a tagged release yet — see
-[the index page](index.md)'s note on project status. This page tracks
-major milestones during development; once the first release ships, it
-will follow the version scheme in `Cargo.toml`.
+This page tracks major milestones during development, following the
+version scheme in `Cargo.toml`.
+
+## 0.3
+
+- **Interpreter and release-build performance**: `FlatMemory`'s
+  multi-byte reads/writes now do a single bounds check plus a native
+  big-endian load/store instead of decomposing into repeated
+  byte-level calls, and the non-`--jit` execution path now runs
+  through the `m68k` crate's `run_batch` (batch size 1) instead of
+  looping its plain `step`, picking up `run_batch`'s non-cycle-accurate
+  bus mode and raw-pointer fast-memory access — same per-instruction
+  granularity, no observable behavior change. Release builds also gain
+  `lto = true`/`codegen-units = 1`. On a real CoreMark 1.0 run, this
+  took the interpreter from 105.9 to 198.2 iterations/sec (~1.9x) and
+  `--jit` from 445.1 to 537.1 (~1.2x) — see the [CLI Reference](CLI-Reference.md#--jit---no-jit)'s
+  `--jit` note for the full comparison table, including `vamos`'s
+  270.6 on the same binary.
 
 ## Unreleased (0.1, in development)
 

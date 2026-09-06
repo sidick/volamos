@@ -227,7 +227,19 @@ volamos --jit fixtures/hello
     `--jit`, though wall-clock barely moved, since most of `sc`'s wall
     time isn't CPU-bound at all. Expect `--jit`'s benefit to scale with
     how CPU-heavy the guest program's own work is, not with how many
-    library calls it makes.
+    library calls it makes. A purely CPU-bound benchmark shows the full
+    effect: [CoreMark 1.0](https://github.com/eembc/coremark) (`-O2
+    -m68020 -msoft-float`, `--cpu 68020`) scores 198.2 iterations/sec
+    interpreted and 537.1 with `--jit` (volamos 0.3) — for comparison,
+    `vamos` scores 270.6 on the same binary with no JIT of its own.
+
+    | Runtime | CoreMark 1.0 |
+    | --- | --- |
+    | `vamos` | 270.6 |
+    | volamos 0.2, interpreter | 105.9 |
+    | volamos 0.2, `--jit` | 445.1 |
+    | volamos 0.3, interpreter | 198.2 (~1.9x faster than 0.2) |
+    | volamos 0.3, `--jit` | 537.1 (~1.2x faster than 0.2) |
 
 ## No flags at all
 
