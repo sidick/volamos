@@ -1378,7 +1378,9 @@ fn getsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
                 };
                 ctx.mem.write_u32(optval_ptr, t as u32);
             }
-            (IPPROTO_TCP, TCP_NODELAY) => ctx.mem.write_u32(optval_ptr, socket.tcp_nodelay()? as u32),
+            (IPPROTO_TCP, TCP_NODELAY) => {
+                ctx.mem.write_u32(optval_ptr, socket.tcp_nodelay()? as u32)
+            }
             _ => unreachable!("filtered out above"),
         }
         Ok(())
