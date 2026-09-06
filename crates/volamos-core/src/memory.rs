@@ -104,6 +104,59 @@ impl AddressSpace for FlatMemory {
             *slot = value;
         }
     }
+
+    // Overridden (rather than relying on the default trait methods'
+    // byte-by-byte composition) so the common in-range case is a single
+    // bounds check plus a native big-endian load/store, instead of two or
+    // four separate bounds-checked `read_u8`/`write_u8` calls. This is a
+    // hot path: every instruction fetch and most operand reads/writes go
+    // through here.
+
+    fn read_u16(&self, addr: u32) -> u16 {
+        let addr = addr as usize;
+        match self.bytes.get(addr..addr + 2) {
+            Some(slice) => u16::from_be_bytes(slice.try_into().unwrap()),
+            None => {
+                let hi = self.read_u8(addr as u32) as u16;
+                let lo = self.read_u8(addr.wrapping_add(1) as u32) as u16;
+                (hi << 8) | lo
+            }
+        }
+    }
+
+    fn write_u16(&mut self, addr: u32, value: u16) {
+        let addr = addr as usize;
+        match self.bytes.get_mut(addr..addr + 2) {
+            Some(slice) => slice.copy_from_slice(&value.to_be_bytes()),
+            None => {
+                self.write_u8(addr as u32, (value >> 8) as u8);
+                self.write_u8(addr.wrapping_add(1) as u32, value as u8);
+            }
+        }
+    }
+
+    fn read_u32(&self, addr: u32) -> u32 {
+        let addr = addr as usize;
+        match self.bytes.get(addr..addr + 4) {
+            Some(slice) => u32::from_be_bytes(slice.try_into().unwrap()),
+            None => {
+                let hi = self.read_u16(addr as u32) as u32;
+                let lo = self.read_u16(addr.wrapping_add(2) as u32) as u32;
+                (hi << 16) | lo
+            }
+        }
+    }
+
+    fn write_u32(&mut self, addr: u32, value: u32) {
+        let addr = addr as usize;
+        match self.bytes.get_mut(addr..addr + 4) {
+            Some(slice) => slice.copy_from_slice(&value.to_be_bytes()),
+            None => {
+                self.write_u16(addr as u32, (value >> 16) as u16);
+                self.write_u16(addr.wrapping_add(2) as u32, value as u16);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

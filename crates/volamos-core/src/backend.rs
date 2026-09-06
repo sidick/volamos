@@ -228,44 +228,38 @@ impl Cpu for M68kCpu {
         }
     }
 
-    /// When [`Self::jit`] is set, runs a whole batch of instructions via
-    /// [`m68k::CpuCore::run_batch`] instead of stepping one at a time --
-    /// the crate's trace JIT compiles hot backward-branch loops under
-    /// the hood, but every trap/halt this runtime cares about is still
-    /// surfaced at exactly the same boundary [`Cpu::step`]'s default
-    /// `run` loop would stop at (see [`m68k::BatchExit`]'s doc comment:
-    /// traps are reported, never taken as hardware exceptions, matching
-    /// [`StepResult`] one-for-one). `max_instructions` is unbounded
-    /// (`u32::MAX`) since this runtime has no use for budget-based
-    /// preemption; a `BudgetExhausted` exit (astronomically unlikely in
-    /// practice, since AmigaOS guest code traps out to library calls
-    /// constantly) just resumes the batch loop rather than returning
-    /// early. When unset, falls back to the plain step loop (the same
-    /// logic as [`Cpu::run`]'s own default implementation, duplicated
-    /// here since overriding `run` at all requires handling both
-    /// branches in one method).
+    /// Runs via [`m68k::CpuCore::run_batch`] rather than stepping one
+    /// instruction at a time through [`Cpu::step`]/`core.step` -- every
+    /// trap/halt this runtime cares about is still surfaced at exactly
+    /// the same boundary the old per-instruction loop stopped at (see
+    /// [`m68k::BatchExit`]'s doc comment: traps are reported, never
+    /// taken as hardware exceptions, matching [`StepResult`]
+    /// one-for-one).
+    ///
+    /// The batch size is the only difference [`Self::jit`] makes here:
+    /// when set, `max_instructions` is unbounded (`u32::MAX`), letting
+    /// the crate's trace JIT compile hot backward-branch loops; when
+    /// unset, it's `1`, so this still executes and reports one
+    /// instruction at a time (preserving `--no-jit`'s per-instruction
+    /// granularity as a correctness reference against `--jit`) while
+    /// still getting `run_batch`'s other, independent speedup: it runs
+    /// with `precise_bus` off and raw-pointer `fast_mem` access, unlike
+    /// `core.step`, which always tracks cycle-accurate bus/fetch-cache
+    /// state that this non-cycle-accurate runtime never uses. A
+    /// `BudgetExhausted` exit (the batch ending without a trap/halt --
+    /// always, in `--no-jit` mode's batch-of-1) just resumes the batch
+    /// loop rather than returning early.
     fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
         use m68k::BatchExit;
 
-        if !self.jit {
-            loop {
-                let pc = self.pc();
-                if pc as usize >= AddressSpace::len(mem) {
-                    return StopReason::PcOutOfBounds { pc };
-                }
-                match self.step(mem) {
-                    StopReason::Step => continue,
-                    other => return other,
-                }
-            }
-        }
+        let max_instructions = if self.jit { u32::MAX } else { 1 };
 
         loop {
             let pc = self.pc();
             if pc as usize >= AddressSpace::len(mem) {
                 return StopReason::PcOutOfBounds { pc };
             }
-            let result = self.core.run_batch(mem, u32::MAX, &[]);
+            let result = self.core.run_batch(mem, max_instructions, &[]);
             match result.exit {
                 BatchExit::BudgetExhausted => continue,
                 BatchExit::Stopped => return StopReason::Halted,

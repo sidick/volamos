@@ -11,3 +11,7 @@ description = "A Rust-native, Wine-style runtime for classic AmigaOS m68k CLI bi
 
 [workspace.dependencies]
 volamos-core = { path = "crates/volamos-core" }
+
+[profile.release]
+lto = true
+codegen-units = 1
