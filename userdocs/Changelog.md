@@ -15,7 +15,7 @@ version scheme in `Cargo.toml`.
   granularity, no observable behavior change. Release builds also gain
   `lto = true`/`codegen-units = 1`. On a real CoreMark 1.0 run, this
   took the interpreter from 105.9 to 198.2 iterations/sec (~1.9x) and
-  `--jit` from 445.1 to 537.1 (~1.2x) — see the [CLI Reference](CLI-Reference.md#--jit---no-jit)'s
+  `--jit` from 445.1 to 537.1 (~1.2x) — see the [CLI Reference](CLI-Reference.md#-jit-no-jit)'s
   `--jit` note for the full comparison table, including `vamos`'s
   270.6 on the same binary.
 
