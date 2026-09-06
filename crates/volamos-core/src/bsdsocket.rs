@@ -1269,7 +1269,7 @@ fn setsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
         Apply::Linger(v) => socket.set_linger(v),
         Apply::RecvTimeout(v) => socket.set_read_timeout(v),
         Apply::SendTimeout(v) => socket.set_write_timeout(v),
-        Apply::Nodelay(v) => socket.set_nodelay(v),
+        Apply::Nodelay(v) => socket.set_tcp_nodelay(v),
         Apply::Unsupported => unreachable!("filtered out above"),
     }) else {
         return Ok(());
@@ -1378,7 +1378,7 @@ fn getsockopt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
                 };
                 ctx.mem.write_u32(optval_ptr, t as u32);
             }
-            (IPPROTO_TCP, TCP_NODELAY) => ctx.mem.write_u32(optval_ptr, socket.nodelay()? as u32),
+            (IPPROTO_TCP, TCP_NODELAY) => ctx.mem.write_u32(optval_ptr, socket.tcp_nodelay()? as u32),
             _ => unreachable!("filtered out above"),
         }
         Ok(())
