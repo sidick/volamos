@@ -1270,7 +1270,41 @@ dropped from ~3.1s to ~2.3s of CPU time (a ~25% reduction) with
 <code>--jit</code>, though wall-clock barely moved, since most of <code>sc</code>'s wall
 time isn't CPU-bound at all. Expect <code>--jit</code>'s benefit to scale with
 how CPU-heavy the guest program's own work is, not with how many
-library calls it makes.</p>
+library calls it makes. A purely CPU-bound benchmark shows the full
+effect: <a href="https://github.com/eembc/coremark">CoreMark 1.0</a> (<code>-O2
+-m68020 -msoft-float</code>, <code>--cpu 68020</code>) scores 198.2 iterations/sec
+interpreted and 537.1 with <code>--jit</code> (volamos 0.3) — for comparison,
+<code>vamos</code> scores 270.6 on the same binary with no JIT of its own.</p>
+<table>
+<thead>
+<tr>
+<th>Runtime</th>
+<th>CoreMark 1.0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vamos</code></td>
+<td>270.6</td>
+</tr>
+<tr>
+<td>volamos 0.2, interpreter</td>
+<td>105.9</td>
+</tr>
+<tr>
+<td>volamos 0.2, <code>--jit</code></td>
+<td>445.1</td>
+</tr>
+<tr>
+<td>volamos 0.3, interpreter</td>
+<td>198.2 (~1.9x faster than 0.2)</td>
+</tr>
+<tr>
+<td>volamos 0.3, <code>--jit</code></td>
+<td>537.1 (~1.2x faster than 0.2)</td>
+</tr>
+</tbody>
+</table>
 </div>
 <h2 id="no-flags-at-all">No flags at all<a class="headerlink" href="#no-flags-at-all" title="Permanent link">&para;</a></h2>
 <p>If none of <code>-V</code>/<code>-a</code>/<code>--cwd</code>/<code>--auto-assign</code> are given, no volume/assign
