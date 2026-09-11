@@ -2,6 +2,9 @@
 """Two-oracle comparison harness: runs volamos's own fixtures under both
 volamos and `vamos` (amitools) and diffs stdout/exit code, catching real
 functional divergences between the two independent implementations.
+See also `tools/compare_amitools_suite.py`, the same idea run against
+amitools' own much larger `test/bin` corpus instead of these ~6
+hand-written fixtures (local-only -- needs an external GPL checkout).
 
 This is the two-oracle *subset* of `docs/plan.md`'s Phase 4 three-oracle
 harness (volamos vs. `vamos` vs. real Kickstart) -- the third column
