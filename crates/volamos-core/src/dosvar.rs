@@ -416,6 +416,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "ENV:".to_string(),
+            ..Default::default()
         })
         .expect("build vfs");
         (FlatMemory::new(0x1000), DosState::new(Some(vfs)), tmp)

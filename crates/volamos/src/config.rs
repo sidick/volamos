@@ -45,6 +45,7 @@
 use std::path::{Path, PathBuf};
 
 use volamos_core::backend::CpuType;
+use volamos_core::vfs::LazyVolume;
 
 use crate::{parse_byte_size, parse_cpu_type, split_name_value};
 
@@ -75,6 +76,36 @@ pub(crate) struct Overrides {
     /// explicitly on the command line every time, not silently inherited
     /// from a config file the invoker may not even remember exists.
     pub(crate) net: Option<bool>,
+    /// `DEFAULTS`/`--defaults`/`--no-defaults`: whether the built-in
+    /// standard-volume defaults layer (issue #43 -- `SYS:`/`RAM:` and
+    /// the standard assigns onto them, see [`built_in_defaults`])
+    /// applies at all. `None` (unset by every source) means "on",
+    /// resolved in [`crate::resolve`]. Unlike every other field here,
+    /// only a real config file or CLI flag ever sets this one --
+    /// [`built_in_defaults`]'s own `Overrides` never touches it, so
+    /// there's no risk of the defaults layer somehow disabling itself.
+    pub(crate) standard_volumes: Option<bool>,
+    /// `VOLUMES_DIR`/`--volumes-dir`: overrides where the standard
+    /// `SYS:` default volume lives on the host (default
+    /// `~/.volamos.d/volumes`). Relative paths anchor to the setting
+    /// config file's own directory, same as `VOLUME`/`AUTO_ASSIGN` --
+    /// see [`anchor_relative_host_paths`].
+    pub(crate) volumes_dir: Option<PathBuf>,
+    /// Default volumes contributed by [`built_in_defaults`] -- see
+    /// [`volamos_core::vfs::VfsConfig::lazy_volumes`]'s doc for what
+    /// these actually do. Always empty for every other source (a real
+    /// config file/CLI flag has no way to set this), so concatenating
+    /// `higher ++ lower` on merge (matching `volumes`/`assigns`) is
+    /// trivially correct: at most one layer -- the defaults one, always
+    /// lowest-precedence -- ever contributes anything here.
+    pub(crate) lazy_volumes: Vec<LazyVolume>,
+    /// Host directories [`built_in_defaults`] wants removed once this
+    /// run (and every nested run sharing its `VfsConfig`) is over --
+    /// see [`volamos_core::vfs::VfsConfig::ephemeral_dirs`]'s doc for
+    /// why this can't just be a `Drop` impl, and `main.rs`'s own use of
+    /// [`crate::Options::ephemeral_dirs`]. Same "only the defaults layer
+    /// ever sets this" reasoning as [`Self::lazy_volumes`].
+    pub(crate) ephemeral_dirs: Vec<PathBuf>,
 }
 
 /// Parses a `true`/`false` value (case-insensitive), for the `FPU`/
@@ -132,6 +163,10 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
             "JIT" => overrides.jit = Some(parse_bool("JIT", value).map_err(with_line)?),
             "VERBOSE" => overrides.verbose = Some(parse_bool("VERBOSE", value).map_err(with_line)?),
             "SNOOP" => overrides.snoop = Some(parse_bool("SNOOP", value).map_err(with_line)?),
+            "DEFAULTS" => {
+                overrides.standard_volumes = Some(parse_bool("DEFAULTS", value).map_err(with_line)?)
+            }
+            "VOLUMES_DIR" => overrides.volumes_dir = Some(PathBuf::from(value)),
             other => return Err(with_line(format!("unknown key {other:?}"))),
         }
     }
@@ -167,6 +202,23 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         // just "the CLI's own value passes through unchanged", not a
         // real merge.
         net: higher.net.or(lower.net),
+        standard_volumes: higher.standard_volumes.or(lower.standard_volumes),
+        volumes_dir: higher.volumes_dir.or(lower.volumes_dir),
+        // Only built_in_defaults() ever populates these (see their own
+        // docs), so this concatenation never actually combines two
+        // real sources' worth of data -- it's here purely so this
+        // layer can flow through the same merge chain as everything
+        // else, with no special-casing in main.rs.
+        lazy_volumes: higher
+            .lazy_volumes
+            .into_iter()
+            .chain(lower.lazy_volumes)
+            .collect(),
+        ephemeral_dirs: higher
+            .ephemeral_dirs
+            .into_iter()
+            .chain(lower.ephemeral_dirs)
+            .collect(),
     }
 }
 
@@ -210,6 +262,11 @@ fn anchor_relative_host_paths(overrides: &mut Overrides, base: &Path) {
         && root.is_relative()
     {
         *root = base.join(&*root);
+    }
+    if let Some(dir) = &mut overrides.volumes_dir
+        && dir.is_relative()
+    {
+        *dir = base.join(&*dir);
     }
 }
 
@@ -272,6 +329,123 @@ fn load_candidates(candidates: [Option<PathBuf>; 3]) -> Result<Overrides, String
         merged = merge(merged, layer);
     }
     Ok(merged)
+}
+
+/// `~/.volamos.d/volumes`, if `$HOME` is set -- the default base
+/// directory for [`built_in_defaults`]'s persistent `SYS:` volume when
+/// no `VOLUMES_DIR`/`--volumes-dir` override is given. Not
+/// `~/.volamos/volumes`: `~/.volamos` is itself a *file* (the global
+/// config), so a directory can't share that name.
+fn default_volumes_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".volamos.d").join("volumes"))
+}
+
+/// A unique, per-process host directory under the OS temp directory,
+/// for the ephemeral `RAM:` default (issue #43's own follow-up note on
+/// why this must never be a fixed path: two concurrent volamos
+/// instances sharing one `RAM:` would clash, and worse, one instance's
+/// normal-exit cleanup would delete files a still-running sibling
+/// instance is using). `std::process::id()` alone isn't quite enough
+/// (pids get reused over a long-running host's uptime), so this also
+/// mixes in a nanosecond timestamp -- cheap, dependency-free uniqueness
+/// matching what vamos's own `tempfile.mkdtemp`-based approach
+/// (`amitools/vamos/path/volume.py`'s `_create_temp`) achieves via the
+/// `tempfile` crate, without pulling that crate in for one call site.
+/// Only the *name* is decided here -- nothing is created on the host
+/// yet (see [`built_in_defaults`]'s own doc for why).
+fn unique_ram_dir() -> PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("volamos-ram-{pid}-{nanos}"))
+}
+
+/// Builds the built-in standard-volume defaults layer (issue #43): a
+/// `SYS:` volume plus the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`
+/// assigns onto it, and an ephemeral, per-process `RAM:` volume plus
+/// `T:`/`ENV:` assigns onto *that* -- `RAM:env` matches the real
+/// AmigaOS convention `volamos_core::dosvar`'s own module doc already
+/// notes for `ENV:` ("conventionally `RAM:env`"). Deliberately **not**
+/// vamos's broader auto-assign machinery, which makes *any* name
+/// resolve somewhere: these are the only names real AmigaOS itself
+/// defines, so a genuinely unknown/typo'd volume name still fails
+/// loudly rather than silently succeeding against a directory nobody
+/// asked for.
+///
+/// Every directory here is created lazily, on first actual use, not by
+/// this function -- see [`volamos_core::vfs::LazyVolume`]. This
+/// function itself does no I/O at all beyond `$HOME`/temp-dir path
+/// lookups: a `volamos hello` that never touches the filesystem must
+/// leave nothing behind on disk, and `RAM:`'s unique name must be
+/// decided exactly once per process regardless of whether the guest
+/// ever uses it.
+///
+/// `volumes_dir` is the resolved `VOLUMES_DIR`/`--volumes-dir`
+/// override, if any (already anchored/absolute by the time it reaches
+/// here via [`anchor_relative_host_paths`]); `None` means "use
+/// [`default_volumes_dir`]". If neither is available (no `$HOME` and
+/// no override), the `SYS:`-anchored defaults -- and everything hung
+/// off it (`C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`) -- are skipped
+/// entirely, but `RAM:`/`T:`/`ENV:` are still installed, since they
+/// only need the OS temp directory, which is always available.
+///
+/// Returns the `Overrides` layer to merge in at the lowest precedence
+/// (its own `lazy_volumes`/`ephemeral_dirs` fields carry the
+/// directory-creation/cleanup bookkeeping alongside the ordinary
+/// `volumes`/`assigns`/`cwd` settings, so no separate return value is
+/// needed) -- see `crate::Options::ephemeral_dirs` for how `main.rs`
+/// uses the latter.
+pub(crate) fn built_in_defaults(volumes_dir: Option<PathBuf>) -> Overrides {
+    let mut overrides = Overrides::default();
+
+    if let Some(dir) = volumes_dir.or_else(default_volumes_dir) {
+        let sys_root = dir.join("sys");
+        overrides
+            .volumes
+            .push(("SYS".to_string(), sys_root.clone()));
+        for (name, target) in [
+            ("C", "SYS:C"),
+            ("S", "SYS:S"),
+            ("LIBS", "SYS:Libs"),
+            ("DEVS", "SYS:Devs"),
+            ("ENVARC", "SYS:Prefs/Env-Archive"),
+        ] {
+            overrides
+                .assigns
+                .push((name.to_string(), vec![target.to_string()]));
+        }
+        overrides.cwd = Some("SYS:".to_string());
+        overrides.lazy_volumes.push(LazyVolume {
+            companions: vec![
+                sys_root.join("C"),
+                sys_root.join("S"),
+                sys_root.join("Libs"),
+                sys_root.join("Devs"),
+                sys_root.join("Prefs").join("Env-Archive"),
+            ],
+            root: sys_root,
+        });
+    }
+
+    let ram_root = unique_ram_dir();
+    overrides
+        .volumes
+        .push(("RAM".to_string(), ram_root.clone()));
+    overrides
+        .assigns
+        .push(("T".to_string(), vec!["RAM:T".to_string()]));
+    overrides
+        .assigns
+        .push(("ENV".to_string(), vec!["RAM:env".to_string()]));
+    overrides.lazy_volumes.push(LazyVolume {
+        companions: vec![ram_root.join("T"), ram_root.join("env")],
+        root: ram_root.clone(),
+    });
+    overrides.ephemeral_dirs.push(ram_root);
+
+    overrides
 }
 
 #[cfg(test)]
@@ -595,5 +769,116 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(merged, Overrides::default());
+    }
+
+    // --- built_in_defaults (issue #43) ---
+
+    #[test]
+    fn built_in_defaults_installs_sys_and_its_standard_assigns() {
+        let tmp = TempDir::new("defaults-sys");
+        let overrides = built_in_defaults(Some(tmp.path().to_path_buf()));
+
+        let sys_root = tmp.path().join("sys");
+        assert_eq!(
+            overrides.volumes.iter().find(|(n, _)| n == "SYS"),
+            Some(&("SYS".to_string(), sys_root.clone()))
+        );
+        for (name, target) in [
+            ("C", "SYS:C"),
+            ("S", "SYS:S"),
+            ("LIBS", "SYS:Libs"),
+            ("DEVS", "SYS:Devs"),
+            ("ENVARC", "SYS:Prefs/Env-Archive"),
+        ] {
+            assert_eq!(
+                overrides.assigns.iter().find(|(n, _)| n == name),
+                Some(&(name.to_string(), vec![target.to_string()])),
+                "missing/wrong target for {name}:"
+            );
+        }
+        assert_eq!(overrides.cwd, Some("SYS:".to_string()));
+
+        let sys_lazy = overrides
+            .lazy_volumes
+            .iter()
+            .find(|lv| lv.root == sys_root)
+            .expect("SYS: should be registered as a lazy volume");
+        for companion in [
+            sys_root.join("C"),
+            sys_root.join("S"),
+            sys_root.join("Libs"),
+            sys_root.join("Devs"),
+            sys_root.join("Prefs").join("Env-Archive"),
+        ] {
+            assert!(
+                sys_lazy.companions.contains(&companion),
+                "missing companion: {companion:?}"
+            );
+        }
+        assert!(
+            !sys_root.exists(),
+            "built_in_defaults must not touch the host itself -- only naming paths, not creating them"
+        );
+    }
+
+    #[test]
+    fn built_in_defaults_always_installs_ram_t_and_env() {
+        let tmp = TempDir::new("defaults-ram");
+        // Some(...) here only to keep the SYS:-side assertions
+        // deterministic in this test file; RAM:/T:/ENV: don't depend on
+        // it at all (see the next test).
+        let overrides = built_in_defaults(Some(tmp.path().to_path_buf()));
+
+        let ram_entry = overrides
+            .volumes
+            .iter()
+            .find(|(n, _)| n == "RAM")
+            .expect("RAM: should be installed");
+        let ram_root = ram_entry.1.clone();
+        assert_eq!(
+            overrides.assigns.iter().find(|(n, _)| n == "T"),
+            Some(&("T".to_string(), vec!["RAM:T".to_string()]))
+        );
+        assert_eq!(
+            overrides.assigns.iter().find(|(n, _)| n == "ENV"),
+            Some(&("ENV".to_string(), vec!["RAM:env".to_string()]))
+        );
+
+        let ram_lazy = overrides
+            .lazy_volumes
+            .iter()
+            .find(|lv| lv.root == ram_root)
+            .expect("RAM: should be registered as a lazy volume");
+        assert!(ram_lazy.companions.contains(&ram_root.join("T")));
+        assert!(ram_lazy.companions.contains(&ram_root.join("env")));
+
+        assert_eq!(
+            overrides.ephemeral_dirs,
+            vec![ram_root],
+            "RAM:'s root -- and only RAM:'s root -- is ephemeral; SYS: persists across runs"
+        );
+    }
+
+    #[test]
+    fn built_in_defaults_without_a_volumes_dir_still_installs_ram() {
+        // No explicit override; falls back to default_volumes_dir()
+        // (which may or may not resolve, depending on the test
+        // machine's $HOME) -- but RAM:/T:/ENV: only ever need the OS
+        // temp directory, so they must appear regardless.
+        let overrides = built_in_defaults(None);
+        assert!(overrides.volumes.iter().any(|(n, _)| n == "RAM"));
+        assert!(overrides.assigns.iter().any(|(n, _)| n == "T"));
+        assert!(overrides.assigns.iter().any(|(n, _)| n == "ENV"));
+        assert_eq!(overrides.ephemeral_dirs.len(), 1);
+    }
+
+    #[test]
+    fn built_in_defaults_gives_ram_a_fresh_directory_each_call() {
+        // Two calls (standing in for two concurrent volamos instances)
+        // must never propose the same RAM: root -- see issue #43's
+        // follow-up comment on why a shared/fixed RAM: would be unsafe.
+        let a = built_in_defaults(None);
+        let b = built_in_defaults(None);
+        assert_ne!(a.ephemeral_dirs[0], b.ephemeral_dirs[0]);
     }
 }

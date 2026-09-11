@@ -47,6 +47,8 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 | `JIT` | `--jit`/`--no-jit` | `true`/`false` |
 | `VERBOSE` | `-v`/`--verbose` | `true`/`false` |
 | `SNOOP` | `-s`/`--snoop` | `true`/`false` |
+| `DEFAULTS` | `--defaults`/`--no-defaults` | `true`/`false`; see [Volumes and Assigns](Volumes-and-Assigns.md#standard-defaults) |
+| `VOLUMES_DIR` | `--volumes-dir` | where the default `SYS:` volume lives |
 
 `VOLUME`/`ASSIGN` are **repeatable** — one line per entry, same as
 giving `-V`/`-a` more than once. Every other key is **singular**: if

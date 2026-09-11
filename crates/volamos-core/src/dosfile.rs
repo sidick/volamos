@@ -1585,6 +1585,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .expect("build vfs")
     }

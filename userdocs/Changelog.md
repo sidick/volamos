@@ -5,6 +5,24 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
+  and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
+  assigns onto them now resolve out of the box, with zero `-V`/`-a`
+  configuration needed — backed by empty host directories created only
+  on first actual use (`SYS:` persists across runs under
+  `--volumes-dir`/`VOLUMES_DIR`, default `~/.volamos.d/volumes`;
+  `RAM:`/`T:`/`ENV:` are a fresh, unique-per-process temp directory,
+  removed automatically once the run ends — never shared between, or
+  surviving past, a single `volamos` invocation). An explicit `-V`/`-a`
+  for the same name always overrides the matching default, so
+  `-V SYS:~/amiga/wb31` brings that volume's own real `C:`/`Libs:`/etc.
+  along with it rather than the synthetic skeleton reappearing
+  underneath it. `--no-defaults`/`DEFAULTS=false` restores the
+  original "nothing configured means no filesystem at all" behavior.
+  Only these specific real-AmigaOS names are covered — unlike `vamos`'s
+  broader auto-assign machinery, a genuinely unknown/typo'd volume name
+  still fails loudly with an `IoErr()`. See
+  [Volumes and Assigns](Volumes-and-Assigns.md#standard-defaults).
 - **Program-directory config file** (issue #16): a `.volamos` next to
   the launched binary (in `<program>`'s own containing directory) is
   now consulted between `./.volamos` and `~/.volamos`, so a toolchain

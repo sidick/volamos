@@ -26,10 +26,16 @@
 //! `-V`/`--volume`, `-a`/`--assign`, `--cwd`, and `--auto-assign` set up
 //! a [`volamos_core::vfs::Vfs`] for `dos.library`'s path-based calls
 //! (`Open`, `Lock`, `Examine`, ...) -- see [`print_usage`] for the exact
-//! grammar and the `--cwd` defaulting rule. If none of those flags are
-//! given, no `Vfs` is installed at all (unchanged from pre-T13
-//! behavior): path-based dos.library calls fail cleanly with an IoErr,
-//! everything else (`Input`/`Output`/`PutStr`/...) still works.
+//! grammar and the `--cwd` defaulting rule. Since issue #43, a built-in
+//! standard-volume defaults layer (`SYS:`/`RAM:` and the standard
+//! `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:` assigns onto them,
+//! all backed by host directories created lazily on first actual use)
+//! is active by default, so these names resolve out of the box even
+//! with none of those flags given -- `--no-defaults`/`DEFAULTS=false`
+//! restores the original pre-#43 behavior of installing no `Vfs` at all
+//! in that case, so path-based dos.library calls fail cleanly with an
+//! IoErr (`Input`/`Output`/`PutStr`/... still work either way) -- see
+//! [`config::built_in_defaults`] for the full design.
 //!
 //! `--stack SIZE` (Phase 3 stage 6) overrides the guest stack region's
 //! size (default [`volamos_core::DEFAULT_STACK_SIZE`], 64 KiB); `SIZE`
@@ -114,12 +120,31 @@ struct Options {
     fpu: bool,
     jit: bool,
     net: bool,
+    /// The built-in defaults layer's own lazy-creation bookkeeping
+    /// (issue #43), if that layer is active -- passed straight through
+    /// to [`vfs_config_from_opts`]'s `VfsConfig`. Empty whenever
+    /// `--no-defaults`/`DEFAULTS=false` disabled it, or (in tests) when
+    /// `Options` was built via [`parse_args`] rather than real config
+    /// loading.
+    lazy_volumes: Vec<volamos_core::vfs::LazyVolume>,
+    /// Host directories to remove once this run (and any nested runs
+    /// sharing its `VfsConfig`) is over -- the defaults layer's
+    /// ephemeral `RAM:` root. `main` reads this directly after `run`
+    /// returns; see [`volamos_core::vfs::VfsConfig::ephemeral_dirs`]'s
+    /// doc for why cleanup can't just be a `Drop` impl.
+    ephemeral_dirs: Vec<PathBuf>,
 }
 
 impl Options {
-    /// Whether any VFS-related flag was given at all -- if not, `run`
-    /// doesn't install a [`Vfs`] on the [`Runtime`], preserving
-    /// pre-T13 behavior exactly.
+    /// Whether any VFS-related flag or setting was given at all -- if
+    /// not, `run` doesn't install a [`Vfs`] on the [`Runtime`]. Since
+    /// issue #43, `main` unconditionally merges in
+    /// `config::built_in_defaults`'s `SYS:`/`RAM:` layer before
+    /// `resolve` ever builds an `Options` (unless `--no-defaults`/
+    /// `DEFAULTS=false` disabled it), so `self.volumes` is non-empty --
+    /// and this returns `true` -- for an ordinary zero-flag invocation
+    /// too now; pre-T13's original "nothing at all was configured"
+    /// behavior is what `--no-defaults` restores.
     fn wants_vfs(&self) -> bool {
         !self.volumes.is_empty()
             || !self.assigns.is_empty()
@@ -132,7 +157,8 @@ fn print_usage(program_name: &str) {
     eprintln!(
         "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
-         [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
+         [--auto-assign HOSTDIR] [--defaults|--no-defaults] [--volumes-dir HOSTDIR] \
+         [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
          [--fpu|--no-fpu] [--jit|--no-jit] [--net] <program> [args...]"
     );
     eprintln!();
@@ -159,6 +185,24 @@ fn print_usage(program_name: &str) {
     eprintln!("                            (relying on --auto-assign to resolve it)");
     eprintln!("  --auto-assign HOSTDIR     fall back to <HOSTDIR>/NAME for any otherwise");
     eprintln!("                            unknown volume/assign NAME:");
+    eprintln!("  --defaults / --no-defaults");
+    eprintln!(
+        "                            whether the built-in standard-volume defaults (SYS:/RAM:"
+    );
+    eprintln!(
+        "                            and the standard C:/S:/LIBS:/DEVS:/ENVARC:/T:/ENV: assigns"
+    );
+    eprintln!(
+        "                            onto them) apply (default: on). An explicit -V/-a for the"
+    );
+    eprintln!(
+        "                            same NAME: always overrides the matching default, exactly"
+    );
+    eprintln!("                            like any other higher-precedence source");
+    eprintln!("  --volumes-dir HOSTDIR     where the default SYS: volume lives on the host");
+    eprintln!(
+        "                            (default ~/.volamos.d/volumes); ignored with --no-defaults"
+    );
     eprintln!(
         "  --stack SIZE              guest stack size in bytes (default {DEFAULT_STACK_SIZE});"
     );
@@ -198,17 +242,24 @@ fn print_usage(program_name: &str) {
     eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
     eprintln!();
     eprintln!(
-        "If none of -V/-a/--cwd/--auto-assign are given, no volume/assign filesystem is \
-         installed at all: dos.library path-based calls (Open, Lock, Examine, ...) fail \
-         cleanly with an IoErr; Input/Output/PutStr/IoErr/SetIoErr work either way."
+        "By default (see --defaults above), SYS:, C:, S:, LIBS:, DEVS:, ENVARC:, RAM:, T:, and \
+         ENV: all resolve out of the box, backed by empty host directories created only on \
+         first actual use (SYS: persists across runs under --volumes-dir; RAM:/T:/ENV: are a \
+         fresh, per-process temp directory, removed when this run ends). Any other name still \
+         fails cleanly with an IoErr -- a typo isn't silently treated as a new empty volume. \
+         With --no-defaults (or if none of -V/-a/--cwd/--auto-assign/the defaults apply), no \
+         volume/assign filesystem is installed at all: dos.library path-based calls (Open, \
+         Lock, Examine, ...) fail cleanly with an IoErr; Input/Output/PutStr/IoErr/SetIoErr \
+         work either way."
     );
     eprintln!();
     eprintln!(
         "~/.volamos supplies default values for the flags above (KEY=value lines, e.g. \
-         STACK=256K); a .volamos next to <program> (in its own directory) overrides it; a \
-         .volamos in the current directory overrides both; explicit flags on this command \
-         line win over all three. Relative VOLUME/AUTO_ASSIGN paths in a config file \
-         resolve against that file's own directory. See the Configuration page in the docs."
+         STACK=256K, DEFAULTS=false, VOLUMES_DIR=/path); a .volamos next to <program> (in its \
+         own directory) overrides it; a .volamos in the current directory overrides both; \
+         explicit flags on this command line win over all three. Relative VOLUME/AUTO_ASSIGN/ \
+         VOLUMES_DIR paths in a config file resolve against that file's own directory. See the \
+         Configuration page in the docs."
     );
 }
 
@@ -439,6 +490,14 @@ fn parse_args_raw(
             "--jit" => overrides.jit = Some(true),
             "--no-jit" => overrides.jit = Some(false),
             "--net" => overrides.net = Some(true),
+            "--defaults" => overrides.standard_volumes = Some(true),
+            "--no-defaults" => overrides.standard_volumes = Some(false),
+            "--volumes-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--volumes-dir requires a HOSTDIR argument".to_string())?;
+                overrides.volumes_dir = Some(PathBuf::from(value));
+            }
             _ => program = Some(arg),
         }
     }
@@ -467,6 +526,14 @@ fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String
         fpu: overrides.fpu.unwrap_or(false),
         jit: overrides.jit.unwrap_or(false),
         net: overrides.net.unwrap_or(false),
+        // Only ever non-empty when `overrides` already includes
+        // `config::built_in_defaults`'s own layer -- `main` merges that
+        // in before calling `resolve`; `parse_args` (CLI-only, no
+        // config files, no defaults -- see its own doc) never does, so
+        // both are always empty there, matching its "just the flags"
+        // scope.
+        lazy_volumes: overrides.lazy_volumes,
+        ephemeral_dirs: overrides.ephemeral_dirs,
     }
 }
 
@@ -519,6 +586,7 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
         assigns: opts.assigns.clone(),
         auto_assign_root: opts.auto_assign_root.clone(),
         cwd: default_cwd(opts),
+        lazy_volumes: opts.lazy_volumes.clone(),
     })
 }
 
@@ -810,13 +878,40 @@ fn main() -> ExitCode {
         }
     };
 
-    let opts = resolve(
-        config::merge(cli_overrides, file_overrides),
-        program,
-        guest_args,
-    );
+    // Built-in standard-volume defaults (issue #43): merged in at the
+    // very bottom of the precedence chain, below every real config
+    // source, so `DEFAULTS`/`VOLUMES_DIR` (from *any* of cli/cwd/
+    // program-dir/global -- checked on the merged result, not any one
+    // source) can still override whether/where this layer applies.
+    // `built_in_defaults` does no I/O itself (see its own doc) -- the
+    // directories it names are created lazily, by `Vfs`, only if the
+    // guest program actually uses them.
+    let base = config::merge(cli_overrides, file_overrides);
+    let defaults_enabled = base.standard_volumes.unwrap_or(true);
+    let volumes_dir = base.volumes_dir.clone();
+    let merged = if defaults_enabled {
+        config::merge(base, config::built_in_defaults(volumes_dir))
+    } else {
+        base
+    };
 
-    match run(&opts) {
+    let opts = resolve(merged, program, guest_args);
+
+    // Cleanup happens here, once, after `run` (and every nested
+    // System()/Execute() it spawned, all sharing this same
+    // `ephemeral_dirs` list) has completely finished -- not via a
+    // `Drop` impl anywhere -- see `VfsConfig::lazy_volumes`'s doc for
+    // why an early per-Vfs `Drop` would be actively wrong here. This
+    // also has to run *before* the `std::process::exit` below: that
+    // call terminates the process immediately, skipping every pending
+    // destructor on the stack, so relying on a scope guard's `Drop`
+    // here wouldn't fire in time.
+    let result = run(&opts);
+    for dir in &opts.ephemeral_dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    match result {
         Ok(code) => {
             // Guest exit codes are conventionally small (AmigaOS process
             // return codes fit a byte in practice), but D0 is a full
@@ -1263,6 +1358,52 @@ mod tests {
     fn no_jit_flag_after_jit_wins() {
         let opts = parse_args(args(&["--jit", "--no-jit", "prog"])).unwrap();
         assert!(!opts.jit);
+    }
+
+    // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---
+    //
+    // `standard_volumes`/`volumes_dir` are consumed by `main` before
+    // `resolve` ever runs (deciding whether/where to merge in
+    // `config::built_in_defaults`), so they don't surface on `Options`
+    // itself -- these check `parse_args_raw`'s `Overrides` directly,
+    // unlike every test above.
+
+    #[test]
+    fn defaults_flag_sets_standard_volumes_on() {
+        let (overrides, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
+        assert_eq!(overrides.standard_volumes, Some(true));
+    }
+
+    #[test]
+    fn no_defaults_flag_sets_standard_volumes_off() {
+        let (overrides, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
+        assert_eq!(overrides.standard_volumes, Some(false));
+    }
+
+    #[test]
+    fn default_standard_volumes_is_unset() {
+        // Resolved to "on" by `main` (`.unwrap_or(true)`), but the raw
+        // CLI parse itself must report "not specified", so a config
+        // file's own DEFAULTS= can still be told apart from an explicit
+        // --defaults.
+        let (overrides, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        assert_eq!(overrides.standard_volumes, None);
+    }
+
+    #[test]
+    fn volumes_dir_flag_sets_the_override() {
+        let (overrides, _, _) =
+            parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
+        assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
+    }
+
+    #[test]
+    fn volumes_dir_missing_value_is_an_error() {
+        let err = parse_args_raw(args(&["--volumes-dir"])).unwrap_err();
+        assert!(
+            err.contains("--volumes-dir requires"),
+            "unexpected message: {err}"
+        );
     }
 
     // --- attn_flags_for ---

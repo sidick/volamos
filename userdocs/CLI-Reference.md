@@ -108,6 +108,32 @@ reference. See [Volumes and Assigns](Volumes-and-Assigns.md).
 volamos --auto-assign /home/me/amiga-volumes fixtures/hello
 ```
 
+## `--defaults`, `--no-defaults`
+
+Whether the built-in standard-volume defaults (`SYS:`, `RAM:`, and the
+standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:` assigns onto
+them — see [Volumes and Assigns](Volumes-and-Assigns.md#standard-defaults))
+apply at all. On by default; `--no-defaults` turns them off, restoring
+the original "nothing configured means no filesystem at all" behavior:
+
+```sh
+volamos --no-defaults fixtures/hello
+```
+
+An explicit `-V`/`-a` for a name a default would otherwise supply
+always wins — `-V SYS:~/amiga/wb31` shadows the default `SYS:`
+entirely, and its own real `C:`/`Libs:`/etc. come along with it, same
+as a real boot volume.
+
+## `--volumes-dir HOSTDIR`
+
+Overrides where the default `SYS:` volume's host directory lives
+(default `~/.volamos.d/volumes`). Ignored if `--no-defaults` is given.
+
+```sh
+volamos --volumes-dir /var/lib/volamos/volumes fixtures/hello
+```
+
 ## `--stack SIZE`
 
 Overrides the guest stack region's size — default 64 KiB (65536
@@ -243,9 +269,17 @@ volamos --jit fixtures/hello
 
 ## No flags at all
 
-If none of `-V`/`-a`/`--cwd`/`--auto-assign` are given, no volume/assign
+With the [built-in defaults](Volumes-and-Assigns.md#standard-defaults)
+active (the default), `SYS:`, `C:`, `S:`, `LIBS:`, `DEVS:`, `ENVARC:`,
+`RAM:`, `T:`, and `ENV:` all resolve out of the box even with no `-V`/
+`-a`/`--cwd`/`--auto-assign` given — backed by empty host directories
+created only on first actual use, so [Getting Started](Getting-Started.md)'s
+first two examples (which never touch the filesystem at all) leave no
+trace on disk either way. Any other name still fails cleanly with an
+`IoErr()` — a typo isn't silently treated as a new empty volume.
+
+With `--no-defaults`, or if none of the above apply, no volume/assign
 filesystem is installed at all: `dos.library` path-based calls
 (`Open`, `Lock`, `Examine`, ...) fail cleanly with an `IoErr()`, but
 `Input`/`Output`/`PutStr`/`IoErr`/`SetIoErr` (and anything that doesn't
-touch a path) still work — exactly what [Getting Started](Getting-Started.md)'s
-first two examples rely on.
+touch a path) still work.

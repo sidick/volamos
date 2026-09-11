@@ -7,10 +7,14 @@ mounting a device or running `ASSIGN` does on a real Amiga — so a guest
 program's `Open`/`Lock`/`Examine`/etc. calls resolve to real files on
 your machine.
 
-If none of `-V`/`-a`/`--cwd`/`--auto-assign` are given at all, no
-filesystem is installed: path-based calls fail cleanly with an
-`IoErr()`, while everything else (`Input`/`Output`/`PutStr`/...) still
-works — see [Getting Started](Getting-Started.md)'s first two examples.
+volamos also installs a small set of [standard-name
+defaults](#standard-defaults) — `SYS:`, `RAM:`, and the usual assigns
+onto them — automatically, so the common Amiga names resolve to real
+(initially empty) host directories even without any of the above. Only
+`--no-defaults` (or if that layer genuinely has nothing to offer, e.g.
+a name outside that standard set) falls back to installing no
+filesystem at all: path-based calls fail cleanly with an `IoErr()`,
+while everything else (`Input`/`Output`/`PutStr`/...) still works.
 
 ## Amiga path syntax
 
@@ -101,6 +105,45 @@ subdirectories of one fallback root, without needing an explicit
 `-V`/`-a` for each one. This mirrors `vamos`'s own auto-assign
 fallback. Without `--auto-assign` configured, referencing an unknown
 volume/assign name is a clean `IoErr()`, not a crash.
+
+## Standard defaults
+
+Without any config at all, these names already resolve (issue #43):
+
+| Name | Kind | Points at |
+|---|---|---|
+| `SYS:` | volume | `<VOLUMES_DIR>/sys` (default `~/.volamos.d/volumes/sys`) |
+| `C:` | assign | `SYS:C` |
+| `S:` | assign | `SYS:S` |
+| `LIBS:` | assign | `SYS:Libs` |
+| `DEVS:` | assign | `SYS:Devs` |
+| `ENVARC:` | assign | `SYS:Prefs/Env-Archive` |
+| `RAM:` | volume | a fresh, unique, per-process temp directory |
+| `T:` | assign | `RAM:T` |
+| `ENV:` | assign | `RAM:env` |
+
+`SYS:`'s host directory (and its standard `C`/`S`/`Libs`/`Devs`/
+`Prefs/Env-Archive` skeleton) is created on first actual use and
+persists across runs, exactly like an explicit `-V`. `RAM:`'s
+directory is also created lazily, but is unique to this process and
+removed automatically once it exits — never shared between concurrent
+`volamos` instances, and never surviving one.
+
+An explicit `-V`/`-a` for any of these names overrides the matching
+default entirely, the same "higher-precedence source wins" rule as
+`-V`/`-a` against a config file. This is deliberately useful with a
+real Workbench disk image: `-V SYS:~/amiga/wb31` brings that volume's
+*own* real `C:`/`Libs:`/`Devs:`/`S:` along with it automatically,
+since those are assigns that resolve relative to whichever `SYS:` is
+actually configured — the synthetic default skeleton never reappears
+underneath a user-supplied `SYS:`.
+
+Unlike `vamos`'s broader auto-assign machinery (which makes *any* name
+resolve somewhere), only these specific real-AmigaOS names are
+covered: a genuinely unknown or typo'd volume name still fails loudly
+with an `IoErr()`, matching every other case in this page. See
+[CLI Reference](CLI-Reference.md#--defaults---no-defaults) for
+`--defaults`/`--no-defaults`/`--volumes-dir`.
 
 ## Case sensitivity
 

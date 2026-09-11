@@ -248,6 +248,37 @@ fn parse_path(amiga_path: &str) -> Result<ParsedPath, VfsError> {
     }
 }
 
+/// A default-installed volume (issue #43's built-in `SYS:`/`RAM:`
+/// standard-name layer, `crate::config` in the `volamos` binary crate)
+/// whose root host directory -- and, since a fresh empty directory has
+/// none of the standard subdirectories a real AmigaOS assign expects to
+/// find inside it, a set of companion subdirectories too -- is created
+/// on first actual use rather than required to pre-exist. See
+/// [`Vfs::maybe_create_lazy_volume`].
+///
+/// Matched by *exact host path*, not by volume name: a higher-
+/// precedence config layer that maps the same name to a different host
+/// directory (a user's own `-V SYS:~/amiga/wb31`, say) silently opts
+/// this entry out of lazy creation entirely, since
+/// [`Vfs::lookup_volume`]'s first-match-wins lookup never even returns
+/// this root once it's shadowed -- exactly the property that lets a
+/// user's own `VOLUME=SYS:~/amiga/wb31` bring its own real `C:`/
+/// `Libs:`/etc. along (the whole point of routing the standard names as
+/// *assigns onto* `SYS:` rather than as independent default volumes of
+/// their own), instead of volamos's synthetic skeleton silently
+/// reappearing underneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LazyVolume {
+    /// The volume's own root directory.
+    pub root: PathBuf,
+    /// Subdirectories created alongside `root`, at the same moment
+    /// `root` itself is first created -- e.g. `SYS:`'s standard
+    /// `C`/`S`/`Libs`/`Devs`/`Prefs/Env-Archive` skeleton, so an assign
+    /// onto one of them (`C: -> SYS:C`) doesn't fail on a freshly
+    /// created, otherwise still-empty `SYS:`.
+    pub companions: Vec<PathBuf>,
+}
+
 /// Configuration for a [`Vfs`]: volume map, assign map, auto-assign
 /// fallback root, and current directory.
 #[derive(Debug, Clone, Default)]
@@ -265,6 +296,27 @@ pub struct VfsConfig {
     /// auto-assignable volume) — validated when the [`Vfs`] is built
     /// and whenever [`Vfs::set_cwd`] is called.
     pub cwd: String,
+    /// Default volumes (from `crate::config`'s built-in defaults layer
+    /// in the `volamos` binary crate, never from an explicit `-V`/
+    /// config-file `VOLUME`) whose host directories are created on
+    /// first use instead of being required to pre-exist -- see
+    /// [`LazyVolume`]. Always empty for a `VfsConfig` built any other
+    /// way (e.g. every test in this module).
+    ///
+    /// A *lazily*-created default volume's root can also be
+    /// *ephemeral* (removed once the run is over -- `RAM:`'s own
+    /// per-process temp directory), but that bookkeeping isn't kept
+    /// here: this `Vfs`/`VfsConfig` never itself does the removing (a
+    /// nested `System()`/`Execute()` run builds its *own* `Vfs` from a
+    /// cloned `VfsConfig` naming the very same ephemeral path -- so a
+    /// nested guest's `RAM:` is the parent's `RAM:`, matching real
+    /// single-machine semantics -- and an early `Drop` when that nested
+    /// `Vfs` goes out of scope would delete the directory out from
+    /// under the still-running parent). Cleanup is instead the
+    /// top-level caller's own job, once, after every nested run has
+    /// finished, tracked independently in `crate::Options::
+    /// ephemeral_dirs` in the `volamos` binary crate -- see its doc.
+    pub lazy_volumes: Vec<LazyVolume>,
 }
 
 /// Result of [`Vfs::resolve_with_amiga_path`]: a resolved host path plus
@@ -567,7 +619,7 @@ impl Vfs {
                 name: name.to_string(),
             });
         }
-        if let Some(dir) = self.lookup_volume(name) {
+        if let Some(dir) = self.lookup_volume_path(name) {
             return Ok(dir);
         }
         if let Some(targets) = self.lookup_assign(name) {
@@ -614,12 +666,56 @@ impl Vfs {
         name.to_string()
     }
 
-    fn lookup_volume(&self, name: &str) -> Option<PathBuf> {
+    /// Pure lookup: `name`'s configured host directory, if any -- no
+    /// side effects. Used for validation-only lookups (cwd soundness
+    /// checking via [`Self::host_dir_for_name`]) that must never touch
+    /// the host filesystem just because a cwd happens to name a lazy
+    /// default volume -- see [`Self::lookup_volume`], the side-
+    /// effecting version real path resolution uses instead.
+    fn lookup_volume_path(&self, name: &str) -> Option<PathBuf> {
         self.config
             .volumes
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, dir)| dir.clone())
+    }
+
+    /// As [`Self::lookup_volume_path`], but also lazily creates the
+    /// directory if `name` resolves to one of [`VfsConfig::lazy_volumes`]'s
+    /// own roots (see [`Self::maybe_create_lazy_volume`]). This is what
+    /// every *real* path resolution (`assign_targets`, and so
+    /// everything built on it) uses -- constructing a `Vfs` or merely
+    /// `cd`ing into a lazy volume must not touch the host, only an
+    /// actual file operation against it should.
+    fn lookup_volume(&self, name: &str) -> Option<PathBuf> {
+        let dir = self.lookup_volume_path(name)?;
+        self.maybe_create_lazy_volume(&dir);
+        Some(dir)
+    }
+
+    /// If `dir` is exactly one of [`VfsConfig::lazy_volumes`]'s own
+    /// roots and doesn't exist on the host yet, creates it -- and its
+    /// companion subdirectories -- now. Best-effort: a creation failure
+    /// here isn't reported (there's no `IoErr()`-shaped error channel
+    /// at this layer, and [`Self::lookup_volume`] must still return the
+    /// path either way), it just means the caller's *own* subsequent
+    /// real filesystem operation (the `read_dir`/`metadata` this lookup
+    /// was for) fails with its own, perfectly ordinary `IoErr()`
+    /// instead -- exactly as if the directory had gone missing for any
+    /// other reason.
+    fn maybe_create_lazy_volume(&self, dir: &Path) {
+        let Some(lazy) = self.config.lazy_volumes.iter().find(|lv| lv.root == dir) else {
+            return;
+        };
+        if lazy.root.exists() {
+            return;
+        }
+        if fs::create_dir_all(&lazy.root).is_err() {
+            return;
+        }
+        for companion in &lazy.companions {
+            let _ = fs::create_dir_all(companion);
+        }
     }
 
     fn lookup_assign(&self, name: &str) -> Option<Vec<String>> {
@@ -874,6 +970,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .expect("build vfs")
     }
@@ -1050,6 +1147,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         };
         config.cwd = "SYS:work".to_string();
         let vfs = Vfs::new(config).unwrap();
@@ -1067,6 +1165,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:work".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs.resolve("sub/bar.txt", ResolveMode::MustExist).unwrap();
@@ -1085,6 +1184,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:work".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs.resolve(":root.txt", ResolveMode::MustExist).unwrap();
@@ -1152,6 +1252,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:work/sub".to_string(),
+            ..Default::default()
         })
         .unwrap();
         // "/sibling.txt" from cwd work/sub: leading '/' pops once (to
@@ -1229,6 +1330,7 @@ mod tests {
             assigns: vec![("LIBS".to_string(), vec!["SYS:libs".to_string()])],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs
@@ -1251,6 +1353,7 @@ mod tests {
             )],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         // Not in libsA, found in libsB: search order matters.
@@ -1275,6 +1378,7 @@ mod tests {
             )],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs
@@ -1296,6 +1400,7 @@ mod tests {
             )],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs
@@ -1317,6 +1422,7 @@ mod tests {
             ],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs
@@ -1336,6 +1442,7 @@ mod tests {
             ],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let err = vfs.resolve("A:x", ResolveMode::MustExist).unwrap_err();
@@ -1355,6 +1462,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: Some(auto_root.clone()),
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs.resolve("T:scratch", ResolveMode::MustExist).unwrap();
@@ -1371,6 +1479,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: Some(auto_root),
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .unwrap();
         let resolved = vfs.resolve("SYS:real.txt", ResolveMode::MustExist).unwrap();
@@ -1494,6 +1603,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "OUTER:".to_string(),
+            ..Default::default()
         })
         .expect("build vfs");
         assert_eq!(
@@ -1553,11 +1663,125 @@ mod tests {
             assigns: vec![("Data".to_string(), vec!["SYS:stuff".to_string()])],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .expect("build vfs");
         let resolved = vfs
             .resolve_with_amiga_path("DATA:", ResolveMode::MustExist)
             .unwrap();
         assert_eq!(resolved.amiga_path, "Data:");
+    }
+
+    // --- lazy volumes (issue #43) ---
+
+    #[test]
+    fn lazy_volume_root_is_created_on_first_resolve() {
+        let tmp = TempDir::new("lazy-root");
+        let sys_root = tmp.path().join("sys");
+        assert!(!sys_root.exists(), "must not exist before any resolve");
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), sys_root.clone())],
+            cwd: "SYS:".to_string(),
+            lazy_volumes: vec![LazyVolume {
+                root: sys_root.clone(),
+                companions: vec![],
+            }],
+            ..Default::default()
+        })
+        .expect("build vfs -- cwd validation doesn't require the dir to exist yet");
+        assert!(
+            !sys_root.exists(),
+            "building the Vfs alone must not touch the host -- lazy, not eager"
+        );
+        vfs.resolve("SYS:", ResolveMode::MustExist)
+            .expect("resolving the volume root should succeed once created");
+        assert!(sys_root.is_dir(), "should now exist");
+    }
+
+    #[test]
+    fn lazy_volume_companions_are_created_alongside_the_root() {
+        let tmp = TempDir::new("lazy-companions");
+        let sys_root = tmp.path().join("sys");
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), sys_root.clone())],
+            assigns: vec![("C".to_string(), vec!["SYS:C".to_string()])],
+            cwd: "SYS:".to_string(),
+            lazy_volumes: vec![LazyVolume {
+                root: sys_root.clone(),
+                companions: vec![sys_root.join("C"), sys_root.join("Libs")],
+            }],
+            ..Default::default()
+        })
+        .expect("build vfs");
+        // Resolving the C: assign is what triggers SYS:'s root (and so
+        // its companions) to be created -- SYS:C didn't exist as a real
+        // on-disk entry a moment ago, so an ordinary (non-lazy) resolve
+        // would have failed here.
+        let resolved = vfs
+            .resolve("C:", ResolveMode::MustExist)
+            .expect("the C companion should already be there once SYS: is touched");
+        assert_eq!(resolved, sys_root.join("C"));
+        assert!(
+            sys_root.join("Libs").is_dir(),
+            "every companion is created together, not just the one actually referenced"
+        );
+    }
+
+    #[test]
+    fn lazy_volume_is_not_recreated_once_it_exists() {
+        let tmp = TempDir::new("lazy-idempotent");
+        let sys_root = tmp.mkdir("sys");
+        // Put something in it, so we can tell a second "creation" from
+        // a no-op: create_dir_all on an existing dir is itself already
+        // a no-op, but this also guards against a hypothetical future
+        // change that clobbers the directory instead of leaving it.
+        fs::write(sys_root.join("marker.txt"), b"x").unwrap();
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), sys_root.clone())],
+            cwd: "SYS:".to_string(),
+            lazy_volumes: vec![LazyVolume {
+                root: sys_root.clone(),
+                companions: vec![],
+            }],
+            ..Default::default()
+        })
+        .expect("build vfs");
+        vfs.resolve("SYS:", ResolveMode::MustExist).unwrap();
+        assert!(sys_root.join("marker.txt").exists());
+    }
+
+    #[test]
+    fn a_volume_overriding_the_same_name_is_never_treated_as_lazy() {
+        // The core property the design relies on: if a higher-
+        // precedence config layer maps SYS: to a *different* host
+        // directory than the one `lazy_volumes` names, lookup_volume's
+        // first-match-wins semantics mean the lazy entry is never even
+        // consulted -- so the user's own (real, pre-existing) directory
+        // is never auto-created into and never wrongly treated as
+        // ephemeral.
+        let tmp = TempDir::new("lazy-overridden");
+        let real_sys = tmp.mkdir("real-sys");
+        let default_sys = tmp.path().join("default-sys"); // never created
+        let vfs = Vfs::new(VfsConfig {
+            // Higher-precedence entry first, matching config::merge's
+            // "higher ++ lower" convention.
+            volumes: vec![
+                ("SYS".to_string(), real_sys.clone()),
+                ("SYS".to_string(), default_sys.clone()),
+            ],
+            cwd: "SYS:".to_string(),
+            lazy_volumes: vec![LazyVolume {
+                root: default_sys.clone(),
+                companions: vec![],
+            }],
+            ..Default::default()
+        })
+        .expect("build vfs");
+        let resolved = vfs.resolve("SYS:", ResolveMode::MustExist).unwrap();
+        assert_eq!(resolved, real_sys, "the user's own mapping wins");
+        assert!(
+            !default_sys.exists(),
+            "the shadowed default entry must never be created"
+        );
     }
 }
