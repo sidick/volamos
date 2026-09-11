@@ -57,12 +57,14 @@
 //! `Execute()` run (see [`run_nested_program`]) reuses the same CPU
 //! configuration as the top-level run, same as `--stack`.
 //!
-//! `~/.volamos` and a `.volamos` in the current directory supply
-//! default values for all of the above (except `<program>`/
-//! `[args...]` themselves) so a repeated-use project doesn't need to
+//! `~/.volamos`, a `.volamos` next to the launched binary, and a
+//! `.volamos` in the current directory supply default values for all
+//! of the above (except `<program>`/`[args...]` themselves) so a
+//! repeated-use project or self-contained toolchain doesn't need to
 //! retype them -- explicit flags on the command line always win, then
-//! the local file, then the global one -- see [`config`]'s module doc
-//! for the exact grammar and merge semantics.
+//! the cwd file, then the program-directory file, then the global one
+//! -- see [`config`]'s module doc for the exact grammar and merge
+//! semantics.
 
 mod config;
 
@@ -203,8 +205,10 @@ fn print_usage(program_name: &str) {
     eprintln!();
     eprintln!(
         "~/.volamos supplies default values for the flags above (KEY=value lines, e.g. \
-         STACK=256K); a .volamos in the current directory overrides it; explicit flags on \
-         this command line win over both. See the Configuration page in the docs."
+         STACK=256K); a .volamos next to <program> (in its own directory) overrides it; a \
+         .volamos in the current directory overrides both; explicit flags on this command \
+         line win over all three. Relative VOLUME/AUTO_ASSIGN paths in a config file \
+         resolve against that file's own directory. See the Configuration page in the docs."
     );
 }
 
@@ -798,7 +802,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let file_overrides = match config::load_all() {
+    let file_overrides = match config::load_all(&program) {
         Ok(overrides) => overrides,
         Err(msg) => {
             eprintln!("volamos: {msg}");

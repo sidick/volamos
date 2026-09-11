@@ -5,6 +5,17 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Program-directory config file** (issue #16): a `.volamos` next to
+  the launched binary (in `<program>`'s own containing directory) is
+  now consulted between `./.volamos` and `~/.volamos`, so a toolchain
+  installation can carry its own volume/CPU settings and be invoked
+  from anywhere. **Behavior change**: relative `VOLUME`/`AUTO_ASSIGN`
+  paths in *any* config file now resolve against that file's own
+  directory instead of volamos's process working directory — an
+  existing `~/.volamos` or `./.volamos` using relative paths resolves
+  differently if its directory isn't where you invoke volamos from
+  (CLI-supplied relative paths are unchanged). See
+  [Configuration](Configuration.md).
 - **Parent-step (`a//b`) fidelity**: a parent step that climbs above
   the volume root now fails like a missing object instead of being
   clamped at the root — the root has no parent, matching real FFS

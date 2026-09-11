@@ -4224,3 +4224,37 @@ volamos`, using the workflow's own `GITHUB_TOKEN` (no new secret
 needed for same-repo GHCR publishing). Filed issue #25 as an explicit
 follow-up (standalone per-arch binary zips on the GitHub Release, for
 users who don't want Docker) rather than folding it into this scope.
+
+## Issue #16 implemented: program-directory `.volamos` + config-file-relative paths — 2026-09-11
+
+Config precedence gains a third file source, per the issue's decided
+design: `CLI > ./.volamos (cwd) > <program-dir>/.volamos > ~/.volamos
+> built-in default`. The new source is the `.volamos` in the launched
+binary's own containing directory, so a toolchain installation (the
+motivating case: SAS/C's multi-volume `SC:`/`LIB:`/`INCLUDE:` layout)
+is self-contained and invocable from any cwd. A bare `<program>` name
+with no directory part contributes no separate source (its directory
+*is* the cwd, already covered at higher precedence), and the same
+physical file named by two sources (cwd == program dir, or either ==
+`$HOME`) is loaded once at its highest precedence, compared by
+canonicalized path -- this dedup also fixes the pre-existing
+double-load when cwd == `$HOME`, which used to duplicate `VOLUME`/
+`ASSIGN` entries harmlessly-but-uglily through the concatenating
+merge.
+
+**Behavior change** (issue comment's uniform-rule decision): relative
+`VOLUME`/`AUTO_ASSIGN` host paths in *every* config file now resolve
+against the file's own directory (`config::load` re-anchors them right
+after parse), not the process cwd. CLI-supplied relative paths are
+untouched. For `./.volamos` the two rules coincide; for `~/.volamos`
+they differ, flagged in the user-facing changelog.
+
+**Implementation**: `config.rs` only -- `program_dir_path`,
+`anchor_relative_host_paths`, and `load_all` (now taking `<program>`)
+delegating to an environment-free `load_candidates` core so the
+three-layer precedence and dedup are directly unit-testable with temp
+files, no `$HOME`/cwd manipulation. The existing `merge` chain is
+reused unchanged, exactly as the issue's notes predicted. 7 new tests
+(precedence sandwich, dedup, anchoring, bare-name case); help text,
+`config.rs`/`main.rs` module docs, and the userdocs Configuration page
+updated.
