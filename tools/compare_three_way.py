@@ -10,7 +10,10 @@ Hyperion-copyrighted AmigaOS media (via a pre-built AmiBake `os3.1.4`
 corpus -- see below) and a real Kickstart ROM image, both proprietary
 and neither ever committed to this repo. See `docs/plan.md`'s
 2026-08-19 "the three-way Copperline comparison stays local-only"
-decision.
+decision. See also `tools/compare_amitools_suite.py`, a different
+local-only two-oracle harness (volamos vs. `vamos` again, no Copperline
+involved) built the same way for the same reason -- an external,
+never-bundled corpus, this time amitools' own GPLv2 `test/bin`.
 
 ## Prerequisites (all external to this repo, never fetched by this
 ## script)
