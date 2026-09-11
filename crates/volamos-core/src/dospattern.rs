@@ -312,7 +312,7 @@ const C_CLASS_END: u8 = 0x8A;
 /// class member is written without one.
 const C_RANGE_DASH: u8 = 0x8B;
 
-fn encode(node: &Node, out: &mut Vec<u8>) {
+pub(crate) fn encode(node: &Node, out: &mut Vec<u8>) {
     match node {
         Node::Literal(c) => out.push(*c),
         Node::Any => out.push(C_ANY),
@@ -550,8 +550,9 @@ fn decode(buf: &[u8], pos: &mut usize) -> Option<Node> {
 
 /// Same decoding as [`decode`], but reading directly from guest memory
 /// at `*addr` (advancing it past the node, including the terminating
-/// `0x00`) rather than a pre-fetched byte slice.
-fn decode_from_mem(mem: &dyn AddressSpace, addr: &mut u32) -> Option<Node> {
+/// `0x00`) rather than a pre-fetched byte slice. Also used by
+/// [`crate::dosexall`] to decode an `eac_MatchString` pattern.
+pub(crate) fn decode_from_mem(mem: &dyn AddressSpace, addr: &mut u32) -> Option<Node> {
     let mut stream = Stream::new(MemSource { mem, addr: *addr });
     let (node, _) = decode_seq(&mut stream)?;
     *addr = stream.src.addr;

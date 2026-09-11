@@ -1263,16 +1263,23 @@ fn get_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
-/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- the only `AllocDosObject`
-/// `type` this runtime implements (see [`alloc_dos_object_handler`]'s
-/// doc for why). The other four documented types (`DOS_FILEHANDLE` 0,
-/// `DOS_EXALLCONTROL` 1, `DOS_FIB` 2, `DOS_STDPKT` 3, `DOS_CLI` 4)
-/// aren't -- `DOS_FILEHANDLE`/`DOS_CLI` in particular would need real
-/// integration with this runtime's own `FileHandle`/`pr_CLI`
-/// bookkeeping to be genuinely usable, not just a same-shaped zeroed
-/// block, so a real implementation of those is deferred until a corpus
-/// binary actually needs one.
+/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- one of the two
+/// `AllocDosObject` `type`s this runtime implements (see
+/// [`alloc_dos_object_handler`]'s doc for why). The other three
+/// documented types (`DOS_FILEHANDLE` 0, `DOS_FIB` 2, `DOS_STDPKT` 3,
+/// `DOS_CLI` 4) aren't -- `DOS_FILEHANDLE`/`DOS_CLI` in particular
+/// would need real integration with this runtime's own `FileHandle`/
+/// `pr_CLI` bookkeeping to be genuinely usable, not just a same-shaped
+/// zeroed block, so a real implementation of those is deferred until a
+/// corpus binary actually needs one.
 const DOS_RDARGS: u32 = 5;
+/// `DOS_EXALLCONTROL` (1): the `struct ExAllControl` that `ExAll`
+/// requires to be allocated through `AllocDosObject` (see
+/// [`crate::dosexall`]'s module docs). Like [`DOS_RDARGS`], real
+/// `AllocDosObject`'s treatment is just a zeroed block of the struct's
+/// size -- `eac_LastKey == 0` is exactly the required
+/// before-the-first-`ExAll`-call state.
+const DOS_EXALLCONTROL: u32 = 1;
 /// `sizeof(struct RDArgs)` per `<dos/rdargs.h>`: `RDA_Source` (a
 /// `struct CSource`: `CS_Buffer`/`CS_Length`/`CS_CurChr`, 4 each = 12)
 /// plus `RDA_DAList`/`RDA_Buffer`/`RDA_BufSiz`/`RDA_ExtHelp`/
@@ -1289,36 +1296,45 @@ const RDARGS_STRUCT_SIZE: u32 = 32;
 /// want `RDA_ExtHelp`, fills in whatever fields it needs itself
 /// afterward) -- so `tags` is accepted but never read here, matching
 /// real behavior for this specific type exactly rather than only
-/// approximating it. Every other `type` fails loudly (see
-/// [`DOS_RDARGS`]'s doc) rather than silently returning a
-/// same-shaped-but-non-functional block. Found needed running the
-/// real `AmiSnap` binary, which calls `AllocDosObject(DOS_RDARGS,
-/// NULL)` to build the `RDArgs` its own `ReadArgs()` call needs.
+/// approximating it. [`DOS_EXALLCONTROL`] is the same shape of case: a
+/// zeroed `sizeof(struct ExAllControl)` block. Every other `type`
+/// fails loudly (see [`DOS_RDARGS`]'s doc) rather than silently
+/// returning a same-shaped-but-non-functional block. Found needed
+/// running the real `AmiSnap` binary, which calls
+/// `AllocDosObject(DOS_RDARGS, NULL)` to build the `RDArgs` its own
+/// `ReadArgs()` call needs.
 fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let object_type = ctx.cpu.data_register(DataRegister(1));
 
-    if object_type != DOS_RDARGS {
-        return Err(DispatchError::HandlerFailed {
-            library: "dos.library".to_string(),
-            lvo: -228,
-            handler_name: "AllocDosObject".to_string(),
-            message: format!(
-                "AllocDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) is \
-                 implemented -- see DOS_RDARGS's doc for why the other types aren't"
-            ),
-        });
-    }
+    let struct_size = match object_type {
+        DOS_RDARGS => RDARGS_STRUCT_SIZE,
+        DOS_EXALLCONTROL => crate::dosexall::EXALLCONTROL_SIZE,
+        _ => {
+            return Err(DispatchError::HandlerFailed {
+                library: "dos.library".to_string(),
+                lvo: -228,
+                handler_name: "AllocDosObject".to_string(),
+                message: format!(
+                    "AllocDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) and \
+                     DOS_EXALLCONTROL ({DOS_EXALLCONTROL}) are implemented -- see DOS_RDARGS's \
+                     doc for why the other types aren't"
+                ),
+            });
+        }
+    };
 
     let addr = ctx
         .heap
-        .alloc(RDARGS_STRUCT_SIZE)
+        .alloc(struct_size)
         .map_err(|e| DispatchError::HandlerFailed {
             library: "dos.library".to_string(),
             lvo: -228,
             handler_name: "AllocDosObject".to_string(),
-            message: format!("AllocDosObject(DOS_RDARGS): guest heap allocation failed: {e}"),
+            message: format!(
+                "AllocDosObject(type={object_type}): guest heap allocation failed: {e}"
+            ),
         })?;
-    for i in 0..RDARGS_STRUCT_SIZE {
+    for i in 0..struct_size {
         ctx.mem.write_u8(addr.wrapping_add(i), 0);
     }
     ctx.cpu.set_data_register(DataRegister(0), addr);
@@ -1326,7 +1342,7 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
 }
 
 /// `FreeDosObject` (`D1` = `type`, `D2` = the object). No return value.
-/// Frees a [`DOS_RDARGS`] block allocated by
+/// Frees a [`DOS_RDARGS`] or [`DOS_EXALLCONTROL`] block allocated by
 /// [`alloc_dos_object_handler`]; a `NULL` object is a documented-legal
 /// no-op (matches every other free-half-of-a-pair convention in this
 /// runtime, e.g. `crate::execmem`'s `FreeVec`). Any other `type`
@@ -1339,14 +1355,15 @@ fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         return Ok(());
     }
 
-    if object_type != DOS_RDARGS {
+    if object_type != DOS_RDARGS && object_type != DOS_EXALLCONTROL {
         return Err(DispatchError::HandlerFailed {
             library: "dos.library".to_string(),
             lvo: -234,
             handler_name: "FreeDosObject".to_string(),
             message: format!(
-                "FreeDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) is \
-                 implemented -- see DOS_RDARGS's doc for why the other types aren't"
+                "FreeDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) and \
+                 DOS_EXALLCONTROL ({DOS_EXALLCONTROL}) are implemented -- see DOS_RDARGS's doc \
+                 for why the other types aren't"
             ),
         });
     }
@@ -1359,7 +1376,7 @@ fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
             handler_name: "FreeDosObject".to_string(),
             message: format!(
                 "FreeDosObject called on {addr:#010x}, which isn't a currently-live \
-             AllocDosObject(DOS_RDARGS) allocation (never allocated, already freed, or not an \
+             AllocDosObject allocation (never allocated, already freed, or not an \
              AllocDosObject pointer at all): {e}"
             ),
         })
