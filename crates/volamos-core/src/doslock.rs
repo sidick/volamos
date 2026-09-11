@@ -964,6 +964,7 @@ mod tests {
             assigns: vec![],
             auto_assign_root: None,
             cwd: "SYS:".to_string(),
+            ..Default::default()
         })
         .expect("build vfs")
     }
@@ -1730,6 +1731,60 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn end_to_end_lock_and_examine_against_a_lazy_default_volume_creates_it() {
+        // Full-pipeline coverage for issue #43: a guest program's own
+        // Lock/Examine calls against a lazy default volume (built by
+        // `crate::config::built_in_defaults` in the real `volamos`
+        // binary; reproduced here directly via VfsConfig) create the
+        // directory through real trap dispatch, exactly like every
+        // other Lock/Examine end-to-end test in this module.
+        let tmp = TempDir::new("e2e-lazy-default");
+        let sys_root = tmp.path().join("sys"); // does not exist yet
+        let name = b"SYS:\0\0\0\0"; // padded so what follows stays aligned
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = "SYS:" (patched)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32);
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = BPTR
+        words.push(0x2200); // move.l d0,d1 (lock for Examine)
+        push_move_imm_to_d(&mut words, 2, 0x10000); // D2 = fib buffer
+        push_jsr(&mut words, 6, -102); // Examine(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, None);
+        rt.set_vfs(
+            Vfs::new(VfsConfig {
+                volumes: vec![("SYS".to_string(), sys_root.clone())],
+                cwd: "SYS:".to_string(),
+                lazy_volumes: vec![crate::vfs::LazyVolume {
+                    root: sys_root.clone(),
+                    companions: vec![],
+                }],
+                ..Default::default()
+            })
+            .expect("cwd validation must not require sys_root to exist yet"),
+        );
+        assert!(
+            !sys_root.exists(),
+            "constructing/installing the Vfs alone must not touch the host"
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32, "Lock+Examine should both succeed");
+        assert!(
+            sys_root.is_dir(),
+            "SYS: should have been created by the guest's own Lock() call"
+        );
     }
 
     #[test]

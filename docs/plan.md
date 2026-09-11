@@ -4258,3 +4258,84 @@ reused unchanged, exactly as the issue's notes predicted. 7 new tests
 (precedence sandwich, dedup, anchoring, bare-name case); help text,
 `config.rs`/`main.rs` module docs, and the userdocs Configuration page
 updated.
+
+## Issue #43 implemented: built-in standard-volume defaults (SYS:/RAM: and their assigns), lazy directory creation — 2026-09-11
+
+Filed after a user report (`volamos dos_examine_gcc sys:` -> `can't
+Lock(): 'sys:'`) turned out to be correct behavior for zero `-V` flags,
+but surprising precisely because vamos auto-creates `sys:` (via a
+`system:?create` volume plus a `sys:system:` assign,
+`amitools/vamos/path/mgr.py`) with zero config. Rather than copying
+vamos's broader auto-assign machinery (which makes *any* name resolve
+somewhere, silently hiding a typo'd volume), this installs a curated
+set of exactly the names real AmigaOS itself defines -- `SYS:`, `RAM:`,
+and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
+assigns onto them -- expressed as a fourth, lowest-precedence
+`Overrides` layer under #16's chain (`CLI > cwd file > program-dir file
+> global file > built-in defaults`).
+
+**Lazy, not eager**: `crate::config::built_in_defaults` does zero I/O
+itself -- it only *names* paths (including deciding `RAM:`'s unique
+per-process temp directory up front, since that decision has to happen
+exactly once regardless of whether the guest ever uses it). The actual
+`mkdir_all` happens inside `volamos_core::vfs::Vfs::lookup_volume`,
+triggered on the very first real resolve against a
+`VfsConfig::lazy_volumes` entry -- so `volamos hello` (a program that
+never touches the filesystem) leaves `~/.volamos.d` untouched,
+empirically verified with a fake `$HOME`. Getting this right needed
+splitting `lookup_volume` into a pure `lookup_volume_path` (used by cwd
+validation in `Vfs::new`/`set_cwd`, which must not eagerly create a
+directory just because the *default* cwd happens to be `SYS:`) and the
+side-effecting `lookup_volume` (used by real path resolution via
+`assign_targets`) -- an easy trap to fall into, since `Vfs::new`'s own
+cwd-soundness check routes through the same volume-lookup code as
+everything else.
+
+**Companion subdirectories**: a freshly-created, empty `SYS:` has none
+of the subdirectories its own standard assigns (`C:` -> `SYS:C`, etc.)
+expect to find inside it -- `LazyVolume` bundles a root with a fixed
+set of companion paths created alongside it in one shot, so `Lock("C:")`
+against a brand-new `SYS:` doesn't fail on a missing `SYS:C`. Same
+mechanism gives `RAM:` its `T`/`env` subdirectories.
+
+**Override-shadowing falls out for free**: `LazyVolume`/lazy-creation
+match by *exact host path*, not by volume name, and `config::merge`'s
+existing "higher ++ lower, first-match-wins" semantics mean a user's
+own `-V SYS:~/amiga/wb31` is what `lookup_volume` actually returns --
+the default entry (further down the `Vec`) is never even consulted, so
+it's neither auto-created into nor (for `RAM:`) ever wrongly treated as
+ephemeral cleanup fodder.
+
+**Ephemeral cleanup is deliberately not a `Drop` impl**: a nested
+`System()`/`Execute()` run builds its own `Vfs` from a *cloned*
+`VfsConfig` naming the same `RAM:` path (correct -- nested guests share
+`RAM:`, matching real single-machine semantics), so an early `Drop`
+when that nested `Vfs` goes out of scope would delete the directory out
+from under the still-running parent. Cleanup is instead
+`main.rs`'s own explicit job, once, right after the top-level `run()`
+call returns and before `std::process::exit` (which skips pending
+destructors entirely, so a scope-guard `Drop` wouldn't have fired in
+time anyway).
+
+**`RAM:` uniqueness**: pid + a nanosecond timestamp (no new
+dependency), matching vamos's own `tempfile.mkdtemp`-based approach for
+the identical concurrent-instance-safety reason (a fixed/shared `RAM:`
+would let one instance's normal-exit cleanup delete a sibling's live
+files).
+
+New: `volamos_core::vfs::LazyVolume`, `VfsConfig::lazy_volumes`;
+`crate::config::built_in_defaults`/`default_volumes_dir`/
+`unique_ram_dir`; `--defaults`/`--no-defaults`/`--volumes-dir` CLI
+flags and `DEFAULTS`/`VOLUMES_DIR` config keys. 4 new `vfs.rs` unit
+tests (root creation, companions, idempotency, override-shadowing), 1
+full-trap-dispatch end-to-end test in `doslock.rs` (real Lock/Examine
+against a lazy volume through the CPU), 5 `config.rs` unit tests for
+`built_in_defaults`'s exact structure, 2 CLI-flag tests, 2 real-binary
+`hello_cli.rs` tests (zero-touch property, `--no-defaults` opt-out).
+Manually reproduced the original bug report's exact command
+end-to-end against a real built release binary and a fake `$HOME`,
+confirming both the fix (`Examine: SYS` / `<DIR> C` / `<DIR> Devs` /
+... / `ok`) and that `--no-defaults` reproduces the original error
+verbatim. Help text, module docs, and three userdocs pages
+(Volumes-and-Assigns, CLI-Reference, Configuration) updated;
+Changelog flags the new default-on behavior clearly.
