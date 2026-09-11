@@ -145,10 +145,11 @@ const FIB_COMMENT_OFFSET: u32 = 144;
 /// `fib_DirEntryType`/`fib_EntryType` for a directory (positive; the
 /// exact positive value is only ever compared `> 0` by real callers, `2`
 /// matches what real AmigaOS filesystems commonly report for a
-/// subdirectory).
-const ENTRY_TYPE_DIR: i32 = 2;
+/// subdirectory). Also `ed_Type` in [`crate::dosexall`]'s `ExAllData`
+/// entries.
+pub(crate) const ENTRY_TYPE_DIR: i32 = 2;
 /// `fib_DirEntryType`/`fib_EntryType` for a plain file.
-const ENTRY_TYPE_FILE: i32 = -3;
+pub(crate) const ENTRY_TYPE_FILE: i32 = -3;
 
 /// Bytes per block used to compute `fib_NumBlocks` from a file's size
 /// (`ceil(size / BLOCK_SIZE)`); AmigaOS filesystems commonly use 512-byte
@@ -534,15 +535,7 @@ impl DosState {
         fill_fib(mem, fib_addr, &display_name, is_dir, size, &host_path);
 
         if is_dir {
-            let mut names = Vec::new();
-            for dirent in std::fs::read_dir(&host_path).map_err(|e| map_io_error(&e))? {
-                let dirent = dirent.map_err(|e| map_io_error(&e))?;
-                let name = dirent.file_name().to_string_lossy().into_owned();
-                if !dosmeta::is_sidecar_name(&name) {
-                    names.push(name);
-                }
-            }
-            names.sort();
+            let names = sorted_dir_entries(&host_path)?;
             self.exnext.insert(
                 addr,
                 ExNextState {
@@ -590,6 +583,25 @@ impl DosState {
         fill_fib(mem, fib_addr, &name, is_dir, size, &entry_path);
         Ok(())
     }
+}
+
+/// The directory entry names at `host_path`, sorted byte-wise for
+/// deterministic (parity-run-stable) enumeration order, with `.uaem`
+/// sidecar files ([`crate::dosmeta`]) filtered out. The shared listing
+/// behind both `Examine`'s `ExNext` iterator state and
+/// [`crate::dosexall`]'s `ExAll` scans, so the two directory-listing
+/// calls always agree on order and contents.
+pub(crate) fn sorted_dir_entries(host_path: &Path) -> Result<Vec<String>, i32> {
+    let mut names = Vec::new();
+    for dirent in std::fs::read_dir(host_path).map_err(|e| map_io_error(&e))? {
+        let dirent = dirent.map_err(|e| map_io_error(&e))?;
+        let name = dirent.file_name().to_string_lossy().into_owned();
+        if !dosmeta::is_sidecar_name(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// The "own name" of a lock's target, for `Examine`: the last component

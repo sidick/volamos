@@ -21,6 +21,7 @@ pub mod dosdate;
 pub mod dosdatestr;
 pub mod dosdevlist;
 pub mod dosdevproc;
+pub mod dosexall;
 pub mod dosfault;
 pub mod dosfile;
 pub mod dosfs;

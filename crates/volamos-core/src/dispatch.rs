@@ -1928,6 +1928,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // no-Vfs-required posture as register_dos_handlers above.
         crate::doslock::register_lock_handlers(&mut table, &mut mem);
 
+        // dos.library ExAll/ExAllEnd (the batched directory scanner
+        // libnix's readdir() is built on) -- see crate::dosexall's
+        // module docs. Same posture as register_lock_handlers above.
+        crate::dosexall::register_dosexall_handlers(&mut table, &mut mem);
+
         // dos.library LoadSeg/UnLoadSeg + System()/Execute (Phase 3 stage
         // 7): real BPTR seglist loading into guest memory, and a
         // host-runner-hook-based System()/Execute -- see

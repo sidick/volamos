@@ -3,6 +3,18 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## Unreleased
+
+- **`ExAll`/`ExAllEnd`**: the batched directory scanner libnix's
+  `readdir()` (and so most gcc-built programs that scan a directory)
+  is built on, including continuation across calls via `eac_LastKey`,
+  `eac_MatchString` pattern filtering, all `ED_NAME`..`ED_OWNER`
+  entry levels, and `AllocDosObject`/`FreeDosObject` support for
+  `DOS_EXALLCONTROL`. Before this, `ExAll` was an unhandled call, so
+  every directory looked empty to `readdir()`-based programs. Mirrors
+  [amitools PR #8](https://github.com/AmigaPorts/amitools/pull/8),
+  which added the same to vamos.
+
 ## 0.3
 
 - **Interpreter and release-build performance**: `FlatMemory`'s

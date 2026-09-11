@@ -13,7 +13,7 @@ gap, not a bug in your program, and worth filing an issue for.
 - File I/O: `Open`/`Read`/`Write`/`Seek`/`Close`, `Input`/`Output`,
   `IoErr`/`SetIoErr`.
 - Locks and directory traversal: `Lock`/`UnLock`/`DupLock`/`Examine`/
-  `ExNext`/`CurrentDir`/`ParentDir`/`SameLock`.
+  `ExNext`/`ExAll`/`ExAllEnd`/`CurrentDir`/`ParentDir`/`SameLock`.
 - Pattern matching: `MatchFirst`/`MatchNext`/`MatchEnd`/`ParsePattern`/
   `MatchPattern`(`NoCase`).
 - Argument parsing: `ReadArgs`/`FreeArgs` (the standard `ReadArgs`
@@ -22,7 +22,7 @@ gap, not a bug in your program, and worth filing an issue for.
   real, directory-mapped `ENV:` volume.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`.
 - Process/CLI: `Cli`/`GetProgramName`/`MaxCli`/`AllocDosObject`/
-  `FreeDosObject` (`DOS_RDARGS` only).
+  `FreeDosObject` (`DOS_RDARGS` and `DOS_EXALLCONTROL`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
   `SystemTagList`/`System`/`Execute` for tools that shell out to
