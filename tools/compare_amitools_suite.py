@@ -60,25 +60,45 @@ so for a case where volamos and `vamos` disagree and the `.txt` file
 sides with `vamos`, that's still really just "agrees with vamos", one
 data point, not two.
 
-## Corpus (initial; see this module's own "explicitly deferred" note in
-## `docs/plan.md`'s matching entry for what's intentionally not here yet
-## -- companion-binary-building entries, other compiler flavors, and CI
-## promotion)
+## Corpus (14 entries so far; see this module's own "explicitly
+## deferred" note in `docs/plan.md`'s matching entry for what's
+## intentionally not here yet -- companion-binary-building entries,
+## other compiler flavors, and CI promotion)
 
-The first run against this initial 5-entry corpus already found three
-real volamos bugs (issues #45, #46, #47 -- all still visible `FAIL`s
-below, `KNOWN_DIVERGENCES` is reserved for divergences attributed to
-`vamos`, not for volamos's own unfixed ones) and two things needing
-further investigation (#48, #49) -- concrete evidence this corpus finds
-things volamos's own ~6 fixtures don't.
+Two runs against this corpus so far have found four real volamos bugs
+(issues #45, #46, #47, #53 -- all still visible `FAIL`s below,
+`KNOWN_DIVERGENCES` is reserved for divergences attributed to `vamos`,
+not for volamos's own unfixed ones), one missing feature (#55,
+`FindArg` not implemented), and four things needing further
+investigation or attributed to `vamos` itself (#48, #49, #51, #52) --
+concrete evidence this corpus finds things volamos's own ~6 fixtures
+don't.
 
 - `dos_match`: `MatchFirst`/`MatchNext`/`ap_Buf` via a real `AnchorPath`
   scan of a scratch `SYS:` -- exercises `crate::dosanchor`.
 - `dos_seek`: `Open(MODE_NEWFILE)`/`Write`/`Seek`/`Read`/`IoErr` round
   trip against a scratch `TEST:` volume -- fully self-contained (the
   program creates its own file).
-- `util_date`, `vprintf`, `exec_rawdofmt`: no volume needed at all;
-  compared three-way against their checked-in `test/data/*.txt`.
+- `dos_examine`: `Lock`/`Examine`/`ExNext` against a scratch `TEST:`
+  subdirectory (order-tolerant, matching `test/suite/dos_examine.py`'s
+  own "either ExNext order" acceptance).
+- `dos_findarg`: `dos.library/FindArg` -- not implemented yet (#55).
+- `util_date`, `vprintf`, `exec_rawdofmt`, `dos_stdout`, `util_muldiv`,
+  `exec_copymem`, `math_double`, `math_double_trans`, `math_fast`,
+  `math_fast_trans`: no volume needed at all; the `math_*`/`util_date`/
+  `vprintf`/`exec_rawdofmt` entries compare three-way against their
+  checked-in `test/data/*.txt`.
+
+Explicitly **not** added despite being self-contained: `test_hello`/
+`test_raise` (they call `vamostest.library`, a `vamos`-only internal
+testing/debugging library with no real-AmigaOS counterpart -- there is
+nothing for volamos to implement here, this isn't a gap) and
+`exec_initstruct` (`InitStruct()`'s byte-code interpreter is a real
+gap, but volamos's own `execlib.rs` already documents it as deferred
+to a later phase -- not a quick add) and `math_single`/
+`math_single_trans` (need `mathieeesingbas.library`/
+`mathieeesingtrans.library`, which volamos doesn't implement at all;
+same "real gap, not a quick add" reasoning).
 """
 
 from __future__ import annotations
@@ -115,6 +135,33 @@ KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
         "real-hardware (Copperline) verification, not assumed either way.",
         "https://github.com/sidick/volamos/issues/48",
     ),
+    "dos_stdout": (
+        "WriteChars(msg, sizeof(msg)) legitimately includes the trailing "
+        "NUL sizeof() adds for a string-literal-initialized array; "
+        "WriteChars's own NDK autodoc documents a plain raw byte-count "
+        "write with no NUL special-casing. volamos writes it verbatim; "
+        "vamos's captured output drops everything from the NUL onward.",
+        "https://github.com/sidick/volamos/issues/54",
+    ),
+    "math_double": (
+        "%x hex-digit-case (issue #48) accounts for most of this; the "
+        "rest is IEEEDPCeil() losing the sign of a negative-zero result "
+        "in vamos (issue #51, volamos matches the correct IEEE-754 "
+        "sign-of-zero-through-ceil rule) and a NaN sign-bit convention "
+        "difference for 0/0 and similar (issue #52, genuinely uncertain "
+        "which side -- if either -- matches real hardware).",
+        "https://github.com/sidick/volamos/issues/48, "
+        "https://github.com/sidick/volamos/issues/51, "
+        "https://github.com/sidick/volamos/issues/52",
+    ),
+    "math_double_trans": (
+        "%x hex-digit-case (issue #48) accounts for most of this; the "
+        "rest is the same NaN sign-bit convention question as "
+        "math_double's div0/div1 (issue #52), here showing up in "
+        "acos/asin/log's domain-error results.",
+        "https://github.com/sidick/volamos/issues/48, "
+        "https://github.com/sidick/volamos/issues/52",
+    ),
 }
 
 
@@ -140,6 +187,12 @@ class Entry:
     # KNOWN_DIVERGENCES is reserved for vamos's own divergences). Purely
     # informational: printed alongside the FAIL, doesn't suppress it.
     tracking_issue: str | None = None
+    # Applied to volamos's, vamos's, and `expected`'s own line lists
+    # before comparing -- for output whose real AmigaOS ordering isn't
+    # guaranteed (e.g. an ExNext directory listing), matching
+    # compare_vamos.py's own `dirtest` normalization. `None` (the
+    # default) compares lines exactly as produced, in order.
+    normalize: Callable[[list[str]], list[str]] | None = None
 
 
 def setup_dos_match(tmpdir: Path) -> list[str]:
@@ -152,6 +205,20 @@ def setup_dos_match(tmpdir: Path) -> list[str]:
     for name in ("c", "devs", "libs", "s", "t"):
         (sys_dir / name).mkdir(parents=True)
     return ["-V", f"SYS:{sys_dir}"]
+
+
+def setup_dos_examine(tmpdir: Path) -> list[str]:
+    """A scratch `TEST:` volume with a `bla` subdirectory containing
+    exactly `test/suite/dos_examine.py`'s own fixture: a 14-byte file
+    `foo` ("hello, world!\\n") and an empty directory `bar` -- `bla`
+    itself (not the volume root) is what gets Locked/Examined, so
+    `fib_FileName` reports "bla", matching the real test's own
+    expectation."""
+    bla = tmpdir / "bla"
+    bla.mkdir()
+    (bla / "foo").write_text("hello, world!\n")
+    (bla / "bar").mkdir()
+    return ["-V", f"TEST:{tmpdir}"]
 
 
 def setup_dos_seek(tmpdir: Path) -> list[str]:
@@ -204,6 +271,67 @@ CORPUS = [
         setup=None,
         data_file="exec_rawdofmt.txt",
         tracking_issue="https://github.com/sidick/volamos/issues/45",
+    ),
+    Entry(
+        name="dos_examine",
+        guest_args=["TEST:bla"],
+        setup=setup_dos_examine,
+        # test/suite/dos_examine.py itself accepts either ExNext order
+        # ("foo then bar" or "bar then foo" -- real AmigaOS ExNext
+        # ordering isn't guaranteed), so this is compared sorted, same
+        # normalization compare_vamos.py's own dirtest entry uses.
+        expected=["Examine: bla", "   14 foo", "<DIR> bar", "ok"],
+        normalize=sorted,
+    ),
+    Entry(
+        name="dos_findarg",
+        guest_args=[],
+        setup=None,
+        # dos.library/FindArg's own NDK autodoc confirms these are the
+        # real, documented results (abbreviation/multi-keyword lookup
+        # in a ReadArgs-style template) -- not just "whatever this test
+        # happened to observe". volamos doesn't implement FindArg at
+        # all yet (unhandled-library-call, empty stdout, exit 1).
+        expected=[
+            "FindArg(a=b/k,a)=0  == 0  ok",
+            "FindArg(a=b/k,b)=0  == 0  ok",
+            "FindArg(a=b/k,c)=-1  == -1  ok",
+            "FindArg(hello/k,world/m,world)=1  == 1  ok",
+        ],
+        tracking_issue="https://github.com/sidick/volamos/issues/55",
+    ),
+    Entry(
+        name="dos_stdout",
+        guest_args=[],
+        setup=None,
+        expected=["Hello, world!?", "Hello, world!?"],
+    ),
+    Entry(name="util_muldiv", guest_args=[], setup=None, data_file="util_muldiv.txt"),
+    Entry(name="exec_copymem", guest_args=[], setup=None, expected=[]),
+    Entry(name="math_double", guest_args=[], setup=None, data_file="math_double.txt"),
+    Entry(
+        name="math_double_trans",
+        guest_args=[],
+        setup=None,
+        data_file="math_double_trans.txt",
+    ),
+    Entry(
+        name="math_fast",
+        guest_args=[],
+        setup=None,
+        data_file="math_fast.txt",
+        # Far more than hex-case noise -- ~50 of 84 lines differ in
+        # actual value (e.g. fix1 -- should be 0x3e8 -- returns 0
+        # entirely). Left as a visible FAIL, not KNOWN_DIVERGENCES:
+        # this is very plausibly a real volamos gap, not vamos's.
+        tracking_issue="https://github.com/sidick/volamos/issues/53",
+    ),
+    Entry(
+        name="math_fast_trans",
+        guest_args=[],
+        setup=None,
+        data_file="math_fast_trans.txt",
+        tracking_issue="https://github.com/sidick/volamos/issues/53",
     ),
 ]
 
@@ -270,6 +398,12 @@ def main() -> int:
         ground_truth = entry.expected
         if ground_truth is None and entry.data_file is not None:
             ground_truth = load_data_file(checkout, entry.data_file)
+
+        if entry.normalize is not None:
+            vol_lines = entry.normalize(vol_lines)
+            vam_lines = entry.normalize(vam_lines)
+            if ground_truth is not None:
+                ground_truth = entry.normalize(ground_truth)
 
         mismatches = []
         if vol_lines != vam_lines or vol_code != vam_code:

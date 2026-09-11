@@ -4400,3 +4400,53 @@ real args) or another toolchain, the `sc`/`vc`/`agcc` flavor sweep, and
 CI promotion (plausible later -- amitools itself isn't proprietary the
 way AmiBake/Kickstart are -- but starts local-only for the same
 prove-it-out-by-hand discipline `compare_three_way.py` used).
+
+## Expanded the amitools corpus harness, found 5 more issues (#51-#55) — 2026-09-11
+
+Added the "straightforward" batch identified from the full 34-test
+`test/suite` inventory: `dos_examine`, `dos_findarg`, `dos_stdout`,
+`util_muldiv`, `exec_copymem`, `math_double`, `math_double_trans`,
+`math_fast`, `math_fast_trans` (9 new entries, 14 total). Explicitly
+skipped `test_hello`/`test_raise` (call `vamostest.library`, a
+`vamos`-only internal testing library with no real-AmigaOS counterpart
+at all -- not a gap, just out of scope), `exec_initstruct`
+(`InitStruct()`'s byte-code interpreter is a real but already-known,
+already-deferred gap per `execlib.rs`'s own docs), and
+`math_single`/`math_single_trans` (need `mathieeesingbas.library`/
+`mathieeesingtrans.library`, entirely unimplemented -- same "real gap,
+not a quick add" reasoning).
+
+Found:
+
+- **Issue #51** (vamos's own divergence): `IEEEDPCeil()` of a small
+  negative number should yield `-0.0` (IEEE-754's sign-of-zero rule);
+  volamos preserves the sign, vamos returns `+0.0`.
+- **Issue #52** (needs real-hardware verification): the qNaN sign bit
+  for domain-error results (`0/0`, `acos`/`asin` outside `[-1,1]`,
+  `log` of a negative number) is consistently opposite between the two
+  engines -- IEEE-754 doesn't mandate a specific sign here, so unlike
+  every other finding this needs a real hardware check to resolve.
+- **Issue #53** (likely real volamos gap, large in scope): `math_fast`/
+  `math_fast_trans` (single-precision `mathffp.library`/
+  `mathtrans.library`) diverge on the *majority* of their output lines,
+  not just formatting -- e.g. a simple `fix1` (float-to-int of a known
+  value) returns `0` in volamos where it should be `0x3e8` (1000).
+  Left as a visible `FAIL`, flagged for a dedicated follow-up
+  investigation (likely the FFP encode/decode itself, not a one-line
+  fix) rather than triaged item-by-item here.
+- **Issue #54** (vamos's own divergence): `WriteChars(msg,
+  sizeof(msg))` legitimately writes a trailing `NUL` byte (`sizeof()`
+  includes the string literal's implicit terminator); volamos writes
+  it verbatim per `WriteChars`'s own "raw byte count, no NUL
+  special-casing" NDK contract, vamos's captured output drops it.
+- **Issue #55** (missing feature): `dos.library/FindArg` isn't
+  implemented at all -- unhandled-library-call. NDK autodoc read and
+  cited in the issue for whoever picks it up; `dosargs.rs`'s existing
+  `ReadArgs` template parser looks reusable for it.
+
+`KNOWN_DIVERGENCES` now covers `util_date`/`vprintf`/`dos_stdout`/
+`math_double`/`math_double_trans` (all vamos-attributed or
+genuinely-uncertain, per the harness's own established convention);
+`dos_match`/`dos_seek`/`exec_rawdofmt`/`dos_findarg`/`math_fast`/
+`math_fast_trans` stay visible `FAIL`s, each with a `tracking_issue`
+link, since they represent real volamos-side gaps.
