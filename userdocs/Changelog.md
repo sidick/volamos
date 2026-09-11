@@ -5,6 +5,16 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Parent-step (`a//b`) fidelity**: a parent step that climbs above
+  the volume root now fails like a missing object instead of being
+  clamped at the root — the root has no parent, matching real FFS
+  behavior as verified in
+  [amitools PR #7](https://github.com/AmigaPorts/amitools/pull/7)'s
+  writeup (vamos made the same change there). Lock names reported back
+  to the guest (`NameFromLock()`) now also carry the volume/assign
+  name in its *configured* spelling (`Lock("sys:foo")` names itself
+  `SYS:foo`), completing the canonical-path treatment their components
+  already got (parent steps collapsed, on-disk case).
 - **`ExAll`/`ExAllEnd`**: the batched directory scanner libnix's
   `readdir()` (and so most gcc-built programs that scan a directory)
   is built on, including continuation across calls via `eac_LastKey`,

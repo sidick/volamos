@@ -28,7 +28,13 @@ An Amiga path is `[Vol:]component[/component...]`:
   non-empty component — pops one level, i.e. means "parent directory".
   This is the real AmigaOS convention: `/` plays the role Unix gives to
   `..`, so `Vol:a/b//c` means `Vol:a/c` (from `a/b`, `//` pops back up
-  to `a`, then descends into `c`).
+  to `a`, then descends into `c`). A step that climbs *above* the
+  volume root fails like a missing object — the root has no parent
+  (verified against a real FFS partition in
+  [amitools PR #7](https://github.com/AmigaPorts/amitools/pull/7)'s
+  writeup). Paths reported back to the guest (`NameFromLock()` and
+  friends) are canonical: parent steps collapsed, and the volume/assign
+  name in its configured spelling.
 
 ## Mapping a volume directly: `-V`
 

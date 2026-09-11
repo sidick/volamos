@@ -25,7 +25,9 @@
 //!   plays the role Unix gives to `..`, so `Vol:a/b//c` means `Vol:a/c`
 //!   (from `a/b`, `//` pops back up to `a`, then descends into `c`), and
 //!   `Vol:a//` / `Vol:a/..` (Amiga doesn't have `..`) means the parent of
-//!   `Vol:a`.
+//!   `Vol:a`. A step that climbs *above* the volume root fails like a
+//!   missing object -- the root has no parent (verified on a real FFS
+//!   partition in amitools PR #7's writeup; see [`apply_parent_pops`]).
 //!
 //! # Volumes, assigns, and auto-assign
 //!
@@ -97,7 +99,10 @@ pub enum ResolveMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsError {
     /// A required path component (or the whole target, under
-    /// [`ResolveMode::MustExist`]) doesn't exist on the host.
+    /// [`ResolveMode::MustExist`]) doesn't exist on the host. Also the
+    /// error for a parent step (`/`) that climbs above the volume root
+    /// -- the root has no parent, so a real filesystem's lookup fails
+    /// exactly like a missing object (see [`apply_parent_pops`]).
     NotFound {
         /// The full Amiga path that was being resolved.
         amiga_path: String,
@@ -122,7 +127,7 @@ pub enum VfsError {
         name: String,
     },
     /// The Amiga path syntax itself is malformed (e.g. more than one
-    /// `:`), or an attempt was made to pop above the volume root.
+    /// `:`).
     InvalidPath {
         /// A human-readable description of what was wrong.
         reason: String,
@@ -483,17 +488,22 @@ impl Vfs {
     /// Determine the leading volume/assign name for a parsed path,
     /// falling back to the cwd's volume for a bare leading `:` or a
     /// fully relative path share the same starting point: the cwd's
-    /// leading name.
+    /// leading name. The returned name uses the *configured* spelling
+    /// (via [`Self::canonical_name_spelling`]), not the caller's, so a
+    /// lock's reconstructed `amiga_path` -- what `NameFromLock` reports
+    /// -- carries the canonical name the way real dos.library does
+    /// (`Lock("sys:foo")` names itself `SYS:foo`), matching the
+    /// on-disk-case treatment its path components already get.
     fn leading_name(&self, parsed: &ParsedPath, amiga_path: &str) -> Result<String, VfsError> {
         match &parsed.volume {
-            Some(name) if !name.is_empty() => Ok(name.clone()),
+            Some(name) if !name.is_empty() => Ok(self.canonical_name_spelling(name)),
             _ => {
                 // Either "no ':' at all" (relative) or "bare ':'"
                 // (root of current volume): both start from the cwd's
                 // leading name.
                 let cwd_parsed = parse_path(&self.config.cwd)?;
                 match cwd_parsed.volume {
-                    Some(name) if !name.is_empty() => Ok(name),
+                    Some(name) if !name.is_empty() => Ok(self.canonical_name_spelling(&name)),
                     _ => Err(VfsError::InvalidPath {
                         reason: format!(
                             "cannot resolve '{amiga_path}': current directory '{}' has no volume",
@@ -578,6 +588,32 @@ impl Vfs {
         })
     }
 
+    /// The configured spelling of a volume/assign name (volumes first,
+    /// then assigns, matching the lookup order used for resolution),
+    /// or `name` unchanged if it matches neither -- an auto-assign name
+    /// keeps the caller's spelling, since its host directory is named
+    /// by exactly that spelling and there's no configured form to
+    /// prefer.
+    fn canonical_name_spelling(&self, name: &str) -> String {
+        if let Some((configured, _)) = self
+            .config
+            .volumes
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            return configured.clone();
+        }
+        if let Some((configured, _)) = self
+            .config
+            .assigns
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            return configured.clone();
+        }
+        name.to_string()
+    }
+
     fn lookup_volume(&self, name: &str) -> Option<PathBuf> {
         self.config
             .volumes
@@ -638,18 +674,26 @@ impl Vfs {
 /// Apply `Parent` (pop-one-level) components against a flat list of
 /// preceding `Named` components, producing the final list of named
 /// segments to walk from the volume/assign root. Popping past the root
-/// (more `Parent`s than preceding `Named`s) is clamped at the root
-/// rather than treated as an error, matching AmigaOS/vamos leniency.
+/// (more `Parent`s than preceding `Named`s) is an error: the volume
+/// root has no parent, so a real filesystem's lookup rejects the path
+/// (verified on a real FFS partition in amitools PR #7's writeup --
+/// vamos rejects it the same way since that change; an earlier version
+/// of this function clamped at the root instead, which let paths
+/// resolve that error out on the real OS).
 fn apply_parent_pops(
     components: &[Component],
-    _original_path: &str,
+    original_path: &str,
 ) -> Result<Vec<String>, VfsError> {
     let mut stack: Vec<String> = Vec::new();
     for c in components {
         match c {
             Component::Named(name) => stack.push(name.clone()),
             Component::Parent => {
-                stack.pop();
+                if stack.pop().is_none() {
+                    return Err(VfsError::NotFound {
+                        amiga_path: original_path.to_string(),
+                    });
+                }
             }
         }
     }
@@ -1061,14 +1105,41 @@ mod tests {
     }
 
     #[test]
-    fn leading_slash_after_colon_pops_from_root_clamped() {
-        let tmp = TempDir::new("clamp");
+    fn parent_step_above_volume_root_is_rejected() {
+        let tmp = TempDir::new("above-root");
         tmp.mkdir("a");
         let vfs = simple_vfs(tmp.path());
-        // Popping above the volume root clamps at the root rather than
-        // erroring (AmigaOS/vamos leniency).
-        let resolved = vfs.resolve("SYS:/a", ResolveMode::MustExist).unwrap();
-        assert_eq!(resolved, tmp.path().join("a"));
+        // The volume root has no parent, so a step above it fails like
+        // a missing object -- real-FFS-verified in amitools PR #7 (an
+        // earlier version of this runtime clamped at the root instead,
+        // letting "SYS:/a" resolve to SYS:a).
+        for path in ["SYS:/a", "SYS:/", "SYS://"] {
+            let err = vfs.resolve(path, ResolveMode::MustExist);
+            assert!(
+                matches!(err, Err(VfsError::NotFound { .. })),
+                "{path} climbs above the root and must fail, got {err:?}"
+            );
+        }
+        // The boundary case: "SYS:a//" pops exactly back to the volume
+        // root itself, which is fine -- only going *above* it fails.
+        let resolved = vfs.resolve("SYS:a//", ResolveMode::MustExist).unwrap();
+        assert_eq!(resolved, tmp.path());
+    }
+
+    #[test]
+    fn parent_step_two_levels_matches_real_ffs_example() {
+        // The shape verified on a real FFS partition in amitools PR #7:
+        // `WB3.1:Libs/Picasso96///Devs/Networks` lists
+        // `WB3.1:Devs/Networks` -- two parent steps from two levels
+        // deep land back at the volume root.
+        let tmp = TempDir::new("ffs-example");
+        tmp.mkdir("Libs/Picasso96");
+        tmp.mkdir("Devs/Networks");
+        let vfs = simple_vfs(tmp.path());
+        let resolved = vfs
+            .resolve("SYS:Libs/Picasso96///Devs/Networks", ResolveMode::MustExist)
+            .unwrap();
+        assert_eq!(resolved, tmp.path().join("Devs/Networks"));
     }
 
     #[test]
@@ -1438,5 +1509,55 @@ mod tests {
         let elsewhere = TempDir::new("progdir-elsewhere");
         let vfs = simple_vfs(tmp.path());
         assert_eq!(vfs.amiga_path_for_host_dir(elsewhere.path()), None);
+    }
+
+    // --- canonical lock names (amitools PR #7 parity) ---
+
+    #[test]
+    fn resolved_amiga_path_collapses_parent_steps() {
+        // What NameFromLock reports must be the canonical path, not the
+        // spelling the lock was created with: real dos.library reports
+        // "WB3.1:Devs/Networks" for a lock taken via
+        // "WB3.1:Libs/Picasso96///Devs/Networks" (amitools PR #7's
+        // real-FFS example).
+        let tmp = TempDir::new("canonical-steps");
+        tmp.mkdir("Libs/Picasso96");
+        tmp.mkdir("Devs/Networks");
+        let vfs = simple_vfs(tmp.path());
+        let resolved = vfs
+            .resolve_with_amiga_path("SYS:Libs/Picasso96///Devs/Networks", ResolveMode::MustExist)
+            .unwrap();
+        assert_eq!(resolved.amiga_path, "SYS:Devs/Networks");
+    }
+
+    #[test]
+    fn resolved_amiga_path_uses_the_configured_volume_spelling() {
+        let tmp = TempDir::new("canonical-vol");
+        tmp.mkdir("Work");
+        let vfs = simple_vfs(tmp.path());
+        let resolved = vfs
+            .resolve_with_amiga_path("sys:work", ResolveMode::MustExist)
+            .unwrap();
+        assert_eq!(
+            resolved.amiga_path, "SYS:Work",
+            "both the volume name (configured spelling) and the component (on-disk case) canonicalize"
+        );
+    }
+
+    #[test]
+    fn resolved_amiga_path_uses_the_configured_assign_spelling() {
+        let tmp = TempDir::new("canonical-assign");
+        tmp.mkdir("stuff");
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), tmp.path().to_path_buf())],
+            assigns: vec![("Data".to_string(), vec!["SYS:stuff".to_string()])],
+            auto_assign_root: None,
+            cwd: "SYS:".to_string(),
+        })
+        .expect("build vfs");
+        let resolved = vfs
+            .resolve_with_amiga_path("DATA:", ResolveMode::MustExist)
+            .unwrap();
+        assert_eq!(resolved.amiga_path, "Data:");
     }
 }
