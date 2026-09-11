@@ -2,11 +2,14 @@
 
 Typing out the same `-V`/`-a`/`--cwd`/`--stack`/etc. flags on every
 invocation for a given project gets old fast. `~/.volamos` supplies
-default values for volamos's own flags; a `.volamos` file in the
-current directory overrides it for per-project settings; an explicit
-flag on the command line always wins over both. Neither file can
-choose *what to run* — `<program>`/`[args...]` are never config-file
-settable, only the scaffolding flags around them.
+default values for volamos's own flags; a `.volamos` file next to the
+binary being launched (in `<program>`'s own containing directory)
+overrides it, so a toolchain installation can carry its own settings;
+a `.volamos` file in the current directory overrides both for
+per-project settings; an explicit flag on the command line always
+wins over all three. No config file can choose *what to run* —
+`<program>`/`[args...]` are never config-file settable, only the
+scaffolding flags around them.
 
 ## Grammar
 
@@ -50,19 +53,53 @@ giving `-V`/`-a` more than once. Every other key is **singular**: if
 the same key appears more than once in one file, the last line wins
 (the same rule repeating a CLI flag already follows).
 
-Relative `VOLUME`/`AUTO_ASSIGN` host directories resolve against
-volamos's own process working directory, exactly like a CLI-supplied
-relative path — *not* against the config file's own location. Prefer
-absolute paths in `~/.volamos` for anything meant to work regardless
-of where volamos is invoked from.
+Relative `VOLUME`/`AUTO_ASSIGN` host directories in a config file
+resolve against **the config file's own directory**, not against
+wherever volamos happens to be invoked from. A self-contained
+toolchain's `.volamos` can therefore say `VOLUME=LIB:lib` and mean
+"the `lib` subdirectory next to me" for every caller. (A relative path
+given on the command line still resolves against the process working
+directory, like any CLI path. For a `./.volamos` the two rules give
+the same answer; for `~/.volamos` this rule means relative paths
+resolve against your home directory.)
+
+## The program-directory `.volamos`
+
+A `.volamos` in the launched binary's own containing directory is
+consulted between the current-directory file and `~/.volamos`. This
+makes a toolchain installation fully self-contained and invocable from
+anywhere — for example, with SAS/C installed under `~/amiga/sasc` and
+this next to its binaries:
+
+```
+# ~/amiga/sasc/c/.volamos
+VOLUME=SC:..
+VOLUME=LIB:../lib
+VOLUME=INCLUDE:../include
+CPU=68020
+```
+
+`volamos ~/amiga/sasc/c/sc hello.c` picks these up regardless of your
+shell's own current directory (the relative paths resolve against
+`~/amiga/sasc/c`, the file's directory). A bare program name with no
+directory part (`volamos sc`) has no separate program-directory file —
+its directory *is* the current directory, which the higher-precedence
+`./.volamos` already covers. If two sources name the same physical
+file (e.g. you `cd` into the toolchain directory itself), it's loaded
+once, at the higher precedence.
 
 ## Precedence
 
 For `CWD`/`AUTO_ASSIGN`/`STACK`/`RAM`/`CPU`/`FPU`/`JIT`/`VERBOSE`/`SNOOP`:
 
 ```
-command-line flag  >  ./.volamos  >  ~/.volamos  >  built-in default
+command-line flag  >  ./.volamos  >  <program-dir>/.volamos  >  ~/.volamos  >  built-in default
 ```
+
+The program-directory file sits *below* `./.volamos` so a
+project-local override still beats a toolchain's own defaults, and
+*above* `~/.volamos` so a blanket home-directory preference can't
+silently override what a toolchain declares it needs.
 
 For `VOLUME`/`ASSIGN`: entries from every source all apply — nothing
 is silently dropped — but where the **same `NAME:`** appears in more
