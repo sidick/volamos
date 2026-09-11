@@ -1580,6 +1580,40 @@ mod tests {
         assert_ne!(relative_bptr, 0);
     }
 
+    #[test]
+    fn name_from_lock_reports_the_canonical_path_for_parent_steps() {
+        // A lock created via a path with AmigaDOS parent steps ('//')
+        // and a lowercase volume spelling must report the canonical
+        // path, the way real NameFromLock does (amitools PR #7's
+        // real-FFS observation: dos.library gives "WB3.1:Devs/Networks"
+        // no matter how the lock's path spelled it).
+        let tmp = TempDir::new("namefromlock-canonical");
+        fs::create_dir_all(tmp.path().join("work/sub")).unwrap();
+        fs::create_dir(tmp.path().join("work/other")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "sys:work/sub//other", SHARED_LOCK)
+            .expect("parent step mid-path should resolve");
+        let addr = addr_from_bptr(bptr);
+        assert_eq!(dos.name_from_lock(addr).unwrap(), "SYS:work/other");
+    }
+
+    #[test]
+    fn lock_above_the_volume_root_fails_like_a_missing_object() {
+        let tmp = TempDir::new("lock-above-root");
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos
+            .lock(&mut heap, &mut mem, "SYS:/a", SHARED_LOCK)
+            .unwrap_err();
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+    }
+
     // --- End-to-end tests through Runtime, mirroring dosfile.rs's style ---
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
