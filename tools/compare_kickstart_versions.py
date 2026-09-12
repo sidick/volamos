@@ -3,13 +3,30 @@
 fixture corpus (`fixtures/*`, hand-authored, MIT/Apache-licensed --
 unlike `compare_amitools_suite.py`'s GPL corpus or
 `compare_three_way.py`'s proprietary AmiBake corpus) against every real
-Kickstart ROM found in `assets/*.rom` via Copperline's `copperhf.device`
+Kickstart ROM found in `assets/*.rom`, plus Copperline's bundled AROS
+(see "The `aros` oracle" below), all via Copperline's `copperhf.device`
 (`[copperhf]`), plus `volamos` itself as a baseline oracle.
 
 **Local-only, never CI** -- like `compare_three_way.py`, this needs real
 Kickstart ROM images, Hyperion-copyrighted and never committed to this
 repo (see `assets/README.md`). `assets/*.rom` is gitignored; nothing
-here fetches or vendors a ROM.
+here fetches or vendors a ROM. The `aros` oracle is the one exception --
+see below.
+
+## The `aros` oracle
+
+Copperline ships its own AROS open-source Kickstart replacement built
+in, used automatically whenever a config omits `rom = ...` entirely
+(Copperline's own example config: "Omit this field ... to boot the
+bundled AROS ... Kickstart replacement, which ships with Copperline as
+the default boot ROM"). `discover_roms` always includes an `"aros"`
+entry mapped to `None`; `run_copperline` treats `rom=None` as "write no
+`rom = ...` line at all". Unlike every other oracle here, this one
+needs no file under `assets/` and has no redistribution question at all
+-- AROS is APL 1.1 (MPL-derived, free/open), unlike the real
+Hyperion-copyrighted ROMs -- so it's the one oracle in this harness that
+would still run on a completely clean checkout. See issue #60's own
+case for including it as a "zero-setup" oracle.
 
 ## Why this harness, distinct from `compare_three_way.py`
 
@@ -174,8 +191,19 @@ def skip_reason(label: str) -> str | None:
     return None
 
 
-def discover_roms(explicit: dict[str, str]) -> dict[str, Path]:
-    roms = {path.stem: path for path in sorted(ASSETS.glob("*.rom"))}
+def discover_roms(explicit: dict[str, str]) -> dict[str, Path | None]:
+    # "aros" is always available with no file at all: Copperline ships
+    # its own AROS open-source Kickstart replacement built in, used
+    # whenever a config omits `rom = ...` entirely (its own example
+    # config: "Omit this field ... to boot the bundled AROS ...
+    # Kickstart replacement, which ships with Copperline as the default
+    # boot ROM"). As a free/open reimplementation (APL 1.1, unlike the
+    # real Hyperion-copyrighted ROMs) it's this harness's one oracle
+    # that needs nothing under assets/ at all -- see issue #60's own
+    # case for including it. `--rom aros=PATH` can still override this
+    # with an explicit AROS build if ever needed.
+    roms: dict[str, Path | None] = {"aros": None}
+    roms.update({path.stem: path for path in sorted(ASSETS.glob("*.rom"))})
     roms.update({label: Path(path).resolve() for label, path in explicit.items()})
     return roms
 
@@ -200,7 +228,7 @@ def copperhf_startup_sequence(fixture: str, args: list[str]) -> str:
 def run_copperline(
     copperline_bin: str,
     copperline_ctl_bin: str,
-    rom: Path,
+    rom: Path | None,
     fixture: str,
     args: list[str],
     timeout_seconds: int = 60,
@@ -230,8 +258,9 @@ def run_copperline(
 
         config_path = Path(tmp) / "copperline.toml"
         info_path = Path(tmp) / "control-info.json"
+        rom_line = f'rom = "{rom}"\n\n' if rom is not None else ""
         config_path.write_text(
-            f'rom = "{rom}"\n\n'
+            f"{rom_line}"
             f"[cpu]\n"
             f'model = "68020"\n'
             f"fpu = true\n\n"
