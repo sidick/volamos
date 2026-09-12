@@ -101,9 +101,9 @@ noise) are the only entries still a tracked `FAIL` below.
 - `dos_findarg`: `dos.library/FindArg` -- implemented (#55, fixed).
 - `util_date`, `vprintf`, `exec_rawdofmt`, `dos_stdout`, `util_muldiv`,
   `exec_copymem`, `math_double`, `math_double_trans`, `math_fast`,
-  `math_fast_trans`: no volume needed at all; the `math_*`/`util_date`/
-  `vprintf`/`exec_rawdofmt` entries compare three-way against their
-  checked-in `test/data/*.txt`.
+  `math_fast_trans`, `math_single`, `math_single_trans`: no volume
+  needed at all; the `math_*`/`util_date`/`vprintf`/`exec_rawdofmt`
+  entries compare three-way against their checked-in `test/data/*.txt`.
 
 Explicitly **not** added despite being self-contained: `test_hello`/
 `test_raise` (they call `vamostest.library`, a `vamos`-only internal
@@ -111,10 +111,17 @@ testing/debugging library with no real-AmigaOS counterpart -- there is
 nothing for volamos to implement here, this isn't a gap) and
 `exec_initstruct` (`InitStruct()`'s byte-code interpreter is a real
 gap, but volamos's own `execlib.rs` already documents it as deferred
-to a later phase -- not a quick add) and `math_single`/
-`math_single_trans` (need `mathieeesingbas.library`/
-`mathieeesingtrans.library`, which volamos doesn't implement at all;
-same "real gap, not a quick add" reasoning).
+to a later phase -- not a quick add).
+
+`math_single`/`math_single_trans` (`mathieeesingbas.library`/
+`mathieeesingtrans.library`) were the same kind of deferred gap until
+implemented directly on the user's request -- see `crate::mathlibs`'s
+module docs. Both compare three-way against their own
+`test/data/*.txt` like the double-precision math entries; `math_single`
+is a full `PASS` except the same NaN-sign-bit `vamos` divergence
+`math_double` has (issue #52), and `math_single_trans` additionally has
+the same 1-ULP transcendental rounding noise `math_fast_trans` has
+(issue #53's residual) -- both `KNOWN_DIVERGENCES`, not new findings.
 """
 
 from __future__ import annotations
@@ -194,6 +201,28 @@ KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
         "correct and vamos's negative sign is vamos's own divergence.",
         "https://github.com/sidick/volamos/issues/48, "
         "https://github.com/sidick/volamos/issues/52",
+    ),
+    "math_single": (
+        "Same NaN sign-bit question as math_double's div0/div1 (#52) -- "
+        "mathieeesingbas.library's IEEESPDiv(0,0)/IEEESPDiv(-0,0) give "
+        "the same positive-signed NaN convention its double-precision "
+        "twin does, matching Rust's own natural f32 0.0/0.0 result with "
+        "no special-casing needed; vamos's negative-signed result is "
+        "vamos's own divergence, not independently re-verified against "
+        "real hardware for singles specifically but assumed consistent "
+        "with the already-confirmed double-precision case.",
+        "https://github.com/sidick/volamos/issues/52",
+    ),
+    "math_single_trans": (
+        "Same NaN sign-bit question as math_single's div0/div1 (#52), "
+        "here in acos/asin/log/sqrt's domain-error results, plus the "
+        "same 1-ULP transcendental-rounding noise math_fast_trans has "
+        "(issue #53's residual) in acos/asin/atan -- both carried over "
+        "from the already-established double-precision/FFP findings, "
+        "not independently re-verified against real hardware for "
+        "singles specifically.",
+        "https://github.com/sidick/volamos/issues/52, "
+        "https://github.com/sidick/volamos/issues/53",
     ),
 }
 
@@ -406,6 +435,13 @@ CORPUS = [
         # sub-ULP transcendental rounding is expected to vary across
         # any two independent math library implementations).
         tracking_issue="https://github.com/sidick/volamos/issues/53",
+    ),
+    Entry(name="math_single", guest_args=[], setup=None, data_file="math_single.txt"),
+    Entry(
+        name="math_single_trans",
+        guest_args=[],
+        setup=None,
+        data_file="math_single_trans.txt",
     ),
 ]
 

@@ -401,6 +401,16 @@ pub const BSDSOCKET_LIBRARY_BASE: u32 = 0x23B0;
 /// `layers.library`).
 pub const GRAPHICS_LIBRARY_BASE: u32 = 0x25B0;
 
+/// Real `mathieeesingbas.library` base address -- same chunked layout
+/// as [`MATHTRANS_LIBRARY_BASE`], in the `0x2600`..`0x2800` chunk.
+/// Deepest real LVO: `IEEESPCeil` at `-96`.
+pub const MATHIEEESINGBAS_LIBRARY_BASE: u32 = 0x27B0;
+
+/// Real `mathieeesingtrans.library` base address -- same chunked layout
+/// as [`MATHTRANS_LIBRARY_BASE`], in the `0x2800`..`0x2A00` chunk.
+/// Deepest real LVO: `IEEESPLog10` at `-126`.
+pub const MATHIEEESINGTRANS_LIBRARY_BASE: u32 = 0x29B0;
+
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
 /// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
@@ -2155,6 +2165,8 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHTRANS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBBAS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHIEEEDOUBTRANS_LIBRARY_BASE);
+        write_library_node(&mut mem, MATHIEEESINGBAS_LIBRARY_BASE);
+        write_library_node(&mut mem, MATHIEEESINGTRANS_LIBRARY_BASE);
         write_library_node(&mut mem, MATHFFP_LIBRARY_BASE);
         write_library_node(&mut mem, LOCALE_LIBRARY_BASE);
         write_library_node(&mut mem, INTUITION_LIBRARY_BASE);
@@ -2208,6 +2220,8 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("mathtrans.library", MATHTRANS_LIBRARY_BASE);
         registry.register_real("mathieeedoubbas.library", MATHIEEEDOUBBAS_LIBRARY_BASE);
         registry.register_real("mathieeedoubtrans.library", MATHIEEEDOUBTRANS_LIBRARY_BASE);
+        registry.register_real("mathieeesingbas.library", MATHIEEESINGBAS_LIBRARY_BASE);
+        registry.register_real("mathieeesingtrans.library", MATHIEEESINGTRANS_LIBRARY_BASE);
         registry.register_real("mathffp.library", MATHFFP_LIBRARY_BASE);
         registry.register_real("locale.library", LOCALE_LIBRARY_BASE);
         registry.register_real("intuition.library", INTUITION_LIBRARY_BASE);
@@ -3503,12 +3517,13 @@ mod tests {
     /// only [`STANDARD_WORKBENCH_LIBRARIES`] names fake-succeed then (an
     /// arbitrary unknown name would just return `NULL`, silently turning
     /// this into a second copy of the `NULL` test above), and
-    /// `mathieeesingbas.library` is on that list without being backed by
-    /// a `Real` registered base.
+    /// `layers.library` is on that list without being backed by a
+    /// `Real` registered base (unlike `mathieeesingbas.library`, which
+    /// this test used before it got a real implementation).
     #[test]
     fn close_library_of_a_faked_base_is_a_no_op() {
         let entry = TRAP_TABLE_END;
-        let name = b"mathieeesingbas.library\0";
+        let name = b"layers.library\0";
 
         let mut words = Vec::new();
         push_movea_imm(&mut words, 1, 0); // A1 placeholder, patched below
