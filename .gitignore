@@ -16,3 +16,8 @@ __pycache__/
 /ndk/
 /NDK/
 *.lha
+
+# assets/ is a local-only holding area for non-redistributable files
+# (Kickstart ROMs, etc. -- see assets/README.md); track the README only.
+/assets/*
+!/assets/README.md
