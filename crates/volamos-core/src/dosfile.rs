@@ -776,18 +776,40 @@ impl DosState {
     /// `Output()` default handles (and any handle backed by stdin/
     /// stdout) aren't seekable and always fail with
     /// [`ERROR_SEEK_ERROR`].
+    ///
+    /// Real `Seek`'s own NDK autodoc is explicit that "you cannot Seek()
+    /// beyond the end of a file" -- unlike a host `seek()` (standard
+    /// POSIX behavior allows seeking arbitrarily far past EOF, creating
+    /// a sparse file on a later write), so the target position is
+    /// computed and validated against the file's actual length (and
+    /// against `0` for a negative target) *before* touching the host
+    /// file at all; an out-of-range target fails with
+    /// [`ERROR_SEEK_ERROR`] and leaves the file's position untouched.
+    /// (The autodoc's own BUGS note says pre-V39 filesystems returned
+    /// the *current* position instead of `-1` on this exact error --
+    /// amitools' own `dos_seek` test expects that old, documented-as-
+    /// fixed behavior, since it's a hardcoded assertion in vamos's own
+    /// `pytest` suite, not real hardware. volamos targets KS/WB 3.1
+    /// (V40, well past the V39 fix), so `Err` here -- which the caller
+    /// turns into `D0 = -1` -- is the correct, modern contract, not a
+    /// bug to replicate.)
     pub fn seek(&mut self, addr: u32, position: i32, offset_mode: i32) -> Result<i32, i32> {
         match self.handles.get_mut(&addr) {
             Some(HostHandle::HostFile(f, _)) => {
-                let old = f.stream_position().map_err(|_| ERROR_SEEK_ERROR)? as i32;
-                let seek_from = match offset_mode {
-                    OFFSET_BEGINNING => SeekFrom::Start(position.max(0) as u64),
-                    OFFSET_CURRENT => SeekFrom::Current(position as i64),
-                    OFFSET_END => SeekFrom::End(position as i64),
+                let old = f.stream_position().map_err(|_| ERROR_SEEK_ERROR)? as i64;
+                let len = f.metadata().map_err(|_| ERROR_SEEK_ERROR)?.len() as i64;
+                let target = match offset_mode {
+                    OFFSET_BEGINNING => position as i64,
+                    OFFSET_CURRENT => old + position as i64,
+                    OFFSET_END => len + position as i64,
                     _ => return Err(ERROR_SEEK_ERROR),
                 };
-                f.seek(seek_from).map_err(|_| ERROR_SEEK_ERROR)?;
-                Ok(old)
+                if !(0..=len).contains(&target) {
+                    return Err(ERROR_SEEK_ERROR);
+                }
+                f.seek(SeekFrom::Start(target as u64))
+                    .map_err(|_| ERROR_SEEK_ERROR)?;
+                Ok(old as i32)
             }
             Some(_) => Err(ERROR_SEEK_ERROR),
             None => Err(ERROR_INVALID_LOCK),
@@ -1836,6 +1858,75 @@ mod tests {
             .expect("seek to beginning should succeed");
         assert_eq!(old2, 10, "position after the OFFSET_END seek was 10");
         assert_eq!(dos.read(addr, 4).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn seek_rejects_a_target_position_beyond_end_of_file() {
+        // amitools' own dos_seek_gcc (issue #47): Seek(fh, 10,
+        // OFFSET_END) on a 14-byte file targets byte 24, past EOF --
+        // real Seek()'s own NDK autodoc says "you cannot Seek() beyond
+        // the end of a file". Must fail *without* moving the file's
+        // actual position (a later read from the pre-seek position
+        // must still see the right bytes).
+        let tmp = TempDir::new("seek_oob");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        dos.seek(addr, 3, OFFSET_BEGINNING).unwrap();
+        assert_eq!(
+            dos.seek(addr, 100, OFFSET_END),
+            Err(ERROR_SEEK_ERROR),
+            "seeking 100 bytes past a 10-byte file's end must fail"
+        );
+        // Position must be unchanged by the failed seek.
+        assert_eq!(dos.read(addr, 3).unwrap(), b"345");
+    }
+
+    #[test]
+    fn seek_rejects_a_negative_target_position() {
+        let tmp = TempDir::new("seek_neg");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        dos.seek(addr, 3, OFFSET_BEGINNING).unwrap();
+        assert_eq!(
+            dos.seek(addr, -10, OFFSET_CURRENT),
+            Err(ERROR_SEEK_ERROR),
+            "seeking to a negative absolute position must fail"
+        );
+        assert_eq!(dos.read(addr, 3).unwrap(), b"345");
+    }
+
+    #[test]
+    fn seek_to_exactly_end_of_file_still_succeeds() {
+        // The boundary itself (position == length) is explicitly
+        // allowed by the same autodoc note ("the end of the file is a
+        // Seek() positioned by zero from end") -- only *beyond* it is
+        // rejected.
+        let tmp = TempDir::new("seek_exact_eof");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        assert_eq!(dos.seek(addr, 10, OFFSET_BEGINNING), Ok(0));
+        assert!(dos.read(addr, 1).unwrap().is_empty(), "at EOF, not past it");
     }
 
     #[test]

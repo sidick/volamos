@@ -128,9 +128,20 @@ FLAVOR = "gcc"
 # compare_vamos.py's KNOWN_DIVERGENCES -- reserved for divergences
 # attributed to vamos (or genuinely unresolved pending real-hardware
 # verification), never for volamos's own unfixed bugs, which should stay
-# visible FAILs until fixed (see dos_match/dos_seek/exec_rawdofmt below,
-# each with its own open volamos-side issue).
+# visible FAILs until fixed (see dos_match/exec_rawdofmt below, each
+# with its own open volamos-side issue).
 KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
+    "dos_seek": (
+        "Seek()'s own NDK autodoc BUGS note: pre-V39 filesystems "
+        "returned the *current* position instead of -1 when a Seek() "
+        "target landed beyond EOF, fixed in V39. volamos (target: "
+        "KS/WB 3.1, V40) now rejects the out-of-range Seek() (issue "
+        "#47, fixed) and correctly returns -1/ERROR_SEEK_ERROR; vamos's "
+        "old_pos=14 still reproduces the old, documented-as-fixed "
+        "pre-V39 behavior -- it's a hardcoded assertion in vamos's own "
+        "pytest suite, not real V39+/V40 hardware.",
+        "https://github.com/sidick/volamos/issues/47",
+    ),
     "util_date": (
         "utility.library/CheckDate's own NDK autodoc documents 'the wday "
         "field ... is not checked' as a real historical AmigaOS bug -- "
@@ -271,6 +282,15 @@ CORPUS = [
         name="dos_seek",
         guest_args=["TEST:test"],
         setup=setup_dos_seek,
+        # `Seek()`'s own NDK autodoc BUGS note: pre-V39 filesystems
+        # returned the *current* position instead of `-1` when a Seek()
+        # target lands beyond EOF; fixed in V39. This literal ground
+        # truth (and vamos's own output) still reproduces that old,
+        # documented-as-fixed behavior -- it's a hardcoded assertion in
+        # vamos's own pytest suite, not real hardware. volamos (target:
+        # KS/WB 3.1, V40) now correctly rejects the out-of-range Seek()
+        # (issue #47) and returns the modern `-1`/`ERROR_SEEK_ERROR`
+        # instead of the old pre-V39 position -- see KNOWN_DIVERGENCES.
         expected=[
             "old_pos=14, io_err=0, num_read=5, buf='Hello'",
             "old_pos=5, io_err=0, num_read=5, buf='rld!?'",

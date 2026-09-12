@@ -38,6 +38,18 @@ version scheme in `Cargo.toml`.
   already apply -- confirmed against real Kickstart 3.1 hardware and
   amitools' own `exec_rawdofmt` test (`BStr: 'Hoi!'`, previously
   garbled).
+- **Fixed `Seek()` not rejecting an out-of-range target position**
+  (issue #47): a host file's own `seek()` happily allows seeking
+  arbitrarily far past end-of-file (standard POSIX behavior), but real
+  `Seek()`'s own NDK autodoc says "you cannot Seek() beyond the end of
+  a file." The target position is now computed and validated against
+  the file's actual length (and against a negative result) before
+  touching the host file at all, matching `-1`/`ERROR_SEEK_ERROR`, the
+  modern (post-V39) contract -- not the old, documented-as-fixed
+  pre-V39 behavior of returning the current position instead, which
+  amitools' own `dos_seek` test still (incorrectly, for a V40 target)
+  expects since it's a literal `vamos`-captured assertion, not real
+  hardware.
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`
