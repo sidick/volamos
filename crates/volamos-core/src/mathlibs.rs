@@ -21,11 +21,16 @@
 //!
 //! `mathtrans.library` predates `mathieeedoubbas.library`/
 //! `mathieeedoubtrans.library` and operates on AmigaOS's own 32-bit FFP
-//! encoding, not IEEE-754. Per <https://wiki.amigaos.net/wiki/Math_Libraries>:
-//! bit 0 is the sign, bits 1-7 are a 7-bit exponent in excess-64 (so a
-//! stored field of `$40` means an unbiased exponent of `0`), and bits 8-31
-//! are a 24-bit normalized mantissa treated as a fraction in `[0.5, 1)`
-//! (or the whole value is `0` if every bit is `0`). [`ffp_to_f32`]/
+//! encoding, not IEEE-754. Bit 7 is the sign, bits 0-6 are a 7-bit
+//! exponent in excess-64 (so a stored field of `$40` means an unbiased
+//! exponent of `0`), and bits 8-31 are a 24-bit normalized mantissa
+//! treated as a fraction in `[0.5, 1)` (or the whole value is `0` if
+//! every bit is `0`) -- confirmed directly against amitools' own
+//! `test/src/math_fast.h` FFP constants (`FFP_ONE = $80000041`,
+//! `FFP_PI = $C90FDB42`, `FFP_1000 = $FA00004A`, ...decoding each to
+//! its real value under this layout, byte for byte) rather than a
+//! secondhand wiki description -- see issue #53's writeup for the
+//! decode-by-hand verification of all five. [`ffp_to_f32`]/
 //! [`f32_to_ffp`] convert to/from a plain `f32` by re-deriving the shared
 //! bit pattern from IEEE-754 single precision's own `1.mantissa * 2^exp`
 //! layout (see [`f32_to_ffp`]'s doc for the derivation) rather than a
@@ -64,8 +69,8 @@ fn ffp_to_f32(bits: u32) -> f32 {
     if bits == 0 {
         return 0.0;
     }
-    let sign = if bits & 1 != 0 { -1.0f32 } else { 1.0f32 };
-    let exponent = ((bits >> 1) & 0x7F) as i32 - 64;
+    let sign = if bits & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exponent = (bits & 0x7F) as i32 - 64;
     let mantissa = bits >> 8; // already a 24-bit fraction over 2^24
     sign * (mantissa as f32 / (1u32 << 24) as f32) * 2f32.powi(exponent)
 }
@@ -88,23 +93,84 @@ fn ffp_to_f32(bits: u32) -> f32 {
 /// biased again), the stored field is `E_ieee + 65 = (raw_exp - 127) + 65
 /// = raw_exp - 62`.
 fn f32_to_ffp(value: f32) -> u32 {
-    if value == 0.0 || !value.is_finite() {
-        // No FFP encoding for +-inf/NaN; 0 is the closest honest answer
-        // this runtime can give without inventing a value real FFP
-        // hardware never had to represent either.
+    if value == 0.0 {
+        return 0;
+    }
+    // A domain error (`SPAcos`/`SPAsin` outside `[-1,1]`, `SPLog`/
+    // `SPSqrt` of a negative number, ...) produces `NaN` here, not a
+    // finite-but-huge value -- there's no honest FFP encoding for
+    // "undefined", and issue #53's real-corpus comparison confirms `0`
+    // (not saturating to the largest magnitude, which is for a
+    // genuine overflow -- see below) is what real `mathtrans.library`
+    // itself reports for these.
+    if value.is_nan() {
         return 0;
     }
     let bits = value.to_bits();
     let sign = (bits >> 31) & 1;
+
+    // FFP's exponent field is 7 bits (excess-64, so 1..=127 once
+    // clamped away from the reserved all-zero "value is 0" encoding);
+    // IEEE single's own range is wider on both ends (roughly
+    // 2^-126..2^127 versus FFP's 2^-64..2^63 -- see this module's doc
+    // comment), and this project's own comparison harness against
+    // amitools' real test/bin corpus (issue #53) found real
+    // `mathffp`/`mathtrans` saturate *asymmetrically* on the two
+    // sides, not just clamp the exponent field in place:
+    // - Overflow (too *large* to represent, including `value` already
+    //   being `+-inf` -- e.g. `SPExp`/`SPCosh`/`SPSinh` of a huge
+    //   input routinely overflow `f32` to infinity before FFP encoding
+    //   even sees a finite number) saturates to FFP's largest
+    //   representable magnitude with the *correct sign* -- mantissa
+    //   all-`1`s, exponent field `127` (`$FFFFFF7F`/`$FFFFFFFF`,
+    //   exactly `test/src/math_fast.h`'s own `FFP_MAX`/`FFP_MAX_NEG`
+    //   constants) -- not the previous behavior of clamping only the
+    //   exponent field while leaving whatever mantissa the original
+    //   value happened to have, which produced a smaller-magnitude,
+    //   wrong value still tagged with the maximum exponent.
+    // - Underflow (too *small* to represent even at FFP's smallest
+    //   nonzero exponent, e.g. converting IEEE's own `FLT_MIN`, whose
+    //   magnitude is far below FFP's floor) flushes to `0` instead --
+    //   clamping *up* to FFP's smallest representable nonzero
+    //   magnitude would silently turn a tiny-but-real value into one
+    //   many orders of magnitude larger, which is a far worse
+    //   approximation than just rounding it down to zero.
+    if value.is_infinite() {
+        return ffp_max_magnitude(sign);
+    }
     let raw_exp = (bits >> 23) & 0xFF;
-    let mantissa24 = (1u32 << 23) | (bits & 0x7F_FFFF);
-
     let e_ffp_field = raw_exp as i32 - 62;
-    // FFP's exponent field is 7 bits (0..=127); saturate rather than
-    // wrap on overflow/underflow -- see this module's doc comment.
-    let e_ffp_field = e_ffp_field.clamp(1, 127) as u32;
+    // `>= 127`, not `> 127`: verified against real Kickstart 3.1
+    // (40.72) via Copperline (issue #53's `mul3`/`mul4` residual --
+    // `SPMul(FFP_INT_MAX, FFP_INT_MAX)`/`SPMul(FFP_INT_MIN,
+    // FFP_INT_MIN)`, whose exact mathematical result's exponent field
+    // computes to precisely `127`). Real hardware treats that boundary
+    // value as already-saturated (full `$FFFFFF7F`/`$FFFFFFFF`), not a
+    // legitimately representable finite value with a merely-large
+    // mantissa -- i.e. field `127` is reserved for "this is FFP_MAX",
+    // the same way field `0` is reserved for "this is zero", leaving
+    // only `1..=126` for ordinary finite magnitudes.
+    if e_ffp_field >= 127 {
+        return ffp_max_magnitude(sign);
+    }
+    if e_ffp_field < 1 {
+        return 0;
+    }
 
-    (mantissa24 << 8) | (e_ffp_field << 1) | sign
+    let mantissa24 = (1u32 << 23) | (bits & 0x7F_FFFF);
+    (mantissa24 << 8) | (sign << 7) | (e_ffp_field as u32)
+}
+
+/// FFP's largest representable magnitude with the given sign (`0` or
+/// `1`, as extracted from an IEEE bit pattern) -- mantissa all-`1`s,
+/// exponent field `127`. Matches `test/src/math_fast.h`'s own
+/// `FFP_MAX`/`FFP_MAX_NEG` constants (`$FFFFFF7F`/`$FFFFFFFF`) exactly.
+/// Also stands in for `+-inf`/`NaN`, which FFP has no encoding for at
+/// all -- see [`f32_to_ffp`]'s own doc for why this, not `0`, is the
+/// honest answer for an overflowing (as opposed to underflowing)
+/// result.
+fn ffp_max_magnitude(sign: u32) -> u32 {
+    (0x00FF_FFFFu32 << 8) | (sign << 7) | 127
 }
 
 /// `mathieeedoubbas.library`'s `IEEEDPFix` (LVO -30: `D0/D1` = `double`
@@ -214,7 +280,18 @@ fn ieeedp_floor_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 /// `mathieeedoubbas.library`'s `IEEEDPCeil` (LVO -96: `D0/D1` = `y`).
 fn ieeedp_ceil_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let y = read_f64(ctx.cpu, 0);
-    write_f64(ctx.cpu, 0, y.ceil());
+    let result = y.ceil();
+    // Rust's `f64::ceil` (like strict IEEE-754) preserves the sign of
+    // a zero result -- `(-0.5f64).ceil()` is `-0.0`. Real Kickstart
+    // 3.1's `mathieeedoubbas.library` does not: verified against real
+    // hardware via Copperline (issue #51/#52's writeup) that
+    // `IEEEDPCeil` of a small negative number (rounding up to zero)
+    // gives plain `+0.0`, matching `vamos`; volamos previously matched
+    // Rust's/strict IEEE-754's `-0.0` instead, which was the actual
+    // bug (the opposite of what issue #51 originally assumed -- `vamos`
+    // was right here, not volamos).
+    let result = if result == 0.0 { 0.0 } else { result };
+    write_f64(ctx.cpu, 0, result);
     Ok(())
 }
 
@@ -259,7 +336,27 @@ fn ieeedp_unary<C: Cpu>(
     f: impl FnOnce(f64) -> f64,
 ) -> Result<(), DispatchError> {
     let y = read_f64(ctx.cpu, 0);
-    write_f64(ctx.cpu, 0, f(y));
+    let result = f(y);
+    // A domain error (IEEEDPAcos/IEEEDPAsin outside [-1,1], IEEEDPLog/
+    // IEEEDPLog10/IEEEDPSqrt of a negative number) produces NaN.
+    // Rust's f64 math propagates whatever sign its own internal
+    // computation happens to leave on the NaN -- e.g. `(-2.0f64).asin()`
+    // is negative-signed while `(2.0f64).asin()`/`(-2.0f64).acos()` are
+    // positive-signed, an inconsistency with no documented meaning.
+    // Real Kickstart 3.1's mathieeedoubtrans.library doesn't have this
+    // inconsistency -- verified against real hardware via Copperline
+    // (issue #52's writeup: mathieeedoubbas.library's IEEEDPDiv(0,0)/
+    // IEEEDPDiv(-0,0) both give the identical positive-signed NaN
+    // `$7FF10000_00000000`, regardless of input sign) -- so every
+    // domain-error result here is canonicalized to a single, fixed,
+    // positive-signed NaN too, rather than trusting Rust's own
+    // input-sign-dependent propagation. The exact NaN payload bits
+    // aren't reproduced (NaN payloads are implementation-specific
+    // microcode detail no emulator is expected to match exactly), only
+    // the sign, which is the only part any real program could
+    // meaningfully observe (e.g. via IEEEDPTst).
+    let result = if result.is_nan() { f64::NAN } else { result };
+    write_f64(ctx.cpu, 0, result);
     Ok(())
 }
 
@@ -412,12 +509,20 @@ fn sp_sincos_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 }
 
 /// `mathtrans.library`'s `SPPow` (LVO -90: `D1` = `fnum1`, `D0` =
-/// `fnum2`). `D0` = `fnum1` raised to the `fnum2` power, FFP-encoded.
+/// `fnum2`). **Real `SPPow` computes `fnum2` raised to the `fnum1`
+/// power, not `fnum1` raised to the `fnum2` power** -- the same
+/// historical argument-order quirk as [`sp_sub_handler`]/
+/// [`sp_div_handler`] (confirmed empirically against `vamos`, via
+/// amitools' own `test/src/math_fast_trans.c`: `SPPow(FFP_2, FFP_10)`
+/// -- `fnum1=2`, `fnum2=10` in this LVO's own register convention --
+/// produces `100` (`10^2`), not `1024` (`2^10`); `SPPow(FFP_1000,
+/// FFP_ZERO)` produces `0` (`0^1000`), not `1` (`1000^0`) -- issue
+/// #53). `D0` = the FFP-encoded result.
 fn sp_pow_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let fnum1 = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
     let fnum2 = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
     ctx.cpu
-        .set_data_register(DataRegister(0), f32_to_ffp(fnum1.powf(fnum2)));
+        .set_data_register(DataRegister(0), f32_to_ffp(fnum2.powf(fnum1)));
     Ok(())
 }
 
@@ -682,13 +787,79 @@ mod tests {
     }
 
     #[test]
+    fn ffp_overflow_saturates_to_the_signed_max_magnitude() {
+        // A value whose IEEE exponent is far beyond FFP's own
+        // -64..63-ish range -- issue #53: this used to clamp only the
+        // exponent field while keeping the original (too-small)
+        // mantissa, producing a wrong-magnitude value still tagged
+        // with the maximum exponent.
+        assert_eq!(f32_to_ffp(1.0e30), 0xFFFF_FF7F, "FFP_MAX");
+        assert_eq!(f32_to_ffp(-1.0e30), 0xFFFF_FFFF, "FFP_MAX_NEG");
+    }
+
+    #[test]
+    fn ffp_infinity_also_saturates_to_the_signed_max_magnitude() {
+        // Several real mathtrans functions (SPExp/SPCosh/SPSinh of a
+        // huge input) overflow f32 to +-inf before FFP encoding ever
+        // sees a finite number -- issue #53: this used to return 0 for
+        // any non-finite input, which is a far worse answer than the
+        // format's own saturation value for a result that's genuinely
+        // "too large", as opposed to "undefined" (NaN).
+        assert_eq!(f32_to_ffp(f32::INFINITY), 0xFFFF_FF7F);
+        assert_eq!(f32_to_ffp(f32::NEG_INFINITY), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn ffp_nan_flushes_to_zero_not_the_saturated_max_magnitude() {
+        // A domain error (SPAcos/SPAsin outside [-1,1], SPLog/SPSqrt of
+        // a negative number, ...) produces NaN, not a huge-but-finite
+        // value -- issue #53's real-corpus comparison confirms real
+        // mathtrans.library reports 0 for these, distinct from a
+        // genuine overflow (which saturates -- see the test above).
+        assert_eq!(f32_to_ffp(f32::NAN), 0);
+    }
+
+    #[test]
+    fn ffp_underflow_flushes_to_zero_rather_than_the_smallest_nonzero_magnitude() {
+        // f32::MIN_POSITIVE (IEEE's smallest normal, ~2^-126) is far
+        // below FFP's own smallest representable nonzero magnitude
+        // (~2^-64) -- issue #53: this used to clamp *up* to that
+        // smallest nonzero FFP value, silently turning a tiny-but-real
+        // input into one many orders of magnitude larger.
+        assert_eq!(f32_to_ffp(f32::MIN_POSITIVE), 0);
+        assert_eq!(f32_to_ffp(-f32::MIN_POSITIVE), 0);
+    }
+
+    #[test]
     fn ffp_one_matches_known_encoding() {
         // 1.0: FFP mantissa 0x800000 (0.5 as a 24-bit fraction),
         // exponent field 65 ($41, excess-64 for unbiased exponent 1,
-        // since 0.5 * 2^1 == 1.0), sign 0 -- independently derivable
-        // from this module's doc comment's bit layout, not just a
-        // round-trip check.
-        assert_eq!(f32_to_ffp(1.0), (0x0080_0000u32 << 8) | (65 << 1));
+        // since 0.5 * 2^1 == 1.0) in bits 0-6, sign (positive, 0) in
+        // bit 7 -- NOT independently re-derived from this module's own
+        // doc comment (issue #53: an earlier version of this test did
+        // exactly that, which just re-encoded the same sign/exponent
+        // bit-position swap the doc comment itself had, silently
+        // agreeing with a bug instead of catching it). This asserts
+        // against amitools' own real `test/src/math_fast.h` constant
+        // (`FFP_ONE = $80000041`) instead -- external ground truth.
+        assert_eq!(f32_to_ffp(1.0), 0x8000_0041);
+        assert_eq!(ffp_to_f32(0x8000_0041), 1.0);
+    }
+
+    #[test]
+    fn ffp_matches_more_known_encodings_from_amitools() {
+        // Same external-ground-truth approach as
+        // ffp_one_matches_known_encoding, for a broader spread of real
+        // constants from amitools' test/src/math_fast.h (issue #53).
+        for (value, bits) in [
+            (-1.0f32, 0x8000_00C1u32),
+            (10.0, 0xA000_0044),
+            (1000.0, 0xFA00_004A),
+            (std::f32::consts::PI, 0xC90F_DB42),
+        ] {
+            assert_eq!(f32_to_ffp(value), bits, "encoding {value}");
+            assert_eq!(ffp_to_f32(bits), value, "decoding {bits:#010x}");
+        }
     }
 
     // --- mathffp.library, via the actual jump-table dispatch ---
@@ -700,7 +871,10 @@ mod tests {
     // of the FFP encoding.
 
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
-    use crate::dispatch::{MATHFFP_LIBRARY_BASE, Runtime, StartConfig};
+    use crate::dispatch::{
+        MATHFFP_LIBRARY_BASE, MATHIEEEDOUBBAS_LIBRARY_BASE, MATHIEEEDOUBTRANS_LIBRARY_BASE,
+        MATHTRANS_LIBRARY_BASE, Runtime, StartConfig,
+    };
     use crate::memory::FlatMemory;
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
@@ -753,9 +927,45 @@ mod tests {
         )
     }
 
+    /// Prepends `movea.l #MATHTRANS_LIBRARY_BASE,a6` and builds a
+    /// runtime -- see [`mathffp_program`]'s twin, for `mathtrans.library`
+    /// functions like `SPPow` (as opposed to `mathffp.library`'s
+    /// `SPAdd`/`SPSub`/etc.).
+    fn mathtrans_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (MATHTRANS_LIBRARY_BASE >> 16) as u16,
+            MATHTRANS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
     /// `D1 = left` (FFP), `D0 = right` (FFP), calls the LVO at `disp`,
-    /// returns `D0` as FFP-decoded `f32`.
-    fn run_binary_ffp(disp: i32, left: f32, right: f32) -> f32 {
+    /// returns `D0` as FFP-decoded `f32`. `program` picks which library
+    /// base gets loaded into `A6` first -- [`mathffp_program`] for
+    /// `mathffp.library`'s own functions, [`mathtrans_program`] for
+    /// `mathtrans.library`'s.
+    fn run_binary_ffp_via(
+        program: fn(&[u16]) -> Runtime<M68kCpu>,
+        disp: i32,
+        left: f32,
+        right: f32,
+    ) -> f32 {
         let mut words = Vec::new();
         words.push(move_imm_to_d(1));
         let left_bits = f32_to_ffp(left);
@@ -768,10 +978,16 @@ mod tests {
         words.extend_from_slice(&jsr_disp16_a6(disp));
         words.push(RTS);
 
-        let mut rt = mathffp_program(&words);
+        let mut rt = program(&words);
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         ffp_to_f32(code as u32)
+    }
+
+    /// `D1 = left` (FFP), `D0 = right` (FFP), calls the `mathffp.library`
+    /// LVO at `disp`, returns `D0` as FFP-decoded `f32`.
+    fn run_binary_ffp(disp: i32, left: f32, right: f32) -> f32 {
+        run_binary_ffp_via(mathffp_program, disp, left, right)
     }
 
     #[test]
@@ -795,11 +1011,42 @@ mod tests {
     }
 
     #[test]
+    fn sp_mul_overflow_saturates_to_ffp_max_at_the_exact_boundary_exponent() {
+        // SPMul(FFP_INT_MAX, FFP_INT_MAX) / SPMul(FFP_INT_MIN,
+        // FFP_INT_MIN) -- amitools' own math_fast.c mul3/mul4. The
+        // exact mathematical product's FFP exponent field computes to
+        // precisely 127 (FFP's reserved "this is FFP_MAX" boundary,
+        // not just a large-but-representable finite value) -- verified
+        // against real Kickstart 3.1 (40.72) via Copperline, which
+        // prints FFFFFF7F for both (issue #53's residual, now closed).
+        let int_max = 2147483648.0f32; // FFP_INT_MAX
+        let int_min = -2147483648.0f32; // FFP_INT_MIN
+        assert_eq!(
+            f32_to_ffp(run_binary_ffp(-78, int_max, int_max)),
+            0xFFFF_FF7F
+        );
+        assert_eq!(
+            f32_to_ffp(run_binary_ffp(-78, int_min, int_min)),
+            0xFFFF_FF7F
+        );
+    }
+
+    #[test]
     fn sp_div_computes_right_divided_by_left_not_left_divided_by_right() {
         // leftParm=D1=2, rightParm=D0=10 -- real SPDiv returns
         // rightParm / leftParm = 10 / 2 = 5, per sp_div_handler's doc.
         let result = run_binary_ffp(-84, 2.0, 10.0);
         assert!((result - 5.0).abs() < 1e-4, "got {result}");
+    }
+
+    #[test]
+    fn sp_pow_computes_fnum2_to_the_fnum1_not_fnum1_to_the_fnum2() {
+        // fnum1=D1=2, fnum2=D0=10 -- real SPPow returns fnum2 ** fnum1
+        // = 10 ** 2 = 100, not 2 ** 10 = 1024, per sp_pow_handler's doc
+        // (issue #53, confirmed against amitools' own
+        // test/src/math_fast_trans.c via a real vamos run).
+        let result = run_binary_ffp_via(mathtrans_program, -90, 2.0, 10.0);
+        assert!((result - 100.0).abs() < 1e-2, "got {result}");
     }
 
     #[test]
@@ -868,6 +1115,144 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert!((ffp_to_f32(code as u32) - 3.0).abs() < 1e-4);
+    }
+
+    /// Prepends `movea.l #MATHIEEEDOUBBAS_LIBRARY_BASE,a6` and builds a
+    /// runtime -- see [`mathffp_program`]'s twin, for
+    /// `mathieeedoubbas.library` functions.
+    fn mathieeedoubbas_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (MATHIEEEDOUBBAS_LIBRARY_BASE >> 16) as u16,
+            MATHIEEEDOUBBAS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    /// Prepends `movea.l #MATHIEEEDOUBTRANS_LIBRARY_BASE,a6` and builds
+    /// a runtime -- see [`mathieeedoubbas_program`]'s twin, for
+    /// `mathieeedoubtrans.library` functions.
+    fn mathieeedoubtrans_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (MATHIEEEDOUBTRANS_LIBRARY_BASE >> 16) as u16,
+            MATHIEEEDOUBTRANS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn ieeedp_asin_domain_error_is_always_positive_signed_nan() {
+        // IEEEDPAsin(-2.0) is outside [-1,1] -- Rust's own
+        // (-2.0f64).asin() happens to produce a *negative*-signed NaN
+        // (an internal-computation artifact, not a documented
+        // convention), while IEEEDPAsin(2.0)/IEEEDPAcos(+-2.0) all give
+        // positive-signed NaNs from Rust. Real Kickstart 3.1 has no
+        // such inconsistency (issue #52's writeup) -- every
+        // domain-error result canonicalizes to the same, fixed,
+        // positive sign.
+        const RESULT_ADDR: u32 = 0x1_0000;
+        let mut words = Vec::new();
+        let bits = (-2.0f64).to_bits();
+        words.push(move_imm_to_d(0));
+        words.push((bits >> 48) as u16);
+        words.push((bits >> 32) as u16);
+        words.push(move_imm_to_d(1));
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IEEEDPAsin
+        words.push(move_imm_to_a(0));
+        words.push((RESULT_ADDR >> 16) as u16);
+        words.push(RESULT_ADDR as u16);
+        words.push(0x2080); // move.l d0,(a0)
+        words.push(move_imm_to_a(0));
+        words.push(((RESULT_ADDR + 4) >> 16) as u16);
+        words.push((RESULT_ADDR + 4) as u16);
+        words.push(0x2081); // move.l d1,(a0)
+        words.push(RTS);
+
+        let mut rt = mathieeedoubtrans_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        let hi = mem.read_u32(RESULT_ADDR) as u64;
+        let lo = mem.read_u32(RESULT_ADDR + 4) as u64;
+        let result = f64::from_bits((hi << 32) | lo);
+        assert!(result.is_nan());
+        assert!(!result.is_sign_negative(), "must be a positive-signed NaN");
+    }
+
+    #[test]
+    fn ieeedp_ceil_of_a_small_negative_number_gives_positive_zero() {
+        // IEEEDPCeil(-0.5): Rust's/strict IEEE-754's f64::ceil gives
+        // -0.0 here (sign-of-zero preserved), but real Kickstart 3.1's
+        // mathieeedoubbas.library does not -- verified against real
+        // hardware via Copperline (issue #51/#52's writeup: math_double
+        // ceil7/ceil9 both print plain positive zero, matching vamos).
+        // D0/D1 (the double result) get stashed to a fixed guest
+        // address before RTS, since the exit-code mechanism only
+        // captures D0's 32 bits, not a full double.
+        const RESULT_ADDR: u32 = 0x1_0000;
+        let mut words = Vec::new();
+        let bits = (-0.5f64).to_bits();
+        words.push(move_imm_to_d(0));
+        words.push((bits >> 48) as u16);
+        words.push((bits >> 32) as u16);
+        words.push(move_imm_to_d(1));
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // IEEEDPCeil
+        // move.l #RESULT_ADDR,a0 ; move.l d0,(a0)
+        words.push(move_imm_to_a(0));
+        words.push((RESULT_ADDR >> 16) as u16);
+        words.push(RESULT_ADDR as u16);
+        words.push(0x2080); // move.l d0,(a0)
+        // move.l #RESULT_ADDR+4,a0 ; move.l d1,(a0)
+        words.push(move_imm_to_a(0));
+        words.push(((RESULT_ADDR + 4) >> 16) as u16);
+        words.push((RESULT_ADDR + 4) as u16);
+        words.push(0x2081); // move.l d1,(a0)
+        words.push(RTS);
+
+        let mut rt = mathieeedoubbas_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        let hi = mem.read_u32(RESULT_ADDR) as u64;
+        let lo = mem.read_u32(RESULT_ADDR + 4) as u64;
+        let result = f64::from_bits((hi << 32) | lo);
+        assert_eq!(result, 0.0);
+        assert!(!result.is_sign_negative(), "must be +0.0, not -0.0");
     }
 
     #[test]

@@ -5,6 +5,51 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Fixed `mathffp.library`/`mathtrans.library`'s FFP encoding**
+  (issue #53): the sign bit and exponent field were in swapped bit
+  positions (an old bug hidden by a unit test that re-derived the same
+  wrong layout from this module's own -- also wrong -- doc comment
+  instead of checking against real hardware), and overflow/underflow/
+  domain-error (`NaN`) results weren't saturating correctly. Found via
+  a new local comparison harness against amitools' own test corpus
+  (`tools/compare_amitools_suite.py`); took the affected tests'
+  divergence from `vamos` from the large majority of their output
+  lines down to a handful of residual, believed-benign ones (a single
+  overflow-boundary edge case and ordinary cross-implementation
+  transcendental-function rounding variance). Both since confirmed
+  against real Kickstart 3.1 hardware: the overflow-boundary case
+  (`SPMul` saturating exactly at FFP's maximum exponent field) was
+  correct as fixed, and two more real bugs turned up in the same pass
+  -- `RawDoFmt`/`VPrintf`'s `%x`/`%lx` printed lowercase hex where real
+  hardware prints uppercase (issue #48), and `IEEEDPCeil()` returned
+  `-0.0` for a ceil-to-zero result where real hardware (matching
+  `vamos`) returns `+0.0` (issue #51, originally misdiagnosed as
+  correct IEEE-754 behavior on volamos's side and `vamos`'s divergence
+  -- backwards). Also confirmed that `mathieeedoubbas`/
+  `mathieeedoubtrans`'s positive-signed `NaN` convention for
+  domain-error results (`0/0`, out-of-domain `acos`/`asin`/`log`/etc.)
+  matches real hardware and `vamos`'s negative-signed convention is
+  `vamos`'s own divergence (issue #52), and canonicalized an internal
+  inconsistency where Rust's own `f64::asin`/`acos` didn't agree with
+  themselves on `NaN` sign for symmetric out-of-domain inputs.
+- **Fixed `RawDoFmt`'s `%b` (BSTR) format** (issue #45): the data-list
+  entry for `%b` is a `BPTR`, not a raw byte address, so it needs the
+  same `<< 2` conversion `dos.library`'s own `BPTR`-taking calls
+  already apply -- confirmed against real Kickstart 3.1 hardware and
+  amitools' own `exec_rawdofmt` test (`BStr: 'Hoi!'`, previously
+  garbled).
+- **Fixed `Seek()` not rejecting an out-of-range target position**
+  (issue #47): a host file's own `seek()` happily allows seeking
+  arbitrarily far past end-of-file (standard POSIX behavior), but real
+  `Seek()`'s own NDK autodoc says "you cannot Seek() beyond the end of
+  a file." The target position is now computed and validated against
+  the file's actual length (and against a negative result) before
+  touching the host file at all, matching `-1`/`ERROR_SEEK_ERROR`, the
+  modern (post-V39) contract -- not the old, documented-as-fixed
+  pre-V39 behavior of returning the current position instead, which
+  amitools' own `dos_seek` test still (incorrectly, for a V40 target)
+  expects since it's a literal `vamos`-captured assertion, not real
+  hardware.
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`

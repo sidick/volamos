@@ -53,7 +53,7 @@ use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason};
 use crate::dispatch::{
     DispatchError, EXEC_LIBRARY_BASE, EXIT_STUB_ADDR, HandlerContext, LibraryTable,
 };
-use crate::guestmem::read_c_string;
+use crate::guestmem::{addr_from_bptr, read_bstr, read_c_string};
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
 
@@ -259,7 +259,12 @@ fn format_value(
         }
         FmtType::Hex => {
             let v: u32 = if is_long { raw } else { u32::from(raw as u16) };
-            format!("{v:x}").into_bytes()
+            // Uppercase, matching real `RawDoFmt` -- verified against
+            // real Kickstart 3.1 (40.72) via Copperline: amitools'
+            // `test/bin/math_fast_gcc` (`RawDoFmt`-based `Printf`)
+            // prints `FA000069`/`FFFFFF7F`/etc., not lowercase (issue
+            // #48, resolved).
+            format!("{v:X}").into_bytes()
         }
         FmtType::Char => {
             vec![raw as u8]
@@ -340,13 +345,18 @@ pub(crate) fn render_format(
                 (0, bytes)
             }
             FmtType::Bstr => {
-                let ptr = mem.read_u32(data_ptr);
+                // `%b`'s data-list entry is a BPTR, not a byte address --
+                // needs `addr_from_bptr` (`<< 2`) before it can be read
+                // like any other pointer. Confirmed against real
+                // Kickstart 3.1 hardware via Copperline (issue #45):
+                // amitools' exec_rawdofmt_gcc's `BStr: 'Hoi!'` only comes
+                // out right once the BPTR is actually converted.
+                let bptr = mem.read_u32(data_ptr);
                 data_ptr = data_ptr.wrapping_add(4);
-                let bytes = if ptr == 0 {
+                let bytes = if bptr == 0 {
                     Vec::new()
                 } else {
-                    let len = u32::from(mem.read_u8(ptr));
-                    (0..len).map(|j| mem.read_u8(ptr + 1 + j)).collect()
+                    read_bstr(mem, addr_from_bptr(bptr))
                 };
                 (0, bytes)
             }
@@ -653,6 +663,40 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, -1, "RawMayGetChar should report no input pending");
         assert!(out.is_empty(), "debug output must not leak into stdout");
+    }
+
+    #[test]
+    fn bstr_format_converts_the_bptr_to_a_real_address() {
+        // Verified against real Kickstart 3.1 (40.72) via Copperline
+        // (issue #45): amitools' test/bin/exec_rawdofmt_gcc builds its
+        // %b argument via `MKBADDR(bstr)` (a real BPTR, `addr >> 2`),
+        // and real RawDoFmt renders it as `Hoi!` from the BSTR
+        // `"\x04Hoi!"`. Using the BPTR as a raw byte address instead of
+        // converting it first (the original bug) reads garbage.
+        let mut mem = FlatMemory::new(0x1000);
+        let bstr_addr = 0x100u32;
+        mem.write_u8(bstr_addr, 4);
+        for (i, b) in b"Hoi!".iter().enumerate() {
+            mem.write_u8(bstr_addr + 1 + i as u32, *b);
+        }
+        let bptr = crate::guestmem::bptr_from_addr(bstr_addr);
+        write_c_string(&mut mem, 0x300, b"%b");
+        mem.write_u32(0x400, bptr);
+        let (rendered, _) = render_format(&mem, &read_c_string(&mem, 0x300), 0x400);
+        assert_eq!(rendered, b"Hoi!");
+    }
+
+    #[test]
+    fn hex_format_is_uppercase() {
+        // Verified against real Kickstart 3.1 (40.72) via Copperline
+        // (issue #48): amitools' test/bin/math_fast_gcc -- a real
+        // RawDoFmt-based Printf("%08lx", ...) -- prints e.g. `FA000069`
+        // on real hardware, not lowercase.
+        let mut mem = FlatMemory::new(0x1000);
+        write_c_string(&mut mem, 0x100, b"%08lx");
+        mem.write_u32(0x200, 0xFA00_0069);
+        let (rendered, _) = render_format(&mem, &read_c_string(&mem, 0x100), 0x200);
+        assert_eq!(rendered, b"FA000069");
     }
 
     fn runtime_with_program(words: &[u16]) -> Runtime<M68kCpu> {

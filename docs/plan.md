@@ -4450,3 +4450,146 @@ genuinely-uncertain, per the harness's own established convention);
 `dos_match`/`dos_seek`/`exec_rawdofmt`/`dos_findarg`/`math_fast`/
 `math_fast_trans` stay visible `FAIL`s, each with a `tracking_issue`
 link, since they represent real volamos-side gaps.
+
+## Issue #53 fixed: mathffp.library/mathtrans.library FFP encoding had sign and exponent bits swapped — 2026-09-12
+
+Root-caused via `tools/compare_amitools_suite.py`'s `math_fast`/
+`math_fast_trans` entries: `mathlibs.rs`'s `ffp_to_f32`/`f32_to_ffp`
+had the FFP format's sign bit and exponent field in the wrong bit
+positions -- bit 0 = sign, bits 1-7 = exponent, when real FFP (verified
+by hand-decoding amitools' own `test/src/math_fast.h` constants --
+`FFP_ONE = $80000041`, `FFP_PI = $C90FDB42`, `FFP_1000 = $FA00004A`,
+etc. -- against both bit layouts) is bit 7 = sign, bits 0-6 = exponent.
+A pre-existing unit test (`ffp_one_matches_known_encoding`) had
+independently re-derived the *wrong* layout from this module's own
+(also wrong) doc comment instead of checking against any external
+ground truth, so it passed despite encoding a real bug -- rewritten to
+assert against amitools' constants directly instead, plus a new test
+covering several more of them.
+
+This single fix took `math_fast`'s substantive (non-hex-case)
+divergence from vamos from ~50 of 84 lines to 3, and
+`math_fast_trans`'s from ~110 of 149 lines to 20. The remaining ones
+resolved two more real, narrower bugs in the same module:
+
+- `f32_to_ffp` clamped only the *exponent field* on overflow/underflow,
+  leaving whatever mantissa the original (out-of-range) value happened
+  to carry -- producing a wrong-magnitude value still tagged with the
+  boundary exponent. Real overflow (including `f32` itself already
+  having overflowed to `+-inf`, which several `mathtrans` functions do
+  routinely -- `SPExp`/`SPCosh`/`SPSinh` of a large input) saturates to
+  FFP's true largest magnitude (mantissa all-`1`s, exponent `127` --
+  exactly `math_fast.h`'s own `FFP_MAX`/`FFP_MAX_NEG` constants); real
+  underflow (a value smaller than FFP's own floor, e.g. converting
+  IEEE's `FLT_MIN`) flushes to `0` instead of clamping *up* to FFP's
+  smallest nonzero magnitude. A domain-error `NaN` (`SPAcos`/`SPAsin`
+  outside `[-1,1]`, `SPLog`/`SPSqrt` of a negative number) needed its
+  own third case -- `0`, not the overflow saturation value, confirmed
+  against `vamos`'s real output for exactly these cases.
+- `SPPow` (`mathtrans.library`) computed `fnum1 ** fnum2` when real
+  `SPPow` computes `fnum2 ** fnum1` -- the same historical
+  argument-order quirk already known and reproduced for `SPSub`/
+  `SPDiv` (their own doc comments), just not yet applied here.
+  Confirmed against `math_fast_trans.c`'s own `SPPow(FFP_2, FFP_10)` ->
+  `100` (`10**2`), not `1024` (`2**10`).
+
+After all three fixes: `math_fast` is down to 2 residual lines
+(`mul3`/`mul4`, an overflow-saturation boundary case sitting exactly at
+FFP's maximum exponent field, where it's genuinely unclear -- without
+real-hardware verification -- whether volamos's unsaturated or vamos's
+saturated answer is the more correct one; left unresolved rather than
+guessed at). `math_fast_trans` is down to 5 residual lines, all
+1-ULP-ish mantissa differences in `acos`/`asin`/`atan` results --
+consistent with ordinary cross-implementation transcendental-function
+rounding variance, not a bug.
+
+5 new/rewritten unit tests in `mathlibs.rs` (overflow saturation,
+infinity saturation, NaN-vs-infinity distinction, underflow flush,
+`SPPow`'s argument order via a new `mathtrans_program`/
+`run_binary_ffp_via` e2e test helper alongside the existing
+`mathffp_program` one). Full suite: 705 passing, clippy/fmt clean.
+
+## Real-hardware (Copperline) verification resolves #48/#49/#51/#52 and the #53 mul3/mul4 boundary — 2026-09-12
+
+The previous entry left several findings genuinely uncertain because
+they came only from comparing volamos against `vamos` (or against
+amitools' own `test/data/*.txt`, itself just a captured `vamos` run) --
+agreement with `vamos` isn't a second, independent oracle. Resolved
+these against real Kickstart 3.1 hardware via the Copperline emulator's
+`--run`/CCP tooling: Kickstart 40.72 (from `~/src/amibake/assets/hyperion`, *not*
+34.5, which is Kickstart 1.3, not 3.1), A600 model (Gayle IDE support),
+a `[[filesys]]` mount of a real built Workbench 3.1.4 `Libs:` tree
+(`~/amiga/wb314/full/Libs`) for disk-resident libraries like
+`mathieeedoubbas.library`, `copperline-ctl`'s `run_until {loadseg}`
+plus `--screenshot-after` bisection to catch scrolling CON: output at
+the right moment.
+
+Findings, each changing or confirming exactly one prior conclusion:
+
+- **#48 (hex digit case) -- volamos was wrong, fixed.** Real hardware's
+  `RawDoFmt`/`VPrintf` `%x`/`%lx` print uppercase (`FA000069`, not
+  `fa000069`); `execfmt.rs`'s `FmtType::Hex` case now uses `{v:X}`.
+- **#49 (CheckDate wday) -- confirmed vamos's own divergence**, no
+  volamos change; matches the NDK autodoc's documented historical bug
+  and now has real-hardware confirmation, not just the doc citation.
+- **#51 (IEEEDPCeil sign-of-zero) -- reversed: this was actually a
+  real volamos bug, not vamos's.** The original filing reasoned
+  volamos's `-0.0` was "correct IEEE-754 sign-of-zero preservation" and
+  vamos's `+0.0` was the divergence -- backwards. Real hardware gives
+  `+0.0`, matching `vamos`. `ieeedp_ceil_handler` now forces `+0.0`
+  when the mathematical result is zero. (Lesson repeated from #53's
+  bit-swap bug: a plausible-sounding IEEE-754 argument is not a
+  substitute for checking against an actual oracle.)
+- **#52 (NaN sign bit) -- confirmed volamos's positive-signed
+  convention is correct, vamos's negative-signed is vamos's own
+  divergence.** Real hardware's `IEEEDPDiv(0,0)` and `IEEEDPDiv(-0,0)`
+  both give the identical positive-signed `$7FF10000_00000000`.
+  Separately (not something either engine's default output surfaced,
+  found only via a targeted test), Rust's `f64::asin`/`acos` don't
+  themselves agree on NaN sign for symmetric out-of-domain inputs
+  (`(-2.0).asin()` gives a negative-signed NaN, `(2.0).asin()`/
+  `(-2.0).acos()` don't) -- `ieeedp_unary` (the shared handler behind
+  `acos`/`asin`/`atan`/`sin`/`cos`/`tan`/`sinh`/`cosh`/`tanh`/`exp`/
+  `log`/`log10`/`sqrt`) now canonicalizes any NaN result to a fixed
+  positive-signed `f64::NAN`, independent of whatever sign Rust's own
+  libm happened to produce. The exact NaN payload bits beyond the sign
+  weren't chased -- real hardware's `$7FF1...` vs Rust's default
+  `$7FF8...` payload is treated as implementation-specific noise, same
+  as the existing 1-ULP transcendental-rounding residuals.
+- **#53's mul3/mul4 overflow-saturation boundary -- confirmed
+  saturated.** Real hardware's `SPMul` at exactly FFP's maximum
+  exponent field saturates to `FFP_MAX` (`FFFFFF7F`), matching
+  `f32_to_ffp`'s already-fixed `>= 127` (not `> 127`) boundary check --
+  `math_fast` is now a full three-way `PASS`, no residual lines at all.
+
+`tools/compare_amitools_suite.py`'s `KNOWN_DIVERGENCES` entries and
+corpus comments updated to match. Full workspace suite still 709
+passing (21 in `mathlibs`), clippy/fmt clean, harness run after
+rebuilding: only 5 non-KNOWN entries remain, all real, already-tracked
+volamos gaps (`dos_match` #46, `dos_seek` #47, `exec_rawdofmt` #45,
+`dos_findarg` #55 -- not implemented, and `math_fast_trans`'s 5-line
+1-ULP transcendental residual under #53, left as-is since real hardware
+wasn't chased for that specific sub-ULP rounding noise).
+
+## Issue #45 fixed: RawDoFmt's %b never converted its BPTR argument to a real address — 2026-09-12
+
+`execfmt.rs`'s `FmtType::Bstr` handling read the data-list entry
+straight off as a byte address, but real `RawDoFmt`'s `%b` takes a
+`BPTR` there (confirmed by amitools' own `exec_rawdofmt.c`, which
+builds it via `MKBADDR(bstr)`) -- needs `addr_from_bptr` (`<< 2`)
+first, the same conversion `dosbuf.rs`'s `FGetC`/`FPutC`/etc. already
+apply to their own `BPTR` arguments. Also switched to the existing
+`guestmem::read_bstr` helper instead of hand-rolling the length-byte
+read. One-line-equivalent fix; `exec_rawdofmt` is now a full three-way
+`PASS` against `vamos` and amitools' own ground truth (`BStr: 'Hoi!'`),
+confirmed directly against the real binary too, not just the harness.
+New regression test: `bstr_format_converts_the_bptr_to_a_real_address`.
+Full suite: 710 passing, clippy/fmt clean.
+
+## Issue #47 fixed: Seek() didn't reject a target position beyond end-of-file — 2026-09-12
+
+`dosfile.rs`'s `DosState::seek` delegated straight to the host `std::fs::File`'s own `seek()`, which (standard POSIX behavior) happily seeks arbitrarily far past EOF. Real `Seek()`'s own NDK autodoc is explicit: "you cannot Seek() beyond the end of a file." Fixed by computing the absolute target position for all three `offset_mode`s up front (via `stream_position()` for the pre-seek position and `metadata().len()` for the file's length) and validating it against `0..=len` *before* touching the host file at all -- an out-of-range target (too far forward *or* negative) now fails with `ERROR_SEEK_ERROR` and leaves the file's actual position untouched, rather than the fallible host seek silently succeeding.
+
+One nuance surfaced by the autodoc's own BUGS note: pre-V39 filesystems returned the *current* position (not `-1`) when this exact error occurred, a bug "fixed in the V39 filesystem." amitools' own `dos_seek` test (`test/suite/dos_seek.py`) still hardcodes that old behavior (`old_pos=14, io_err=219`) -- it's a literal assertion in vamos's own `pytest` suite, not real hardware, and vamos itself still reproduces it. volamos targets KS/WB 3.1 (V40, well past the V39 fix), so returning `-1` (`ERROR_SEEK_ERROR`'s existing `seek_handler` contract, unchanged) is the correct modern behavior, not a bug to replicate -- `tools/compare_amitools_suite.py`'s `dos_seek` entry moved from a visible tracked `FAIL` to `KNOWN_DIVERGENCES`, same treatment as #49's `CheckDate` `wday` quirk.
+
+Three new regression tests in `dosfile.rs`: `seek_rejects_a_target_position_beyond_end_of_file`, `seek_rejects_a_negative_target_position`, `seek_to_exactly_end_of_file_still_succeeds` (confirming the boundary itself -- `position == length` -- is still allowed, only *beyond* it is rejected, per the autodoc's own "the end of the file is a Seek() positioned by zero from end" wording). Confirmed directly against the real `dos_seek_gcc` binary too: `old_pos=-1, io_err=219` for the out-of-range seek. Full suite: 713 passing, clippy/fmt clean.
