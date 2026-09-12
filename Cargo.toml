@@ -15,3 +15,16 @@ volamos-core = { path = "crates/volamos-core" }
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Full debug info on every dev/test build is the main driver of
+# `target/debug`'s disk footprint (this workspace's large integration-test
+# surface means many separate test binaries, each carrying its own copy).
+# Line tables alone still give useful panic/backtrace locations without the
+# full per-variable debug info a live debugger session needs -- a trade this
+# project already leans away from, since correctness here is established via
+# ground-truth comparison harnesses (`tools/compare_*.py`), not step-through
+# debugging. See `tools/clean_stale_target.py` for the complementary
+# long-term-creep cleanup (an aged-out `target/` `debug` alone doesn't
+# address).
+[profile.dev]
+debug = "line-tables-only"
