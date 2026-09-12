@@ -3,6 +3,21 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## Unreleased
+
+- **Implemented `mathieeesingbas.library`/`mathieeesingtrans.library`**:
+  the single-precision IEEE math libraries, previously only a fake
+  `OpenLibrary` stand-in with no real function support. Mirrors
+  `mathieeedoubbas.library`/`mathieeedoubtrans.library` function-for-
+  function on plain `f32` instead of `f64`. Fixed a real bug found via
+  amitools' own `math_single_trans` ground truth along the way:
+  `IEEESPPow`'s result is `y` raised to the `x` power (`IEEESPPow(3.0,
+  4.0)` -> `64.0` = `4**3`), not `x` raised to `y` as a naive reading
+  of its `.conf`-derived argument names would suggest -- tracing this
+  down also revealed `mathieeedoubtrans.library`'s existing
+  `IEEEDPPow` already had the equivalent (correct) behavior, just a
+  misleading doc comment, now corrected.
+
 ## 0.4
 
 - **Fixed `mathffp.library`/`mathtrans.library`'s FFP encoding**

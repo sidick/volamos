@@ -77,9 +77,12 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// `0x2200` for `bsdsocket.library`’s real base (see
 /// `crate::dispatch::BSDSOCKET_LIBRARY_BASE`), then once more from
 /// `0x2400` for `graphics.library`’s real base (see
-/// `crate::dispatch::GRAPHICS_LIBRARY_BASE`) -- same reasoning each
-/// time.
-pub const TRAP_TABLE_SIZE: u32 = 0x2600;
+/// `crate::dispatch::GRAPHICS_LIBRARY_BASE`), then once more (this time
+/// two `0x200` chunks at once) from `0x2600` for
+/// `mathieeesingbas.library`/`mathieeesingtrans.library`'s real bases
+/// (see `crate::dispatch::MATHIEEESINGBAS_LIBRARY_BASE`/
+/// `MATHIEEESINGTRANS_LIBRARY_BASE`) -- same reasoning each time.
+pub const TRAP_TABLE_SIZE: u32 = 0x2A00;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

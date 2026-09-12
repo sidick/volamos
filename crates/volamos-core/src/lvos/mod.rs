@@ -27,6 +27,8 @@ pub mod locale;
 pub mod mathffp;
 pub mod mathieeedoubbas;
 pub mod mathieeedoubtrans;
+pub mod mathieeesingbas;
+pub mod mathieeesingtrans;
 pub mod mathtrans;
 pub mod utility;
 

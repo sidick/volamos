@@ -1,10 +1,21 @@
-//! `mathieeedoubbas.library`/`mathieeedoubtrans.library`/`mathtrans.library`:
-//! real math library implementations, not just [`crate::dispatch`]'s
-//! "vamos escape hatch" fake traps -- see
+//! `mathieeedoubbas.library`/`mathieeedoubtrans.library`/
+//! `mathieeesingbas.library`/`mathieeesingtrans.library`/
+//! `mathtrans.library`: real math library implementations, not just
+//! [`crate::dispatch`]'s "vamos escape hatch" fake traps -- see
 //! `crate::dispatch::STANDARD_WORKBENCH_LIBRARIES`'s doc for why these
 //! specific libraries (unlike an arbitrary optional disk library) are
 //! treated as always-present. Found missing while running the real
 //! `PhxAss` assembler.
+//!
+//! `mathieeesingbas`/`mathieeesingtrans` mirror `mathieeedoubbas`/
+//! `mathieeedoubtrans` function-for-function (same LVO offsets, per
+//! AROS's own `.conf` files -- `IEEESPFix`/`IEEEDPFix` are both `-30`,
+//! and so on down the list) but operate on IEEE single precision
+//! (`f32`, one register per value) instead of double (`f64`, a register
+//! pair) -- see [`ieeesp_unary`]'s doc for the one place their
+//! behavior is an *assumption* carried over from the double-precision
+//! real-hardware verification (issue #52) rather than independently
+//! confirmed for singles specifically.
 //!
 //! # Calling convention
 //!
@@ -45,6 +56,8 @@ use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, HandlerContext, LibraryTable};
 use crate::lvos::mathieeedoubbas::MATHIEEEDOUBBAS_LVOS;
 use crate::lvos::mathieeedoubtrans::MATHIEEEDOUBTRANS_LVOS;
+use crate::lvos::mathieeesingbas::MATHIEEESINGBAS_LVOS;
+use crate::lvos::mathieeesingtrans::MATHIEEESINGTRANS_LVOS;
 use crate::lvos::mathtrans::MATHTRANS_LVOS;
 use crate::memory::AddressSpace;
 
@@ -329,6 +342,164 @@ fn register_mathieeedoubbas_handlers<C: Cpu + 'static>(
     reg!("IEEEDPCeil", ieeedp_ceil_handler::<C>);
 }
 
+/// `mathieeesingbas.library`'s `IEEESPFix` (LVO -30: `D0` = single `y`).
+/// `D0` = `y` truncated toward zero to a 32-bit integer.
+fn ieeesp_fix_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu.set_data_register(DataRegister(0), y as i32 as u32);
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPFlt` (LVO -36: `D0` = 32-bit
+/// integer `y`). `D0` = `y` converted to an IEEE single.
+fn ieeesp_flt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = ctx.cpu.data_register(DataRegister(0)) as i32;
+    ctx.cpu
+        .set_data_register(DataRegister(0), (y as f32).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPCmp` (LVO -42: `D0` = `y`, `D1` =
+/// `z`). `D0` = `0` if equal, negative if `y < z`, positive if `y > z`.
+fn ieeesp_cmp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let z = f32::from_bits(ctx.cpu.data_register(DataRegister(1)));
+    let result = if y < z {
+        -1i32
+    } else if y > z {
+        1
+    } else {
+        0
+    };
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPTst` (LVO -48: `D0` = `y`). `D0` =
+/// `0` if `y == 0`, negative if `y < 0`, positive if `y > 0`.
+fn ieeesp_tst_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let result = if y < 0.0 {
+        -1i32
+    } else if y > 0.0 {
+        1
+    } else {
+        0
+    };
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPAbs` (LVO -54: `D0` = `y`).
+fn ieeesp_abs_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), y.abs().to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPNeg` (LVO -60: `D0` = `y`).
+fn ieeesp_neg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu.set_data_register(DataRegister(0), (-y).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPAdd` (LVO -66: `D0` = `y`, `D1` =
+/// `z`).
+fn ieeesp_add_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let z = f32::from_bits(ctx.cpu.data_register(DataRegister(1)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), (y + z).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPSub` (LVO -72: `D0` = `y`, `D1` =
+/// `z`). Result is `y - z`.
+fn ieeesp_sub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let z = f32::from_bits(ctx.cpu.data_register(DataRegister(1)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), (y - z).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPMul` (LVO -78: `D0` = `y`, `D1` =
+/// `z`).
+fn ieeesp_mul_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let z = f32::from_bits(ctx.cpu.data_register(DataRegister(1)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), (y * z).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPDiv` (LVO -84: `D0` = `y`, `D1` =
+/// `z`). Result is `y / z`; division by `0` yields IEEE-754
+/// infinity/NaN, same posture as [`ieeedp_div_handler`].
+fn ieeesp_div_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let z = f32::from_bits(ctx.cpu.data_register(DataRegister(1)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), (y / z).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPFloor` (LVO -90: `D0` = `y`).
+fn ieeesp_floor_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), y.floor().to_bits());
+    Ok(())
+}
+
+/// `mathieeesingbas.library`'s `IEEESPCeil` (LVO -96: `D0` = `y`). See
+/// [`ieeedp_ceil_handler`]'s doc for the real-hardware-confirmed
+/// positive-zero convention this carries over by analogy (not
+/// independently reverified for singles).
+fn ieeesp_ceil_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let result = y.ceil();
+    let result = if result == 0.0 { 0.0 } else { result };
+    ctx.cpu.set_data_register(DataRegister(0), result.to_bits());
+    Ok(())
+}
+
+/// Registers every implemented `mathieeesingbas.library` handler onto
+/// [`crate::dispatch::MATHIEEESINGBAS_LIBRARY_BASE`].
+fn register_mathieeesingbas_handlers<C: Cpu + 'static>(
+    table: &mut LibraryTable<C>,
+    mem: &mut C::Memory,
+) {
+    macro_rules! reg {
+        ($name:literal, $handler:expr) => {
+            table
+                .register_by_name(
+                    mem,
+                    crate::dispatch::MATHIEEESINGBAS_LIBRARY_BASE,
+                    MATHIEEESINGBAS_LVOS,
+                    "mathieeesingbas.library",
+                    $name,
+                    $handler,
+                )
+                .unwrap_or_else(|e| panic!("{} should be in MATHIEEESINGBAS_LVOS: {e}", $name));
+        };
+    }
+    reg!("IEEESPFix", ieeesp_fix_handler::<C>);
+    reg!("IEEESPFlt", ieeesp_flt_handler::<C>);
+    reg!("IEEESPCmp", ieeesp_cmp_handler::<C>);
+    reg!("IEEESPTst", ieeesp_tst_handler::<C>);
+    reg!("IEEESPAbs", ieeesp_abs_handler::<C>);
+    reg!("IEEESPNeg", ieeesp_neg_handler::<C>);
+    reg!("IEEESPAdd", ieeesp_add_handler::<C>);
+    reg!("IEEESPSub", ieeesp_sub_handler::<C>);
+    reg!("IEEESPMul", ieeesp_mul_handler::<C>);
+    reg!("IEEESPDiv", ieeesp_div_handler::<C>);
+    reg!("IEEESPFloor", ieeesp_floor_handler::<C>);
+    reg!("IEEESPCeil", ieeesp_ceil_handler::<C>);
+}
+
 /// One-`double`-argument `mathieeedoubtrans.library` function
 /// (`D0/D1` in, `D0/D1` out).
 fn ieeedp_unary<C: Cpu>(
@@ -396,8 +567,19 @@ fn ieeedp_sincos_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     Ok(())
 }
 
-/// `mathieeedoubtrans.library`'s `IEEEDPPow` (LVO -90: `D0/D1` = `x`,
-/// `D2/D3` = `y`). Result is `x` raised to the `y` power.
+/// `mathieeedoubtrans.library`'s `IEEEDPPow` (LVO -90: `D0/D1` and
+/// `D2/D3` hold the call's two `double` arguments). Confirmed against
+/// amitools' own `math_double_trans` ground truth (`IEEEDPPow(3.0,
+/// 4.0)` -> `64.0` = `4**3`, not `3**4` = `81`) that `D0/D1` (labeled
+/// `x` here) ends up holding the *second* C-level argument and is the
+/// real base, with `D2/D3` (`y`) the real exponent -- whether that's
+/// the real LVO's own documented convention or an artifact of how the
+/// compiled C stub happens to push a two-`double` call's arguments
+/// wasn't traced further, but the observable effect (and this
+/// handler's own already-correct `x.powf(y)`) is confirmed either way.
+/// [`ieeesp_pow_handler`]'s own doc has the equivalent single-precision
+/// story, including the parallel with `mathtrans.library`'s FFP
+/// `SPPow`, which has the same base/exponent relationship.
 fn ieeedp_pow_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let (x, y) = (read_f64(ctx.cpu, 0), read_f64(ctx.cpu, 2));
     write_f64(ctx.cpu, 0, x.powf(y));
@@ -460,6 +642,134 @@ fn register_mathieeedoubtrans_handlers<C: Cpu + 'static>(
     reg!("IEEEDPAsin", ieeedp_asin_handler::<C>);
     reg!("IEEEDPAcos", ieeedp_acos_handler::<C>);
     reg!("IEEEDPLog10", ieeedp_log10_handler::<C>);
+}
+
+/// One-single-argument `mathieeesingtrans.library` function (`D0` in,
+/// `D0` out). See [`ieeedp_unary`]'s doc for the NaN-sign
+/// canonicalization this carries over by analogy -- not independently
+/// reverified against real hardware for singles specifically, only
+/// assumed consistent with the same library family's double-precision
+/// behavior (issue #52).
+fn ieeesp_unary<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    f: impl FnOnce(f32) -> f32,
+) -> Result<(), DispatchError> {
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let result = f(y);
+    let result = if result.is_nan() { f32::NAN } else { result };
+    ctx.cpu.set_data_register(DataRegister(0), result.to_bits());
+    Ok(())
+}
+
+macro_rules! ieeesp_unary_handler {
+    ($fn_name:ident, $op:expr) => {
+        fn $fn_name<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+            ieeesp_unary(ctx, $op)
+        }
+    };
+}
+
+ieeesp_unary_handler!(ieeesp_atan_handler, f32::atan);
+ieeesp_unary_handler!(ieeesp_sin_handler, f32::sin);
+ieeesp_unary_handler!(ieeesp_cos_handler, f32::cos);
+ieeesp_unary_handler!(ieeesp_tan_handler, f32::tan);
+ieeesp_unary_handler!(ieeesp_sinh_handler, f32::sinh);
+ieeesp_unary_handler!(ieeesp_cosh_handler, f32::cosh);
+ieeesp_unary_handler!(ieeesp_tanh_handler, f32::tanh);
+ieeesp_unary_handler!(ieeesp_exp_handler, f32::exp);
+ieeesp_unary_handler!(ieeesp_log_handler, f32::ln);
+ieeesp_unary_handler!(ieeesp_sqrt_handler, f32::sqrt);
+ieeesp_unary_handler!(ieeesp_asin_handler, f32::asin);
+ieeesp_unary_handler!(ieeesp_acos_handler, f32::acos);
+ieeesp_unary_handler!(ieeesp_log10_handler, f32::log10);
+
+/// `mathieeesingtrans.library`'s `IEEESPSincos` (LVO -54: `A0` = pointer
+/// to store the cosine as a single, `D0` = `y`). `D0` = the sine (the
+/// function's actual return value); the cosine is written to `*A0`.
+fn ieeesp_sincos_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let z_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    let (sin, cos) = y.sin_cos();
+    ctx.mem.write_u32(z_ptr, cos.to_bits());
+    ctx.cpu.set_data_register(DataRegister(0), sin.to_bits());
+    Ok(())
+}
+
+/// `mathieeesingtrans.library`'s `IEEESPPow` (LVO -90: `D1` = the
+/// C-level `x` parameter, `D0` = `y`, per AROS's own `.conf` -- note the
+/// register order is *not* `D0`-then-`D1` the way every other
+/// two-argument single-precision call in these two libraries is; this
+/// is the real ABI, not a transcription error). Despite the `.conf`'s
+/// own naming, the result is `y` raised to the `x` power, *not* `x`
+/// raised to `y` -- confirmed against amitools' own `math_single_trans`
+/// ground truth (`IEEESPPow(3.0, 4.0)` -> `64.0` = `4**3`, not
+/// `3**4` = `81`; `IEEESPPow(1000.0, 0.0)` -> `0.0` = `0**1000`, not
+/// `1000**0` = `1.0`). `D0` ends up the real base and `D1` the real
+/// exponent here, the same base/exponent relationship
+/// [`ieeedp_pow_handler`]'s own (already-correct) code has for its
+/// `D0/D1` register pair vs. `D2/D3`, and the same shape as
+/// `mathtrans.library`'s FFP `SPPow` quirk (see `sp_pow_handler`'s
+/// doc) -- whether this is the real LVO's own documented convention or
+/// an artifact of how a compiled C stub pushes a multi-argument call's
+/// registers wasn't traced further; the observable effect is what's
+/// confirmed.
+fn ieeesp_pow_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let x = f32::from_bits(ctx.cpu.data_register(DataRegister(1)));
+    let y = f32::from_bits(ctx.cpu.data_register(DataRegister(0)));
+    ctx.cpu
+        .set_data_register(DataRegister(0), y.powf(x).to_bits());
+    Ok(())
+}
+
+/// `mathieeesingtrans.library`'s `IEEESPTieee`/`IEEESPFieee` (LVOs -102/
+/// -108: `D0` = `y`). Both are documented no-ops -- "included for
+/// completeness although they just return the input parameter" (their
+/// own NDK autodoc) -- since the library's own native format already
+/// *is* IEEE single precision, unlike `mathieeedoubtrans.library`'s
+/// `IEEEDPTieee`/`IEEEDPFieee`, which do a real double<->single
+/// conversion.
+fn ieeesp_identity_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let _ = ctx;
+    Ok(())
+}
+
+/// Registers every implemented `mathieeesingtrans.library` handler onto
+/// [`crate::dispatch::MATHIEEESINGTRANS_LIBRARY_BASE`].
+fn register_mathieeesingtrans_handlers<C: Cpu + 'static>(
+    table: &mut LibraryTable<C>,
+    mem: &mut C::Memory,
+) {
+    macro_rules! reg {
+        ($name:literal, $handler:expr) => {
+            table
+                .register_by_name(
+                    mem,
+                    crate::dispatch::MATHIEEESINGTRANS_LIBRARY_BASE,
+                    MATHIEEESINGTRANS_LVOS,
+                    "mathieeesingtrans.library",
+                    $name,
+                    $handler,
+                )
+                .unwrap_or_else(|e| panic!("{} should be in MATHIEEESINGTRANS_LVOS: {e}", $name));
+        };
+    }
+    reg!("IEEESPAtan", ieeesp_atan_handler::<C>);
+    reg!("IEEESPSin", ieeesp_sin_handler::<C>);
+    reg!("IEEESPCos", ieeesp_cos_handler::<C>);
+    reg!("IEEESPTan", ieeesp_tan_handler::<C>);
+    reg!("IEEESPSincos", ieeesp_sincos_handler::<C>);
+    reg!("IEEESPSinh", ieeesp_sinh_handler::<C>);
+    reg!("IEEESPCosh", ieeesp_cosh_handler::<C>);
+    reg!("IEEESPTanh", ieeesp_tanh_handler::<C>);
+    reg!("IEEESPExp", ieeesp_exp_handler::<C>);
+    reg!("IEEESPLog", ieeesp_log_handler::<C>);
+    reg!("IEEESPPow", ieeesp_pow_handler::<C>);
+    reg!("IEEESPSqrt", ieeesp_sqrt_handler::<C>);
+    reg!("IEEESPTieee", ieeesp_identity_handler::<C>);
+    reg!("IEEESPFieee", ieeesp_identity_handler::<C>);
+    reg!("IEEESPAsin", ieeesp_asin_handler::<C>);
+    reg!("IEEESPAcos", ieeesp_acos_handler::<C>);
+    reg!("IEEESPLog10", ieeesp_log10_handler::<C>);
 }
 
 /// One-FFP-argument `mathtrans.library` function (`D0` in, `D0` out).
@@ -752,7 +1062,7 @@ fn register_mathffp_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("SPCeil", sp_ceil_handler::<C>);
 }
 
-/// Registers every implemented handler for all four math libraries.
+/// Registers every implemented handler for all six math libraries.
 /// Called unconditionally from [`crate::dispatch::Runtime::new`].
 pub fn register_mathlibs_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
@@ -760,6 +1070,8 @@ pub fn register_mathlibs_handlers<C: Cpu + 'static>(
 ) {
     register_mathieeedoubbas_handlers(table, mem);
     register_mathieeedoubtrans_handlers(table, mem);
+    register_mathieeesingbas_handlers(table, mem);
+    register_mathieeesingtrans_handlers(table, mem);
     register_mathtrans_handlers(table, mem);
     register_mathffp_handlers(table, mem);
 }
@@ -1269,5 +1581,187 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert!((ffp_to_f32(code as u32) - 3.0).abs() < 1e-4);
+    }
+
+    /// Prepends `movea.l #MATHIEEESINGBAS_LIBRARY_BASE,a6` and builds a
+    /// runtime -- see [`mathffp_program`]'s twin, for
+    /// `mathieeesingbas.library` functions. Unlike the double-precision
+    /// twins, a single-precision result fits entirely in `D0`, so these
+    /// tests can just read it back as the program's own exit code --
+    /// no guest-memory write-back trick needed.
+    fn mathieeesingbas_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (crate::dispatch::MATHIEEESINGBAS_LIBRARY_BASE >> 16) as u16,
+            crate::dispatch::MATHIEEESINGBAS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    /// Prepends `movea.l #MATHIEEESINGTRANS_LIBRARY_BASE,a6` and builds
+    /// a runtime -- see [`mathieeesingbas_program`]'s twin, for
+    /// `mathieeesingtrans.library` functions.
+    fn mathieeesingtrans_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (crate::dispatch::MATHIEEESINGTRANS_LIBRARY_BASE >> 16) as u16,
+            crate::dispatch::MATHIEEESINGTRANS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn ieeesp_add_sub_mul_div_natural_order() {
+        // Unlike mathtrans.library's FFP SPAdd/SPSub/etc., the IEEE
+        // single-precision library has no argument-order quirk -- D0=y,
+        // D1=z, result is the ordinary y op z (matches IEEEDPAdd/Sub/
+        // Mul/Div's own natural order too).
+        let mut words = vec![
+            move_imm_to_d(0),
+            (10.0f32.to_bits() >> 16) as u16,
+            10.0f32.to_bits() as u16,
+            move_imm_to_d(1),
+            (3.0f32.to_bits() >> 16) as u16,
+            3.0f32.to_bits() as u16,
+        ];
+        words.extend_from_slice(&jsr_disp16_a6(-72)); // IEEESPSub
+        words.push(RTS);
+
+        let mut rt = mathieeesingbas_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let result = f32::from_bits(code as u32);
+        assert!((result - 7.0).abs() < 1e-4, "got {result}");
+    }
+
+    #[test]
+    fn ieeesp_fix_and_flt_round_trip() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(42);
+        words.extend_from_slice(&jsr_disp16_a6(-36)); // IEEESPFlt -> D0 = 42.0f32
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // IEEESPFix -> D0 = 42
+        words.push(RTS);
+
+        let mut rt = mathieeesingbas_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn ieeesp_ceil_of_a_small_negative_number_gives_positive_zero() {
+        // Same real-hardware-confirmed convention as IEEEDPCeil (issue
+        // #51/#52), carried over by analogy for the single-precision
+        // twin.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        let bits = (-0.5f32).to_bits();
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // IEEESPCeil
+        words.push(RTS);
+
+        let mut rt = mathieeesingbas_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let result = f32::from_bits(code as u32);
+        assert_eq!(result, 0.0);
+        assert!(!result.is_sign_negative(), "must be +0.0, not -0.0");
+    }
+
+    #[test]
+    fn ieeesp_pow_computes_d0_to_the_d1_not_d1_to_the_d0() {
+        // D1 = 10, D0 = 2 -- confirmed against amitools' own
+        // math_single_trans ground truth (IEEESPPow(3.0, 4.0) -> 64.0
+        // = 4**3, not 3**4 = 81; see ieeesp_pow_handler's own doc) that
+        // the result is D0**D1 = 2**10 = 1024, not D1**D0 = 10**2 = 100.
+        let mut words = vec![
+            move_imm_to_d(1),
+            (10.0f32.to_bits() >> 16) as u16,
+            10.0f32.to_bits() as u16,
+            move_imm_to_d(0),
+            (2.0f32.to_bits() >> 16) as u16,
+            2.0f32.to_bits() as u16,
+        ];
+        words.extend_from_slice(&jsr_disp16_a6(-90)); // IEEESPPow
+        words.push(RTS);
+
+        let mut rt = mathieeesingtrans_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let result = f32::from_bits(code as u32);
+        assert!((result - 1024.0).abs() < 1e-2, "got {result}");
+    }
+
+    #[test]
+    fn ieeesp_tieee_and_fieee_are_identity() {
+        // Both are documented no-ops for this library (its own native
+        // format already is IEEE single) -- see ieeesp_identity_handler's
+        // doc.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        let bits = 3.5f32.to_bits();
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-102)); // IEEESPTieee
+        words.extend_from_slice(&jsr_disp16_a6(-108)); // IEEESPFieee
+        words.push(RTS);
+
+        let mut rt = mathieeesingtrans_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(f32::from_bits(code as u32), 3.5);
+    }
+
+    #[test]
+    fn ieeesp_asin_domain_error_is_always_positive_signed_nan() {
+        // Same canonicalization as IEEEDPAsin (issue #52), carried over
+        // by analogy for the single-precision twin.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        let bits = (-2.0f32).to_bits();
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IEEESPAsin
+        words.push(RTS);
+
+        let mut rt = mathieeesingtrans_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let result = f32::from_bits(code as u32);
+        assert!(result.is_nan());
+        assert!(!result.is_sign_negative(), "must be a positive-signed NaN");
     }
 }
