@@ -65,23 +65,30 @@ data point, not two.
 ## intentionally not here yet -- companion-binary-building entries,
 ## other compiler flavors, and CI promotion)
 
-Two runs against this corpus so far have found seven real volamos bugs
-(issues #45, #46, #47, #48, #51, #53 -- #45, `RawDoFmt`'s `%b` never
-converting its `BPTR` argument to a real address, #48, `%x`/`%lx` hex
-digit case, #51, `IEEEDPCeil()`'s negative-zero sign, and #53,
-`mathffp.library`/`mathtrans.library` having its FFP sign/exponent bits
-swapped plus wrong overflow/underflow saturation, have all since been
-fixed in `crates/volamos-core/src/` and confirmed correct against real
-Kickstart 3.1 hardware via Copperline (A600 model, for Gayle IDE
-support); #46-#47 are still visible `FAIL`s below, `KNOWN_DIVERGENCES`
-is reserved for divergences attributed to `vamos`, not for volamos's
-own unfixed ones), one missing feature (#55, `FindArg` not
-implemented), and one divergence now confirmed attributed to `vamos`
-itself via the same real-hardware verification (#52, qNaN sign bit for
-domain-error results -- volamos's positive sign matches real hardware,
-vamos's negative sign doesn't) -- concrete evidence this corpus finds
-things volamos's own ~6 fixtures don't. #49 (CheckDate wday) is also
-now confirmed against real hardware, not just NDK-autodoc citation.
+Multiple runs against this corpus have found and fixed eight real
+volamos bugs (issues #45, #46, #47, #48, #51, #53, #55 -- #45,
+`RawDoFmt`'s `%b` never converting its `BPTR` argument to a real
+address; #46, `AnchorPath`'s `ap_Buf` always stripping the caller's own
+device prefix instead of tracking whatever qualification level the
+caller's own pattern text had; #47, `Seek()` never rejecting a target
+position beyond EOF; #48, `%x`/`%lx` hex digit case; #51,
+`IEEEDPCeil()`'s negative-zero sign; #53, `mathffp.library`/
+`mathtrans.library`'s FFP sign/exponent bits swapped plus wrong
+overflow/underflow saturation; #55, `dos.library/FindArg` not
+implemented at all -- confirmed correct against real Kickstart 3.1
+hardware via Copperline (A600 model, for Gayle IDE support, and for
+#46 specifically, a genuine in-memory FFS synthesized from a host
+directory via `[ide]`, not just `--run`'s convenience mount, after an
+initial `--run`-based fix attempt caused a direct, reproducible
+regression in volamos's own `Delete` -- see issue #46's own comment
+thread for the full story), one further, narrower gap surfaced by
+fixing #46 (issue #58, `MatchFirst`'s volume-root `fib_FileName`/
+`APF_DirChanged` flags), and two divergences confirmed attributed to
+`vamos` itself via the same real-hardware verification (#49, `CheckDate`
+wday; #52, qNaN sign bit for domain-error results) -- concrete evidence
+this corpus finds things volamos's own ~6 fixtures don't. `dos_match`
+(#58) and `math_fast_trans` (#53's own residual 1-ULP transcendental
+noise) are the only entries still a tracked `FAIL` below.
 
 - `dos_match`: `MatchFirst`/`MatchNext`/`ap_Buf` via a real `AnchorPath`
   scan of a scratch `SYS:` -- exercises `crate::dosanchor`.
@@ -91,7 +98,7 @@ now confirmed against real hardware, not just NDK-autodoc citation.
 - `dos_examine`: `Lock`/`Examine`/`ExNext` against a scratch `TEST:`
   subdirectory (order-tolerant, matching `test/suite/dos_examine.py`'s
   own "either ExNext order" acceptance).
-- `dos_findarg`: `dos.library/FindArg` -- not implemented yet (#55).
+- `dos_findarg`: `dos.library/FindArg` -- implemented (#55, fixed).
 - `util_date`, `vprintf`, `exec_rawdofmt`, `dos_stdout`, `util_muldiv`,
   `exec_copymem`, `math_double`, `math_double_trans`, `math_fast`,
   `math_fast_trans`: no volume needed at all; the `math_*`/`util_date`/
@@ -267,6 +274,15 @@ CORPUS = [
         # directory itself once more on the way back out of its
         # descent), not a typo; this entry exists specifically to
         # exercise that.
+        #
+        # ap_Buf's own device-prefix question (originally issue #46) is
+        # fixed and confirmed via real Kickstart 3.1 hardware -- every
+        # ap_Buf column now matches vamos's exactly. The residual
+        # mismatch is narrower: the volume-root rows' fib_FileName
+        # ("SYS"/empty first column) and the ap_Flags values on the
+        # "c" and final rows -- see issue #58 (fib_FileName confirmed
+        # via real hardware to want blank; the ap_Flags/APF_DirChanged
+        # question is still unconfirmed either way).
         expected=[
             "sys: sys: 0 5",
             "c sys:c 0 1",
@@ -276,7 +292,7 @@ CORPUS = [
             "t sys:t 0 1",
             "sys: sys: 0 9",
         ],
-        tracking_issue="https://github.com/sidick/volamos/issues/46",
+        tracking_issue="https://github.com/sidick/volamos/issues/58",
     ),
     Entry(
         name="dos_seek",
@@ -325,8 +341,8 @@ CORPUS = [
         # dos.library/FindArg's own NDK autodoc confirms these are the
         # real, documented results (abbreviation/multi-keyword lookup
         # in a ReadArgs-style template) -- not just "whatever this test
-        # happened to observe". volamos doesn't implement FindArg at
-        # all yet (unhandled-library-call, empty stdout, exit 1).
+        # happened to observe". Implemented (#55, fixed) on top of
+        # dosargs.rs's existing ReadArgs template parser.
         expected=[
             "FindArg(a=b/k,a)=0  == 0  ok",
             "FindArg(a=b/k,b)=0  == 0  ok",

@@ -50,6 +50,23 @@ version scheme in `Cargo.toml`.
   amitools' own `dos_seek` test still (incorrectly, for a V40 target)
   expects since it's a literal `vamos`-captured assertion, not real
   hardware.
+- **Implemented `dos.library/FindArg`** (issue #55): finds the
+  zero-based slot index a keyword names in a `ReadArgs`-style template
+  (or `-1`), reusing the same template parser and `NAME=ABBREV` alias
+  handling `ReadArgs` itself already had. Previously an unhandled
+  library call.
+- **Fixed `AnchorPath`'s `ap_Buf` qualification** (issue #46): confirmed
+  via real Kickstart 3.1 hardware (through a genuine in-memory FFS/OFS
+  volume synthesized from a host directory, not just a convenience
+  boot mount) that `ap_Buf` tracks whatever device/path qualification
+  the caller's own `MatchFirst`/`MatchNext` pattern text had -- a
+  device-qualified pattern (`"sys:"`) reports device-qualified entries
+  (`"sys:c"`); a bare, current-directory-relative pattern with no
+  prefix at all reports entries with no qualification either, matching
+  `fib_FileName` exactly. volamos previously always stripped `ap_Buf`
+  down to a bare relative name regardless (issue #14's own fix, which
+  turned out to be treating a symptom rather than the actual
+  mechanism -- see #46's closing comment for the full story).
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`

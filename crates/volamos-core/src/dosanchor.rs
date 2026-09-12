@@ -125,7 +125,25 @@ struct ScanLevel {
     dir_lock_addr: u32,
     /// The Amiga path that reached this directory, always ending in `:`
     /// or `/`, so a child entry's full path is just this plus its name.
+    /// This is always fully `VFS`-qualified (used for real host
+    /// resolution -- `lock_dir`/`Vfs`) and is *not* what `ap_Buf` is
+    /// built from -- see [`Self::display_prefix`].
     dir_amiga_path: String,
+    /// The prefix `ap_Buf`-bound paths for entries in this directory are
+    /// built from (`join_amiga(display_prefix, name)`) -- confirmed
+    /// against real Kickstart 3.1 hardware (Copperline, issue #46) to
+    /// track the *caller's own pattern text*, not this module's
+    /// internal `VFS`-qualified `dir_amiga_path`: a device-qualified
+    /// pattern (`"sys:"`) reports device-qualified `ap_Buf` entries
+    /// (`"sys:c"`), but a bare, cwd-relative pattern with no device or
+    /// path prefix at all (`"Shell-Startup"`, after a prior `CurrentDir`)
+    /// reports entries with *no* qualification whatsoever (`ap_Buf` ==
+    /// `fib_FileName` == `"Shell-Startup"`), even though `dir_amiga_path`
+    /// for that same scan is fully qualified internally (`"SYS:S/"`).
+    /// Threaded independently of `dir_amiga_path` through every
+    /// `APF_DODIR` descent so a scan that started unqualified stays
+    /// unqualified at every depth.
+    display_prefix: String,
     dir_host_path: PathBuf,
     /// Entries already filtered by the pattern and sorted, with a flag
     /// for whether each is itself a directory (eligible for further
@@ -192,22 +210,6 @@ fn join_amiga(dir: &str, name: &str) -> String {
     }
 }
 
-/// Strips a leading `volume:`/`assign:` device-name prefix, if any --
-/// what `ap_Buf` actually holds on real hardware isn't the fully
-/// `VFS`-qualified path this module otherwise works with internally,
-/// but a path *relative to the volume* (the RKRM's own wording: "its
-/// complete (*relative*) path"). Found via disassembling the real
-/// `C:Delete` binary (issue #14): it builds its own device-name prefix
-/// separately (by scanning the *pattern text itself* for a leading
-/// `:`, not from `ap_Buf`) and concatenates that with `ap_Buf`'s own
-/// content when printing a match -- so a caller-supplied device name
-/// stayed *in* `ap_Buf` too, real output would double it (exactly
-/// volamos's old, wrong behavior: `SYS:SYS:S/Shell-Startup`, vs. real
-/// hardware's `SYS:S/Shell-Startup`).
-fn strip_device_prefix(path: &str) -> &str {
-    path.split_once(':').map_or(path, |(_, rest)| rest)
-}
-
 fn set_flag_bit(mem: &mut dyn AddressSpace, ap_addr: u32, bit: u8, set: bool) {
     let flags = mem.read_u8(ap_addr + AP_FLAGS_OFFSET);
     mem.write_u8(
@@ -228,10 +230,25 @@ fn alloc_achain(heap: &mut GuestHeap, mem: &mut dyn AddressSpace) -> Result<u32,
 
 /// Fills `ap_Info` (in the `AnchorPath` at `ap_addr`) and `an_Info` (in
 /// the `AChain` at `achain_addr`) for a matched entry, and `ap_Buf`
-/// (truncated to `ap_Strlen`, per the documented convention) with its
-/// full path, if `ap_Strlen` is non-zero. Returns
+/// (truncated to `ap_Strlen`, per the documented convention) with
+/// `display_path` verbatim, if `ap_Strlen` is non-zero. Returns
 /// [`ERROR_BUFFER_OVERFLOW`] (still having filled everything else) if
 /// the path didn't fit.
+///
+/// `display_path` is *not* this module's own internal `VFS`-qualified
+/// path -- every call site builds it from [`ScanLevel::display_prefix`]
+/// (or, for a non-wildcard `MatchFirst`, the caller's own literal
+/// pattern text) specifically so it reflects whatever qualification
+/// level the caller's own pattern had, not this module's internal
+/// canonical form. See `display_prefix`'s own doc for why (issue #46,
+/// confirmed against real Kickstart 3.1 hardware via Copperline): this
+/// reverses issue #14's conclusion that `ap_Buf` should always be
+/// volume-relative, which was itself based on a real but incomplete
+/// observation (see this issue's own comment thread for the full
+/// story -- the short version is that #14's `Delete SYS:S/Shell-Startup`
+/// repro happened to use a device-qualified pattern, and real `Delete`
+/// doesn't double the prefix regardless of `ap_Buf`'s qualification, so
+/// stripping was never actually the mechanism keeping it single).
 #[allow(clippy::too_many_arguments)] // internal helper; one param per real FIB/AnchorPath field it fills
 fn write_match_result(
     mem: &mut dyn AddressSpace,
@@ -240,7 +257,7 @@ fn write_match_result(
     name: &str,
     is_dir: bool,
     size: u32,
-    full_amiga_path: &str,
+    display_path: &str,
     host_path: &Path,
 ) -> Result<(), i32> {
     fill_fib(mem, ap_addr + AP_INFO_OFFSET, name, is_dir, size, host_path);
@@ -257,7 +274,7 @@ fn write_match_result(
     if strlen == 0 {
         return Ok(());
     }
-    let bytes = strip_device_prefix(full_amiga_path).as_bytes();
+    let bytes = display_path.as_bytes();
     let overflowed = bytes.len() + 1 > strlen;
     let n = bytes.len().min(strlen.saturating_sub(1));
     let buf_addr = ap_addr + AP_BUF_OFFSET;
@@ -317,15 +334,25 @@ fn match_first(
 ) -> Result<(), i32> {
     let pat_str = String::from_utf8_lossy(pat_bytes).into_owned();
     let split_idx = pat_str.rfind([':', '/']);
-    let (dir_part, name_part) = match split_idx {
-        Some(i) => (pat_str[..=i].to_string(), &pat_str[i + 1..]),
+    let (dir_part, display_dir_part, name_part) = match split_idx {
+        Some(i) => {
+            let literal = pat_str[..=i].to_string();
+            (literal.clone(), literal, &pat_str[i + 1..])
+        }
         None => {
             let cwd = dos
                 .vfs
                 .as_ref()
                 .map(|v| v.cwd().to_string())
                 .unwrap_or_default();
-            (format!("{cwd}/"), pat_str.as_str())
+            // Deliberately empty, *not* `cwd` -- a bare pattern with no
+            // device or path prefix at all reports `ap_Buf` entries with
+            // no qualification either, confirmed against real Kickstart
+            // 3.1 hardware (issue #46): `MatchFirst("Shell-Startup", ...)`
+            // after a `CurrentDir` reports `ap_Buf == fib_FileName ==
+            // "Shell-Startup"`, even though this scan's own internal
+            // `dir_part`/`dir_amiga_path` is fully qualified (`"SYS:S/"`).
+            (format!("{cwd}/"), String::new(), pat_str.as_str())
         }
     };
     let (pattern_node, has_wild) =
@@ -348,6 +375,10 @@ fn match_first(
         let display_name = own_display_name(&entry.amiga_path);
         let achain_addr = alloc_achain(heap, mem)?;
         mem.write_u32(achain_addr + AN_LOCK_OFFSET, bptr);
+        // The caller's own literal pattern text, verbatim -- a
+        // non-wildcard `MatchFirst`'s `ap_Buf` is just `pat_str` itself
+        // on real hardware (issue #46), not this module's internal
+        // `VFS`-qualified `entry.amiga_path`.
         write_match_result(
             mem,
             ap_addr,
@@ -355,7 +386,7 @@ fn match_first(
             &display_name,
             is_dir,
             size,
-            &entry.amiga_path,
+            &pat_str,
             &entry.host_path,
         )?;
         mem.write_u32(ap_addr + AP_BASE_OFFSET, achain_addr);
@@ -370,6 +401,7 @@ fn match_first(
             // uses it verbatim (via `direct_self`) as the descend
             // target when the caller sets `APF_DODIR`.
             dir_amiga_path: entry.amiga_path.clone(),
+            display_prefix: pat_str.clone(),
             dir_host_path: entry.host_path,
             self_name: display_name.clone(),
             // Deliberately empty: this level doesn't scan a directory's
@@ -418,7 +450,7 @@ fn match_first(
     let achain_addr = alloc_achain(heap, mem)?;
     mem.write_u32(achain_addr + AN_LOCK_OFFSET, bptr);
     let (name0, is_dir0) = entries[0].clone();
-    let full_path0 = join_amiga(&dir_part, &name0);
+    let display_path0 = join_amiga(&display_dir_part, &name0);
     let host_path0 = host_path.join(&name0);
     let size0 = if is_dir0 {
         0
@@ -434,7 +466,7 @@ fn match_first(
         &name0,
         is_dir0,
         size0,
-        &full_path0,
+        &display_path0,
         &host_path0,
     )?;
     mem.write_u32(ap_addr + AP_BASE_OFFSET, achain_addr);
@@ -446,6 +478,7 @@ fn match_first(
         achain_addr,
         dir_lock_addr: addr,
         dir_amiga_path: dir_part,
+        display_prefix: display_dir_part,
         dir_host_path: host_path,
         self_name,
         entries,
@@ -505,6 +538,14 @@ fn match_next_inner(
             } else {
                 join_amiga(&top.dir_amiga_path, &format!("{name}/"))
             };
+            // Same construction as `child_amiga`, but from `display_prefix`
+            // -- keeps a scan that started unqualified (see that field's
+            // own doc) unqualified at every further `APF_DODIR` depth too.
+            let child_display = if state.direct_self {
+                ensure_trailing_sep(&top.display_prefix)
+            } else {
+                join_amiga(&top.display_prefix, &format!("{name}/"))
+            };
             state.direct_self = false;
             let old_top_achain = top.achain_addr;
 
@@ -523,6 +564,7 @@ fn match_next_inner(
                 achain_addr,
                 dir_lock_addr: addr,
                 dir_amiga_path: child_amiga,
+                display_prefix: child_display,
                 dir_host_path: host_path,
                 self_name: name,
                 entries,
@@ -540,7 +582,7 @@ fn match_next_inner(
     let level = state.levels.last_mut().expect("non-empty by construction");
     if let Some((name, is_dir)) = level.entries.get(level.cursor).cloned() {
         level.cursor += 1;
-        let full_path = join_amiga(&level.dir_amiga_path, &name);
+        let display_path = join_amiga(&level.display_prefix, &name);
         let host_path = level.dir_host_path.join(&name);
         let achain_addr = level.achain_addr;
         let size = if is_dir {
@@ -557,7 +599,7 @@ fn match_next_inner(
             &name,
             is_dir,
             size,
-            &full_path,
+            &display_path,
             &host_path,
         )?;
         // Same directory as the previous iteration -- per the RKRM,
@@ -582,13 +624,13 @@ fn match_next_inner(
     dos.unlock(heap, finished.dir_lock_addr);
     let parent = state.levels.last().expect("len() > 1 just checked");
     let parent_achain = parent.achain_addr;
-    // `finished.dir_amiga_path` is already this level's own full path
-    // (the invariant every `ScanLevel` maintains) -- using it directly
-    // avoids re-deriving it via `join_amiga(parent, finished.self_name)`,
-    // which breaks when `finished` was reached via `direct_self`
-    // descent (its path isn't `parent.dir_amiga_path + self_name` at
-    // all, e.g. a bare volume root like `"WORK:"`).
-    let full_path = finished.dir_amiga_path.clone();
+    // `finished.display_prefix` is already this level's own full display
+    // path (the invariant every `ScanLevel` maintains) -- using it
+    // directly avoids re-deriving it via `join_amiga(parent,
+    // finished.self_name)`, which breaks when `finished` was reached via
+    // `direct_self` descent (its path isn't `parent.display_prefix +
+    // self_name` at all, e.g. a bare volume root like `"WORK:"`).
+    let display_path = finished.display_prefix.clone();
     mem.write_u32(ap_addr + AP_LAST_OFFSET, parent_achain);
     // Restore ap_Info to the just-exited directory's own descriptor
     // (see ScanLevel::self_name's doc) before signaling APF_DIDDIR.
@@ -599,7 +641,7 @@ fn match_next_inner(
         &finished.self_name,
         true,
         0,
-        &full_path,
+        &display_path,
         &finished.dir_host_path,
     )?;
     set_flag_bit(mem, ap_addr, APF_DIDDIR, true);
@@ -875,10 +917,44 @@ mod tests {
 
         match_first(&mut heap, &mut mem, &mut dos, b"SYS:hello.txt", ap).expect("match");
         let path = read_c_string(&mem, ap + AP_BUF_OFFSET);
-        // Not "SYS:hello.txt" -- see strip_device_prefix's doc (issue
-        // #14): ap_Buf holds a path *relative to the volume*, not the
-        // fully device-qualified form.
+        // The caller's own literal pattern text, verbatim -- confirmed
+        // against real Kickstart 3.1 hardware (issue #46; see
+        // `write_match_result`'s own doc for the full story, including
+        // why this reverses issue #14's original conclusion).
+        assert_eq!(path, b"SYS:hello.txt");
+    }
+
+    #[test]
+    fn ap_buf_has_no_device_qualifier_for_a_bare_cwd_relative_pattern() {
+        // Confirmed against real Kickstart 3.1 hardware (issue #46): a
+        // pattern with no device or path prefix at all reports `ap_Buf`
+        // with no qualification either, matching `fib_FileName` exactly
+        // -- even though this scan's own internal resolution is fully
+        // qualified (`SYS:hello.txt` on disk).
+        let tmp = TempDir::new("apbuf-relative");
+        fs::write(tmp.path().join("hello.txt"), b"hi").unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        let ap = alloc_ap(&mut heap, &mut mem, 64);
+
+        match_first(&mut heap, &mut mem, &mut dos, b"hello.txt", ap).expect("match");
+        let path = read_c_string(&mem, ap + AP_BUF_OFFSET);
         assert_eq!(path, b"hello.txt");
+    }
+
+    #[test]
+    fn ap_buf_for_a_wildcard_scan_keeps_the_callers_own_device_prefix() {
+        // Confirmed against real Kickstart 3.1 hardware (issue #46):
+        // amitools' own dos_match_gcc scanning "sys:" reports ap_Buf
+        // entries like "sys:c" (lowercase, matching the caller's own
+        // typed case), not the bare "c" this used to report.
+        let tmp = TempDir::new("apbuf-wildcard");
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        let ap = alloc_ap(&mut heap, &mut mem, 64);
+
+        match_first(&mut heap, &mut mem, &mut dos, b"sys:#?", ap).expect("match");
+        let path = read_c_string(&mem, ap + AP_BUF_OFFSET);
+        assert_eq!(path, b"sys:sub");
     }
 
     #[test]
