@@ -259,7 +259,12 @@ fn format_value(
         }
         FmtType::Hex => {
             let v: u32 = if is_long { raw } else { u32::from(raw as u16) };
-            format!("{v:x}").into_bytes()
+            // Uppercase, matching real `RawDoFmt` -- verified against
+            // real Kickstart 3.1 (40.72) via Copperline: amitools'
+            // `test/bin/math_fast_gcc` (`RawDoFmt`-based `Printf`)
+            // prints `FA000069`/`FFFFFF7F`/etc., not lowercase (issue
+            // #48, resolved).
+            format!("{v:X}").into_bytes()
         }
         FmtType::Char => {
             vec![raw as u8]
@@ -653,6 +658,19 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, -1, "RawMayGetChar should report no input pending");
         assert!(out.is_empty(), "debug output must not leak into stdout");
+    }
+
+    #[test]
+    fn hex_format_is_uppercase() {
+        // Verified against real Kickstart 3.1 (40.72) via Copperline
+        // (issue #48): amitools' test/bin/math_fast_gcc -- a real
+        // RawDoFmt-based Printf("%08lx", ...) -- prints e.g. `FA000069`
+        // on real hardware, not lowercase.
+        let mut mem = FlatMemory::new(0x1000);
+        write_c_string(&mut mem, 0x100, b"%08lx");
+        mem.write_u32(0x200, 0xFA00_0069);
+        let (rendered, _) = render_format(&mem, &read_c_string(&mem, 0x100), 0x200);
+        assert_eq!(rendered, b"FA000069");
     }
 
     fn runtime_with_program(words: &[u16]) -> Runtime<M68kCpu> {

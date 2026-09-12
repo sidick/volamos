@@ -4508,3 +4508,65 @@ infinity saturation, NaN-vs-infinity distinction, underflow flush,
 `SPPow`'s argument order via a new `mathtrans_program`/
 `run_binary_ffp_via` e2e test helper alongside the existing
 `mathffp_program` one). Full suite: 705 passing, clippy/fmt clean.
+
+## Real-hardware (Copperline) verification resolves #48/#49/#51/#52 and the #53 mul3/mul4 boundary — 2026-09-12
+
+The previous entry left several findings genuinely uncertain because
+they came only from comparing volamos against `vamos` (or against
+amitools' own `test/data/*.txt`, itself just a captured `vamos` run) --
+agreement with `vamos` isn't a second, independent oracle. Resolved
+these against real Kickstart 3.1 hardware via the Copperline emulator's
+`--run`/CCP tooling: Kickstart 40.72 (from `~/src/amibake/assets/hyperion`, *not*
+34.5, which is Kickstart 1.3, not 3.1), A600 model (Gayle IDE support),
+a `[[filesys]]` mount of a real built Workbench 3.1.4 `Libs:` tree
+(`~/amiga/wb314/full/Libs`) for disk-resident libraries like
+`mathieeedoubbas.library`, `copperline-ctl`'s `run_until {loadseg}`
+plus `--screenshot-after` bisection to catch scrolling CON: output at
+the right moment.
+
+Findings, each changing or confirming exactly one prior conclusion:
+
+- **#48 (hex digit case) -- volamos was wrong, fixed.** Real hardware's
+  `RawDoFmt`/`VPrintf` `%x`/`%lx` print uppercase (`FA000069`, not
+  `fa000069`); `execfmt.rs`'s `FmtType::Hex` case now uses `{v:X}`.
+- **#49 (CheckDate wday) -- confirmed vamos's own divergence**, no
+  volamos change; matches the NDK autodoc's documented historical bug
+  and now has real-hardware confirmation, not just the doc citation.
+- **#51 (IEEEDPCeil sign-of-zero) -- reversed: this was actually a
+  real volamos bug, not vamos's.** The original filing reasoned
+  volamos's `-0.0` was "correct IEEE-754 sign-of-zero preservation" and
+  vamos's `+0.0` was the divergence -- backwards. Real hardware gives
+  `+0.0`, matching `vamos`. `ieeedp_ceil_handler` now forces `+0.0`
+  when the mathematical result is zero. (Lesson repeated from #53's
+  bit-swap bug: a plausible-sounding IEEE-754 argument is not a
+  substitute for checking against an actual oracle.)
+- **#52 (NaN sign bit) -- confirmed volamos's positive-signed
+  convention is correct, vamos's negative-signed is vamos's own
+  divergence.** Real hardware's `IEEEDPDiv(0,0)` and `IEEEDPDiv(-0,0)`
+  both give the identical positive-signed `$7FF10000_00000000`.
+  Separately (not something either engine's default output surfaced,
+  found only via a targeted test), Rust's `f64::asin`/`acos` don't
+  themselves agree on NaN sign for symmetric out-of-domain inputs
+  (`(-2.0).asin()` gives a negative-signed NaN, `(2.0).asin()`/
+  `(-2.0).acos()` don't) -- `ieeedp_unary` (the shared handler behind
+  `acos`/`asin`/`atan`/`sin`/`cos`/`tan`/`sinh`/`cosh`/`tanh`/`exp`/
+  `log`/`log10`/`sqrt`) now canonicalizes any NaN result to a fixed
+  positive-signed `f64::NAN`, independent of whatever sign Rust's own
+  libm happened to produce. The exact NaN payload bits beyond the sign
+  weren't chased -- real hardware's `$7FF1...` vs Rust's default
+  `$7FF8...` payload is treated as implementation-specific noise, same
+  as the existing 1-ULP transcendental-rounding residuals.
+- **#53's mul3/mul4 overflow-saturation boundary -- confirmed
+  saturated.** Real hardware's `SPMul` at exactly FFP's maximum
+  exponent field saturates to `FFP_MAX` (`FFFFFF7F`), matching
+  `f32_to_ffp`'s already-fixed `>= 127` (not `> 127`) boundary check --
+  `math_fast` is now a full three-way `PASS`, no residual lines at all.
+
+`tools/compare_amitools_suite.py`'s `KNOWN_DIVERGENCES` entries and
+corpus comments updated to match. Full workspace suite still 709
+passing (21 in `mathlibs`), clippy/fmt clean, harness run after
+rebuilding: only 5 non-KNOWN entries remain, all real, already-tracked
+volamos gaps (`dos_match` #46, `dos_seek` #47, `exec_rawdofmt` #45,
+`dos_findarg` #55 -- not implemented, and `math_fast_trans`'s 5-line
+1-ULP transcendental residual under #53, left as-is since real hardware
+wasn't chased for that specific sub-ULP rounding noise).

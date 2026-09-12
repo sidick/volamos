@@ -140,7 +140,17 @@ fn f32_to_ffp(value: f32) -> u32 {
     }
     let raw_exp = (bits >> 23) & 0xFF;
     let e_ffp_field = raw_exp as i32 - 62;
-    if e_ffp_field > 127 {
+    // `>= 127`, not `> 127`: verified against real Kickstart 3.1
+    // (40.72) via Copperline (issue #53's `mul3`/`mul4` residual --
+    // `SPMul(FFP_INT_MAX, FFP_INT_MAX)`/`SPMul(FFP_INT_MIN,
+    // FFP_INT_MIN)`, whose exact mathematical result's exponent field
+    // computes to precisely `127`). Real hardware treats that boundary
+    // value as already-saturated (full `$FFFFFF7F`/`$FFFFFFFF`), not a
+    // legitimately representable finite value with a merely-large
+    // mantissa -- i.e. field `127` is reserved for "this is FFP_MAX",
+    // the same way field `0` is reserved for "this is zero", leaving
+    // only `1..=126` for ordinary finite magnitudes.
+    if e_ffp_field >= 127 {
         return ffp_max_magnitude(sign);
     }
     if e_ffp_field < 1 {
@@ -270,7 +280,18 @@ fn ieeedp_floor_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 /// `mathieeedoubbas.library`'s `IEEEDPCeil` (LVO -96: `D0/D1` = `y`).
 fn ieeedp_ceil_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let y = read_f64(ctx.cpu, 0);
-    write_f64(ctx.cpu, 0, y.ceil());
+    let result = y.ceil();
+    // Rust's `f64::ceil` (like strict IEEE-754) preserves the sign of
+    // a zero result -- `(-0.5f64).ceil()` is `-0.0`. Real Kickstart
+    // 3.1's `mathieeedoubbas.library` does not: verified against real
+    // hardware via Copperline (issue #51/#52's writeup) that
+    // `IEEEDPCeil` of a small negative number (rounding up to zero)
+    // gives plain `+0.0`, matching `vamos`; volamos previously matched
+    // Rust's/strict IEEE-754's `-0.0` instead, which was the actual
+    // bug (the opposite of what issue #51 originally assumed -- `vamos`
+    // was right here, not volamos).
+    let result = if result == 0.0 { 0.0 } else { result };
+    write_f64(ctx.cpu, 0, result);
     Ok(())
 }
 
@@ -315,7 +336,27 @@ fn ieeedp_unary<C: Cpu>(
     f: impl FnOnce(f64) -> f64,
 ) -> Result<(), DispatchError> {
     let y = read_f64(ctx.cpu, 0);
-    write_f64(ctx.cpu, 0, f(y));
+    let result = f(y);
+    // A domain error (IEEEDPAcos/IEEEDPAsin outside [-1,1], IEEEDPLog/
+    // IEEEDPLog10/IEEEDPSqrt of a negative number) produces NaN.
+    // Rust's f64 math propagates whatever sign its own internal
+    // computation happens to leave on the NaN -- e.g. `(-2.0f64).asin()`
+    // is negative-signed while `(2.0f64).asin()`/`(-2.0f64).acos()` are
+    // positive-signed, an inconsistency with no documented meaning.
+    // Real Kickstart 3.1's mathieeedoubtrans.library doesn't have this
+    // inconsistency -- verified against real hardware via Copperline
+    // (issue #52's writeup: mathieeedoubbas.library's IEEEDPDiv(0,0)/
+    // IEEEDPDiv(-0,0) both give the identical positive-signed NaN
+    // `$7FF10000_00000000`, regardless of input sign) -- so every
+    // domain-error result here is canonicalized to a single, fixed,
+    // positive-signed NaN too, rather than trusting Rust's own
+    // input-sign-dependent propagation. The exact NaN payload bits
+    // aren't reproduced (NaN payloads are implementation-specific
+    // microcode detail no emulator is expected to match exactly), only
+    // the sign, which is the only part any real program could
+    // meaningfully observe (e.g. via IEEEDPTst).
+    let result = if result.is_nan() { f64::NAN } else { result };
+    write_f64(ctx.cpu, 0, result);
     Ok(())
 }
 
@@ -830,7 +871,10 @@ mod tests {
     // of the FFP encoding.
 
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
-    use crate::dispatch::{MATHFFP_LIBRARY_BASE, MATHTRANS_LIBRARY_BASE, Runtime, StartConfig};
+    use crate::dispatch::{
+        MATHFFP_LIBRARY_BASE, MATHIEEEDOUBBAS_LIBRARY_BASE, MATHIEEEDOUBTRANS_LIBRARY_BASE,
+        MATHTRANS_LIBRARY_BASE, Runtime, StartConfig,
+    };
     use crate::memory::FlatMemory;
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
@@ -967,6 +1011,27 @@ mod tests {
     }
 
     #[test]
+    fn sp_mul_overflow_saturates_to_ffp_max_at_the_exact_boundary_exponent() {
+        // SPMul(FFP_INT_MAX, FFP_INT_MAX) / SPMul(FFP_INT_MIN,
+        // FFP_INT_MIN) -- amitools' own math_fast.c mul3/mul4. The
+        // exact mathematical product's FFP exponent field computes to
+        // precisely 127 (FFP's reserved "this is FFP_MAX" boundary,
+        // not just a large-but-representable finite value) -- verified
+        // against real Kickstart 3.1 (40.72) via Copperline, which
+        // prints FFFFFF7F for both (issue #53's residual, now closed).
+        let int_max = 2147483648.0f32; // FFP_INT_MAX
+        let int_min = -2147483648.0f32; // FFP_INT_MIN
+        assert_eq!(
+            f32_to_ffp(run_binary_ffp(-78, int_max, int_max)),
+            0xFFFF_FF7F
+        );
+        assert_eq!(
+            f32_to_ffp(run_binary_ffp(-78, int_min, int_min)),
+            0xFFFF_FF7F
+        );
+    }
+
+    #[test]
     fn sp_div_computes_right_divided_by_left_not_left_divided_by_right() {
         // leftParm=D1=2, rightParm=D0=10 -- real SPDiv returns
         // rightParm / leftParm = 10 / 2 = 5, per sp_div_handler's doc.
@@ -1050,6 +1115,144 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert!((ffp_to_f32(code as u32) - 3.0).abs() < 1e-4);
+    }
+
+    /// Prepends `movea.l #MATHIEEEDOUBBAS_LIBRARY_BASE,a6` and builds a
+    /// runtime -- see [`mathffp_program`]'s twin, for
+    /// `mathieeedoubbas.library` functions.
+    fn mathieeedoubbas_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (MATHIEEEDOUBBAS_LIBRARY_BASE >> 16) as u16,
+            MATHIEEEDOUBBAS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    /// Prepends `movea.l #MATHIEEEDOUBTRANS_LIBRARY_BASE,a6` and builds
+    /// a runtime -- see [`mathieeedoubbas_program`]'s twin, for
+    /// `mathieeedoubtrans.library` functions.
+    fn mathieeedoubtrans_program(words: &[u16]) -> Runtime<M68kCpu> {
+        let mut full = vec![
+            move_imm_to_a(6),
+            (MATHIEEEDOUBTRANS_LIBRARY_BASE >> 16) as u16,
+            MATHIEEEDOUBTRANS_LIBRARY_BASE as u16,
+        ];
+        full.extend_from_slice(words);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        let load_end = entry + 0x400;
+        Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn ieeedp_asin_domain_error_is_always_positive_signed_nan() {
+        // IEEEDPAsin(-2.0) is outside [-1,1] -- Rust's own
+        // (-2.0f64).asin() happens to produce a *negative*-signed NaN
+        // (an internal-computation artifact, not a documented
+        // convention), while IEEEDPAsin(2.0)/IEEEDPAcos(+-2.0) all give
+        // positive-signed NaNs from Rust. Real Kickstart 3.1 has no
+        // such inconsistency (issue #52's writeup) -- every
+        // domain-error result canonicalizes to the same, fixed,
+        // positive sign.
+        const RESULT_ADDR: u32 = 0x1_0000;
+        let mut words = Vec::new();
+        let bits = (-2.0f64).to_bits();
+        words.push(move_imm_to_d(0));
+        words.push((bits >> 48) as u16);
+        words.push((bits >> 32) as u16);
+        words.push(move_imm_to_d(1));
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-114)); // IEEEDPAsin
+        words.push(move_imm_to_a(0));
+        words.push((RESULT_ADDR >> 16) as u16);
+        words.push(RESULT_ADDR as u16);
+        words.push(0x2080); // move.l d0,(a0)
+        words.push(move_imm_to_a(0));
+        words.push(((RESULT_ADDR + 4) >> 16) as u16);
+        words.push((RESULT_ADDR + 4) as u16);
+        words.push(0x2081); // move.l d1,(a0)
+        words.push(RTS);
+
+        let mut rt = mathieeedoubtrans_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        let hi = mem.read_u32(RESULT_ADDR) as u64;
+        let lo = mem.read_u32(RESULT_ADDR + 4) as u64;
+        let result = f64::from_bits((hi << 32) | lo);
+        assert!(result.is_nan());
+        assert!(!result.is_sign_negative(), "must be a positive-signed NaN");
+    }
+
+    #[test]
+    fn ieeedp_ceil_of_a_small_negative_number_gives_positive_zero() {
+        // IEEEDPCeil(-0.5): Rust's/strict IEEE-754's f64::ceil gives
+        // -0.0 here (sign-of-zero preserved), but real Kickstart 3.1's
+        // mathieeedoubbas.library does not -- verified against real
+        // hardware via Copperline (issue #51/#52's writeup: math_double
+        // ceil7/ceil9 both print plain positive zero, matching vamos).
+        // D0/D1 (the double result) get stashed to a fixed guest
+        // address before RTS, since the exit-code mechanism only
+        // captures D0's 32 bits, not a full double.
+        const RESULT_ADDR: u32 = 0x1_0000;
+        let mut words = Vec::new();
+        let bits = (-0.5f64).to_bits();
+        words.push(move_imm_to_d(0));
+        words.push((bits >> 48) as u16);
+        words.push((bits >> 32) as u16);
+        words.push(move_imm_to_d(1));
+        words.push((bits >> 16) as u16);
+        words.push(bits as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // IEEEDPCeil
+        // move.l #RESULT_ADDR,a0 ; move.l d0,(a0)
+        words.push(move_imm_to_a(0));
+        words.push((RESULT_ADDR >> 16) as u16);
+        words.push(RESULT_ADDR as u16);
+        words.push(0x2080); // move.l d0,(a0)
+        // move.l #RESULT_ADDR+4,a0 ; move.l d1,(a0)
+        words.push(move_imm_to_a(0));
+        words.push(((RESULT_ADDR + 4) >> 16) as u16);
+        words.push((RESULT_ADDR + 4) as u16);
+        words.push(0x2081); // move.l d1,(a0)
+        words.push(RTS);
+
+        let mut rt = mathieeedoubbas_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        let hi = mem.read_u32(RESULT_ADDR) as u64;
+        let lo = mem.read_u32(RESULT_ADDR + 4) as u64;
+        let result = f64::from_bits((hi << 32) | lo);
+        assert_eq!(result, 0.0);
+        assert!(!result.is_sign_negative(), "must be +0.0, not -0.0");
     }
 
     #[test]

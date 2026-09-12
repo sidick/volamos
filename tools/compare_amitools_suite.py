@@ -65,17 +65,23 @@ data point, not two.
 ## intentionally not here yet -- companion-binary-building entries,
 ## other compiler flavors, and CI promotion)
 
-Two runs against this corpus so far have found four real volamos bugs
-(issues #45, #46, #47, #53 -- #53, `mathffp.library`/`mathtrans.library`
-having its FFP sign/exponent bits swapped plus wrong overflow/
-underflow saturation, has since been fixed in `crates/volamos-core/
-src/mathlibs.rs`; #45-#47 are still visible `FAIL`s below,
-`KNOWN_DIVERGENCES` is reserved for divergences attributed to `vamos`,
-not for volamos's own unfixed ones), one missing feature (#55,
-`FindArg` not implemented), and four things needing further
-investigation or attributed to `vamos` itself (#48, #49, #51, #52) --
-concrete evidence this corpus finds things volamos's own ~6 fixtures
-don't.
+Two runs against this corpus so far have found six real volamos bugs
+(issues #45, #46, #47, #48, #51, #53 -- #53, `mathffp.library`/
+`mathtrans.library` having its FFP sign/exponent bits swapped plus
+wrong overflow/underflow saturation, and #48, `%x`/`%lx` hex digit
+case, and #51, `IEEEDPCeil()`'s negative-zero sign, have all since been
+fixed in `crates/volamos-core/src/` and confirmed correct against real
+Kickstart 3.1 hardware via Copperline (A600 model, for Gayle IDE
+support); #45-#47 are still visible `FAIL`s below, `KNOWN_DIVERGENCES`
+is reserved for divergences attributed to `vamos`, not for volamos's
+own unfixed ones), one missing feature (#55, `FindArg` not
+implemented), and one divergence now confirmed attributed to `vamos`
+itself via the same real-hardware verification (#52, qNaN sign bit for
+domain-error results -- volamos's positive sign matches real hardware,
+vamos's negative sign doesn't) -- concrete evidence this corpus finds
+things volamos's own ~6 fixtures don't. #49 (CheckDate wday) remains
+attributed to vamos on NDK-autodoc grounds alone (not yet independently
+checked against real hardware).
 
 - `dos_match`: `MatchFirst`/`MatchNext`/`ap_Buf` via a real `AnchorPath`
   scan of a scratch `SYS:` -- exercises `crate::dosanchor`.
@@ -133,9 +139,13 @@ KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
         "https://github.com/sidick/volamos/issues/49",
     ),
     "vprintf": (
-        "%x/%lx hex digit case differs (volamos: lowercase, vamos: "
-        "uppercase) -- no NDK autodoc pins this down; genuinely needs "
-        "real-hardware (Copperline) verification, not assumed either way.",
+        "%x/%lx hex digit case: confirmed via real Kickstart 3.1 "
+        "hardware (Copperline, A600/Gayle) that uppercase is correct; "
+        "volamos fixed to match. util_date and the math_* entries below "
+        "were also affected by this same bug and are now clean of it -- "
+        "kept here only because vamos's own captured `%x` output in "
+        "this particular corpus predates volamos's fix and vamos itself "
+        "isn't being changed.",
         "https://github.com/sidick/volamos/issues/48",
     ),
     "dos_stdout": (
@@ -147,21 +157,23 @@ KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
         "https://github.com/sidick/volamos/issues/54",
     ),
     "math_double": (
-        "%x hex-digit-case (issue #48) accounts for most of this; the "
-        "rest is IEEEDPCeil() losing the sign of a negative-zero result "
-        "in vamos (issue #51, volamos matches the correct IEEE-754 "
-        "sign-of-zero-through-ceil rule) and a NaN sign-bit convention "
-        "difference for 0/0 and similar (issue #52, genuinely uncertain "
-        "which side -- if either -- matches real hardware).",
+        "Down to a single remaining question: qNaN sign bit for "
+        "domain-error results (div0/div1). Confirmed via real Kickstart "
+        "3.1 hardware (Copperline, A600/Gayle) that a positive-signed "
+        "NaN ($7FF8...) is correct -- volamos already matches; vamos's "
+        "negative-signed ($FFF8...) is vamos's own divergence, not a "
+        "volamos bug. The %x hex-case (#48) and IEEEDPCeil "
+        "negative-zero (#51, was actually a real volamos bug -- fixed) "
+        "issues that used to also show up here are both resolved.",
         "https://github.com/sidick/volamos/issues/48, "
         "https://github.com/sidick/volamos/issues/51, "
         "https://github.com/sidick/volamos/issues/52",
     ),
     "math_double_trans": (
-        "%x hex-digit-case (issue #48) accounts for most of this; the "
-        "rest is the same NaN sign-bit convention question as "
-        "math_double's div0/div1 (issue #52), here showing up in "
-        "acos/asin/log's domain-error results.",
+        "Same NaN sign-bit question as math_double's div0/div1 (#52), "
+        "here in acos/asin/log's domain-error results -- confirmed via "
+        "real Kickstart 3.1 hardware that volamos's positive sign is "
+        "correct and vamos's negative sign is vamos's own divergence.",
         "https://github.com/sidick/volamos/issues/48, "
         "https://github.com/sidick/volamos/issues/52",
     ),
@@ -326,12 +338,12 @@ CORPUS = [
         # Was far more than hex-case noise (~50 of 84 lines differed in
         # actual value) until issue #53's root cause -- ffp_to_f32/
         # f32_to_ffp had the sign bit and exponent field swapped -- was
-        # fixed; down to 2 residual lines now (mul3/mul4, an overflow-
-        # saturation boundary case at exactly FFP's max exponent field
-        # that's genuinely unclear which side -- if either -- is more
-        # correct without real-hardware verification; see f32_to_ffp's
-        # own doc for the full reasoning). Left as a visible FAIL, not
-        # KNOWN_DIVERGENCES, until that's resolved one way or the other.
+        # fixed. The mul3/mul4 overflow-saturation boundary case (at
+        # exactly FFP's max exponent field) was confirmed via real
+        # Kickstart 3.1 hardware (Copperline) to already-saturate, and
+        # f32_to_ffp's `>= 127` fix matches that. Fully PASSing now;
+        # tracking_issue kept only as a pointer back to #53's history,
+        # it has no effect once there are no mismatches to report.
         tracking_issue="https://github.com/sidick/volamos/issues/53",
     ),
     Entry(
@@ -342,7 +354,10 @@ CORPUS = [
         # Same #53 fix took this from ~110 of 149 lines differing to 5
         # -- all tiny (1-ULP-ish) mantissa differences in acos/asin/
         # atan results, consistent with ordinary cross-implementation
-        # transcendental-function rounding variance rather than a bug.
+        # transcendental-function rounding variance rather than a bug
+        # (real hardware wasn't chased for this specific residual --
+        # sub-ULP transcendental rounding is expected to vary across
+        # any two independent math library implementations).
         tracking_issue="https://github.com/sidick/volamos/issues/53",
     ),
 ]

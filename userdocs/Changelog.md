@@ -16,7 +16,22 @@ version scheme in `Cargo.toml`.
   divergence from `vamos` from the large majority of their output
   lines down to a handful of residual, believed-benign ones (a single
   overflow-boundary edge case and ordinary cross-implementation
-  transcendental-function rounding variance).
+  transcendental-function rounding variance). Both since confirmed
+  against real Kickstart 3.1 hardware: the overflow-boundary case
+  (`SPMul` saturating exactly at FFP's maximum exponent field) was
+  correct as fixed, and two more real bugs turned up in the same pass
+  -- `RawDoFmt`/`VPrintf`'s `%x`/`%lx` printed lowercase hex where real
+  hardware prints uppercase (issue #48), and `IEEEDPCeil()` returned
+  `-0.0` for a ceil-to-zero result where real hardware (matching
+  `vamos`) returns `+0.0` (issue #51, originally misdiagnosed as
+  correct IEEE-754 behavior on volamos's side and `vamos`'s divergence
+  -- backwards). Also confirmed that `mathieeedoubbas`/
+  `mathieeedoubtrans`'s positive-signed `NaN` convention for
+  domain-error results (`0/0`, out-of-domain `acos`/`asin`/`log`/etc.)
+  matches real hardware and `vamos`'s negative-signed convention is
+  `vamos`'s own divergence (issue #52), and canonicalized an internal
+  inconsistency where Rust's own `f64::asin`/`acos` didn't agree with
+  themselves on `NaN` sign for symmetric out-of-domain inputs.
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`
