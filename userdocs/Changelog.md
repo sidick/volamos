@@ -67,6 +67,11 @@ version scheme in `Cargo.toml`.
   down to a bare relative name regardless (issue #14's own fix, which
   turned out to be treating a symptom rather than the actual
   mechanism -- see #46's closing comment for the full story).
+- **Fixed `AnchorPath`'s volume-root `fib_FileName`** (issue #58): a
+  `MatchFirst`/`MatchNext` report for a bare volume root now has a
+  blank `fib_FileName`, matching real Kickstart 3.1 hardware -- a
+  distinct convention from plain `Lock()`/`Examine()` on the same
+  volume root, which correctly keeps reporting the volume name.
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`
