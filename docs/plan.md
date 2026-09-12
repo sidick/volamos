@@ -4570,3 +4570,18 @@ volamos gaps (`dos_match` #46, `dos_seek` #47, `exec_rawdofmt` #45,
 `dos_findarg` #55 -- not implemented, and `math_fast_trans`'s 5-line
 1-ULP transcendental residual under #53, left as-is since real hardware
 wasn't chased for that specific sub-ULP rounding noise).
+
+## Issue #45 fixed: RawDoFmt's %b never converted its BPTR argument to a real address — 2026-09-12
+
+`execfmt.rs`'s `FmtType::Bstr` handling read the data-list entry
+straight off as a byte address, but real `RawDoFmt`'s `%b` takes a
+`BPTR` there (confirmed by amitools' own `exec_rawdofmt.c`, which
+builds it via `MKBADDR(bstr)`) -- needs `addr_from_bptr` (`<< 2`)
+first, the same conversion `dosbuf.rs`'s `FGetC`/`FPutC`/etc. already
+apply to their own `BPTR` arguments. Also switched to the existing
+`guestmem::read_bstr` helper instead of hand-rolling the length-byte
+read. One-line-equivalent fix; `exec_rawdofmt` is now a full three-way
+`PASS` against `vamos` and amitools' own ground truth (`BStr: 'Hoi!'`),
+confirmed directly against the real binary too, not just the harness.
+New regression test: `bstr_format_converts_the_bptr_to_a_real_address`.
+Full suite: 710 passing, clippy/fmt clean.

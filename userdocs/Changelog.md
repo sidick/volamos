@@ -32,6 +32,12 @@ version scheme in `Cargo.toml`.
   `vamos`'s own divergence (issue #52), and canonicalized an internal
   inconsistency where Rust's own `f64::asin`/`acos` didn't agree with
   themselves on `NaN` sign for symmetric out-of-domain inputs.
+- **Fixed `RawDoFmt`'s `%b` (BSTR) format** (issue #45): the data-list
+  entry for `%b` is a `BPTR`, not a raw byte address, so it needs the
+  same `<< 2` conversion `dos.library`'s own `BPTR`-taking calls
+  already apply -- confirmed against real Kickstart 3.1 hardware and
+  amitools' own `exec_rawdofmt` test (`BStr: 'Hoi!'`, previously
+  garbled).
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`

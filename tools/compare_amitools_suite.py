@@ -65,23 +65,23 @@ data point, not two.
 ## intentionally not here yet -- companion-binary-building entries,
 ## other compiler flavors, and CI promotion)
 
-Two runs against this corpus so far have found six real volamos bugs
-(issues #45, #46, #47, #48, #51, #53 -- #53, `mathffp.library`/
-`mathtrans.library` having its FFP sign/exponent bits swapped plus
-wrong overflow/underflow saturation, and #48, `%x`/`%lx` hex digit
-case, and #51, `IEEEDPCeil()`'s negative-zero sign, have all since been
+Two runs against this corpus so far have found seven real volamos bugs
+(issues #45, #46, #47, #48, #51, #53 -- #45, `RawDoFmt`'s `%b` never
+converting its `BPTR` argument to a real address, #48, `%x`/`%lx` hex
+digit case, #51, `IEEEDPCeil()`'s negative-zero sign, and #53,
+`mathffp.library`/`mathtrans.library` having its FFP sign/exponent bits
+swapped plus wrong overflow/underflow saturation, have all since been
 fixed in `crates/volamos-core/src/` and confirmed correct against real
 Kickstart 3.1 hardware via Copperline (A600 model, for Gayle IDE
-support); #45-#47 are still visible `FAIL`s below, `KNOWN_DIVERGENCES`
+support); #46-#47 are still visible `FAIL`s below, `KNOWN_DIVERGENCES`
 is reserved for divergences attributed to `vamos`, not for volamos's
 own unfixed ones), one missing feature (#55, `FindArg` not
 implemented), and one divergence now confirmed attributed to `vamos`
 itself via the same real-hardware verification (#52, qNaN sign bit for
 domain-error results -- volamos's positive sign matches real hardware,
 vamos's negative sign doesn't) -- concrete evidence this corpus finds
-things volamos's own ~6 fixtures don't. #49 (CheckDate wday) remains
-attributed to vamos on NDK-autodoc grounds alone (not yet independently
-checked against real hardware).
+things volamos's own ~6 fixtures don't. #49 (CheckDate wday) is also
+now confirmed against real hardware, not just NDK-autodoc citation.
 
 - `dos_match`: `MatchFirst`/`MatchNext`/`ap_Buf` via a real `AnchorPath`
   scan of a scratch `SYS:` -- exercises `crate::dosanchor`.
