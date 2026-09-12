@@ -654,6 +654,34 @@ fn free_args_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// The zero-based index of the template slot `keyword` names (matching
+/// either of a `NAME=ABBREV` slot's two names, per `FindArg`'s own NDK
+/// autodoc's "abbreviations are handled" -- the same `NAME=ABBREV`
+/// alias [`parse_template`] already recognizes for `ReadArgs`), or `-1`
+/// if `keyword` doesn't name any slot. A malformed template (one
+/// `ReadArgs` itself would reject with [`ERROR_BAD_TEMPLATE`]) has no
+/// error-reporting channel here -- the autodoc's only documented result
+/// is the index or `-1` -- so it's treated the same as "not found".
+fn find_arg(template: &[u8], keyword: &[u8]) -> i32 {
+    let keyword_upper = keyword.to_ascii_uppercase();
+    let index = parse_template(template)
+        .ok()
+        .and_then(|args| args.iter().position(|a| matches_keyword(a, &keyword_upper)));
+    index.map_or(-1, |i| i as i32)
+}
+
+/// `FindArg` (`D1` = template `STRPTR`, `D2` = keyword `STRPTR`). `D0` =
+/// [`find_arg`]'s result.
+fn find_arg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let template_ptr = ctx.cpu.data_register(DataRegister(1));
+    let keyword_ptr = ctx.cpu.data_register(DataRegister(2));
+    let template = read_c_string(ctx.mem, template_ptr);
+    let keyword = read_c_string(ctx.mem, keyword_ptr);
+    let result = find_arg(&template, &keyword);
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
 /// Registers `ReadArgs`/`FreeArgs` onto [`DOS_LIBRARY_BASE`], looked up
 /// by name through [`DOS_LVOS`]. Called from [`crate::dispatch::
 /// Runtime::new`] alongside the other `dos.library` registrations; these
@@ -683,6 +711,16 @@ pub fn register_dosargs_handlers<C: Cpu + 'static>(
             free_args_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("FreeArgs should be in DOS_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            DOS_LIBRARY_BASE,
+            DOS_LVOS,
+            "dos.library",
+            "FindArg",
+            find_arg_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("FindArg should be in DOS_LVOS: {e}"));
 }
 
 #[cfg(test)]
@@ -1008,5 +1046,39 @@ mod tests {
 
         let dir_ptr = rt.memory().read_u32(array_addr);
         assert_eq!(read_c_string(rt.memory(), dir_ptr), b"SYS:");
+    }
+
+    #[test]
+    fn find_arg_matches_either_name_in_a_name_equals_abbrev_slot() {
+        // amitools' own dos_findarg.c (issue #55): FindArg("a=b/k", "a")
+        // and FindArg("a=b/k", "b") both name the same (only) slot, 0.
+        assert_eq!(find_arg(b"a=b/k", b"a"), 0);
+        assert_eq!(find_arg(b"a=b/k", b"b"), 0);
+    }
+
+    #[test]
+    fn find_arg_returns_negative_one_for_an_unknown_keyword() {
+        assert_eq!(find_arg(b"a=b/k", b"c"), -1);
+    }
+
+    #[test]
+    fn find_arg_returns_the_zero_based_slot_index() {
+        assert_eq!(find_arg(b"hello/k,world/m", b"world"), 1);
+        assert_eq!(find_arg(b"hello/k,world/m", b"hello"), 0);
+    }
+
+    #[test]
+    fn find_arg_is_case_insensitive() {
+        assert_eq!(find_arg(b"DIR/A,ALL/S", b"dir"), 0);
+        assert_eq!(find_arg(b"DIR/A,ALL/S", b"all"), 1);
+    }
+
+    #[test]
+    fn find_arg_on_a_malformed_template_reports_not_found_not_an_error() {
+        // FindArg's own NDK autodoc documents only an index or -1 as its
+        // result -- no separate error channel for a bad template -- so
+        // this must not panic even on syntax `ReadArgs` itself would
+        // reject.
+        assert_eq!(find_arg(b"DIR/Q", b"DIR"), -1);
     }
 }

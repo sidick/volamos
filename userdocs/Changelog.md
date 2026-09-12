@@ -50,6 +50,11 @@ version scheme in `Cargo.toml`.
   amitools' own `dos_seek` test still (incorrectly, for a V40 target)
   expects since it's a literal `vamos`-captured assertion, not real
   hardware.
+- **Implemented `dos.library/FindArg`** (issue #55): finds the
+  zero-based slot index a keyword names in a `ReadArgs`-style template
+  (or `-1`), reusing the same template parser and `NAME=ABBREV` alias
+  handling `ReadArgs` itself already had. Previously an unhandled
+  library call.
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`
