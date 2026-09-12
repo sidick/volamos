@@ -82,7 +82,7 @@ use std::path::{Path, PathBuf};
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::{DosState, ERROR_OBJECT_NOT_FOUND, map_io_error};
-use crate::doslock::{ERROR_NO_MORE_ENTRIES, FIB_SIZE, SHARED_LOCK, fill_fib, own_display_name};
+use crate::doslock::{ERROR_NO_MORE_ENTRIES, FIB_SIZE, SHARED_LOCK, fill_fib};
 use crate::dospattern::{self, Node};
 use crate::guestmem::{GuestHeap, addr_from_bptr, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
@@ -190,6 +190,34 @@ pub(crate) struct AnchorMatchState {
     /// found by running the real Workbench 3.1.4 `List` binary against a
     /// bare volume argument.
     direct_self: bool,
+}
+
+/// The "own name" `AnchorPath` reports (`ap_Info.fib_FileName`/
+/// `an_Info.fib_FileName`) for a directory it has matched or is
+/// scanning: the last component of its normalized Amiga path, or --
+/// unlike [`own_display_name`], which plain `Lock`/`Examine` uses for
+/// the same question -- **empty**, not the volume name, when there is
+/// no path component at all (a bare volume root like `"SYS:"`, or a
+/// pattern with a trailing separator and nothing after it).
+///
+/// Confirmed against real Kickstart 3.1 hardware via Copperline (issue
+/// #58): `MatchFirst("sys:", ...)`'s two volume-root reports both have
+/// a blank `fib_FileName` (`Printf`'s `"%s %s %ld %ld\n"` prints
+/// `"  sys: 0 73"` -- two spaces, an empty first field, then `ap_Buf`).
+/// A plain `Lock("SYS:")`/`Examine()` on the very same volume root,
+/// under the very same real hardware, reports `fib_FileName` as `"SYS"`
+/// (the volume name) instead -- confirming this blank-name convention
+/// is specific to `AnchorPath`'s own reporting, matching the NDK
+/// autodoc's own note that "patterns with trailing slashes may cause
+/// MatchFirst()/MatchNext() to return ... a filename of the empty
+/// string", not a general `own_display_name`/`Examine()` behavior to
+/// apply everywhere.
+fn anchor_display_name(amiga_path: &str) -> String {
+    let (_, rest) = amiga_path.split_once(':').unwrap_or((amiga_path, ""));
+    rest.rsplit('/')
+        .find(|c| !c.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Appends a trailing `/` unless `path` already ends in `:`/`/`,
@@ -372,7 +400,7 @@ fn match_first(
                 .map(|m| m.len() as u32)
                 .unwrap_or(0)
         };
-        let display_name = own_display_name(&entry.amiga_path);
+        let display_name = anchor_display_name(&entry.amiga_path);
         let achain_addr = alloc_achain(heap, mem)?;
         mem.write_u32(achain_addr + AN_LOCK_OFFSET, bptr);
         // The caller's own literal pattern text, verbatim -- a
@@ -473,7 +501,7 @@ fn match_first(
     mem.write_u32(ap_addr + AP_LAST_OFFSET, achain_addr);
     set_flag_bit(mem, ap_addr, APF_ITSWILD, true);
 
-    let self_name = own_display_name(&dir_part);
+    let self_name = anchor_display_name(&dir_part);
     let level = ScanLevel {
         achain_addr,
         dir_lock_addr: addr,
@@ -955,6 +983,26 @@ mod tests {
         match_first(&mut heap, &mut mem, &mut dos, b"sys:#?", ap).expect("match");
         let path = read_c_string(&mem, ap + AP_BUF_OFFSET);
         assert_eq!(path, b"sys:sub");
+    }
+
+    #[test]
+    fn fib_filename_is_blank_for_a_bare_volume_root_match() {
+        // Confirmed against real Kickstart 3.1 hardware (issue #58):
+        // MatchFirst("sys:", ...)'s own two volume-root reports both
+        // have a blank fib_FileName -- unlike a plain Lock("SYS:")/
+        // Examine(), which (confirmed on the same real hardware)
+        // reports "SYS" for the very same volume root. AnchorPath's own
+        // reporting convention differs from Examine()'s -- see
+        // anchor_display_name's own doc.
+        let tmp = TempDir::new("root-fib-filename");
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        let ap = alloc_ap(&mut heap, &mut mem, 64);
+
+        // "SYS:" alone has no wildcard, so this takes the non-wildcard
+        // (Lock-the-object-directly) branch -- the volume root itself.
+        match_first(&mut heap, &mut mem, &mut dos, b"SYS:", ap).expect("match");
+        assert_eq!(fib_name(&mem, ap), b"");
     }
 
     #[test]

@@ -277,12 +277,23 @@ CORPUS = [
         #
         # ap_Buf's own device-prefix question (originally issue #46) is
         # fixed and confirmed via real Kickstart 3.1 hardware -- every
-        # ap_Buf column now matches vamos's exactly. The residual
-        # mismatch is narrower: the volume-root rows' fib_FileName
-        # ("SYS"/empty first column) and the ap_Flags values on the
-        # "c" and final rows -- see issue #58 (fib_FileName confirmed
-        # via real hardware to want blank; the ap_Flags/APF_DirChanged
-        # question is still unconfirmed either way).
+        # ap_Buf column now matches vamos's exactly. The volume-root
+        # rows' fib_FileName (issue #58, finding 1) is also fixed and
+        # confirmed blank via real hardware -- distinct from plain
+        # Lock()/Examine()'s own "SYS" on the very same root, verified
+        # separately before touching the shared own_display_name.
+        #
+        # Residual (issue #58, finding 2, refined via that same
+        # real-hardware run): the "c" entry's own ap_Flags (65 =
+        # APF_DIR_CHANGED|APF_DOWILD) already matches real hardware
+        # exactly -- vamos's own "1" (no DIR_CHANGED) is what diverges
+        # there, not volamos. The genuinely open question is narrower
+        # and structural: real hardware reported the root entry twice,
+        # both *after* all five children (flags 73 then 9 back to
+        # back), not framing them with one leading + one trailing
+        # report the way both vamos and volamos's current scan state
+        # machine assume -- a deeper change to AnchorPath's own event
+        # sequence, not a flag-value tweak. Left open, not attempted.
         expected=[
             "sys: sys: 0 5",
             "c sys:c 0 1",
