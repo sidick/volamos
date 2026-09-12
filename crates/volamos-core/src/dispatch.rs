@@ -1898,15 +1898,19 @@ impl<C: Cpu + 'static> Runtime<C> {
     ///
     /// # Guest command-line convention
     ///
-    /// `config.args` is joined with single spaces and a trailing `'\n'`
-    /// (the AmigaOS CLI command-line buffer convention: a program that
+    /// `config.args` is joined with single spaces, plus one more
+    /// trailing space when there's at least one argument, then a `'\n'`
+    /// (the AmigaOS CLI command-line buffer convention, confirmed
+    /// against real Kickstart 3.1 hardware in issue #63: a program that
     /// parses its own arguments out of `A0`/`D0`, e.g. via `ReadArgs`,
-    /// expects exactly this framing) into a buffer allocated on the
-    /// guest heap, with one extra `NUL` byte written after the `'\n'`
-    /// as a defensive terminator for anything that scans for one
-    /// instead of trusting the length. `A0` is set to that buffer's
-    /// address; `D0` is set to the buffer's length *including* the
-    /// `'\n'` but *not* the extra `NUL`, matching the real convention.
+    /// expects exactly this framing -- `"foo bar baz \n"`, not `"foo bar
+    /// baz\n"`; a bare, no-argument line is still just `"\n"`) into a
+    /// buffer allocated on the guest heap, with one extra `NUL` byte
+    /// written after the `'\n'` as a defensive terminator for anything
+    /// that scans for one instead of trusting the length. `A0` is set to
+    /// that buffer's address; `D0` is set to the buffer's length
+    /// *including* the `'\n'` but *not* the extra `NUL`, matching the
+    /// real convention.
     pub fn new(mut cpu: C, mut mem: C::Memory, config: StartConfig) -> Self {
         // Prefill the reserved jump-table region (excluding the real
         // exception vector table at the very bottom -- see
@@ -2287,6 +2291,16 @@ impl<C: Cpu + 'static> Runtime<C> {
         // NUL byte as a defensive terminator for code that scans instead
         // of trusting D0. Allocated on the heap built just above.
         //
+        // **Confirmed against real Kickstart 3.1 hardware (issue #63)**:
+        // when there's at least one argument, real AmigaOS's own buffer
+        // carries an extra trailing space *before* the final '\n' (e.g.
+        // `"foo bar baz \n"`, not `"foo bar baz\n"`) -- as if each
+        // argument were individually followed by a separator space,
+        // including the last one, rather than the arguments being
+        // joined by spaces and only then newline-terminated. A bare,
+        // no-argument command line has no leading space either way
+        // (just `"\n"`), which volamos already produced correctly.
+        //
         // Each `config.args` element is re-quoted with `quote_arg_if_needed`
         // before joining -- the host shell has already split argv into
         // separate elements and stripped ITS OWN quoting, so an element
@@ -2308,6 +2322,9 @@ impl<C: Cpu + 'static> Runtime<C> {
             let quoted_args: Vec<String> =
                 config.args.iter().map(|a| quote_arg_if_needed(a)).collect();
             let mut line = quoted_args.join(" ").into_bytes();
+            if !quoted_args.is_empty() {
+                line.push(b' ');
+            }
             line.push(b'\n');
             line
         };
@@ -3579,9 +3596,12 @@ mod tests {
         let rt = runtime_with_program_and_args(&[RTS], vec!["foo".to_string(), "bar".to_string()]);
         let a0 = rt.cpu.address_register(AddressRegister(0));
         let d0 = rt.cpu.data_register(DataRegister(0));
-        assert_eq!(d0, 8, "\"foo bar\\n\" is 8 bytes");
+        assert_eq!(
+            d0, 9,
+            "\"foo bar \\n\" is 9 bytes (issue #63: trailing space before '\\n')"
+        );
         let bytes: Vec<u8> = (0..d0).map(|i| rt.mem.read_u8(a0 + i)).collect();
-        assert_eq!(bytes, b"foo bar\n");
+        assert_eq!(bytes, b"foo bar \n");
         // A defensive NUL immediately follows, not counted in D0.
         assert_eq!(rt.mem.read_u8(a0 + d0), 0);
     }
@@ -3623,7 +3643,7 @@ mod tests {
         let a0 = rt.cpu.address_register(AddressRegister(0));
         let d0 = rt.cpu.data_register(DataRegister(0));
         let bytes: Vec<u8> = (0..d0).map(|i| rt.mem.read_u8(a0 + i)).collect();
-        assert_eq!(bytes, b"COMMENT \"a whole sentence\"\n");
+        assert_eq!(bytes, b"COMMENT \"a whole sentence\" \n");
     }
 
     #[test]

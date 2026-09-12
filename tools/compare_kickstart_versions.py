@@ -76,23 +76,22 @@ marker convention -- see `fixtures/README.md`), so this is a real
 limitation but not currently a blind spot for anything this harness
 runs.
 
-**Why the marker isn't `echoargs` itself** (found the hard way, while
-wiring this up): `fixtures/echoargs` reads its command-line arguments
-via a plain `PutStr(a0)`, trusting `A0`'s buffer to be NUL-terminated
-rather than reading `D0`'s length -- deliberately exercising volamos's
-own defensive convenience, which pads one extra `NUL` byte onto the
-real convention's buffer "for anything that scans for one instead of
-trusting the length" (`Runtime::new`'s own doc comment, `crate::
-dispatch`). Against a real Kickstart ROM (verified directly, on every
-Kickstart version this harness reaches), `echoargs` with an actual
-argument prints *nothing* rather than echoing it back or garbage --
-confirming real hardware's buffer isn't reliably NUL-terminated (as
-expected), but the specific empty-not-garbage shape isn't explained by
-that alone and hasn't been root-caused (would need a CCP breakpoint at
-`echoargs`'s entry point to inspect `A0`'s real buffer directly). Filed
-as issue #63. Tracked as its own `echoargs` corpus entry below
-(deliberately still included, not swept under the marker mechanism)
-or just this one hand-authored fixture's own assumption.
+**Why the marker isn't `echoargs` itself**: `echoargs` reads its
+command-line argument buffer from `A0` -- exactly the kind of real
+process-startup state this harness exists to cross-check, so it's kept
+as its own corpus entry rather than folded into plumbing every other
+entry depends on. Two real bugs surfaced this way while wiring this
+harness up, both filed and fixed as issue #63: `fixtures/echoargs.s`
+itself read the args pointer back from `A0` *after* an `OpenLibrary`
+call, not realizing `A0` is a scratch register real Kickstart's
+`OpenLibrary` actually clobbers (volamos's own doesn't, which is why
+this only showed up against real hardware); and, once that was fixed,
+a second, genuine `Runtime::new` bug came into view underneath it --
+real AmigaOS's own command-line buffer carries a trailing space
+*before* the final `'\n'` whenever there's at least one argument
+(`"foo bar baz \n"`, not `"foo bar baz\n"`), which volamos's own buffer
+construction didn't reproduce. Both are fixed now, confirmed against
+real Kickstart 3.1 hardware directly.
 
 ## Usage
 
@@ -133,14 +132,18 @@ CORPUS: list[tuple[str, str, list[str]]] = [
 ]
 
 # corpus entry name -> (reason, issue URL), same convention as
-# compare_vamos.py's KNOWN_DIVERGENCES. Empty until a real, understood
-# version-skew divergence is found and triaged.
+# compare_vamos.py's KNOWN_DIVERGENCES.
 KNOWN_DIVERGENCES: dict[str, tuple[str, str]] = {
     "echoargs": (
-        "volamos prints the real args ('foo bar'); every real Kickstart ROM "
-        "this harness reaches prints nothing -- see this module's docstring "
-        "('Why the marker isn't echoargs itself') for the args-ABI mismatch "
-        "found while wiring this harness up. Not yet root-caused.",
+        "a real AmigaOS version-skew difference, not a volamos bug: "
+        "Kickstart 2.0/3.0/3.1 all produce a trailing space before the "
+        "command-line buffer's final '\\n' when there's at least one "
+        "argument ('foo bar \\n'), matching volamos (see issue #63) and "
+        "this project's own stated Phase 1 target (KS/WB 3.1); Kickstart "
+        "3.2 alone drops that trailing space ('foo bar\\n'). Confirmed "
+        "reproducible, not a fluke -- exactly the kind of divergence this "
+        "harness exists to catch, just one that isn't volamos's to fix "
+        "since it targets 3.1, not 3.2.",
         "https://github.com/sidick/volamos/issues/63",
     ),
 }

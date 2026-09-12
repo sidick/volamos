@@ -48,15 +48,22 @@ def build_program() -> bytes:
     code.label("start")
     code.move_l_abs4_to_a(A5)  # A5 = AbsExecBase (kept constant)
 
-    # copy the command-line arg (A0) into namebuf up to the first '\n' --
-    # must happen before any library call: A0 is a caller-clobbered
-    # ("scratch") register per the RKRM calling convention (D0/D1/A0/A1),
-    # not guaranteed to survive one (see libcall.s's header comment).
+    # copy the command-line arg (A0) into namebuf up to the first '\n'
+    # or ' ' -- must happen before any library call: A0 is a
+    # caller-clobbered ("scratch") register per the RKRM calling
+    # convention (D0/D1/A0/A1), not guaranteed to survive one (see
+    # libcall.s's header comment). Stopping at a space too matters
+    # because real AmigaOS's command-line buffer carries a trailing
+    # space *before* the newline whenever there's at least one argument
+    # (issue #63) -- without this, namebuf would end up "test.library "
+    # (trailing space included), which OpenLibrary would never match.
     code.move_l_a_to_a(A1, A0)
     code.move_l_label_to_a(A2, "namebuf")
     code.label("parseloop")
     code.move_b_postinc_to_d(D1, A1)
     code.cmpi_b_imm_to_d(D1, 10)  # '\n'
+    code.branch(CodeBuilder.BEQ, "parsedone")
+    code.cmpi_b_imm_to_d(D1, 32)  # ' '
     code.branch(CodeBuilder.BEQ, "parsedone")
     code.move_b_d_to_postinc(A2, D1)
     code.branch(CodeBuilder.BRA, "parseloop")

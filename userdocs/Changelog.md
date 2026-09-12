@@ -5,6 +5,21 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Fixed the guest command-line buffer's missing trailing space**
+  (issue #63): whenever a launched program has at least one argument,
+  real AmigaOS's own command-line buffer carries a trailing space
+  before the final `'\n'` (`"foo bar baz \n"`, not `"foo bar
+  baz\n"`) -- confirmed directly against real Kickstart 2.0/3.0/3.1
+  hardware via a new local, real-Kickstart comparison harness
+  (`tools/compare_kickstart_versions.py`, using Copperline's
+  `copperhf.device`). Kickstart 3.2 alone doesn't add it -- a real,
+  intentionally-untouched AmigaOS version difference, not a bug (this
+  project targets 3.1 first). Also fixed a real bug found along the
+  way in `fixtures/echoargs.s`/`libcall.s`: `A0` is a scratch register
+  across any library call (real Kickstart's `OpenLibrary` clobbers it;
+  volamos's own doesn't), so reading the command-line pointer back from
+  `A0` *after* an `OpenLibrary` call is real-hardware-unsafe even
+  though it happened to work under volamos.
 - **Implemented `mathieeesingbas.library`/`mathieeesingtrans.library`**:
   the single-precision IEEE math libraries, previously only a fake
   `OpenLibrary` stand-in with no real function support. Mirrors

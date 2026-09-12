@@ -173,18 +173,27 @@ deterministic output).
 
 Source: `echoargs.s`; generator: `gen_echoargs.py`.
 
-1. Real startup (as above; `OpenLibrary`'s own calling convention -- `A1`
-   = name, `D0` = version -- doesn't touch `A0`, so the command-line
-   pointer AmigaOS startup convention hands the program survives).
-2. `PutStr(a0)` directly: the runtime (`Runtime::new` in
+1. Real startup, saving the command-line pointer into `A2` *before* the
+   `OpenLibrary` call, then reading it back from `A2` afterward --
+   `OpenLibrary`'s own *documented* convention only says `A1` = name,
+   `D0` = version, but `A0` is still a scratch register across any
+   library call, and real Kickstart's `OpenLibrary` does clobber it even
+   though volamos's own doesn't. **Found the hard way, via real
+   Kickstart hardware (issue #63)**: an earlier revision read the
+   command-line pointer back from `A0` after the call, assuming it
+   survived -- worked under volamos, produced empty output on every real
+   Kickstart ROM tested.
+2. `PutStr(a2)`: the runtime (`Runtime::new` in
    `crates/volamos-core/src/dispatch.rs`) already leaves the guest
-   command-line buffer `'\n'`-terminated *and* NUL-terminated, so `A0` is
+   command-line buffer `'\n'`-terminated *and* NUL-terminated, so it's
    already a valid `CString*` -- no copying needed.
 3. Exit 0.
 
-`volamos fixtures/echoargs foo bar` prints `foo bar\n`; with no guest
-args, the buffer is still just `"\n"` (the trailing newline is
-unconditional), so it prints `\n`.
+`volamos fixtures/echoargs foo bar` prints `foo bar \n` (a trailing
+space before the newline -- real AmigaOS's own convention, also
+confirmed via real Kickstart hardware, issue #63, and now matched here
+too); with no guest args, the buffer is still just `"\n"` (no leading
+space, and the trailing newline is unconditional), so it prints `\n`.
 
 ### Regenerating
 

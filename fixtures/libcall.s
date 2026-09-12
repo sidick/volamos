@@ -70,15 +70,23 @@ LIB_OPENCNT_OFFSET equ 32
 start:
         move.l  4.w,a5                  ; A5 = AbsExecBase (kept constant)
 
-        ; copy the command-line arg (A0) into namebuf up to the first '\n'
-        ; -- must happen before any library call: A0 is a scratch
-        ; register (RKRM calling convention), not guaranteed to survive
-        ; one (see header comment).
+        ; copy the command-line arg (A0) into namebuf up to the first
+        ; '\n' or ' ' -- must happen before any library call: A0 is a
+        ; scratch register (RKRM calling convention), not guaranteed to
+        ; survive one (see header comment). Stopping at a space too
+        ; (not just '\n') matters because real AmigaOS's command-line
+        ; buffer carries a trailing space *before* the newline whenever
+        ; there's at least one argument (confirmed via real Kickstart
+        ; hardware, issue #63) -- without this, namebuf would end up
+        ; "test.library " (trailing space included), which OpenLibrary
+        ; would never match.
         move.l  a0,a1
         move.l  #namebuf,a2
 parseloop:
         move.b  (a1)+,d1
         cmpi.b  #10,d1                  ; '\n'
+        beq     parsedone
+        cmpi.b  #32,d1                  ; ' '
         beq     parsedone
         move.b  d1,(a2)+
         bra     parseloop

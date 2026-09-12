@@ -92,12 +92,13 @@ fn systest_runs_nested_echoargs_and_propagates_output_and_control() {
     );
 
     let stdout = stdout_of(&output);
-    // Nested echoargs' own output ("sys arg\n" -- it PutStrs its command
-    // line verbatim) must appear, and it must appear *before* systest's
+    // Nested echoargs' own output ("sys arg \n" -- it PutStrs its command
+    // line verbatim, which carries a trailing space before the newline;
+    // see issue #63) must appear, and it must appear *before* systest's
     // own trailing message, proving the nested run actually completed
     // (synchronously) before the parent continued.
     let nested_pos = stdout
-        .find("sys arg\n")
+        .find("sys arg \n")
         .expect("nested echoargs output should appear on stdout");
     let trailing_pos = stdout
         .find("after system\n")

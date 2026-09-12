@@ -246,7 +246,9 @@ fn echoargs_prints_the_joined_command_line_with_args() {
         .expect("failed to run volamos");
 
     assert!(output.status.success());
-    assert_eq!(stdout_of(&output), "foo bar\n");
+    // Trailing space before the '\n' matches real Kickstart hardware
+    // (issue #63), not just a single-space join between arguments.
+    assert_eq!(stdout_of(&output), "foo bar \n");
 }
 
 #[test]

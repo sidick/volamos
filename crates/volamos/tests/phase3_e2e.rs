@@ -90,7 +90,9 @@ fn stack_flag_accepts_a_suffixed_value_and_the_program_still_runs() {
         .expect("failed to run volamos");
 
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
-    assert_eq!(stdout_of(&output), "foo bar\n");
+    // Trailing space before the '\n' matches real Kickstart hardware
+    // (issue #63), not just a single-space join between arguments.
+    assert_eq!(stdout_of(&output), "foo bar \n");
 }
 
 #[test]
