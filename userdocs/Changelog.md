@@ -5,6 +5,18 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Fixed `mathffp.library`/`mathtrans.library`'s FFP encoding**
+  (issue #53): the sign bit and exponent field were in swapped bit
+  positions (an old bug hidden by a unit test that re-derived the same
+  wrong layout from this module's own -- also wrong -- doc comment
+  instead of checking against real hardware), and overflow/underflow/
+  domain-error (`NaN`) results weren't saturating correctly. Found via
+  a new local comparison harness against amitools' own test corpus
+  (`tools/compare_amitools_suite.py`); took the affected tests'
+  divergence from `vamos` from the large majority of their output
+  lines down to a handful of residual, believed-benign ones (a single
+  overflow-boundary edge case and ordinary cross-implementation
+  transcendental-function rounding variance).
 - **Built-in standard-volume defaults** (issue #43): `SYS:`, `RAM:`,
   and the standard `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:`
   assigns onto them now resolve out of the box, with zero `-V`/`-a`

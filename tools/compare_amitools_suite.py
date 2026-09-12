@@ -66,7 +66,10 @@ data point, not two.
 ## other compiler flavors, and CI promotion)
 
 Two runs against this corpus so far have found four real volamos bugs
-(issues #45, #46, #47, #53 -- all still visible `FAIL`s below,
+(issues #45, #46, #47, #53 -- #53, `mathffp.library`/`mathtrans.library`
+having its FFP sign/exponent bits swapped plus wrong overflow/
+underflow saturation, has since been fixed in `crates/volamos-core/
+src/mathlibs.rs`; #45-#47 are still visible `FAIL`s below,
 `KNOWN_DIVERGENCES` is reserved for divergences attributed to `vamos`,
 not for volamos's own unfixed ones), one missing feature (#55,
 `FindArg` not implemented), and four things needing further
@@ -320,10 +323,15 @@ CORPUS = [
         guest_args=[],
         setup=None,
         data_file="math_fast.txt",
-        # Far more than hex-case noise -- ~50 of 84 lines differ in
-        # actual value (e.g. fix1 -- should be 0x3e8 -- returns 0
-        # entirely). Left as a visible FAIL, not KNOWN_DIVERGENCES:
-        # this is very plausibly a real volamos gap, not vamos's.
+        # Was far more than hex-case noise (~50 of 84 lines differed in
+        # actual value) until issue #53's root cause -- ffp_to_f32/
+        # f32_to_ffp had the sign bit and exponent field swapped -- was
+        # fixed; down to 2 residual lines now (mul3/mul4, an overflow-
+        # saturation boundary case at exactly FFP's max exponent field
+        # that's genuinely unclear which side -- if either -- is more
+        # correct without real-hardware verification; see f32_to_ffp's
+        # own doc for the full reasoning). Left as a visible FAIL, not
+        # KNOWN_DIVERGENCES, until that's resolved one way or the other.
         tracking_issue="https://github.com/sidick/volamos/issues/53",
     ),
     Entry(
@@ -331,6 +339,10 @@ CORPUS = [
         guest_args=[],
         setup=None,
         data_file="math_fast_trans.txt",
+        # Same #53 fix took this from ~110 of 149 lines differing to 5
+        # -- all tiny (1-ULP-ish) mantissa differences in acos/asin/
+        # atan results, consistent with ordinary cross-implementation
+        # transcendental-function rounding variance rather than a bug.
         tracking_issue="https://github.com/sidick/volamos/issues/53",
     ),
 ]

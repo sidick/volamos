@@ -4450,3 +4450,61 @@ genuinely-uncertain, per the harness's own established convention);
 `dos_match`/`dos_seek`/`exec_rawdofmt`/`dos_findarg`/`math_fast`/
 `math_fast_trans` stay visible `FAIL`s, each with a `tracking_issue`
 link, since they represent real volamos-side gaps.
+
+## Issue #53 fixed: mathffp.library/mathtrans.library FFP encoding had sign and exponent bits swapped — 2026-09-12
+
+Root-caused via `tools/compare_amitools_suite.py`'s `math_fast`/
+`math_fast_trans` entries: `mathlibs.rs`'s `ffp_to_f32`/`f32_to_ffp`
+had the FFP format's sign bit and exponent field in the wrong bit
+positions -- bit 0 = sign, bits 1-7 = exponent, when real FFP (verified
+by hand-decoding amitools' own `test/src/math_fast.h` constants --
+`FFP_ONE = $80000041`, `FFP_PI = $C90FDB42`, `FFP_1000 = $FA00004A`,
+etc. -- against both bit layouts) is bit 7 = sign, bits 0-6 = exponent.
+A pre-existing unit test (`ffp_one_matches_known_encoding`) had
+independently re-derived the *wrong* layout from this module's own
+(also wrong) doc comment instead of checking against any external
+ground truth, so it passed despite encoding a real bug -- rewritten to
+assert against amitools' constants directly instead, plus a new test
+covering several more of them.
+
+This single fix took `math_fast`'s substantive (non-hex-case)
+divergence from vamos from ~50 of 84 lines to 3, and
+`math_fast_trans`'s from ~110 of 149 lines to 20. The remaining ones
+resolved two more real, narrower bugs in the same module:
+
+- `f32_to_ffp` clamped only the *exponent field* on overflow/underflow,
+  leaving whatever mantissa the original (out-of-range) value happened
+  to carry -- producing a wrong-magnitude value still tagged with the
+  boundary exponent. Real overflow (including `f32` itself already
+  having overflowed to `+-inf`, which several `mathtrans` functions do
+  routinely -- `SPExp`/`SPCosh`/`SPSinh` of a large input) saturates to
+  FFP's true largest magnitude (mantissa all-`1`s, exponent `127` --
+  exactly `math_fast.h`'s own `FFP_MAX`/`FFP_MAX_NEG` constants); real
+  underflow (a value smaller than FFP's own floor, e.g. converting
+  IEEE's `FLT_MIN`) flushes to `0` instead of clamping *up* to FFP's
+  smallest nonzero magnitude. A domain-error `NaN` (`SPAcos`/`SPAsin`
+  outside `[-1,1]`, `SPLog`/`SPSqrt` of a negative number) needed its
+  own third case -- `0`, not the overflow saturation value, confirmed
+  against `vamos`'s real output for exactly these cases.
+- `SPPow` (`mathtrans.library`) computed `fnum1 ** fnum2` when real
+  `SPPow` computes `fnum2 ** fnum1` -- the same historical
+  argument-order quirk already known and reproduced for `SPSub`/
+  `SPDiv` (their own doc comments), just not yet applied here.
+  Confirmed against `math_fast_trans.c`'s own `SPPow(FFP_2, FFP_10)` ->
+  `100` (`10**2`), not `1024` (`2**10`).
+
+After all three fixes: `math_fast` is down to 2 residual lines
+(`mul3`/`mul4`, an overflow-saturation boundary case sitting exactly at
+FFP's maximum exponent field, where it's genuinely unclear -- without
+real-hardware verification -- whether volamos's unsaturated or vamos's
+saturated answer is the more correct one; left unresolved rather than
+guessed at). `math_fast_trans` is down to 5 residual lines, all
+1-ULP-ish mantissa differences in `acos`/`asin`/`atan` results --
+consistent with ordinary cross-implementation transcendental-function
+rounding variance, not a bug.
+
+5 new/rewritten unit tests in `mathlibs.rs` (overflow saturation,
+infinity saturation, NaN-vs-infinity distinction, underflow flush,
+`SPPow`'s argument order via a new `mathtrans_program`/
+`run_binary_ffp_via` e2e test helper alongside the existing
+`mathffp_program` one). Full suite: 705 passing, clippy/fmt clean.
