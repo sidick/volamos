@@ -3,7 +3,7 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## Unreleased
+## 0.4
 
 - **Fixed `mathffp.library`/`mathtrans.library`'s FFP encoding**
   (issue #53): the sign bit and exponent field were in swapped bit
