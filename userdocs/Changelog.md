@@ -3,7 +3,7 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## Unreleased
+## 0.5
 
 - **Fixed the guest command-line buffer's missing trailing space**
   (issue #63): whenever a launched program has at least one argument,
