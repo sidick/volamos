@@ -91,6 +91,18 @@ KNOWN_DIVERGENCES = {
         "hardware here; this is vamos's own divergence, not a volamos bug",
         "https://github.com/sidick/volamos/issues/6",
     ),
+    "echoargs": (
+        "vamos doesn't add the real trailing space before the command-line "
+        "buffer's final '\\n' when there's at least one argument -- confirmed "
+        "against real Kickstart 2.0/3.0/3.1 hardware (issue #63); vamos's own "
+        "divergence, not a volamos bug",
+        "https://github.com/sidick/volamos/issues/64",
+    ),
+    "systest": (
+        "same root cause as 'echoargs' above, via SystemTagList's nested "
+        "process launch reusing the same command-line-buffer construction",
+        "https://github.com/sidick/volamos/issues/64",
+    ),
 }
 
 
