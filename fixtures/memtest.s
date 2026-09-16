@@ -28,6 +28,26 @@
 ;   uaf       -- AllocMem 32 bytes, FreeMem it, then read 1 byte at
 ;                offset 0 of the now-freed block. Expect a
 ;                use-after-free READ at the freed block's start.
+;   uninit    -- AllocMem 32 bytes *without* MEMF_CLEAR, then read 1
+;                byte at offset 0 without ever writing it. Silent under
+;                plain --sanitize; expect one uninitialized-read report
+;                at block+0 under the (not-yet-existing as of this
+;                writing) --sanitize-uninit.
+;   uninitpartial -- AllocMem 32 bytes without MEMF_CLEAR, write only
+;                the first 16 bytes (offsets 0..15), then read offset
+;                20 (inside the still-unwritten second half). Silent
+;                under plain --sanitize; expect one uninitialized-read
+;                report at block+20 under --sanitize-uninit -- proves
+;                the detector is byte-granular, not per-allocation,
+;                since offsets 0..15 of the very same block are Valid.
+;   written   -- false-positive guard. AllocMem 32 bytes without
+;                MEMF_CLEAR, write all 32 bytes, read all 32 back.
+;                Every byte read was written first, so this must
+;                report NOTHING even under --sanitize-uninit.
+;   cleared   -- second false-positive guard. AllocMem 32 bytes *with*
+;                MEMF_CLEAR, then read offset 0 without ever writing
+;                it. MEMF_CLEAR memory is genuinely initialized, so
+;                this must report NOTHING even under --sanitize-uninit.
 ;
 ; No argument, or an unrecognised one, prints a usage line and exits 0.
 ; Every mode PutStr's a short self-describing line before doing its
@@ -131,6 +151,30 @@ start:
         bsr     strmatch
         tst.l   d0
         bne     mode_uaf
+
+        move.l  a2,a1
+        move.l  #kw_uninit,a0
+        bsr     strmatch
+        tst.l   d0
+        bne     mode_uninit
+
+        move.l  a2,a1
+        move.l  #kw_uninitpartial,a0
+        bsr     strmatch
+        tst.l   d0
+        bne     mode_uninitpartial
+
+        move.l  a2,a1
+        move.l  #kw_written,a0
+        bsr     strmatch
+        tst.l   d0
+        bne     mode_written
+
+        move.l  a2,a1
+        move.l  #kw_cleared,a0
+        bsr     strmatch
+        tst.l   d0
+        bne     mode_cleared
 
         bra     mode_usage
 
@@ -267,6 +311,131 @@ mode_uaf:
         moveq   #0,d0
         rts
 
+; --- uninit: alloc 32 bytes *without* MEMF_CLEAR, then read 1 byte at
+; offset 0 without ever writing it. Under plain --sanitize this is
+; silent (the byte is in-bounds, still allocated, not freed); under
+; --sanitize-uninit it should report one uninitialized-read at
+; block+0. ---
+mode_uninit:
+        move.l  a3,a6
+        move.l  #msg_uninit,d1
+        jsr     -948(a6)                 ; PutStr
+        move.l  a4,a6
+        moveq   #32,d0
+        moveq   #0,d1                    ; no MEMF_CLEAR -- block starts fully Uninit
+        jsr     -198(a6)                 ; AllocMem(32,0) -> D0
+        tst.l   d0
+        beq     allocfail
+        move.l  d0,a2
+
+        move.b  0(a2),d0                 ; the uninitialized read itself
+
+        move.l  a4,a6
+        move.l  a2,a1
+        moveq   #32,d0
+        jsr     -210(a6)                 ; FreeMem(block,32)
+        moveq   #0,d0
+        rts
+
+; --- uninitpartial: alloc 32 bytes without MEMF_CLEAR, write only the
+; first 16 bytes (offsets 0..15), then read offset 20 -- inside the
+; still-unwritten second half. The more realistic bug shape: proves
+; the detector is byte-granular, not per-allocation, since offsets
+; 0..15 of this very same block are genuinely Valid by the time of the
+; read. Expect one uninitialized-read at block+20 under
+; --sanitize-uninit, nothing under plain --sanitize. ---
+mode_uninitpartial:
+        move.l  a3,a6
+        move.l  #msg_uninitpartial,d1
+        jsr     -948(a6)                 ; PutStr
+        move.l  a4,a6
+        moveq   #32,d0
+        moveq   #0,d1                    ; no MEMF_CLEAR
+        jsr     -198(a6)                 ; AllocMem(32,0) -> D0
+        tst.l   d0
+        beq     allocfail
+        move.l  d0,a2
+
+        move.l  a2,a1
+        moveq   #15,d1                   ; dbra runs count+1 = 16 times -> offsets 0..15
+uninitpartial_write_loop:
+        move.b  d1,(a1)+                 ; in-bounds write, offsets 0..15 only
+        dbra    d1,uninitpartial_write_loop
+
+        move.b  20(a2),d0                ; read offset 20 -- never written
+
+        move.l  a4,a6
+        move.l  a2,a1
+        moveq   #32,d0
+        jsr     -210(a6)                 ; FreeMem(block,32)
+        moveq   #0,d0
+        rts
+
+; --- written: false-positive guard. Alloc 32 bytes without
+; MEMF_CLEAR, write all 32, read all 32 back -- every byte read was
+; written first, so this must report NOTHING even under
+; --sanitize-uninit (same access shape as `clean`, but deliberately
+; starting from an un-cleared allocation, to isolate the uninit
+; detector's own false-positive behaviour from the heap-redzone
+; detector's). ---
+mode_written:
+        move.l  a3,a6
+        move.l  #msg_written,d1
+        jsr     -948(a6)                 ; PutStr
+        move.l  a4,a6
+        moveq   #32,d0
+        moveq   #0,d1                    ; no MEMF_CLEAR
+        jsr     -198(a6)                 ; AllocMem(32,0) -> D0
+        tst.l   d0
+        beq     allocfail
+        move.l  d0,a2
+
+        move.l  a2,a1
+        moveq   #31,d1                   ; dbra runs count+1 = 32 times
+written_write_loop:
+        move.b  d1,(a1)+                 ; in-bounds write, offsets 0..31
+        dbra    d1,written_write_loop
+
+        move.l  a2,a1
+        moveq   #31,d1
+written_read_loop:
+        move.b  (a1)+,d0                 ; in-bounds read, offsets 0..31
+        dbra    d1,written_read_loop
+
+        move.l  a4,a6
+        move.l  a2,a1
+        moveq   #32,d0
+        jsr     -210(a6)                 ; FreeMem(block,32)
+        moveq   #0,d0
+        rts
+
+; --- cleared: second false-positive guard. Alloc 32 bytes *with*
+; MEMF_CLEAR, then read offset 0 without ever writing it. MEMF_CLEAR
+; memory is genuinely initialized (exec.library zeroed it), so this
+; must report NOTHING even under --sanitize-uninit -- distinguishing
+; "never written" from "never written by this program but zeroed by
+; AllocMem itself". ---
+mode_cleared:
+        move.l  a3,a6
+        move.l  #msg_cleared,d1
+        jsr     -948(a6)                 ; PutStr
+        move.l  a4,a6
+        moveq   #32,d0
+        move.l  #65536,d1                ; MEMF_CLEAR -- doesn't fit moveq's range
+        jsr     -198(a6)                 ; AllocMem(32,MEMF_CLEAR) -> D0
+        tst.l   d0
+        beq     allocfail
+        move.l  d0,a2
+
+        move.b  0(a2),d0                 ; read of MEMF_CLEAR'd, never-written byte
+
+        move.l  a4,a6
+        move.l  a2,a1
+        moveq   #32,d0
+        jsr     -210(a6)                 ; FreeMem(block,32)
+        moveq   #0,d0
+        rts
+
 ; --- usage: no argument, or an unrecognised one ---
 mode_usage:
         move.l  a3,a6
@@ -301,6 +470,18 @@ kw_underrun:
 kw_uaf:
         dc.b    "uaf",0
         even
+kw_uninit:
+        dc.b    "uninit",0
+        even
+kw_uninitpartial:
+        dc.b    "uninitpartial",0
+        even
+kw_written:
+        dc.b    "written",0
+        even
+kw_cleared:
+        dc.b    "cleared",0
+        even
 
 msg_clean:
         dc.b    "clean: alloc 32 bytes, write+read all 32, free",10,0
@@ -314,8 +495,20 @@ msg_underrun:
 msg_uaf:
         dc.b    "uaf: reading a freed 32-byte block",10,0
         even
+msg_uninit:
+        dc.b    "uninit: alloc 32 bytes without MEMF_CLEAR, read offset 0 unwritten",10,0
+        even
+msg_uninitpartial:
+        dc.b    "uninitpartial: alloc 32, write bytes 0-15, read offset 20 unwritten",10,0
+        even
+msg_written:
+        dc.b    "written: alloc 32 bytes without MEMF_CLEAR, write+read all 32",10,0
+        even
+msg_cleared:
+        dc.b    "cleared: alloc 32 bytes with MEMF_CLEAR, read offset 0 unwritten",10,0
+        even
 msg_usage:
-        dc.b    "usage: memtest clean|overrun|underrun|uaf",10,0
+        dc.b    "usage: memtest clean|overrun|underrun|uaf|uninit|uninitpartial|written|cleared",10,0
         even
 msg_allocfail:
         dc.b    "AllocMem failed",10,0

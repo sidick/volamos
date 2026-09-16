@@ -29,7 +29,8 @@ filetest.s/dirtest.s/echoargs.s):
 3. Command-line dispatch: a small `strmatch` subroutine (A1 = the
    command-line cursor, A0 = the candidate keyword's data label,
    D0/D1/D2/D3 scratch; returns D0=1/0) is `bsr`'d once per candidate
-   keyword ("clean", "overrun", "underrun", "uaf"), each time re-copying
+   keyword ("clean", "overrun", "underrun", "uaf", "uninit",
+   "uninitpartial", "written", "cleared"), each time re-copying
    A2 into A1 first (the subroutine consumes A1 via postincrement).
    `strmatch` requires the keyword to be followed immediately by a space
    or newline, so "clean" doesn't spuriously match a hypothetical
@@ -38,9 +39,10 @@ filetest.s/dirtest.s/echoargs.s):
    those two terminators.
 4. Whichever mode matches jumps to that mode's body -- see the module's
    MODES list below and fixtures/README.md's "memtest" section for what
-   each one does and what --sanitize is expected to report for it. No
-   match (including an empty command line, which is just "\\n") falls
-   through to `mode_usage`, which PutStrs a usage line and exits 0.
+   each one does and what --sanitize/--sanitize-uninit are expected to
+   report for it. No match (including an empty command line, which is
+   just "\\n") falls through to `mode_usage`, which PutStrs a usage line
+   and exits 0.
 5. Every mode body reuses A2 (no longer needed once dispatch has
    committed) as the AllocMem'd block pointer. AllocMem's exec.library
    LVO is -198 (D0 = byte size, D1 = requirements, D0 returns the
@@ -75,6 +77,9 @@ LVO_PUTSTR = -948
 
 BLOCK_SIZE = 32
 
+# See crates/volamos-core/src/execmem.rs's MEMF_CLEAR constant.
+MEMF_CLEAR = 1 << 16
+
 # Registers (see crates/volamos-core/src/cpu.rs's DataRegister/
 # AddressRegister numbering, matching real 68k D0-D7/A0-A7).
 D0, D1, D2, D3 = 0, 1, 2, 3
@@ -91,12 +96,36 @@ def build_program() -> bytes:
     data.cstr("kw_overrun", "overrun")
     data.cstr("kw_underrun", "underrun")
     data.cstr("kw_uaf", "uaf")
+    data.cstr("kw_uninit", "uninit")
+    data.cstr("kw_uninitpartial", "uninitpartial")
+    data.cstr("kw_written", "written")
+    data.cstr("kw_cleared", "cleared")
 
     data.cstr("msg_clean", "clean: alloc 32 bytes, write+read all 32, free\n")
     data.cstr("msg_overrun", "overrun: writing 1 byte past a 32-byte block\n")
     data.cstr("msg_underrun", "underrun: reading 1 byte before a 32-byte block\n")
     data.cstr("msg_uaf", "uaf: reading a freed 32-byte block\n")
-    data.cstr("msg_usage", "usage: memtest clean|overrun|underrun|uaf\n")
+    data.cstr(
+        "msg_uninit",
+        "uninit: alloc 32 bytes without MEMF_CLEAR, read offset 0 unwritten\n",
+    )
+    data.cstr(
+        "msg_uninitpartial",
+        "uninitpartial: alloc 32, write bytes 0-15, read offset 20 unwritten\n",
+    )
+    data.cstr(
+        "msg_written",
+        "written: alloc 32 bytes without MEMF_CLEAR, write+read all 32\n",
+    )
+    data.cstr(
+        "msg_cleared",
+        "cleared: alloc 32 bytes with MEMF_CLEAR, read offset 0 unwritten\n",
+    )
+    data.cstr(
+        "msg_usage",
+        "usage: memtest clean|overrun|underrun|uaf|uninit|uninitpartial|"
+        "written|cleared\n",
+    )
     data.cstr("msg_allocfail", "AllocMem failed\n")
 
     code = CodeBuilder()
@@ -117,6 +146,10 @@ def build_program() -> bytes:
         ("kw_overrun", "mode_overrun"),
         ("kw_underrun", "mode_underrun"),
         ("kw_uaf", "mode_uaf"),
+        ("kw_uninit", "mode_uninit"),
+        ("kw_uninitpartial", "mode_uninitpartial"),
+        ("kw_written", "mode_written"),
+        ("kw_cleared", "mode_cleared"),
     ):
         code.move_l_a_to_a(A1, A2)  # fresh cursor -- strmatch consumes it
         code.move_l_label_to_a(A0, keyword)
@@ -271,6 +304,131 @@ def build_program() -> bytes:
 
     code.move_b_disp_a_to_d(A2, 0, D0)  # the use-after-free read itself
 
+    code.moveq(D0, 0)
+    code.rts()
+
+    # --- uninit: alloc 32 bytes *without* MEMF_CLEAR, then read 1 byte
+    # at offset 0 without ever writing it. Under plain --sanitize this
+    # is silent (the byte is in-bounds, still allocated, not freed);
+    # under --sanitize-uninit it should report one uninitialized-read
+    # at block+0. ---
+    code.label("mode_uninit")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_uninit")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+    code.move_l_a_to_a(A6, A4)
+    code.moveq(D0, BLOCK_SIZE)
+    code.moveq(D1, 0)  # no MEMF_CLEAR -- block starts fully Uninit
+    code.jsr_disp16_a(A6, LVO_ALLOCMEM)
+    code.tst_l_d(D0)
+    code.branch(CodeBuilder.BEQ, "allocfail")
+    code.move_l_d_to_a(A2, D0)
+
+    code.move_b_disp_a_to_d(A2, 0, D0)  # the uninitialized read itself
+
+    code.move_l_a_to_a(A6, A4)
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D0, BLOCK_SIZE)
+    code.jsr_disp16_a(A6, LVO_FREEMEM)
+    code.moveq(D0, 0)
+    code.rts()
+
+    # --- uninitpartial: alloc 32 bytes without MEMF_CLEAR, write only
+    # the first 16 bytes (offsets 0..15), then read offset 20 -- inside
+    # the still-unwritten second half. The more realistic bug shape:
+    # proves the detector is byte-granular, not per-allocation, since
+    # offsets 0..15 of this very same block are genuinely Valid by the
+    # time of the read. Expect one uninitialized-read at block+20 under
+    # --sanitize-uninit, nothing under plain --sanitize. ---
+    code.label("mode_uninitpartial")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_uninitpartial")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+    code.move_l_a_to_a(A6, A4)
+    code.moveq(D0, BLOCK_SIZE)
+    code.moveq(D1, 0)  # no MEMF_CLEAR
+    code.jsr_disp16_a(A6, LVO_ALLOCMEM)
+    code.tst_l_d(D0)
+    code.branch(CodeBuilder.BEQ, "allocfail")
+    code.move_l_d_to_a(A2, D0)
+
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D1, 15)  # dbra runs count+1 = 16 times -> offsets 0..15
+    code.label("uninitpartial_write_loop")
+    code.move_b_d_to_postinc(A1, D1)  # in-bounds write, offsets 0..15 only
+    code.dbra(D1, "uninitpartial_write_loop")
+
+    code.move_b_disp_a_to_d(A2, 20, D0)  # read offset 20 -- never written
+
+    code.move_l_a_to_a(A6, A4)
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D0, BLOCK_SIZE)
+    code.jsr_disp16_a(A6, LVO_FREEMEM)
+    code.moveq(D0, 0)
+    code.rts()
+
+    # --- written: false-positive guard. Alloc 32 bytes without
+    # MEMF_CLEAR, write all 32, read all 32 back -- every byte read was
+    # written first, so this must report NOTHING even under
+    # --sanitize-uninit (same access shape as `clean`, but deliberately
+    # starting from an un-cleared allocation, to isolate the uninit
+    # detector's own false-positive behaviour from the heap-redzone
+    # detector's). ---
+    code.label("mode_written")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_written")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+    code.move_l_a_to_a(A6, A4)
+    code.moveq(D0, BLOCK_SIZE)
+    code.moveq(D1, 0)  # no MEMF_CLEAR
+    code.jsr_disp16_a(A6, LVO_ALLOCMEM)
+    code.tst_l_d(D0)
+    code.branch(CodeBuilder.BEQ, "allocfail")
+    code.move_l_d_to_a(A2, D0)
+
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D1, BLOCK_SIZE - 1)  # dbra runs count+1 = 32 times
+    code.label("written_write_loop")
+    code.move_b_d_to_postinc(A1, D1)  # in-bounds write, offsets 0..31
+    code.dbra(D1, "written_write_loop")
+
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D1, BLOCK_SIZE - 1)
+    code.label("written_read_loop")
+    code.move_b_postinc_to_d(D0, A1)  # in-bounds read, offsets 0..31
+    code.dbra(D1, "written_read_loop")
+
+    code.move_l_a_to_a(A6, A4)
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D0, BLOCK_SIZE)
+    code.jsr_disp16_a(A6, LVO_FREEMEM)
+    code.moveq(D0, 0)
+    code.rts()
+
+    # --- cleared: second false-positive guard. Alloc 32 bytes *with*
+    # MEMF_CLEAR, then read offset 0 without ever writing it.
+    # MEMF_CLEAR memory is genuinely initialized (exec.library zeroed
+    # it), so this must report NOTHING even under --sanitize-uninit --
+    # distinguishing "never written" from "never written by this
+    # program but zeroed by AllocMem itself". ---
+    code.label("mode_cleared")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_cleared")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+    code.move_l_a_to_a(A6, A4)
+    code.moveq(D0, BLOCK_SIZE)
+    code.move_l_imm_to_d(D1, MEMF_CLEAR)  # MEMF_CLEAR -- doesn't fit moveq's range
+    code.jsr_disp16_a(A6, LVO_ALLOCMEM)
+    code.tst_l_d(D0)
+    code.branch(CodeBuilder.BEQ, "allocfail")
+    code.move_l_d_to_a(A2, D0)
+
+    code.move_b_disp_a_to_d(A2, 0, D0)  # read of MEMF_CLEAR'd, never-written byte
+
+    code.move_l_a_to_a(A6, A4)
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D0, BLOCK_SIZE)
+    code.jsr_disp16_a(A6, LVO_FREEMEM)
     code.moveq(D0, 0)
     code.rts()
 

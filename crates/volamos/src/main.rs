@@ -104,6 +104,45 @@ const DEFAULT_RAM_SIZE: u32 = 16 * 1024 * 1024;
 /// bytes.
 const MIN_HEAP_HEADROOM: u32 = 4096;
 
+/// The `--sanitize` family, kept together and **CLI-only** -- see
+/// [`Options::sanitize`]'s doc for why instrumentation flags
+/// deliberately aren't part of `config::Overrides` (a stale config file
+/// silently enabling a debugging mode is a surprise nobody wants).
+///
+/// Grouped into a struct rather than threaded as three more positional
+/// arguments: `parse_args_raw`/`resolve` already carry a four-element
+/// tuple, and growing it to six interchangeable `bool`s is exactly how
+/// arguments end up swapped at a call site.
+#[derive(Debug, Default, Clone)]
+struct SanitizeOptions {
+    /// `--sanitize`: install the shadow map and check every guest access.
+    enabled: bool,
+    /// `--sanitize-uninit`: additionally report reads of memory that was
+    /// allocated but never written. Off by default even with
+    /// `--sanitize`, because uninitialized-read detection is the
+    /// noisiest class in any sanitizer -- see `crate::sanitize`'s docs
+    /// and issue #68.
+    uninit: bool,
+    /// `--sanitize-ignore-pc`: guest PCs whose violations are
+    /// suppressed, for silencing a site that has already been triaged
+    /// without needing a suppression file.
+    ignore_pcs: Vec<u32>,
+}
+
+impl SanitizeOptions {
+    /// Applies these options to a freshly-installed shadow map. A no-op
+    /// when sanitizing is off (there is no shadow map to configure).
+    fn apply(&self, mem: &mut FlatMemory) {
+        let Some(shadow) = mem.shadow_mut() else {
+            return;
+        };
+        shadow.report_uninit = self.uninit;
+        for &pc in &self.ignore_pcs {
+            shadow.ignore_pc(pc);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Options {
     verbose: bool,
@@ -127,8 +166,8 @@ struct Options {
     /// `config::Overrides` deliberately, so enabling extra diagnostic
     /// overhead/behavior-changing instrumentation is always an explicit,
     /// per-invocation choice rather than something a stale config file
-    /// silently turns on.
-    sanitize: bool,
+    /// silently turns on. See [`SanitizeOptions`] for the family.
+    sanitize: SanitizeOptions,
     net: bool,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
@@ -169,7 +208,8 @@ fn print_usage(program_name: &str) {
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--defaults|--no-defaults] [--volumes-dir HOSTDIR] \
          [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] [--net] <program> [args...]"
+         [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] [--sanitize-uninit]\n\
+         [--sanitize-ignore-pc ADDR] [--net] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -256,6 +296,29 @@ fn print_usage(program_name: &str) {
     );
     eprintln!(
         "                            JIT's fast memory path would otherwise bypass every check"
+    );
+    eprintln!(
+        "  --sanitize-uninit         additionally report reads of memory that was allocated but"
+    );
+    eprintln!("                            never written. Implies --sanitize. Separate and off by");
+    eprintln!(
+        "                            default because uninitialized-read detection is the noisiest"
+    );
+    eprintln!(
+        "                            class in any sanitizer -- a whole-struct copy that includes"
+    );
+    eprintln!(
+        "                            padding, or a table scan touching unused slots, can report"
+    );
+    eprintln!("                            legitimately");
+    eprintln!(
+        "  --sanitize-ignore-pc ADDR suppress violations reported at guest PC ADDR (decimal, or"
+    );
+    eprintln!(
+        "                            hex with a 0x prefix). Repeatable. For silencing a site you"
+    );
+    eprintln!(
+        "                            have already triaged, without needing a suppression file"
     );
     eprintln!("  --net                     enable bsdsocket.library: real host network access for");
     eprintln!("                            the guest (socket/connect/send/recv/... via real host");
@@ -447,11 +510,11 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// test) actually want.
 fn parse_args_raw(
     mut args: impl Iterator<Item = String>,
-) -> Result<(config::Overrides, bool, String, Vec<String>), String> {
+) -> Result<(config::Overrides, SanitizeOptions, String, Vec<String>), String> {
     let mut overrides = config::Overrides::default();
     // CLI-only, unlike every other flag here -- see `Options::sanitize`'s
     // doc for why this deliberately isn't part of `config::Overrides`.
-    let mut sanitize = false;
+    let mut sanitize = SanitizeOptions::default();
     let mut program = None;
     let mut guest_args = Vec::new();
 
@@ -515,7 +578,27 @@ fn parse_args_raw(
             "--no-fpu" => overrides.fpu = Some(false),
             "--jit" => overrides.jit = Some(true),
             "--no-jit" => overrides.jit = Some(false),
-            "--sanitize" => sanitize = true,
+            "--sanitize" => sanitize.enabled = true,
+            // Implies --sanitize: asking for uninitialized-read
+            // reporting without the shadow map installed could only be
+            // a mistake, and silently doing nothing would be worse than
+            // the implication.
+            "--sanitize-uninit" => {
+                sanitize.enabled = true;
+                sanitize.uninit = true;
+            }
+            "--sanitize-ignore-pc" => {
+                let raw = args.next().ok_or(
+                    "--sanitize-ignore-pc needs an address, e.g. --sanitize-ignore-pc 0xe14a",
+                )?;
+                let hex = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
+                let pc = match hex {
+                    Some(digits) => u32::from_str_radix(digits, 16),
+                    None => raw.parse::<u32>(),
+                }
+                .map_err(|_| format!("--sanitize-ignore-pc: '{raw}' isn't a valid address"))?;
+                sanitize.ignore_pcs.push(pc);
+            }
             "--net" => overrides.net = Some(true),
             "--defaults" => overrides.standard_volumes = Some(true),
             "--no-defaults" => overrides.standard_volumes = Some(false),
@@ -539,7 +622,7 @@ fn parse_args_raw(
 /// merging CLI overrides with `~/.volamos`/`.volamos`).
 fn resolve(
     overrides: config::Overrides,
-    sanitize: bool,
+    sanitize: SanitizeOptions,
     program: String,
     guest_args: Vec<String>,
 ) -> Options {
@@ -716,7 +799,7 @@ fn run_nested_program(
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
-    sanitize: bool,
+    sanitize: SanitizeOptions,
     net: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
@@ -730,8 +813,9 @@ fn run_nested_program(
     // harmless either way (see `FlatMemory::enable_sanitizer`'s doc for
     // why the default `Valid` shadow state makes the ordering a
     // non-issue), this is just the more obvious place to put the call.
-    if sanitize {
+    if sanitize.enabled {
         mem.enable_sanitizer();
+        sanitize.apply(&mut mem);
     }
     let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
         return -1;
@@ -758,9 +842,9 @@ fn run_nested_program(
     // is belt-and-braces (that impl already returns `None` once a
     // shadow map is installed, but making it explicit here means a
     // nested run never even attempts the JIT path in the first place).
-    cpu.set_jit(jit && !sanitize);
+    cpu.set_jit(jit && !sanitize.enabled);
     let mut runtime = Runtime::new(cpu, mem, config);
-    if sanitize {
+    if sanitize.enabled {
         // The shadow map installed on `mem` above only records what it
         // is told to poison; this is what makes the heap actually
         // reserve and report redzones around guest allocations.
@@ -810,7 +894,7 @@ fn build_runtime_with_vfs(
     if opts.net {
         runtime.enable_bsdsocket();
     }
-    if opts.sanitize {
+    if opts.sanitize.enabled {
         // Pairs with the `mem.enable_sanitizer()` both of `run`'s
         // loading strategies already did: that installs the shadow map,
         // this makes the heap reserve redzones and quarantine freed
@@ -834,7 +918,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // See run_nested_program's matching comment: --sanitize always wins
     // over --jit, since the JIT's fast_mem path would otherwise bypass
     // every shadow-map check.
-    cpu.set_jit(opts.jit && !opts.sanitize);
+    cpu.set_jit(opts.jit && !opts.sanitize.enabled);
     let program_name = program_name_from_path(std::path::Path::new(&opts.program));
     let vfs_config = vfs_config_from_opts(opts);
 
@@ -853,8 +937,9 @@ fn run(opts: &Options) -> Result<i32, String> {
         // -- harmless either way, see FlatMemory::enable_sanitizer's
         // doc on why the default Valid shadow state makes the ordering
         // a non-issue; this is simply the more obvious place to put it.
-        if opts.sanitize {
+        if opts.sanitize.enabled {
             mem.enable_sanitizer();
+            opts.sanitize.apply(&mut mem);
         }
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
@@ -872,8 +957,9 @@ fn run(opts: &Options) -> Result<i32, String> {
         runtime
     } else {
         let mut mem = FlatMemory::new(opts.ram_size as usize);
-        if opts.sanitize {
+        if opts.sanitize.enabled {
             mem.enable_sanitizer();
+            opts.sanitize.apply(&mut mem);
         }
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
             .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
@@ -902,7 +988,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
     let nested_jit = opts.jit;
-    let nested_sanitize = opts.sanitize;
+    let nested_sanitize = opts.sanitize.clone();
     let nested_net = opts.net;
     runtime.set_system_runner(move |req| {
         run_nested_program(
@@ -915,7 +1001,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_cpu_type,
             nested_fpu,
             nested_jit,
-            nested_sanitize,
+            nested_sanitize.clone(),
             nested_net,
         )
     });
@@ -1462,13 +1548,49 @@ mod tests {
     #[test]
     fn default_sanitize_is_off() {
         let opts = parse_args(args(&["prog"])).unwrap();
-        assert!(!opts.sanitize);
+        assert!(!opts.sanitize.enabled);
+        assert!(!opts.sanitize.uninit);
+        assert!(opts.sanitize.ignore_pcs.is_empty());
     }
 
     #[test]
     fn sanitize_flag_enables_sanitize() {
         let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
-        assert!(opts.sanitize);
+        assert!(opts.sanitize.enabled);
+        assert!(
+            !opts.sanitize.uninit,
+            "--sanitize alone must not turn on uninitialized-read reporting"
+        );
+    }
+
+    #[test]
+    fn sanitize_uninit_implies_sanitize() {
+        // Asking for uninitialized-read reporting without the shadow
+        // map installed could only be a mistake, so the flag implies
+        // --sanitize rather than silently doing nothing.
+        let opts = parse_args(args(&["--sanitize-uninit", "prog"])).unwrap();
+        assert!(opts.sanitize.enabled);
+        assert!(opts.sanitize.uninit);
+    }
+
+    #[test]
+    fn sanitize_ignore_pc_accepts_hex_and_decimal_and_repeats() {
+        let opts = parse_args(args(&[
+            "--sanitize",
+            "--sanitize-ignore-pc",
+            "0xe14a",
+            "--sanitize-ignore-pc",
+            "4096",
+            "prog",
+        ]))
+        .unwrap();
+        assert_eq!(opts.sanitize.ignore_pcs, vec![0xe14a, 4096]);
+    }
+
+    #[test]
+    fn sanitize_ignore_pc_rejects_a_bad_address_and_a_missing_one() {
+        assert!(parse_args(args(&["--sanitize-ignore-pc", "nonsense", "prog"])).is_err());
+        assert!(parse_args(args(&["--sanitize-ignore-pc"])).is_err());
     }
 
     #[test]
@@ -1479,7 +1601,7 @@ mod tests {
         // settings, combined only where the CPU is actually configured.
         let opts = parse_args(args(&["--jit", "--sanitize", "prog"])).unwrap();
         assert!(opts.jit);
-        assert!(opts.sanitize);
+        assert!(opts.sanitize.enabled);
     }
 
     // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---

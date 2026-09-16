@@ -97,15 +97,44 @@
 //! implementation would) turns an O(1) per-instruction operation into an
 //! O(stack size) one, which would make `--sanitize` unusably slow on any
 //! program that isn't trivial. Instead only the delta between the last
-//! seen SP and the new one is touched: growth (`sp` decreased) marks the
-//! newly-used bytes [`ShadowState::Uninit`] rather than
+//! seen SP and the new one is touched: growth (`sp` decreased) promotes
+//! the newly-exposed bytes to [`ShadowState::Uninit`] rather than
 //! [`ShadowState::Valid`] -- this is deliberate, not an oversight, since
 //! it means a later increment gets uninitialized-stack-read detection
-//! for free, and it's harmless today because [`ShadowMap::report_uninit`]
-//! defaults to off. Shrinkage (`sp` increased) marks the newly-released
-//! bytes [`PoisonReason::BelowStackPointer`]. An unchanged SP -- by far
-//! the most common case, since most instructions don't touch A7 at all
-//! -- does no work beyond the one comparison that detects this.
+//! for free, and (once [`ShadowMap::report_uninit`] is on -- see issue
+//! #68) it lets a `RTS`/data read reach genuinely-never-written stack
+//! slots. Shrinkage (`sp` increased) marks the newly-released bytes
+//! [`PoisonReason::BelowStackPointer`]. An unchanged SP -- by far the
+//! most common case, since most instructions don't touch A7 at all --
+//! does no work beyond the one comparison that detects this.
+//!
+//! **Growth promotes only bytes that are still `Unaddressable`; it never
+//! touches a byte that's already `Valid`.** This looks like it should be
+//! a blanket `mark_uninit(sp, old_sp - sp)` over the whole delta -- an
+//! earlier version of this code was exactly that, and it is a real bug,
+//! latent and undetected until issue #68 turned `report_uninit` on for
+//! the first time against real binaries (109,204 raw reports against
+//! pLhA, almost all of them this). The reason a blanket mark is wrong is
+//! an ordering fact about m68k, not a corner case: **a push writes as it
+//! decrements.** `move.l d0,-(sp)` (and `MOVEM`/`LINK`/`JSR`) move `A7`
+//! *and* store to the new address in the same instruction, and
+//! [`ShadowMap::check_write`] -- called from the memory write path that
+//! executes that store -- already promoted that byte from
+//! `Unaddressable` (or `Uninit`) to [`ShadowState::Valid`] before
+//! [`Self::update_stack_pointer`] is ever told the SP moved (see
+//! [`Self::check_write_byte`]). So by the time growth is observed here,
+//! the bytes right at the new SP are typically not "newly-exposed
+//! garbage" at all -- they're the value the very instruction that moved
+//! SP just wrote. A blanket mark clobbers that `Valid` state back to
+//! `Uninit`, so the pushed value is retroactively treated as never
+//! written, and the next ordinary read of it (the matching `RTS`, or any
+//! later `MOVEM`-style restore) reports a false [`ViolationKind::
+//! UninitRead`]. A byte in the delta that is *still* `Unaddressable`,
+//! by contrast, is genuine: either this instruction didn't write every
+//! byte it exposed (e.g. a `sub.l #N,sp` stack-frame reservation with no
+//! store at all), or it's a previously-popped frame's stale contents
+//! that a real, uninitialized read should catch. So only those bytes are
+//! promoted; see [`Self::promote_unaddressable_to_uninit`].
 //!
 //! The tricky part is that the SP can legitimately leave the tracked
 //! region entirely: `exec.library`'s `StackSwap` (see `exectask.rs`)
@@ -271,8 +300,66 @@
 //! dropped_call_frames`]) rather than silently vanishing, so a report
 //! can at least say "N frames were never checked" instead of implying a
 //! false all-clear for arbitrarily deep recursion.
+//!
+//! # Turning `report_uninit` on for real (issue #68)
+//!
+//! [`ShadowMap::report_uninit`] and both codepaths that ever produce
+//! [`ShadowState::Uninit`] (heap allocation, `execmem.rs`, and the
+//! stack-growth path above) shipped in increment 2, but nothing ever set
+//! the flag -- issue #65 scoped turning it on as a later increment,
+//! since uninitialized-read detection is only as good as *every*
+//! allocator/heap codepath's own `Uninit`-marking discipline, which
+//! hadn't been audited yet. Issue #68 did that audit, the hard way: with
+//! `report_uninit` flipped on behind a temporary env var, real pLhA
+//! listing a 102-file archive produced 109,204 raw violation reports,
+//! PhxAss 3,389, and even `fixtures/hello` -- a program that does
+//! nothing but one `PutStr` -- produced 1. Two bugs in *this* module
+//! accounted for nearly all of it, both latent in the code before this
+//! flag ever ran for real and both invisible with the flag off, which is
+//! exactly why nothing had caught them yet:
+//!
+//! - [`Self::check_write_byte`]'s below-SP grace-band arm (see
+//!   [`Self::below_sp_violation_is_within_grace_band`]) forgave the
+//!   violation but left the byte poisoned, so the value a `JSR`/push had
+//!   just legitimately written read back as `Uninit` forever after. Now
+//!   fixed to heal the byte to [`ShadowState::Valid`], the same
+//!   promotion the ordinary (non-grace-band) `Uninit` write arm right
+//!   below it already performs -- see that method's own doc for the
+//!   detail.
+//! - [`Self::update_stack_pointer`]'s growth path blanket-marked the
+//!   whole newly-exposed delta `Uninit`, clobbering the `Valid` state
+//!   the very push instruction that moved SP had just set (m68k writes
+//!   as it decrements) -- see this module's "stack-pointer tracking" doc
+//!   above for the full explanation and [`Self::
+//!   promote_unaddressable_to_uninit`] for the fix.
+//!
+//! After both fixes, pLhA's count went to **0**, `fixtures/hello`'s to
+//! **0**, and PhxAss's to 574 -- but those 574 come from only about six
+//! distinct instructions, 568 of them a single one walking a table at a
+//! fixed stride: 568 *different addresses*, which the `(pc, addr, kind)`
+//! dedup key can't collapse since the address is part of the key. Two
+//! more pieces of machinery turn that residual wall of near-identical
+//! lines into something a developer can actually read and act on:
+//!
+//! - [`Self::report`] now rolls violations up **by PC** rather than
+//!   printing one line per deduplicated entry -- see its own doc. This
+//!   also fixes a robustness problem visible in the pre-fix pLhA
+//!   numbers: 108,204 of those 109,204 reports were merely *counted* as
+//!   suppressed once the flat log hit [`MAX_VIOLATIONS`], which made the
+//!   report simultaneously enormous and silent about almost everything
+//!   it found. Per-PC rollup makes the cap far harder to reach in
+//!   practice, since a whole table-walk now costs one log entry instead
+//!   of one per address touched.
+//! - [`Self::ignore_pc`] lets a site a developer has already triaged be
+//!   silenced without editing/rerunning with any file format. A
+//!   valgrind-style suppression *file* was considered and deliberately
+//!   deferred (see issue #68's own discussion): the measured need is one
+//!   site, in application code volamos itself can just fix once verdict
+//!   is reached, not (yet) noise from a shared, unpatchable, statically-
+//!   linked runtime the way glibc is for valgrind -- the situation that
+//!   would actually justify a shareable suppression file.
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 /// The maximum number of distinct violations [`ShadowMap`] will retain.
@@ -639,6 +726,13 @@ pub struct ShadowMap {
     /// was invoked while the stack was already at
     /// [`MAX_CALL_STACK_DEPTH`] -- see [`Self::dropped_call_frames`].
     dropped_call_frames: u64,
+    /// PCs a caller has silenced via [`Self::ignore_pc`] -- checked by
+    /// [`Self::record`]/[`Self::record_return_corruption`] before either
+    /// does any dedup/log bookkeeping, so an ignored site's violations
+    /// cost only the hash-set lookup, not a wasted log entry. See
+    /// [`Self::ignore_pc`]'s own doc for why this is a per-invocation
+    /// flag rather than a suppression file.
+    ignored_pcs: HashSet<u32>,
 }
 
 impl ShadowMap {
@@ -655,6 +749,7 @@ impl ShadowMap {
             stack: None,
             call_stack: VecDeque::new(),
             dropped_call_frames: 0,
+            ignored_pcs: HashSet::new(),
         }
     }
 
@@ -754,6 +849,39 @@ impl ShadowMap {
         self.bytes[range].fill(Self::encode_unaddressable(reason));
     }
 
+    /// Promotes every byte in `[addr, addr + len)` that is currently
+    /// [`ShadowState::Unaddressable`] to [`ShadowState::Uninit`],
+    /// leaving any byte that is already [`ShadowState::Valid`] (or
+    /// already [`ShadowState::Uninit`]) untouched. Used by
+    /// [`Self::update_stack_pointer`]'s growth path instead of a
+    /// blanket [`Self::mark_uninit`] over the same range -- see this
+    /// module's "stack-pointer tracking" doc for why a blanket mark is
+    /// wrong (it clobbers the `Valid` state the push instruction that
+    /// moved SP just set) and [`Self::check_write_byte`]'s grace-band
+    /// arm for the other half of the same story.
+    ///
+    /// Deliberately a direct loop over the raw `bytes` slice -- checking
+    /// the tag bit ([`UNADDRESSABLE_TAG`]) rather than going through
+    /// [`Self::state`]/[`Self::decode_byte`] -- rather than anything
+    /// that scans more than `len` bytes: this is called from
+    /// [`Self::update_stack_pointer`], which the run loop invokes once
+    /// per instruction, and the delta here is typically tiny (2, 4, or
+    /// up to [`BELOW_SP_GRACE_BYTES`] bytes for the widest single-
+    /// instruction `MOVEM`), so a per-byte loop over just the delta
+    /// costs nothing extra worth avoiding -- see [`Self::clamp_range`]
+    /// for why this can never touch more than `[addr, addr + len)`
+    /// clamped to the map's own bounds.
+    fn promote_unaddressable_to_uninit(&mut self, addr: u32, len: u32) {
+        let Some(range) = self.clamp_range(addr, len) else {
+            return;
+        };
+        for byte in &mut self.bytes[range] {
+            if *byte & UNADDRESSABLE_TAG != 0 {
+                *byte = UNINIT_BYTE;
+            }
+        }
+    }
+
     /// The current [`ShadowState`] of `addr`, or [`ShadowState::Valid`]
     /// if `addr` is out of range -- out-of-range guest addresses are
     /// already handled (as reading `0`/dropping the write) by
@@ -826,6 +954,9 @@ impl ShadowMap {
     /// struct's "interior mutability" doc.
     fn record(&self, addr: u32, size: u8, kind: ViolationKind, reason: Option<PoisonReason>) {
         let pc = self.current_pc;
+        if self.ignored_pcs.contains(&pc) {
+            return;
+        }
         let key: ViolationKey = (pc, addr, kind);
         self.push_violation(
             key,
@@ -852,6 +983,9 @@ impl ShadowMap {
     /// poisoned byte.
     fn record_return_corruption(&self, addr: u32, expected: u32, actual: u32) {
         let pc = self.current_pc;
+        if self.ignored_pcs.contains(&pc) {
+            return;
+        }
         let kind = ViolationKind::ReturnAddressCorrupted;
         let key: ViolationKey = (pc, addr, kind);
         self.push_violation(
@@ -924,6 +1058,28 @@ impl ShadowMap {
     /// library handlers write guest output buffers through this same
     /// path. `size` is carried through the same way as
     /// [`Self::check_read_byte`]'s.
+    ///
+    /// A write forgiven by the below-SP grace band (see
+    /// [`Self::below_sp_violation_is_within_grace_band`]) heals the byte
+    /// to [`ShadowState::Valid`] too, exactly like the ordinary
+    /// `Uninit` -> `Valid` promotion below -- see that promotion's own
+    /// reasoning. This isn't a special case invented for the grace band;
+    /// it follows from what the grace band *is*: a forgiven below-SP
+    /// write is never a spurious/accidental access, it's the push
+    /// itself (see [`Self::below_sp_violation_is_within_grace_band`]'s
+    /// doc -- the run loop can't republish the new SP until the
+    /// instruction finishes, so the store lands at an address the
+    /// shadow map still believes is below SP). That byte now holds a
+    /// real value a real instruction just wrote, so it should read back
+    /// as `Valid`. Leaving it poisoned instead -- which is what this
+    /// code did before issue #68 -- means the value a `JSR`/`MOVEM`
+    /// push just wrote is subsequently treated as never-written, so any
+    /// later legitimate read of it (most commonly the matching `RTS`)
+    /// reports a false [`ViolationKind::UninitRead`] once
+    /// [`Self::report_uninit`] is on. This was one of the two bugs that
+    /// made turning `report_uninit` on for real binaries produce tens of
+    /// thousands of false positives -- see this module's "turning
+    /// `report_uninit` on for real" doc.
     fn check_write_byte(&mut self, addr: u32, size: u8) {
         match self.state(addr) {
             ShadowState::Unaddressable => {
@@ -931,6 +1087,9 @@ impl ShadowMap {
                 if reason == Some(PoisonReason::BelowStackPointer)
                     && self.below_sp_violation_is_within_grace_band(addr)
                 {
+                    if let Some(slot) = self.bytes.get_mut(addr as usize) {
+                        *slot = VALID_BYTE;
+                    }
                     return;
                 }
                 self.record(addr, size, ViolationKind::InvalidWrite, reason);
@@ -1103,8 +1262,11 @@ impl ShadowMap {
     ///
     /// - Unchanged SP (the overwhelmingly common case): does nothing
     ///   beyond the one comparison that detects this.
-    /// - SP decreased (stack grew): marks `[sp, old_sp)`
-    ///   [`ShadowState::Uninit`].
+    /// - SP decreased (stack grew): promotes whichever bytes of
+    ///   `[sp, old_sp)` are still [`ShadowState::Unaddressable`] to
+    ///   [`ShadowState::Uninit`], leaving any byte already
+    ///   [`ShadowState::Valid`] alone (see [`Self::
+    ///   promote_unaddressable_to_uninit`]).
     /// - SP increased (stack shrank): marks `[old_sp, sp)`
     ///   [`PoisonReason::BelowStackPointer`].
     /// - New SP outside `[stack_base, stack_top]`: suspends tracking --
@@ -1161,7 +1323,12 @@ impl ShadowMap {
                 // needed (mark_uninit/mark_unaddressable also clamp to
                 // the map's own bounds regardless; see clamp_range).
                 if sp < old_sp {
-                    self.mark_uninit(sp, old_sp - sp);
+                    // Promote, don't blanket-mark -- see
+                    // promote_unaddressable_to_uninit's doc and this
+                    // module's "stack-pointer tracking" doc for why a
+                    // plain mark_uninit here would clobber bytes the
+                    // instruction that just moved SP already wrote.
+                    self.promote_unaddressable_to_uninit(sp, old_sp - sp);
                 } else {
                     self.mark_unaddressable(old_sp, sp - old_sp, PoisonReason::BelowStackPointer);
                 }
@@ -1337,25 +1504,162 @@ impl ShadowMap {
         self.dropped_call_frames
     }
 
+    /// Silences every future violation attributed to `pc` -- i.e. one
+    /// whose [`Violation::pc`] would equal `pc` (see this module's "PC
+    /// attribution" doc for what that means for a host-side library
+    /// handler's access). Meant for a developer who has already looked
+    /// at a reported site and confirmed it isn't a bug: repeat the run
+    /// with the site ignored, instead of wading through the same report
+    /// again.
+    ///
+    /// This is deliberately a small, per-invocation mechanism, not a
+    /// valgrind-style suppression *file* -- see this module's "turning
+    /// `report_uninit` on for real" doc above for why issue #68 chose
+    /// this over a file. `ignore_pc` can be called repeatedly to
+    /// suppress more than one PC; there's no way to un-ignore one short
+    /// of starting a fresh [`ShadowMap`], which matches how this is
+    /// meant to be used (decided once, for the rest of one run).
+    ///
+    /// Already-recorded violations at `pc` are **not** retroactively
+    /// removed from [`Self::violations`] -- only [`Self::record`]/
+    /// [`Self::record_return_corruption`] consult the ignore set, and
+    /// they only run when a *new* violation is about to be logged. In
+    /// practice this doesn't matter: callers are expected to set up
+    /// their ignore list before a run (or before the interesting part of
+    /// one) starts, not mid-run against a log they've already printed.
+    pub fn ignore_pc(&mut self, pc: u32) {
+        self.ignored_pcs.insert(pc);
+    }
+
     /// A human-readable multi-line report of every recorded violation,
     /// suitable for printing to stderr after a `--sanitize` run. Empty
     /// when [`Self::violation_count`] is `0`.
+    ///
+    /// Rolled up **by PC**, not unconditionally one line per
+    /// deduplicated `(pc, addr, kind)` entry -- see this module's
+    /// "turning `report_uninit` on for real" doc for the measurement
+    /// that made this necessary: a single instruction that scans a
+    /// table (a loop over `n` distinct addresses) produces `n` distinct
+    /// dedup keys, since the address is part of the key, even though
+    /// it's one call site and, realistically, one bug. Real PhxAss
+    /// output had ~6 distinct PCs behind 574 flat violation entries; a
+    /// flat listing is a wall of near-identical lines for what's really
+    /// a handful of things to look at.
+    ///
+    /// **The rollup is conditional, not blanket**, because collapsing
+    /// *every* group loses real information for the common case where a
+    /// PC only produced a few violations: a
+    /// [`ViolationKind::ReturnAddressCorrupted`] carries `expected`/
+    /// `actual` addresses that are the entire point of the report ("your
+    /// buffer overflowed with ASCII `AAAA`" lives only in those two
+    /// numbers), and even for the other kinds, printing "N invalid reads
+    /// at addresses X-Y" for `N == 1` or `2` is strictly less useful
+    /// than just showing the one or two lines. So within each PC, this
+    /// first sub-groups entries by `(kind, size, reason)` -- everything
+    /// a [`Violation`] carries except `addr`/`hits`/the return-address
+    /// fields, i.e. what actually makes two entries "the same finding at
+    /// a different address" rather than two unrelated findings that
+    /// happen to share a PC -- and only *that* cluster collapses into
+    /// one aggregate summary line, and only if:
+    ///
+    /// - its kind isn't [`ViolationKind::ReturnAddressCorrupted`] (that
+    ///   kind's diagnostic value is the two addresses, which don't
+    ///   aggregate into anything meaningful -- every entry is always
+    ///   printed in full, regardless of how many share a PC), and
+    /// - it has more than [`ROLLUP_COLLAPSE_THRESHOLD`] distinct
+    ///   (already-deduplicated) entries.
+    ///
+    /// A cluster that doesn't meet both conditions prints each of its
+    /// entries individually, using [`Violation`]'s own `Display` (the
+    /// same per-line format this module used before issue #68's
+    /// rollup), so a small number of high-information violations reads
+    /// exactly as it always has. A cluster that does collapses to one
+    /// line: the total hit count, a description mirroring
+    /// [`Violation`]'s own phrasing but pluralized by that count, and
+    /// the address range the cluster's entries span (a single address,
+    /// not a degenerate `X-X` range, when they're all the same one).
+    /// This is the rule that produces this module's `PC 0x0000e14a: 568
+    /// uninitialized 4-byte reads, addresses 0x00038068-0x0003a3d8`-
+    /// style output for the PhxAss table-walk case, while still printing
+    /// `return address corrupted at stack slot ...: expected ..., found
+    /// ... from PC ...` in full for a single stack-smash violation.
+    ///
+    /// Grouping happens on every call rather than being tracked
+    /// incrementally as violations are recorded, same tradeoff [`Self::
+    /// violations`] already makes: this runs once, after a run finishes,
+    /// not on any hot path, so the O(sites x entries-per-site) grouping
+    /// work (bounded by [`MAX_VIOLATIONS`] regardless) costs nothing
+    /// that matters.
     pub fn report(&self) -> String {
         use std::fmt::Write as _;
 
         let violations = self.violations.borrow();
-        let mut out = String::new();
         if violations.is_empty() {
-            return out;
+            return String::new();
         }
+
+        // Group by PC, preserving first-seen order (the same order
+        // `violations` -- and therefore `sites` -- is already in).
+        let mut sites: Vec<(u32, Vec<&Violation>)> = Vec::new();
+        for v in violations.iter() {
+            match sites.iter_mut().find(|(pc, _)| *pc == v.pc) {
+                Some((_, vs)) => vs.push(v),
+                None => sites.push((v.pc, vec![v])),
+            }
+        }
+
+        let total: u64 = violations.iter().map(|v| v.hits).sum();
+        let mut out = String::new();
         let _ = writeln!(
             out,
-            "sanitizer: {} distinct violation(s):",
-            violations.len()
+            "sanitizer: {} site(s), {total} violation(s):",
+            sites.len()
         );
-        for v in violations.iter() {
-            let _ = writeln!(out, "  {v}");
+
+        for (pc, vs) in &sites {
+            // Sub-group this site's entries by (kind, size, reason) --
+            // what actually distinguishes one finding from another once
+            // the address (which can legitimately vary a lot for one
+            // site -- the table-walk case) is set aside.
+            let mut clusters: Vec<Vec<&Violation>> = Vec::new();
+            for v in vs {
+                match clusters.iter_mut().find(|c| {
+                    let first = c[0];
+                    first.kind == v.kind && first.size == v.size && first.reason == v.reason
+                }) {
+                    Some(c) => c.push(v),
+                    None => clusters.push(vec![v]),
+                }
+            }
+
+            for cluster in &clusters {
+                let kind = cluster[0].kind;
+                let collapse = kind != ViolationKind::ReturnAddressCorrupted
+                    && cluster.len() > ROLLUP_COLLAPSE_THRESHOLD;
+                if collapse {
+                    let count: u64 = cluster.iter().map(|v| v.hits).sum();
+                    let min_addr = cluster.iter().map(|v| v.addr).min().unwrap_or(0);
+                    let max_addr = cluster.iter().map(|v| v.addr).max().unwrap_or(0);
+                    let _ = writeln!(
+                        out,
+                        "  PC {pc:#010x}: {}",
+                        describe_cluster(
+                            kind,
+                            cluster[0].size,
+                            cluster[0].reason,
+                            count,
+                            min_addr,
+                            max_addr
+                        )
+                    );
+                } else {
+                    for v in cluster {
+                        let _ = writeln!(out, "  {v}");
+                    }
+                }
+            }
         }
+
         let suppressed = self.suppressed.get();
         if suppressed > 0 {
             let _ = writeln!(
@@ -1365,6 +1669,73 @@ impl ShadowMap {
         }
         out
     }
+}
+
+/// The minimum number of distinct (already-deduplicated) violations a
+/// single `(pc, kind, size, reason)` cluster must have before
+/// [`ShadowMap::report`] collapses it into one aggregate summary line
+/// instead of listing every entry individually -- see that method's own
+/// doc for the full rule (and why [`ViolationKind::
+/// ReturnAddressCorrupted`] is never collapsed regardless of this
+/// threshold). Small enough that the PhxAss 568-address table walk this
+/// was built for still collapses by a wide margin, large enough that a
+/// PC producing two or three genuinely-worth-reading violations (the
+/// overwhelmingly common shape for every fixture and real binary this
+/// was measured against, per issue #68) still gets to show them in full.
+const ROLLUP_COLLAPSE_THRESHOLD: usize = 3;
+
+/// Renders one `(kind, size, reason)` cluster of violations sharing a PC
+/// as [`ShadowMap::report`]'s aggregate summary line, e.g. `"568
+/// uninitialized 4-byte reads, addresses 0x00038068-0x0003a3d8"` or `"4
+/// invalid 1-byte writes (heap redzone), addresses 0x00002ee0-
+/// 0x00002ee3"` -- singular wording and a single address (not a
+/// degenerate `X-X` range) when `min_addr == max_addr`, mirroring
+/// [`Violation`]'s own `Display` phrasing but aggregated over `count`
+/// instead of a single access. Never called for
+/// [`ViolationKind::ReturnAddressCorrupted`] -- see [`ShadowMap::
+/// report`]'s doc for why that kind is always printed per-entry instead.
+fn describe_cluster(
+    kind: ViolationKind,
+    size: u8,
+    reason: Option<PoisonReason>,
+    count: u64,
+    min_addr: u32,
+    max_addr: u32,
+) -> String {
+    use std::fmt::Write as _;
+
+    debug_assert_ne!(
+        kind,
+        ViolationKind::ReturnAddressCorrupted,
+        "ReturnAddressCorrupted must never be collapsed -- see report()'s doc"
+    );
+
+    let mut s = String::new();
+    let access = match kind {
+        ViolationKind::InvalidRead | ViolationKind::InvalidWrite => "invalid",
+        ViolationKind::UninitRead => "uninitialized",
+        ViolationKind::ReturnAddressCorrupted => "corrupted",
+    };
+    let verb = match kind {
+        ViolationKind::InvalidRead | ViolationKind::UninitRead => "read",
+        ViolationKind::InvalidWrite => "write",
+        ViolationKind::ReturnAddressCorrupted => "return",
+    };
+    let verb = if count == 1 {
+        verb.to_string()
+    } else {
+        format!("{verb}s")
+    };
+    let _ = write!(s, "{count} {access} {size}-byte {verb}");
+    if let Some(reason) = reason {
+        let _ = write!(s, " ({reason})");
+    }
+    if min_addr == max_addr {
+        let _ = write!(s, ", address {min_addr:#010x}");
+    } else {
+        let _ = write!(s, ", addresses {min_addr:#010x}-{max_addr:#010x}");
+    }
+    s
 }
 
 impl fmt::Display for ShadowMap {
@@ -1640,6 +2011,38 @@ mod tests {
     // -- Stack-pointer tracking -------------------------------------
 
     #[test]
+    fn grace_band_forgiven_write_heals_the_byte() {
+        // Issue #68: a below-SP write inside the grace band is forgiven
+        // (no violation), but it must not stay poisoned -- it's the
+        // push itself, a real write, so the byte should read back as
+        // Valid. Before this fix it stayed Unaddressable, which
+        // (indirectly, via the later state changing to Uninit as SP
+        // tracking caught up) made the value a JSR/push just wrote look
+        // never-written to a later read.
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+        // 4 bytes just below the current SP -- squarely inside
+        // BELOW_SP_GRACE_BYTES, exactly like the store half of
+        // `move.l d0,-(sp)` before the run loop republishes the new SP.
+        assert_eq!(shadow.state(0x17fc), ShadowState::Unaddressable);
+
+        shadow.check_write(0x17fc, 4);
+
+        assert_eq!(
+            shadow.state(0x17fc),
+            ShadowState::Valid,
+            "a forgiven below-SP write must heal the byte, not leave it poisoned"
+        );
+        assert_eq!(shadow.state(0x17ff), ShadowState::Valid);
+        assert_eq!(shadow.violation_count(), 0, "still forgiven, not reported");
+
+        // A subsequent read of that same byte must not be flagged
+        // either -- it's a real, valid value now.
+        shadow.check_read(0x17fc, 4);
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
     fn begin_stack_tracking_poisons_below_the_initial_sp() {
         let mut shadow = ShadowMap::new(0x2000);
         shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
@@ -1674,6 +2077,52 @@ mod tests {
         assert_eq!(shadow.state(0x16ff), ShadowState::Unaddressable);
         // Reading Uninit isn't reported unless report_uninit is set.
         assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn stack_growth_leaves_an_already_written_byte_valid() {
+        // Issue #68: on m68k a push writes as it decrements, so by the
+        // time update_stack_pointer observes growth, check_write_byte
+        // has typically already promoted the byte(s) right at the new
+        // SP to Valid. A blanket mark_uninit over the whole delta would
+        // clobber that back to Uninit and make the pushed value read
+        // back as never-written; promote_unaddressable_to_uninit must
+        // leave an already-Valid byte alone.
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+
+        // Simulate what a `move.l d0,-(sp)` at 0x17fc does: the write
+        // path already healed the 4 bytes it wrote to Valid, before the
+        // run loop tells update_stack_pointer the SP moved.
+        shadow.check_write(0x17fc, 4);
+        assert_eq!(shadow.state(0x17fc), ShadowState::Valid);
+
+        // The run loop now republishes the new SP. The delta is
+        // [0x17fc, 0x1800) -- exactly the 4 bytes just written, plus
+        // nothing else in this case.
+        shadow.update_stack_pointer(0x17fc);
+
+        assert_eq!(
+            shadow.state(0x17fc),
+            ShadowState::Valid,
+            "a byte the push instruction already wrote must not be \
+             clobbered back to Uninit"
+        );
+
+        // A byte in the delta that was never actually written by this
+        // instruction (e.g. a `sub.l #8,sp` frame reservation with no
+        // store) is still genuinely newly-exposed stack, and must still
+        // be promoted to Uninit so a later uninitialized read of it is
+        // caught.
+        shadow.update_stack_pointer(0x17f4); // reserve 8 more bytes, nothing written
+        assert_eq!(
+            shadow.state(0x17f4),
+            ShadowState::Uninit,
+            "a byte that was never written is still newly-exposed stack"
+        );
+        assert_eq!(shadow.state(0x17fb), ShadowState::Uninit);
+        // The earlier, already-written bytes are still untouched.
+        assert_eq!(shadow.state(0x17fc), ShadowState::Valid);
     }
 
     #[test]
@@ -1999,5 +2448,242 @@ mod tests {
             1,
             "dropped frame must not be checked against"
         );
+    }
+
+    // -- Per-PC report rollup (issue #68) ------------------------------
+
+    #[test]
+    fn report_rolls_up_a_single_pc_with_many_addresses_into_one_line() {
+        // The PhxAss shape: one instruction (one PC) scanning a table,
+        // touching many distinct addresses. Dedup can't collapse these
+        // (the address is part of the key), so the report must.
+        let mut shadow = ShadowMap::new(0x1_0000);
+        shadow.mark_uninit(0x1000, 0x100);
+        shadow.set_current_pc(0xe14a);
+        for addr in (0x1000..0x1040).step_by(4) {
+            shadow.report_uninit = true;
+            shadow.check_read(addr, 4);
+        }
+
+        assert_eq!(shadow.violation_count(), 16, "16 distinct addresses hit");
+
+        let report = shadow.report();
+        assert!(
+            report.contains("sanitizer: 1 site(s), 16 violation(s):"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "PC 0x0000e14a: 16 uninitialized 4-byte reads, addresses 0x00001000-0x0000103c"
+            ),
+            "{report}"
+        );
+        // No degenerate single-line-per-address wall of text.
+        assert_eq!(report.lines().count(), 2, "{report}");
+    }
+
+    #[test]
+    fn report_prints_a_single_small_violation_in_full_not_collapsed() {
+        // A PC with only one violation is exactly the case the rollup
+        // must NOT collapse -- see report()'s doc on why a summary line
+        // ("1 invalid write, address 0x...") is strictly less useful
+        // than the plain per-violation line this module always printed.
+        let mut shadow = ShadowMap::new(0x20);
+        shadow.mark_unaddressable(0x10, 1, PoisonReason::Redzone);
+        shadow.set_current_pc(0x3996);
+        shadow.check_write(0x10, 1);
+
+        let report = shadow.report();
+        // The exact pre-rollup Violation::Display line, unmodified.
+        assert!(
+            report.contains("invalid 1-byte write at 0x00000010 (heap redzone) from PC 0x00003996"),
+            "{report}"
+        );
+        // Not summarized into an aggregate "N ... address ..." line.
+        assert!(
+            !report.contains("PC 0x00003996: 1 invalid"),
+            "a lone violation must not be collapsed into a summary line: {report}"
+        );
+    }
+
+    #[test]
+    fn report_prints_each_kind_individually_when_a_pc_has_few_violations() {
+        // One PC producing two different kinds of finding (unusual, but
+        // must still be handled -- see report's own doc). Both clusters
+        // are below the collapse threshold, so both print in full.
+        let mut shadow = ShadowMap::new(0x100);
+        shadow.mark_unaddressable(0x10, 1, PoisonReason::Redzone);
+        shadow.mark_uninit(0x20, 1);
+        shadow.report_uninit = true;
+        shadow.set_current_pc(0x4000);
+
+        shadow.check_read(0x10, 1);
+        shadow.check_read(0x20, 1);
+
+        assert_eq!(shadow.violation_count(), 2);
+        let report = shadow.report();
+        assert!(
+            report.contains("sanitizer: 1 site(s), 2 violation(s):"),
+            "{report}"
+        );
+        assert!(
+            report.contains("invalid 1-byte read at 0x00000010 (heap redzone) from PC 0x00004000"),
+            "{report}"
+        );
+        assert!(
+            report.contains("uninitialized 1-byte read at 0x00000020 from PC 0x00004000"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn report_collapses_a_cluster_only_once_it_exceeds_the_threshold() {
+        // Exactly ROLLUP_COLLAPSE_THRESHOLD distinct violations of the
+        // same (kind, size, reason) at one PC: still small enough to
+        // print in full.
+        let mut shadow = ShadowMap::new(0x100);
+        shadow.mark_unaddressable(
+            0x10,
+            ROLLUP_COLLAPSE_THRESHOLD as u32,
+            PoisonReason::Redzone,
+        );
+        shadow.set_current_pc(0x5000);
+        for i in 0..ROLLUP_COLLAPSE_THRESHOLD as u32 {
+            shadow.check_read(0x10 + i, 1);
+        }
+        let report = shadow.report();
+        assert_eq!(
+            report.matches("invalid 1-byte read").count(),
+            ROLLUP_COLLAPSE_THRESHOLD,
+            "at the threshold, every entry still prints individually: {report}"
+        );
+        assert!(!report.contains("PC 0x00005000: "), "{report}");
+
+        // One more distinct violation of the same cluster tips it over
+        // the threshold and it collapses to a single summary line.
+        let mut shadow = ShadowMap::new(0x100);
+        shadow.mark_unaddressable(
+            0x10,
+            ROLLUP_COLLAPSE_THRESHOLD as u32 + 1,
+            PoisonReason::Redzone,
+        );
+        shadow.set_current_pc(0x5000);
+        for i in 0..(ROLLUP_COLLAPSE_THRESHOLD as u32 + 1) {
+            shadow.check_read(0x10 + i, 1);
+        }
+        let report = shadow.report();
+        assert!(
+            report.contains(&format!(
+                "PC 0x00005000: {} invalid 1-byte reads (heap redzone), addresses 0x00000010-0x00000013",
+                ROLLUP_COLLAPSE_THRESHOLD + 1
+            )),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn report_never_collapses_return_address_corruption_regardless_of_count() {
+        // The whole point of a ReturnAddressCorrupted report is the
+        // expected/actual pair; collapsing it into a count-and-range
+        // summary would throw away the only information that matters.
+        // This must hold even when there are more entries than the
+        // collapse threshold would otherwise allow.
+        let mut shadow = ShadowMap::new(0x10_000);
+        shadow.set_current_pc(0x6000);
+        let entries = ROLLUP_COLLAPSE_THRESHOLD + 3;
+        for i in 0..entries as u32 {
+            let slot = 0x1000 + i * 4;
+            shadow.record_call(slot, 0x2000 + i);
+            shadow.check_return(slot, 0x9999_0000 + i);
+        }
+
+        assert_eq!(shadow.violation_count(), entries as u64);
+        let report = shadow.report();
+        assert!(
+            !report.contains("PC 0x00006000: "),
+            "must never summarize a ReturnAddressCorrupted cluster: {report}"
+        );
+        for i in 0..entries as u32 {
+            assert!(
+                report.contains(&format!("expected {:#010x}", 0x2000 + i)),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!("found {:#010x}", 0x9999_0000 + i)),
+                "{report}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_preserves_the_suppressed_count_line() {
+        let mut shadow = ShadowMap::new(MAX_VIOLATIONS + 10);
+        for i in 0..(MAX_VIOLATIONS + 10) as u32 {
+            shadow.mark_unaddressable(i, 1, PoisonReason::Redzone);
+        }
+        for i in 0..(MAX_VIOLATIONS + 10) as u32 {
+            shadow.set_current_pc(i);
+            shadow.check_read(i, 1);
+        }
+
+        let report = shadow.report();
+        assert!(
+            report.contains(&format!(
+                "... and 10 further violation(s) suppressed (log cap {MAX_VIOLATIONS})"
+            )),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn violations_and_violation_count_semantics_are_unchanged_by_rollup() {
+        // report()'s presentation changed; the underlying accessors used
+        // by callers/other tests must not have.
+        let mut shadow = ShadowMap::new(16);
+        shadow.mark_unaddressable(4, 1, PoisonReason::Redzone);
+        shadow.set_current_pc(0x10);
+        shadow.check_read(4, 1);
+        shadow.set_current_pc(0x20);
+        shadow.check_read(4, 1);
+        shadow.check_read(4, 1);
+
+        assert_eq!(
+            shadow.violations().len(),
+            2,
+            "still deduped by (pc,addr,kind)"
+        );
+        assert_eq!(shadow.violation_count(), 3, "still sums hits");
+    }
+
+    // -- ignore_pc (issue #68) ------------------------------------------
+
+    #[test]
+    fn ignore_pc_suppresses_future_violations_at_that_pc() {
+        let mut shadow = ShadowMap::new(16);
+        shadow.mark_unaddressable(4, 1, PoisonReason::Redzone);
+        shadow.ignore_pc(0x1000);
+
+        shadow.set_current_pc(0x1000);
+        shadow.check_read(4, 1);
+        assert_eq!(shadow.violation_count(), 0, "ignored PC produces nothing");
+
+        // A different, non-ignored PC touching the same address is
+        // still reported -- ignoring is per-PC, not per-address.
+        shadow.set_current_pc(0x2000);
+        shadow.check_read(4, 1);
+        assert_eq!(shadow.violation_count(), 1);
+        assert_eq!(shadow.violations()[0].pc, 0x2000);
+    }
+
+    #[test]
+    fn ignore_pc_also_suppresses_return_address_corruption() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.ignore_pc(0x3a1c);
+        shadow.record_call(0x1000, 0x4000);
+        shadow.set_current_pc(0x3a1c);
+
+        shadow.check_return(0x1000, 0x4141_4141);
+
+        assert_eq!(shadow.violation_count(), 0);
     }
 }
