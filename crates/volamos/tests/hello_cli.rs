@@ -103,6 +103,78 @@ fn sanitize_catches_a_corrupted_return_address() {
     );
 }
 
+/// As [`sanitize_memtest`], but with `--sanitize-uninit` on top.
+fn sanitize_uninit_memtest(mode: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg("--sanitize-uninit")
+        .arg(MEMTEST_PATH)
+        .arg(mode)
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(
+        output.status.success(),
+        "memtest {mode} exited with {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn sanitize_uninit_catches_a_read_of_never_written_heap() {
+    let stderr = sanitize_uninit_memtest("uninit");
+    assert!(
+        stderr.contains("uninitialized 1-byte read"),
+        "expected an uninitialized-read violation, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_uninit_is_byte_granular_not_per_allocation() {
+    // `uninitpartial` writes the first 16 bytes of a 32-byte block and
+    // then reads offset 20. Reporting that proves the detector tracks
+    // individual bytes rather than treating a whole allocation as
+    // initialised once anything in it is written -- which is the
+    // difference between catching a real partial-initialisation bug and
+    // catching nothing useful.
+    let stderr = sanitize_uninit_memtest("uninitpartial");
+    assert!(
+        stderr.contains("uninitialized 1-byte read"),
+        "expected an uninitialized-read violation for the unwritten half, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_uninit_reports_nothing_for_legitimate_heap_use() {
+    // The false-positive guards, and they matter more than the two
+    // detection tests above. `written` writes every byte before reading
+    // it; `cleared` allocates with MEMF_CLEAR, which genuinely *is*
+    // initialised memory. Uninitialised-read detection is the noisiest
+    // class in any sanitizer, so these staying silent is what makes the
+    // flag worth turning on.
+    for mode in ["written", "cleared", "clean"] {
+        let stderr = sanitize_uninit_memtest(mode);
+        assert!(
+            !stderr.contains("sanitizer:"),
+            "expected memtest {mode} to report nothing under --sanitize-uninit, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn uninit_reporting_is_off_unless_asked_for() {
+    // The same two bug modes must be silent under plain --sanitize:
+    // this is an opt-in extra, and `--sanitize` staying quiet on real
+    // software is what makes it trustworthy.
+    for mode in ["uninit", "uninitpartial"] {
+        let stderr = sanitize_memtest(mode);
+        assert!(
+            !stderr.contains("sanitizer:"),
+            "expected memtest {mode} to be silent under plain --sanitize, got: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn sanitize_reports_nothing_for_memtests_clean_mode() {
     // The false-positive guard, and the most important of these four: a

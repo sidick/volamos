@@ -494,11 +494,18 @@ line carries -- both matter for correctly recognising a keyword's end).
 
 A small `strmatch` subroutine (`bsr`'d once per candidate keyword,
 `A1`=command-line cursor/`A0`=candidate keyword, returns `D0`=1/0) picks
-one of four modes by comparing the leading command-line word against
-`"clean"`/`"overrun"`/`"underrun"`/`"uaf"`, requiring a space or newline
-immediately after the match (so `"clean"` can't spuriously match a
-hypothetical `"cleanup"`). No match -- including an empty command line,
-which is just `"\n"` -- falls through to a usage line.
+one of eight modes by comparing the leading command-line word against
+`"clean"`/`"overrun"`/`"underrun"`/`"uaf"`/`"uninit"`/`"uninitpartial"`/
+`"written"`/`"cleared"`, requiring a space or newline immediately after
+the match (so `"clean"` can't spuriously match a hypothetical
+`"cleanup"` -- and, since `"uninit"` is a literal prefix of
+`"uninitpartial"`, the same rule is what stops `"uninit"`'s own
+candidate check from spuriously matching a `"uninitpartial"` command
+line: the byte right after the `"uninit"` prefix is `'p'`, not a space
+or newline, so `strmatch` correctly reports no match and dispatch falls
+through to the `"uninitpartial"` candidate). No match -- including an
+empty command line, which is just `"\n"` -- falls through to a usage
+line.
 
 Every mode `PutStr`s (`-948(a6)`) a short line naming what it's about to
 do, then (except `usage`) calls `exec.library`'s `AllocMem` (`-198(a6)`,
@@ -530,6 +537,38 @@ fixture and its expected-violations table above are what
 
 Run e.g. `volamos fixtures/memtest clean` (no `-V`/`-a` needed -- nothing
 here touches the filesystem).
+
+### Uninitialized-read modes (issue #68) and expected `--sanitize-uninit` behaviour
+
+Four more modes, added for issue #68's opt-in `--sanitize-uninit`
+extra (uninitialized-heap-read detection, layered on top of
+`--sanitize`'s existing redzone/free-quarantine checks -- see that
+issue for why it's a separate flag rather than folded into
+`--sanitize`: uninitialized-read detection is the noisiest class in
+any sanitizer, and false-positive guards matter as much as the
+positive cases). All four alloc without freeing anything unexpected
+(same `AllocMem`/... /`FreeMem` shape as the other modes) and, per
+`crates/volamos-core/src/execmem.rs`'s `MEMF_CLEAR` constant
+(`1 << 16` = 65536), only `cleared` passes it:
+
+| mode | what it does | expected under plain `--sanitize` | expected under `--sanitize-uninit` |
+|---|---|---|---|
+| `uninit` | alloc 32 bytes *without* `MEMF_CLEAR`, read offset 0 without ever writing it | nothing | one uninitialized-read report at `block+0` |
+| `uninitpartial` | alloc 32 bytes without `MEMF_CLEAR`, write only offsets 0-15, read offset 20 (in the unwritten half) | nothing | one uninitialized-read report at `block+20` -- proves the detector is byte-granular, not per-allocation, since offsets 0-15 of this same block are genuinely `Valid` by the time of the read |
+| `written` | alloc 32 bytes without `MEMF_CLEAR`, write all 32, read all 32 back | nothing | **nothing** -- false-positive guard: every byte read was written first |
+| `cleared` | alloc 32 bytes *with* `MEMF_CLEAR`, read offset 0 without ever writing it | nothing | **nothing** -- second false-positive guard: `MEMF_CLEAR` memory is genuinely initialized (`exec.library` zeroed it), so it must never be reported as uninitialized even though this program itself never wrote it |
+
+All four are silent under plain `--sanitize` today (verified by
+actually running them -- see below), since `report_uninit` defaults
+off; that silence is itself a useful check, proving these new modes
+don't spuriously trip the *existing* redzone/free-quarantine
+detectors. `--sanitize-uninit` did not exist yet as of this writing
+(issue #68 is only adding the fixture coverage, not the flag itself),
+so the `--sanitize-uninit` column above is the expected behaviour once
+it lands -- not something observed directly.
+
+Run e.g. `volamos fixtures/memtest uninit` or
+`volamos --sanitize fixtures/memtest uninitpartial`.
 
 ### New `amiga_asm.py` encoders
 
@@ -601,6 +640,20 @@ exactly as expected for "same program, different assembler
 optimization level," not a logic bug. If you change `memtest.s`, update
 `gen_memtest.py` to match (or vice versa), and re-run both builds plus
 the `vamos`/`volamos` mode sweep above before trusting the result.
+
+Re-verified for issue #68's four new modes (`uninit`/`uninitpartial`/
+`written`/`cleared`): after PhxAss reported "0 errors" and "Bytes
+gained by optimization: 36" (`gen_memtest.py`: 1452 bytes total;
+PhxAss: 1420 bytes -- both grew from the prior 784/764 by the same
+four new modes' worth of code and data), all ten command lines
+(`clean`/`overrun`/`underrun`/`uaf`/`uninit`/`uninitpartial`/`written`/
+`cleared`/empty/an unrecognised keyword) were run against both builds
+under plain `volamos` and produced byte-identical stdout and exit code
+0 in every case, and against both builds under `volamos --sanitize`:
+`overrun`/`underrun`/`uaf` still reported their existing redzone/
+free-quarantine violations, and the four new modes reported nothing
+(expected, since `--sanitize-uninit` doesn't exist yet -- see the
+"Uninitialized-read modes" section above).
 
 ## issue #65 increment 2 fixture: `stacktest`
 

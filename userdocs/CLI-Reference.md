@@ -3,7 +3,8 @@
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
-        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] <program> [args...]
+        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize]
+        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself.
@@ -347,6 +348,68 @@ once per byte.
     bypasses the checks entirely, so the two cannot be combined — a
     sanitized JIT run would report a clean bill of health no matter what
     the program did. Expect a sanitized run to be slower accordingly.
+
+## `--sanitize-uninit`
+
+Adds reporting of **uninitialized reads** — memory that was allocated
+but never written — on top of `--sanitize`, which it implies. Off by
+default even when `--sanitize` is on.
+
+```console
+$ volamos --sanitize-uninit fixtures/memtest uninitpartial
+uninitpartial: alloc 32 bytes, write offsets 0-15, read offset 20
+sanitizer: 1 site(s), 1 violation(s):
+  uninitialized 1-byte read at 0x00003154 from PC 0x00002c08
+```
+
+Detection is **byte-granular**: that example writes the first 16 bytes
+of a 32-byte block and is still caught reading offset 20, so a partially
+initialized structure is detected rather than being treated as
+initialized because something in it was written. `AllocMem` with
+`MEMF_CLEAR` is genuinely initialized memory and never reports.
+
+!!! note "Why this is a separate flag"
+    Uninitialized-read detection is the noisiest class in any
+    sanitizer, and it is the one where legitimate patterns trip it: a
+    whole-struct copy that includes padding bytes, or a table scan that
+    touches never-used slots, are both real, correct code that reads
+    bytes nobody wrote. valgrind ships suppression files precisely for
+    this. Keeping `--sanitize` quiet by default is what makes it
+    trustworthy, so this is opt-in.
+
+    For calibration: with this flag, real pLhA listing a 102-file
+    archive reports nothing at all, and the real PhxAss assembler
+    reports 6 sites — of which one instruction walking a table accounts
+    for 568 of the 574 individual violations.
+
+## `--sanitize-ignore-pc ADDR`
+
+Suppresses violations reported at guest PC `ADDR` (decimal, or hex with
+a `0x` prefix). Repeatable.
+
+This is for silencing a site you have already looked at and decided is
+not a bug, without needing a suppression file. Combined with the
+report's per-PC grouping it makes a noisy program tractable:
+
+```console
+$ volamos --sanitize-uninit ... PhxAss ...
+sanitizer: 6 site(s), 574 violation(s):
+  ...
+  PC 0x0000e14a: 568 uninitialized 4-byte reads, addresses 0x00038068-0x0003a3d8
+  ...
+
+$ volamos --sanitize-uninit --sanitize-ignore-pc 0xe14a ... PhxAss ...
+sanitizer: 5 site(s), 6 violation(s):
+  ...
+```
+
+Note the report groups by PC in general: a site with many violations
+collapses to one line with a count and an address range, while a site
+with only a few prints each violation in full. That is deliberate — one
+instruction in a loop producing hundreds of near-identical lines is
+noise, but a single violation's detail (for a corrupted return address,
+the expected and actual addresses) is the whole diagnostic value and is
+never collapsed away.
 
 !!! warning "What it cannot see"
     Overflows *within* a stack frame — a 16-byte local overflowing into

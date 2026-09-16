@@ -3,6 +3,33 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## Unreleased
+
+- **Added `--sanitize-uninit`** (issue #68): opt-in uninitialized-read
+  detection on top of `--sanitize`, plus `--sanitize-ignore-pc` for
+  silencing a site you have already triaged. Byte-granular, so a
+  partially-initialized structure is caught rather than being treated as
+  initialized because something in it was written; `MEMF_CLEAR`
+  allocations never report.
+
+  Getting the false-positive rate usable was the bulk of the work, and
+  it turned on two latent bugs that were harmless only because uninit
+  reporting was off: a below-stack-pointer write forgiven by the grace
+  band returned without healing the byte, so the value a `JSR` had just
+  pushed read back as never-written; and stack growth blanket-marked the
+  newly-exposed range uninitialized, clobbering the bytes the very
+  instruction that moved the stack pointer had just written (a push
+  writes as it decrements). Together those took real pLhA listing a
+  102-file archive from **109,204** reports to **zero**, and every
+  fixture to zero.
+
+  Violation reports now also group by PC: a site with many violations
+  collapses to one line with a count and address range, while a site
+  with few prints each violation in full — so a corrupted return
+  address never loses its expected/actual pair, which is its entire
+  diagnostic value. Real PhxAss goes from a wall of 574 lines to 6
+  legible sites, one of which accounts for 568 of them.
+
 ## 0.6
 
 - **Added `--sanitize`, a valgrind/ASan-style memory sanitizer**
