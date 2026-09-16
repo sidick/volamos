@@ -10,6 +10,77 @@ use std::process::Command;
 /// regardless of the working directory `cargo test` is invoked from.
 const HELLO_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/hello");
 
+/// Path to `fixtures/memtest`, the deliberately-buggy heap fixture
+/// (issue #65). See `fixtures/README.md` for its four modes.
+const MEMTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/memtest");
+
+/// Runs `fixtures/memtest <mode>` under `--sanitize` and returns its
+/// captured stderr, asserting the process itself succeeded. The fixture
+/// deliberately misbehaves but always exits 0: noticing the bug is the
+/// sanitizer's job, not the guest's (see `fixtures/memtest.s`).
+fn sanitize_memtest(mode: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg("--sanitize")
+        .arg(MEMTEST_PATH)
+        .arg(mode)
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(
+        output.status.success(),
+        "memtest {mode} exited with {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn sanitize_reports_nothing_for_memtests_clean_mode() {
+    // The false-positive guard, and the most important of these four: a
+    // program that allocates, writes and reads every byte it asked for,
+    // and frees correctly must be silent. A sanitizer that cries wolf
+    // on correct code is worse than none, so this failing is a louder
+    // signal than any of the three detection tests below.
+    let stderr = sanitize_memtest("clean");
+    assert!(
+        !stderr.contains("sanitizer:"),
+        "expected a clean heap run to report nothing, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_catches_a_one_byte_heap_overrun_write() {
+    let stderr = sanitize_memtest("overrun");
+    assert!(
+        stderr.contains("invalid 1-byte write") && stderr.contains("heap redzone"),
+        "expected a 1-byte redzone write violation, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_catches_a_one_byte_heap_underrun_read() {
+    // The off-by-one *read* MuForce-style page-granular tools can't see
+    // at all -- one byte before the block, still on the same page.
+    let stderr = sanitize_memtest("underrun");
+    assert!(
+        stderr.contains("invalid 1-byte read") && stderr.contains("heap redzone"),
+        "expected a 1-byte redzone read violation, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_catches_a_use_after_free_read() {
+    // Only detectable because guestmem's free quarantine holds the
+    // address out of circulation: without it, nothing would have
+    // re-marked these bytes, but equally nothing would stop a later
+    // allocation from making the read legitimate again.
+    let stderr = sanitize_memtest("uaf");
+    assert!(
+        stderr.contains("invalid 1-byte read") && stderr.contains("freed block"),
+        "expected a use-after-free read violation, got: {stderr}"
+    );
+}
+
 #[test]
 fn running_hello_prints_greeting_and_exits_zero() {
     let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
@@ -46,6 +117,36 @@ fn verbose_flag_logs_the_putstr_call_to_stderr() {
     assert!(
         stderr.contains("PutStr"),
         "expected --verbose output to mention PutStr, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_flag_on_a_clean_program_reports_no_violations() {
+    // hello never does anything a shadow map would flag (no heap
+    // allocation, no freed/redzone memory) -- this is the "default
+    // state is Valid, so a normal run is silent" property from
+    // volamos_core::sanitize's module doc, exercised through the real
+    // binary rather than just the library's own unit tests.
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg("--sanitize")
+        .arg(HELLO_PATH)
+        .output()
+        .expect("failed to run the volamos binary");
+
+    assert!(
+        output.status.success(),
+        "volamos exited with {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Hello from volamos\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("sanitizer:"),
+        "expected a clean --sanitize run to report nothing, got: {stderr}"
     );
 }
 

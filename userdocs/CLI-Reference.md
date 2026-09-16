@@ -3,7 +3,7 @@
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
-        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] <program> [args...]
+        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself.
@@ -266,6 +266,64 @@ volamos --jit fixtures/hello
     | volamos 0.2, `--jit` | 445.1 |
     | volamos 0.3, interpreter | 198.2 (~1.9x faster than 0.2) |
     | volamos 0.3, `--jit` | 537.1 (~1.2x faster than 0.2) |
+
+## `--sanitize`
+
+Turns on shadow-memory checking of every guest memory access, to catch
+heap bugs that would otherwise corrupt memory silently. Default: off.
+
+`m68k-amigaos-gcc` has no `-fsanitize=address`, and MMU-based tools like
+MuForce work at page granularity, so a one-byte overrun or a read just
+past the end of an allocation is invisible to them. volamos can do
+better because it *is* the allocator and every access already funnels
+through one place.
+
+```sh
+volamos --sanitize fixtures/memtest overrun
+```
+```
+overrun: writing 1 byte past a 32-byte block
+sanitizer: 1 distinct violation(s):
+  invalid 1-byte write at 0x00002ee0 (heap redzone) from PC 0x00002af6
+```
+
+What it catches:
+
+- **Heap overruns and underruns**, in either direction and down to a
+  single byte, by placing poisoned redzones either side of every
+  `AllocMem`/`AllocVec`/`AllocPooled` block — including the padding
+  between the size a program asked for and the 8-byte-rounded size it
+  actually got.
+- **Use-after-free**, by poisoning a block on `FreeMem` and holding its
+  address out of circulation in a free quarantine, so the bug doesn't
+  hide behind an address that happens not to have been reused yet.
+- **Bad buffers handed to library calls**, for free: host-side handlers
+  write guest memory through the same checked path, so passing a
+  too-small buffer to a `dos.library` call is caught without any
+  per-function instrumentation.
+
+Violations are reported to stderr after the run, deduplicated by
+(PC, address, kind) with a hit count, and the guest is left to continue
+— this is a detector, not an enforcer, so one run surfaces every bug
+rather than dying at the first.
+
+!!! note "It forces the interpreter"
+    `--sanitize` turns the JIT off even if `--jit` was also given. The
+    JIT's fast path accesses guest memory through a raw pointer that
+    bypasses the checks entirely, so the two cannot be combined — a
+    sanitized JIT run would report a clean bill of health no matter what
+    the program did. Expect a sanitized run to be slower accordingly.
+
+!!! warning "What it cannot see"
+    Overflows *within* a stack frame — a 16-byte local overflowing into
+    the local next to it — need compiler instrumentation to detect, and
+    are invisible here for the same reason they're invisible to
+    valgrind. Stack corruption becomes visible only once it reaches
+    something tracked, such as a return address or a heap block.
+
+    `AvailMem` also legitimately reports less free memory under
+    `--sanitize`, because redzone and quarantined bytes genuinely aren't
+    available.
 
 ## No flags at all
 

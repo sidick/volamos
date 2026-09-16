@@ -473,3 +473,131 @@ mechanics, and the handful of new `CodeBuilder` instruction encodings
 `addq_w_disp_a`, `cmpi_b_imm_to_d`/`cmpi_l_imm_to_d`, `clr_b_ind`,
 `add_l_d_to_d`) they needed. If you change a `.s` file, update its
 `gen_*.py` counterpart to match.
+
+## issue #65 fixture: `memtest`
+
+Source: `memtest.s`; generator: `gen_memtest.py`. Added to validate
+volamos's `--sanitize` memory-sanitizer mode (heap redzones + a free
+quarantine around `exec.library`'s `AllocMem`/`FreeMem`) end to end: a
+deliberately buggy CLI program whose bugs `--sanitize` must catch, and
+whose one *correct* mode it must not flag.
+
+### What it does
+
+Real startup (`AbsExecBase` -> `OpenLibrary("dos.library", 0)` via
+`-552(a6)`, unchecked, same convention as every fixture since
+`filetest.s`). The command-line pointer (`A0`) is copied into `A2`
+*before* that first library call, since `A0` is scratch across a `jsr`
+(see `gen_libcall.py`'s comment, and `echoargs.s`'s header comment for
+the trailing-space-before-newline convention a non-empty guest command
+line carries -- both matter for correctly recognising a keyword's end).
+
+A small `strmatch` subroutine (`bsr`'d once per candidate keyword,
+`A1`=command-line cursor/`A0`=candidate keyword, returns `D0`=1/0) picks
+one of four modes by comparing the leading command-line word against
+`"clean"`/`"overrun"`/`"underrun"`/`"uaf"`, requiring a space or newline
+immediately after the match (so `"clean"` can't spuriously match a
+hypothetical `"cleanup"`). No match -- including an empty command line,
+which is just `"\n"` -- falls through to a usage line.
+
+Every mode `PutStr`s (`-948(a6)`) a short line naming what it's about to
+do, then (except `usage`) calls `exec.library`'s `AllocMem` (`-198(a6)`,
+`D0`=byte size, `D1`=requirements, returns `D0`=address or 0) for a
+32-byte block, does its mode-specific access, then `FreeMem`s
+(`-210(a6)`, `A1`=block, `D0`=byte size) the *same* 32 it allocated --
+`crates/volamos-core/src/execmem.rs`'s `FreeMem` errors out loudly if
+that size doesn't match what was actually allocated (both rounded up to
+8), so getting this wrong would mask the fixture's own intended bug
+behind an unrelated crash. A NULL `AllocMem` result is handled
+uniformly (prints a failure line, exits 20) instead of dereferencing
+NULL.
+
+### Modes and expected `--sanitize` behaviour
+
+| mode | what it does | expected sanitizer report |
+|---|---|---|
+| `clean` | alloc 32, write all 32 bytes, read all 32 back, free | **zero violations** -- the false-positive guard |
+| `overrun` | alloc 32, write 1 byte at offset 32 (into the trailing redzone), free | heap-buffer-overflow **write** at `block+32` |
+| `underrun` | alloc 32, read 1 byte at offset -1 (into the leading redzone), free | heap-buffer-overflow **read** at `block-1` |
+| `uaf` | alloc 32, free it, read 1 byte at offset 0 of the freed block | **use-after-free read** at the freed block's start |
+
+(no argument, or an unrecognised one) prints a usage line and exits 0.
+Every mode exits `0` via a plain `rts` regardless of which bug it just
+committed -- the *sanitizer's* job is to notice, not this program's own
+exit code (`--sanitize` doesn't exist yet as of this writing; this
+fixture and its expected-violations table above are what
+`crates/volamos/tests/` will assert against once it lands).
+
+Run e.g. `volamos fixtures/memtest clean` (no `-V`/`-a` needed -- nothing
+here touches the filesystem).
+
+### New `amiga_asm.py` encoders
+
+Two new `CodeBuilder` instructions, added in the same style/rigor as
+their neighbours: `move_b_imm_to_disp_a` (`move.b #imm,<disp16>(An)`,
+same extension-word shape as `move_w_imm_to_disp_a` with the byte-size
+opcode base) for `overrun`'s offset-32 poke, and `move_b_disp_a_to_d`
+(`move.b <disp16>(An),Dn`, same shape as `move_w_disp_a_to_d`, byte-size
+base) for `underrun`'s offset -1 read and `uaf`'s offset-0 read after
+`FreeMem`.
+
+### A real bug found while developing this fixture
+
+The first version of `strmatch` used `tst.l d2`/`sub.l d2,d3` (full
+32-bit compares) to test bytes loaded with `move.b (a0)+,d2` (which only
+ever writes the *low* byte of `D2`). `D2` still held a leftover `0x2000`
+from the `AllocMem` requirements setup earlier in a previous dispatch
+attempt, so its high 24 bits were never actually zero -- `tst.l d2`
+never saw a true zero at the candidate keyword's NUL terminator, so
+*every* mode silently fell through to `usage` (caught by running the
+fixture under `vamos` before trusting it: every one of `clean`/
+`overrun`/`underrun`/`uaf` printed the usage line instead of its own
+message). Fixed by explicitly zeroing `D1`/`D2` once before `strmatch`'s
+comparison loop, so their untouched high bits stay zero throughout.
+
+### Regenerating
+
+`memtest.s` is written for, and was actually assembled with, the real
+**PhxAss 4.40** assembler (Aminet freeware, not checked into this repo)
+running *under `volamos` itself*, mapping a host directory as an Amiga
+volume so PhxAss can read the source and write the binary:
+
+```sh
+mkdir -p /tmp/phxass_work && cp fixtures/memtest.s /tmp/phxass_work/
+./target/debug/volamos -V work:/tmp/phxass_work ~/amiga/PhxAss/PhxAss work:memtest.s
+cp /tmp/phxass_work/memtest fixtures/memtest
+```
+
+PhxAss emits a hunk **executable** directly (no linker or `EXE/S`
+switch needed, since this program has no external references).
+
+Since PhxAss isn't part of this repo and can't be relied on in CI (or
+on a machine without it fetched from Aminet), `gen_memtest.py` (via
+`amiga_asm.py`) remains the authoritative, byte-identical,
+toolchain-free build actually committed as `fixtures/memtest`:
+
+```sh
+python3 fixtures/gen_memtest.py
+```
+
+**Cross-checked, not byte-identical, confirmed equivalent.** Both paths
+were built and run (via `vamos` and via real `volamos`) for this issue;
+they agree on every mode's output and exit code, but the *raw bytes*
+differ: PhxAss's `(N)ormal Optimization` collapses several `bra`/`beq`/
+`bne`/`bsr` word-form branches (`amiga_asm.py`'s `CodeBuilder.branch`
+always emits the full displacement-word form, matching every other
+fixture's hand-assembler convention) into their one-word short (8-bit
+displacement) forms -- PhxAss itself reported "Bytes gained by
+optimization: 28" for this exact source. Structurally the two binaries
+are identical (`HUNK_HEADER`/`CODE`/`RELOC32`/`END`/`DATA`/`END`, same
+number of relocations, same relocation targets once `memtest.s`'s data
+section was declared `section data,data` -- PhxAss's `SECTION` directive
+defaults an unqualified `section data` to a **CODE** section, unlike
+`vasm`; the plain `section code`/`section data` pairing every other
+`.s` file here uses is a `vasm`-specific convention that doesn't carry
+over) -- only the branch-instruction encodings and the resulting code
+hunk size (`gen_memtest.py`: 784 bytes total; PhxAss: 764 bytes) differ,
+exactly as expected for "same program, different assembler
+optimization level," not a logic bug. If you change `memtest.s`, update
+`gen_memtest.py` to match (or vice versa), and re-run both builds plus
+the `vamos`/`volamos` mode sweep above before trusting the result.

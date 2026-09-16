@@ -358,6 +358,37 @@ class CodeBuilder:
         self.word(0x2028 | (dn << 9) | an)
         self.word(disp & 0xFFFF)
 
+    def move_b_imm_to_disp_a(self, an: int, disp: int, imm: int) -> None:
+        """`move.b #imm,<disp16>(An)`. Same extension-word order and
+        addressing-mode bits as [`move_w_imm_to_disp_a`] (dest=d16(An),
+        src=immediate), just with the byte-size opcode base (`0x1000`
+        instead of `0x3000` -- MOVE's size field is `01`=byte, `11`=word,
+        `10`=long; `0x1000`'s own top nibble already encodes that per the
+        M68000 PRM's MOVE table). Byte immediates still occupy a full
+        extension word (data in the low byte), matching
+        `move_b_imm_to_postinc`. Added for `fixtures/gen_memtest.py`'s
+        `overrun` mode: poking one byte at a *fixed positive* displacement
+        past an `AllocMem`'d block (offset 32 of a 32-byte block) --
+        exactly the shape a heap-redzone overrun sanitizer needs to
+        catch."""
+        self.word(0x1000 | (an << 9) | 0x17C)
+        self.word(imm & 0xFF)
+        self.word(disp & 0xFFFF)
+
+    def move_b_disp_a_to_d(self, an: int, disp: int, dn: int) -> None:
+        """`move.b <disp16>(An),Dn` -- same shape as
+        [`move_w_disp_a_to_d`] with the byte-size base (`0x1000`) instead
+        of word's `0x3000`. Added alongside `move_b_imm_to_disp_a` for
+        `fixtures/gen_memtest.py`'s `underrun` mode (reading `disp=-1`,
+        one byte before an `AllocMem`'d block -- a *negative* displacement,
+        unlike every earlier `disp_a` helper here, which is exactly why
+        `disp` is passed through `& 0xFFFF` like every other displacement
+        field: 68000 `d16` fields are already two's-complement) and `uaf`
+        mode (reading `disp=0` of a block already handed back to
+        `FreeMem`)."""
+        self.word(0x1028 | (dn << 9) | an)
+        self.word(disp & 0xFFFF)
+
     def addq_w_disp_a(self, an: int, disp: int, imm: int) -> None:
         """`addq.w #imm,<disp16>(An)` (`1 <= imm <= 8`, encoded as `imm %
         8`; dest addressing mode d16(An) = 101)."""

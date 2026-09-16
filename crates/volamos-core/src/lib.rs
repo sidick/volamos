@@ -52,6 +52,7 @@ pub mod locale;
 pub mod lvos;
 pub mod mathlibs;
 pub mod memory;
+pub mod sanitize;
 pub mod utility;
 pub mod vfs;
 
@@ -88,4 +89,7 @@ pub use guestmem::{
 pub use loader::{HunkFile, LoadError, LoadResult, load, parse};
 pub use lvos::{ArgReg, LvoEntry, find_by_lvo, find_by_name};
 pub use memory::AddressSpace;
+pub use sanitize::{
+    MAX_VIOLATIONS, PoisonReason, ShadowMap, ShadowState, Violation, ViolationKind,
+};
 pub use vfs::{MAX_ASSIGN_DEPTH, ResolveMode, Resolved, Vfs, VfsConfig, VfsError};
