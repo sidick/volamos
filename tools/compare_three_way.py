@@ -25,7 +25,11 @@ never-bundled corpus, this time amitools' own GPLv2 `test/bin`.
    3.1.4 filesystem tree complete with `.uaem` sidecars in the same
    format `crates/volamos-core/src/dosmeta.rs` already implements) as
    `--corpus`.
-2. A real Kickstart 3.1 ROM image, as `--rom`.
+2. A real Kickstart 3.1 ROM image, as `--rom`, **plus a `--model` that
+   matches it** -- a Kickstart built for one machine generally will not
+   boot another, and a mismatch shows up as every case returning an
+   empty real-Kickstart result rather than as an error. Verified
+   working: the A500/A600/A2000 3.1 ROM (40.63) with `--model A600`.
 3. `copperline`/`copperline-ctl` on `$PATH` (Homebrew: already the
    case on Simon's machine).
 4. A working `vamos` -- `pip install amitools` alone resolves the
@@ -302,6 +306,7 @@ def run_copperline(
     copperline_bin: str,
     copperline_ctl_bin: str,
     rom: Path,
+    model: str,
     corpus: Path,
     command: str,
     output_file: str | None = None,
@@ -329,7 +334,7 @@ def run_copperline(
             [
                 copperline_bin,
                 "--model",
-                "A1200",
+                model,
                 "--fast",
                 "8M",
                 "--config",
@@ -400,6 +405,18 @@ def main() -> int:
     )
     parser.add_argument("--rom", required=True, help="path to a real Kickstart 3.1 ROM image")
     parser.add_argument(
+        "--model",
+        default="A600",
+        help=(
+            "Copperline machine model for the real-Kickstart column. MUST match the "
+            "--rom you pass: a Kickstart built for one machine generally will not boot "
+            "another. Verified working here: the A500/A600/A2000 3.1 ROM (40.63) with "
+            "--model A600. An A3000 3.1 ROM (40.68) with the previously-hardcoded "
+            "A1200 model booted nothing at all -- every case simply returned an empty "
+            "result, which is why this is a flag now (default: A600)"
+        ),
+    )
+    parser.add_argument(
         "--volamos",
         default=str(REPO_ROOT / "target" / "release" / "volamos"),
         help="path to the volamos binary (default: target/release/volamos)",
@@ -425,7 +442,7 @@ def main() -> int:
         ),
         "vamos": lambda command, output_file: run_vamos(args.vamos, corpus, command, output_file),
         "copperline": lambda command, output_file: run_copperline(
-            args.copperline, args.copperline_ctl, rom, corpus, command, output_file
+            args.copperline, args.copperline_ctl, rom, args.model, corpus, command, output_file
         ),
     }
 

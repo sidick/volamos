@@ -809,3 +809,216 @@ bytes; PhxAss: 90 longwords/360 bytes) differs, exactly as expected for
 `stacktest.s`, update `gen_stacktest.py` to match (or vice versa), and
 re-run both builds plus the mode sweep above before trusting the
 result.
+
+## issue #58 fixture: `matchflags`
+
+Source: `matchflags.s`; generator: `gen_matchflags.py` (same dual
+convention and `amiga_asm.py` assembler as `memtest.s`/`stacktest.s`).
+Added to settle a one-bit divergence between `volamos` and `vamos`
+during a `MatchFirst`/`MatchNext` directory scan: `APF_DirChanged` (bit
+6, value 64) in `ap_Flags` -- `volamos` sets it, `vamos` never does.
+Real `dos.library`'s intent is that `dos.library` sets this flag itself
+to tell the caller the reported directory has changed since the
+previous call. Every earlier fixture that exercises `AnchorPath`
+(there isn't one before this) would only ever scan a single, flat
+directory, which can't distinguish "set once per real directory
+transition" (correct) from "set on every entry" (too eager) -- there's
+only one directory to have a flag about. `matchflags` scans a real
+**multi-level** tree (`APF_DODIR` set, re-requested before every
+`MatchNext` -- see below) specifically so the two possibilities produce
+visibly different output.
+
+### What it does
+
+Real startup (`AbsExecBase` -> `OpenLibrary("dos.library", 0)` via
+`-552(a6)`, unchecked). Takes one command-line argument (the directory
+to scan), copied up to (not including) the first space/newline/NUL into
+a scratch buffer (same token-copy idiom as `memtest.s`'s/`stacktest.s`'s
+command parsing, without their multi-keyword dispatch); an empty/missing
+argument prints a usage line and exits 0.
+
+`AllocMem(536, MEMF_CLEAR)` (536 = 280, the fixed `AnchorPath` header
+through `ap_Info`, plus a 256-byte `ap_Buf` tail) for the `AnchorPath`;
+NULL exits 20. `ap_Strlen` (word at `+18`) is set to 256 so `ap_Buf`
+gets filled in; `ap_Flags` (byte at `+16`) is set to `APF_DODIR` (4) so
+the scan descends into subdirectories. `MatchFirst(dirarg, ap)` (`-822`);
+nonzero `D0` prints "MatchFirst failed" and exits 10.
+
+Loop: for the entry currently in `*ap`, print `flags=%ld name='%s'
+buf='%s'\n` via `VPrintf` (`-954`, `D1`=format, `D2`=a small 3-longword
+array built fresh each time: `ap_Flags` zero-extended from a **byte**
+read at `+16` -- not a longword read -- plus `&fib_FileName`
+(`ap_Info+8` == `AnchorPath+28`) and `&ap_Buf` (`AnchorPath+280`), both
+computed with `lea` since they're a fixed displacement off the
+`AllocMem`'d, so only known at runtime, `AnchorPath` base). Quoting the
+strings (`name='%s'`) matters: a blank `fib_FileName` is itself
+significant here (a volume-root `MatchFirst` report has one, per issue
+#58's own Finding 1), and an unquoted empty field would be invisible in
+a diff. Then re-sets `ap_Flags` to `APF_DODIR` (a plain overwrite, not a
+read-modify-write OR -- ap_Flags was already read and printed for this
+entry, so there's nothing else left to preserve) before calling
+`MatchNext` (`-828`) again: `MatchNext` clears `APF_DODIR` itself once
+consumed for a descent (see `crates/volamos-core/src/dosanchor.rs`'s
+module docs), so getting a *multi-level* scan -- the entire point of
+this fixture -- means re-requesting it before every call, exactly like
+the NDK's own `ScanDirectories()` worked example. Loops until
+`MatchNext` returns nonzero, then `MatchEnd` (`-834`), `FreeMem`s the
+`AnchorPath`, and exits 0.
+
+### Verbatim output
+
+Test tree:
+
+```
+/tmp/mftree/a/aa/file1
+/tmp/mftree/a/ab/file2
+/tmp/mftree/b/file3
+/tmp/mftree/file4
+```
+
+```
+$ ./target/debug/volamos -V TEST:/tmp/mftree fixtures/matchflags TEST:
+flags=4 name='' buf='TEST:'
+flags=64 name='a' buf='TEST:a'
+flags=64 name='aa' buf='TEST:a/aa'
+flags=64 name='file1' buf='TEST:a/aa/file1'
+flags=76 name='aa' buf='TEST:a/aa/'
+flags=4 name='ab' buf='TEST:a/ab'
+flags=64 name='file2' buf='TEST:a/ab/file2'
+flags=76 name='ab' buf='TEST:a/ab/'
+flags=76 name='a' buf='TEST:a/'
+flags=4 name='b' buf='TEST:b'
+flags=64 name='file3' buf='TEST:b/file3'
+flags=76 name='b' buf='TEST:b/'
+flags=4 name='file4' buf='TEST:file4'
+flags=76 name='' buf='TEST:'
+```
+
+(exit `0`). `64` = `APF_DirChanged` alone; `76` = `64 | 8 | 4`
+(`APF_DirChanged | APF_DIDDIR`, plus this fixture's own literal
+`APF_DODIR` re-request still sitting in the byte, unconsumed by a pop).
+Under `volamos`, `APF_DirChanged` appears **exactly once per real
+directory transition** -- e.g. `b`'s three entries (only one here,
+`file3`) never repeat it, and stepping sideways from the exhausted `aa`
+back up and across into the sibling `ab` (`flags=4`, no `64`) does not
+set it either -- never once per *entry*. A flat directory can't show
+this at all (there's only one directory, so `APF_DirChanged` can only
+ever fire on the very first entry or never): run for comparison against
+a flat directory of three files:
+
+```
+$ ./target/debug/volamos -V TEST:/tmp/flatdir fixtures/matchflags TEST:
+flags=4 name='' buf='TEST:'
+flags=64 name='one' buf='TEST:one'
+flags=4 name='three' buf='TEST:three'
+flags=4 name='two' buf='TEST:two'
+flags=76 name='' buf='TEST:'
+```
+
+(`/tmp/flatdir` containing `one`/`two`/`three`, no subdirectories --
+`APF_DirChanged` fires once, on the first real child, then never again
+for its two siblings, exactly as the nested tree's own siblings behave.)
+
+```
+$ ./target/debug/volamos fixtures/matchflags
+usage: matchflags <dir>
+$ ./target/debug/volamos -V TEST:/tmp/mftree fixtures/matchflags TEST:doesnotexist
+MatchFirst failed
+```
+
+(both exit `0` and `10` respectively). This says nothing about whether
+`volamos`'s "once per transition" behavior or `vamos`'s "never" is the
+one matching real `dos.library` -- that's what this fixture exists to
+let a real-Kickstart-hardware run (Copperline) settle.
+
+### A real bug found while developing this fixture
+
+`gen_matchflags.py`'s `DataBuilder.cstr()` (used by every fixture's
+generator) never pads a string to an even offset the way a real
+assembler's `even` directive does -- harmless for every earlier fixture,
+since none of them ever took a raw address of a DATA-hunk label and
+issued a real CPU long-word `move.l` into it directly (heap-allocated
+pointers, the only prior target of such writes, are always aligned by
+the allocator). `matchflags` is the first to do exactly that (writing
+`ap_Flags`/`&fib_FileName`/`&ap_Buf` into `argarray`), so an odd-length
+string placed earlier in the data hunk -- even a single added 3-byte
+`cstr` -- could silently misalign `argarray` onto an odd address, and a
+real 68000 long-word write there is an Address Error: the CPU stopped
+with an "Illegal" opcode fault deep inside `print_entry`, at a PC that
+didn't correspond to this program's own code at all. Found via
+`--sanitize` (which flagged the resulting corruption as invalid heap-
+redzone writes from a nonsensical PC) plus a battery of bisection micro-
+fixtures narrowing it down to exactly this cause; `matchflags.s`'s own
+PhxAss build was never affected, since PhxAss's `even` directives (after
+every `dc.b` block) keep everything aligned automatically. Fixed with an
+explicit `data.align4()` right before `dirarg`/`argarray` in
+`gen_matchflags.py` -- see that call's own comment for the full
+derivation.
+
+### New `amiga_asm.py` encoder
+
+One new `CodeBuilder` instruction: `lea_disp_a_to_a` (`lea
+<disp16>(An_src),An_dest`), needed because `&fib_FileName`/`&ap_Buf` are
+a fixed displacement off the `AllocMem`'d (so only known at runtime)
+`AnchorPath` base -- an address to *compute*, not a DATA-hunk label a
+`move_l_label_to_a`-style relocation could bake in. **Verified
+byte-identical against real PhxAss's own output**: a probe source
+
+```
+        section code
+start:
+        lea     28(a5),a0
+        lea     280(a5),a1
+        rts
+        section data,data
+dummy:
+        dc.b    0
+        even
+```
+
+assembled through PhxAss under `volamos`, whose code-hunk payload (10
+bytes) is `41ed 001c 43ed 0118 4e75 4e71`; `amiga_asm.py`'s
+`CodeBuilder` (`lea_disp_a_to_a(0,28,5)`, `lea_disp_a_to_a(1,280,5)`)
+produces the identical words `41ed 001c 43ed 0118` for the two `lea`
+instructions themselves, byte-for-byte (`4e75`/`4e71` are the probe's
+own `rts`/pad, not part of the encoder being checked).
+
+### Regenerating
+
+`matchflags.s` is written for, and was actually assembled with, the real
+**PhxAss 4.40** assembler running *under `volamos` itself*, same
+convention as `memtest.s`/`stacktest.s`:
+
+```sh
+mkdir -p /tmp/phxm && cp fixtures/matchflags.s /tmp/phxm/
+./target/debug/volamos -V work:/tmp/phxm ~/amiga/PhxAss/PhxAss work:matchflags.s
+cp /tmp/phxm/matchflags fixtures/matchflags
+```
+
+PhxAss emits a hunk **executable** directly (no linker/`EXE/S` switch
+needed), reporting "Bytes gained by optimization: 20" for this source,
+no errors.
+
+Since PhxAss isn't checked into this repo (Aminet freeware living
+outside it) and can't be relied on in CI, `gen_matchflags.py` (via
+`amiga_asm.py`) remains the authoritative, byte-identical, toolchain-
+free build actually committed as `fixtures/matchflags`:
+
+```sh
+python3 fixtures/gen_matchflags.py
+```
+
+**Cross-checked, not byte-identical, confirmed equivalent** -- same
+relationship as `memtest`/`stacktest`'s two builds: both paths were
+built and run through `volamos` against both the nested tree and the
+flat directory above, and produce byte-identical stdout and the same
+exit codes under both builds. The raw bytes differ for the same
+optimization-level reason as the other two fixtures: `fixtures/
+matchflags` (the toolchain-free build) is 760 bytes; PhxAss's own build
+is 744 bytes. Structurally identical
+(`HUNK_HEADER`/`CODE`/`RELOC32`/`END`/`DATA`/`END`) -- only
+`amiga_asm.py`'s always-word-form branches (`CodeBuilder.branch` never
+emits PhxAss's short 8-bit-displacement forms) account for the size
+difference. If you change `matchflags.s`, update `gen_matchflags.py` to
+match (or vice versa), and re-run both builds plus the tree/flat/usage/
+bad-path sweep above before trusting the result.
