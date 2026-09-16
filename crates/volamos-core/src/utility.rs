@@ -967,6 +967,49 @@ mod tests {
         0x2040 | (n << 9)
     }
 
+    /// `move.l Dsrc,Ddst` -- MOVE.L with both operands in data-register
+    /// direct mode (`0010 ddd 000 000 sss`), for stashing an address
+    /// across a library call that clobbers D0.
+    fn move_d_to_d(dst: u16, src: u16) -> u16 {
+        0x2000 | (dst << 9) | src
+    }
+
+    #[test]
+    fn freed_tag_items_block_is_poisoned_for_use_after_free() {
+        // The other half: `FreeTagItems` now marks the block freed, so
+        // a guest still holding the pointer is caught reading it.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(3);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // AllocateTagItems -> D0
+        words.push(move_d0_to_a(0)); // A0 = the array
+        words.push(move_d_to_d(2, 0)); // stash the address in D2
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // FreeTagItems(A0)
+        words.push(move_d_to_d(0, 2)); // D0 = the now-freed address
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0, "expected the freed block's address back in D0");
+
+        let shadow = rt.memory().shadow().expect("sanitizer enabled above");
+        assert_eq!(
+            shadow.state(addr),
+            crate::sanitize::ShadowState::Unaddressable,
+            "a freed TagItem array should read as unaddressable"
+        );
+        assert_eq!(
+            shadow.poison_reason(addr),
+            Some(crate::sanitize::PoisonReason::Freed),
+            "and specifically as freed, not as a redzone"
+        );
+    }
+
     #[test]
     fn allocate_tag_items_block_gets_redzones_under_the_sanitizer() {
         // `AllocateTagItems` carves from the same `GuestHeap` as
@@ -1009,6 +1052,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn allocate_tag_items_returns_a_zeroed_block() {
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = numTags (3)

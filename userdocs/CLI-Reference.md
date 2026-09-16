@@ -411,6 +411,56 @@ noise, but a single violation's detail (for a corrupted return address,
 the expected and actual addresses) is the whole diagnostic value and is
 never collapsed away.
 
+## Source locations in diagnostics
+
+When a program carries debug information, volamos annotates sanitizer
+violations with where in the source they happened, instead of only an
+address:
+
+```console
+$ volamos --sanitize memtest overrun
+sanitizer: 1 site(s), 1 violation(s):
+  invalid 1-byte write at 0x000032a0 (heap redzone) from PC 0x00002b38 (at work:memtest.s:281)
+```
+
+Nothing needs enabling — it is used automatically when present. Two
+sources are consulted, best first:
+
+1. **`file:line`**, from a `HUNK_DEBUG` `LINE` block. Emitted by SAS/C
+   when asked (`sc DEBUG=LINE`) and by PhxAss (`LINEDEBUG`).
+2. **`symbol+offset`**, from the binary's `HUNK_SYMBOL` table, when
+   there is no line coverage:
+
+   ```
+   return address corrupted at stack slot 0x00ffffe0: expected 0x00002b40,
+     found 0x41414141 from PC 0x00002b10 (at ___main+0x3c)
+   ```
+
+The raw PC is always kept alongside, because that is what you need to
+find the instruction in a disassembly.
+
+!!! note "What each toolchain gives you"
+    **m68k-amigaos-gcc** emits *stabs* debug info, which volamos does
+    not decode, so `-g` alone does not produce `file:line` here. gcc
+    binaries do carry a symbol table, though, so they get
+    `symbol+offset` — the example above is a real gcc-built program.
+
+    **SAS/C** and **PhxAss** produce `LINE` blocks when asked, and those
+    give true `file:line`.
+
+!!! warning "Two honest limits on attribution"
+    **Line numbers point at statements, not instructions.** `LINE` data
+    is sparse — one entry per source line — so a PC between two entries
+    is reported against the earlier one. That is the right answer for
+    "which statement", not "which instruction".
+
+    **Symbol attribution is only as good as the symbol table.** `static`
+    functions are not exported and so do not appear in `HUNK_SYMBOL` at
+    all; a violation inside one is reported against the nearest
+    preceding *exported* symbol, which can be a surprising name with a
+    large offset. Prefer `file:line` where your toolchain can produce
+    it.
+
 ## `--dirty-heap`
 
 Fills every `AllocMem`/`AllocVec`/`AllocPooled` block allocated

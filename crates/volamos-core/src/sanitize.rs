@@ -1591,6 +1591,22 @@ impl ShadowMap {
     /// work (bounded by [`MAX_VIOLATIONS`] regardless) costs nothing
     /// that matters.
     pub fn report(&self) -> String {
+        self.report_with(|_| None)
+    }
+
+    /// As [`Self::report`], but annotating each site with a
+    /// human-readable source location when `resolve` can supply one for
+    /// its PC -- `"file.c:42"` or `"Do_Law+0x12"` (see
+    /// `crate::loader`'s debug-info lookup).
+    ///
+    /// Taking a closure rather than reaching for the information keeps
+    /// this module free of any dependency on the loader or on how a
+    /// program was loaded: a shadow map knows PCs, and nothing about
+    /// hunks, load addresses or debug hunks. The CLI, which has all of
+    /// that, supplies the mapping. `resolve` returning `None` (the
+    /// default via [`Self::report`]) simply prints the address alone,
+    /// exactly as before this existed.
+    pub fn report_with(&self, resolve: impl Fn(u32) -> Option<String>) -> String {
         use std::fmt::Write as _;
 
         let violations = self.violations.borrow();
@@ -1642,7 +1658,8 @@ impl ShadowMap {
                     let max_addr = cluster.iter().map(|v| v.addr).max().unwrap_or(0);
                     let _ = writeln!(
                         out,
-                        "  PC {pc:#010x}: {}",
+                        "  PC {pc:#010x}{}: {}",
+                        location_suffix(&resolve, *pc),
                         describe_cluster(
                             kind,
                             cluster[0].size,
@@ -1654,7 +1671,7 @@ impl ShadowMap {
                     );
                 } else {
                     for v in cluster {
-                        let _ = writeln!(out, "  {v}");
+                        let _ = writeln!(out, "  {v}{}", location_suffix(&resolve, v.pc));
                     }
                 }
             }
@@ -1668,6 +1685,22 @@ impl ShadowMap {
             );
         }
         out
+    }
+}
+
+/// Renders a resolved source location as the ` (at ...)` suffix
+/// [`ShadowMap::report_with`] appends to a site's line, or an empty
+/// string when the resolver has nothing for that PC.
+///
+/// Appended rather than substituted: the raw PC stays in the message
+/// even when a location is known, because the address is what you need
+/// to find the instruction in a disassembly, and a `file:line` from
+/// sparse debug info points at the *statement*, not necessarily the
+/// exact instruction within it.
+fn location_suffix(resolve: &impl Fn(u32) -> Option<String>, pc: u32) -> String {
+    match resolve(pc) {
+        Some(loc) => format!(" (at {loc})"),
+        None => String::new(),
     }
 }
 

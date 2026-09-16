@@ -138,6 +138,29 @@ fn memtest_stdout(flags: &[&str], mode: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// Path to `fixtures/linetest`, the fixture built with real `LINE`
+/// debug info (PhxAss `LINEDEBUG`) -- see `fixtures/README.md`.
+const LINETEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/linetest");
+
+#[test]
+fn a_binary_with_line_debug_info_still_runs_normally() {
+    // The debug hunks must not disturb loading or execution -- issue
+    // #70 was precisely a leading debug block being rejected outright.
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg(LINETEST_PATH)
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(
+        output.status.success(),
+        "linetest exited {:?}",
+        output.status
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("linetest"),
+        "expected linetest's own message"
+    );
+}
+
 #[test]
 fn dirty_heap_changes_which_branch_a_zero_dependent_guest_takes() {
     // The whole point of --dirty-heap (issue #80): `zerodep` reads an
