@@ -5,6 +5,26 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Diagnostics now name the source location** (issue #74). Sanitizer
+  violations are annotated with `file:line` when the program carries a
+  `HUNK_DEBUG` `LINE` block (SAS/C's `DEBUG=LINE`, PhxAss's
+  `LINEDEBUG`), falling back to `symbol+offset` from `HUNK_SYMBOL`
+  otherwise, and to the bare address when a binary carries neither. The
+  raw PC is always kept alongside, since that is what a disassembly
+  needs.
+
+  Worth knowing what this does and doesn't reach: m68k-amigaos-gcc
+  emits *stabs* debug info, which isn't decoded, so `-g` alone doesn't
+  give `file:line` — but gcc binaries do carry symbols, so a real
+  gcc-built stack-smash now reports
+  `expected 0x00002b40, found 0x41414141 ... (at ___main+0x3c)`.
+  `static` functions never appear in a symbol table, so attribution
+  inside one falls to the nearest exported symbol.
+
+  Also new: `fixtures/linetest`, a repo-owned binary carrying real
+  `LINE` data (PhxAss-built, since `amiga_asm.py` can't emit debug
+  hunks), so the parser's tests don't depend on artefacts that vanish.
+
 - **Added `--dirty-heap`** (issue #80): fills every allocation made
   without `MEMF_CLEAR` with `0xA5` instead of leaving it zeroed, so a
   guest that relies on uncleared memory being zero fails here the way it

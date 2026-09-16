@@ -1131,3 +1131,109 @@ emits PhxAss's short 8-bit-displacement forms) account for the size
 difference. If you change `matchflags.s`, update `gen_matchflags.py` to
 match (or vice versa), and re-run both builds plus the tree/flat/usage/
 bad-path sweep above before trusting the result.
+
+## `linetest`: `HUNK_DEBUG` `LINE` fixture (issue #74)
+
+Source: `linetest.s`. Built binary: `linetest`. This fixture exists
+purely to carry real `HUNK_DEBUG` `LINE` blocks (source-line-to-code-
+offset tables) so the loader's line-info parser has something durable
+to test against — the two artefacts that motivated it (a scratch-
+directory file that gets cleaned up, and the LawBreaker binary, which
+can't be vendored here under Enforcer's non-commercial/no-modification
+licence) don't survive as fixtures.
+
+The program is trivial by design — same shape as `hello.s` (fake
+pre-seeded `A6`, no `OpenLibrary`): it `PutStr`s a short message via
+`dos.library`'s `PutStr` (`-948(a6)`), sets `D0 = 0`, and `rts`s. What
+matters is *where* those three instructions sit in the source: they're
+placed on deliberately spread-out, memorable lines (20, 25, 30) with
+comment/blank padding between them, so the `(line, offset)` pairs
+PhxAss emits are small and easy to check a test against.
+
+### This fixture is PhxAss-only
+
+Unlike every other fixture in this directory, `linetest` has **no**
+`gen_linetest.py` and none is planned. `fixtures/amiga_asm.py` (the
+toolchain-free assembler the other `gen_*.py` scripts share) has no
+notion of source lines at all and cannot emit `HUNK_DEBUG` blocks —
+there is nothing for it to build here that would demonstrate the thing
+this fixture exists to test. A generator that produced a debug-info-
+free binary would look like this repo's usual authoritative,
+toolchain-free build while silently missing the entire point of the
+fixture, so it's deliberately not written. `fixtures/linetest` is
+committed as assembled by real **PhxAss 4.40** (Aminet freeware,
+living outside this repo, not relied on in CI), same "assemble under
+`volamos` itself" convention as `matchflags.s`/`memtest.s`:
+
+```sh
+mkdir -p /tmp/linetest && cp fixtures/linetest.s /tmp/linetest/
+./target/release/volamos -V work:/tmp/linetest ~/amiga/PhxAss/PhxAss work:linetest.s LINEDEBUG
+cp /tmp/linetest/linetest fixtures/linetest
+```
+
+PhxAss's `LINEDEBUG` command-line option is what makes it emit a
+`HUNK_DEBUG` `LINE` block per section (two sections here — CODE and
+DATA — so two `LINE` blocks, confirmed below). Without `LINEDEBUG` it
+assembles the same program with no debug hunks at all.
+
+### Verified binary contents
+
+Running `./target/debug/volamos fixtures/linetest` prints `Hello from
+linetest` and exits 0 — it's still a working program, not just a
+debug-info carrier.
+
+The binary is two hunks (`HUNK_CODE` then `HUNK_DATA`), each followed
+by its own `HUNK_DEBUG`/`LINE` block before the hunk's `HUNK_END`,
+confirmed by walking the raw hunk stream. Both `LINE` blocks record the
+filename PhxAss itself saw while assembling — the **Amiga path passed
+on its command line**, `work:linetest.s` — not any host path; that's
+worth remembering since it won't match `fixtures/linetest.s`'s host
+location.
+
+**Code-hunk `LINE` block** (`tag=b'LINE'`, `base_offset=0`,
+`name="work:linetest.s"`):
+
+| source line | code-hunk offset | instruction |
+|---|---|---|
+| 20 | `0x00` | `move.l #msg,d1` |
+| 25 | `0x06` | `jsr -948(a6)` |
+| 30 | `0x0a` | `moveq #0,d0` |
+| 31 | `0x0c` | `rts` |
+
+**Data-hunk `LINE` block** (`tag=b'LINE'`, `base_offset=0`,
+`name="work:linetest.s"`):
+
+| source line | data-hunk offset | corresponds to |
+|---|---|---|
+| 33 | `0x0e` | `section data,data` (see note below) |
+| 36 | `0x00` | `msg: dc.b "Hello from linetest\n",0` |
+| 37 | `0x15` | `even` (alignment padding byte) |
+
+Both blocks were read straight off the committed binary with a short
+Python script walking the hunk stream for `HUNK_DEBUG` (`0x3F1`) and
+decoding its payload (`base_offset:u32`, `tag:4 bytes`,
+`namelen:u32` longwords, the name itself, then `(line:u32,
+offset:u32)` pairs to the end of the payload) — not hand-transcribed.
+
+**Note on the data-hunk block's first pair**: line 33 is the `section
+data,data` directive itself, yet its recorded offset (`0x0e`, i.e. 14)
+falls *inside* the message string rather than at the start or end of
+the data hunk, and the three pairs are not offset-monotonic in line
+order (33→0x0e, 36→0x00, 37→0x15). This is exactly what real PhxAss
+4.40 emitted — verified via a raw hex dump of the payload bytes, not a
+parsing artefact of the script above — so it's recorded here as an
+observed real-assembler quirk for the `LINE`-block parser to tolerate
+(don't assume offsets are sorted or that every pair maps cleanly onto
+"the instruction that starts there"), not something to "fix" in this
+fixture.
+
+### Regenerating
+
+There is no toolchain-free path for this one — see "This fixture is
+PhxAss-only" above. Re-run the `LINEDEBUG` command shown there with
+real PhxAss under `volamos` and re-commit `fixtures/linetest`. If you
+change `linetest.s`, keep the three instructions' source line numbers
+documented above in sync with the actual file (they're deliberately
+memorable, not incidental), and re-verify the `(line, offset)` table
+by re-dumping the rebuilt binary's `HUNK_DEBUG` blocks rather than
+assuming the old table still applies.

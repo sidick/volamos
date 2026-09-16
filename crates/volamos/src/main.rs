@@ -81,6 +81,7 @@ use std::process::ExitCode;
 use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END};
 use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
 use volamos_core::exectask::install_host_break_handler;
+use volamos_core::loader::Location;
 use volamos_core::memory::FlatMemory;
 use volamos_core::vfs::{Vfs, VfsConfig};
 use volamos_core::{DEFAULT_STACK_SIZE, LoadError, loader};
@@ -801,11 +802,42 @@ fn program_name_from_path(path: &std::path::Path) -> String {
 /// per top-level or nested run, right after it finishes -- so a
 /// `System()`/`Execute()`-spawned nested program's own violations are
 /// reported too, not just the top-level program's.
-fn report_sanitizer_violations(runtime: &Runtime<M68kCpu>) {
+/// Formats a resolved [`Location`] for a diagnostic message:
+/// `"hello.c:42"` for source-line info, `"Do_Law+0x12"` for a symbol.
+fn format_location(loc: &Location) -> String {
+    match loc {
+        Location::Line { file, line } => format!("{file}:{line}"),
+        Location::Symbol { name, offset } if *offset == 0 => name.clone(),
+        Location::Symbol { name, offset } => format!("{name}+{offset:#x}"),
+    }
+}
+
+/// Prints a `--sanitize` run's violations, annotated with source
+/// locations where the program's debug info (or failing that, its
+/// symbol table) can supply them -- see `crate::loader`'s
+/// `lookup_location` and issue #74.
+///
+/// `program` is the parsed executable and `load` where its hunks
+/// landed; both are needed because the debug info records
+/// *hunk-relative* offsets, so a PC has to have its hunk's load address
+/// subtracted before it means anything. Passing `None` (the overlay
+/// loading path, which doesn't produce a `LoadResult`) just prints
+/// addresses alone, exactly as before.
+fn report_sanitizer_violations(
+    runtime: &Runtime<M68kCpu>,
+    program: Option<(&loader::HunkFile, &loader::LoadResult)>,
+) {
     if let Some(shadow) = runtime.memory().shadow()
         && shadow.violation_count() > 0
     {
-        eprint!("{}", shadow.report());
+        match program {
+            Some((file, load)) => eprint!(
+                "{}",
+                shadow
+                    .report_with(|pc| load.lookup_location(file, pc).as_ref().map(format_location))
+            ),
+            None => eprint!("{}", shadow.report()),
+        }
     }
 }
 
@@ -914,7 +946,10 @@ fn run_nested_program(
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let result = runtime.run(&mut out, None).unwrap_or(-1);
-    report_sanitizer_violations(&runtime);
+    // Nested runs parse their own executable locally and don't keep the
+    // result around; source-location lookup is a top-level nicety, so
+    // these report plain addresses.
+    report_sanitizer_violations(&runtime, None);
     result
 }
 
@@ -981,6 +1016,10 @@ fn run(opts: &Options) -> Result<i32, String> {
     // program built that way runs straight into a wild-PC crash --
     // found running a real overlay-linked binary. See
     // Runtime::load_top_level_program's doc for the full story.
+    // `None` on the overlay path, which loads via
+    // `load_top_level_program` and produces no `LoadResult` -- those
+    // runs simply report addresses without source locations.
+    let mut loaded: Option<loader::LoadResult> = None;
     let mut runtime = if hunk_file.overlay.is_some() {
         let mut mem = FlatMemory::new(opts.ram_size as usize);
         // Right after construction, before anything is loaded into it
@@ -1014,6 +1053,11 @@ fn run(opts: &Options) -> Result<i32, String> {
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
             .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
         check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
+        // Kept for the sanitizer report's source-location lookup (issue
+        // #74): the debug info records hunk-relative offsets, so a PC
+        // needs its hunk's load address subtracted, which only this
+        // result knows.
+        loaded = Some(load_result.clone());
         let config = StartConfig {
             entry: load_result.entry,
             load_end: load_result.end,
@@ -1073,7 +1117,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let result = runtime
         .run(&mut out, Some(&mut trace))
         .map_err(|e| format!("{}: {e}", opts.program));
-    report_sanitizer_violations(&runtime);
+    report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
     result
 }
 
