@@ -3,7 +3,7 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## Unreleased
+## 0.7
 
 - **The heap detectors now cover four more allocators** (issue #83,
   tier 0): `utility.library`'s `AllocateTagItems`, `dos.library`'s
