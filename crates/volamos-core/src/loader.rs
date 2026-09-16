@@ -27,10 +27,21 @@
 //! `count == 0`-terminated list, since 16-bit entries can leave the
 //! read position mid-longword).
 //!
-//! `HUNK_SYMBOL` (0x3F0) and `HUNK_DEBUG` (0x3F1) blocks are recognized and
-//! skipped (their contents are discarded) so binaries built with `-nosym`
-//! *or* with symbol/debug info left in still load. `HUNK_LIB` (link
-//! library archives) is still not supported -- that's a different format
+//! `HUNK_NAME` (0x3E8), `HUNK_SYMBOL` (0x3F0) and `HUNK_DEBUG` (0x3F1)
+//! blocks are recognized and skipped (their contents are discarded)
+//! wherever a hunk boundary allows one to appear -- immediately before a
+//! hunk's body (a real assembler-produced binary, e.g. one built by
+//! `vasm`/`PhxAss` with source-line debug info left in, can open a hunk
+//! with one or more `HUNK_DEBUG` blocks before its `HUNK_CODE`), and in
+//! their traditional position after a body's relocations. Any number of
+//! them can appear back-to-back in either spot. This is so binaries built
+//! with `-nosym` *or* with symbol/debug info left in still load.
+//! `HUNK_SYMBOL`'s on-disk shape is not the simple longword-count-prefixed
+//! payload the other two use -- it's a list of `{ name_length_longwords,
+//! name, value }` entries terminated by a zero `name_length`, so it needs
+//! its own parsing loop (see [`skip_metadata_block`]) rather than being
+//! treated like `HUNK_NAME`/`HUNK_DEBUG`. `HUNK_LIB` (link library
+//! archives) is still not supported -- that's a different format
 //! entirely (an indexed collection of object modules for a linker to pull
 //! from, not something `LoadSeg` ever sees).
 //!
@@ -83,6 +94,7 @@ use crate::memory::AddressSpace;
 // --- Hunk type identifiers (top byte reserved for future flag bits) ---
 
 const HUNK_HEADER: u32 = 0x3F3;
+const HUNK_NAME: u32 = 0x3E8;
 const HUNK_CODE: u32 = 0x3E9;
 const HUNK_DATA: u32 = 0x3EA;
 const HUNK_BSS: u32 = 0x3EB;
@@ -392,6 +404,48 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// True for the block types that can appear as loose metadata wherever a
+/// hunk boundary allows one -- immediately before a hunk's body, or (their
+/// traditional position) after one's relocations, and in any number back
+/// to back. See the module docs and [`skip_metadata_block`], which does
+/// the actual parsing.
+fn is_metadata_block(block_type: u32) -> bool {
+    matches!(block_type, HUNK_NAME | HUNK_SYMBOL | HUNK_DEBUG)
+}
+
+/// Skips one metadata block's payload, given that its type word (one of
+/// `HUNK_NAME`/`HUNK_SYMBOL`/`HUNK_DEBUG` -- see [`is_metadata_block`])
+/// has already been consumed. Shared by the leading-position skip (in
+/// [`parse_node`]'s per-hunk loop, before the body-type match) and the
+/// trailing-position skip (in the same function's post-body block loop),
+/// so the two positions can't drift apart on what a metadata block looks
+/// like.
+///
+/// `HUNK_NAME` and `HUNK_DEBUG` share the simple shape: a longword count
+/// `n`, then `n * 4` bytes of payload we don't interpret. `HUNK_SYMBOL`
+/// is *not* that shape -- it's a list of `{ name_length_longwords, name,
+/// value }` entries terminated by a zero `name_length`, and mistakenly
+/// treating it as a single count-prefixed block misparses the rest of
+/// the file (confirmed the hard way against a real binary).
+fn skip_metadata_block(r: &mut Reader<'_>, block_type: u32) -> Result<(), LoadError> {
+    match block_type {
+        HUNK_NAME | HUNK_DEBUG => {
+            let n_longwords = r.read_u32()?;
+            r.skip_longwords(n_longwords as usize)?;
+        }
+        HUNK_SYMBOL => loop {
+            let name_longwords = r.read_u32()?;
+            if name_longwords == 0 {
+                break;
+            }
+            r.skip_longwords(name_longwords as usize)?; // symbol name
+            r.read_u32()?; // symbol value (offset within hunk)
+        },
+        other => unreachable!("skip_metadata_block called with non-metadata block type {other:#x}"),
+    }
+    Ok(())
+}
+
 /// A parsed `HUNK_HEADER`'s own fields, returned alongside the hunks
 /// [`parse_node`] reads for its declared range.
 struct HeaderInfo {
@@ -461,7 +515,21 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
     let mut hunks = Vec::with_capacity(n_sizes);
     for (i, &reserved_size) in declared_sizes.iter().enumerate() {
         let hunk_index = first_hunk + i;
-        let raw_body_type = r.read_u32()?;
+        // Skip any number of leading metadata blocks (HUNK_NAME/
+        // HUNK_SYMBOL/HUNK_DEBUG) before the hunk's real body -- a real
+        // assembler build with source-line debug info left in can open a
+        // hunk with one or more HUNK_DEBUG blocks ahead of its HUNK_CODE
+        // (see the module docs). Memory-flag bits never apply to these
+        // metadata type words (only to CODE/DATA/BSS), so check the raw
+        // word directly.
+        let raw_body_type = loop {
+            let candidate = r.read_u32()?;
+            if is_metadata_block(candidate) {
+                skip_metadata_block(r, candidate)?;
+                continue;
+            }
+            break candidate;
+        };
         // Memory-flag bits (see HUNK_SIZE_FLAGS_MASK's doc) apply to
         // body type words too; both bits set means an extra longword of
         // memory attributes follows the type word -- consume and ignore
@@ -554,17 +622,8 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
                     }
                     r.align_to_longword();
                 }
-                HUNK_SYMBOL => loop {
-                    let name_longwords = r.read_u32()?;
-                    if name_longwords == 0 {
-                        break;
-                    }
-                    r.skip_longwords(name_longwords as usize)?; // symbol name
-                    r.read_u32()?; // symbol value (offset within hunk)
-                },
-                HUNK_DEBUG => {
-                    let n_longwords = r.read_u32()?;
-                    r.skip_longwords(n_longwords as usize)?;
+                HUNK_NAME | HUNK_SYMBOL | HUNK_DEBUG => {
+                    skip_metadata_block(r, block_type)?;
                 }
                 HUNK_END => break,
                 // A new hunk body implicitly ends the current hunk: HUNK_END
@@ -1231,6 +1290,218 @@ mod tests {
         let file = parse(&buf).expect("SYMBOL/DEBUG blocks should be skipped, not error");
         assert_eq!(file.hunks.len(), 1);
         assert_eq!(file.hunks[0].data, 0x4E71_4E71u32.to_be_bytes());
+    }
+
+    /// Appends a `HUNK_DEBUG` block with `n_longwords` longwords of
+    /// arbitrary payload.
+    fn push_debug_block(buf: &mut Vec<u8>, n_longwords: u32) {
+        push_u32(buf, HUNK_DEBUG);
+        push_u32(buf, n_longwords);
+        for i in 0..n_longwords {
+            push_u32(buf, 0xD0D0_0000 | i);
+        }
+    }
+
+    /// Appends a `HUNK_NAME` block with `n_longwords` longwords of
+    /// arbitrary payload (same on-disk shape as `HUNK_DEBUG`).
+    fn push_name_block(buf: &mut Vec<u8>, n_longwords: u32) {
+        push_u32(buf, HUNK_NAME);
+        push_u32(buf, n_longwords);
+        for i in 0..n_longwords {
+            push_u32(buf, 0x00A2_0000 | i);
+        }
+    }
+
+    /// Appends a `HUNK_SYMBOL` block containing `names` as consecutive
+    /// `{ name_length_longwords, name, value }` entries (values are
+    /// synthesized as the entry's index), terminated by a zero
+    /// `name_length`. `name` must be non-empty; it's padded with NUL
+    /// bytes up to the next longword boundary the way a real assembler
+    /// does.
+    fn push_symbol_block(buf: &mut Vec<u8>, names: &[&str]) {
+        push_u32(buf, HUNK_SYMBOL);
+        for (i, name) in names.iter().enumerate() {
+            let mut padded = name.as_bytes().to_vec();
+            while !padded.len().is_multiple_of(4) {
+                padded.push(0);
+            }
+            push_u32(buf, (padded.len() / 4) as u32);
+            buf.extend_from_slice(&padded);
+            push_u32(buf, i as u32); // symbol value
+        }
+        push_u32(buf, 0); // terminate symbol table
+    }
+
+    /// A `HUNK_DEBUG` block sitting *before* a hunk's `HUNK_CODE` body
+    /// (the real-world shape found in `LawBreaker`, an ordinary assembler
+    /// build with source-line debug info left in) must be skipped, not
+    /// rejected as an unexpected hunk-body type -- see issue #70.
+    #[test]
+    fn skips_leading_debug_block_before_hunk_body() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1); // hunk 0: 1 longword
+
+        push_debug_block(&mut buf, 3);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x4E71_4E71);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("leading HUNK_DEBUG should be skipped");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].data, 0x4E71_4E71u32.to_be_bytes());
+    }
+
+    /// Same as above but with a leading `HUNK_SYMBOL` block containing
+    /// real named entries (not just the empty/terminator-only case),
+    /// exercising the NUL-terminated-list parsing rather than a single
+    /// count-prefixed block.
+    #[test]
+    fn skips_leading_symbol_block_with_named_entries_before_hunk_body() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+
+        push_symbol_block(&mut buf, &["_main", "someLabel"]);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x4E71_4E71);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("leading HUNK_SYMBOL should be skipped");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].data, 0x4E71_4E71u32.to_be_bytes());
+    }
+
+    /// Same as above but with a leading `HUNK_NAME` block.
+    #[test]
+    fn skips_leading_name_block_before_hunk_body() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+
+        push_name_block(&mut buf, 2);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x4E71_4E71);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("leading HUNK_NAME should be skipped");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].data, 0x4E71_4E71u32.to_be_bytes());
+    }
+
+    /// Several leading metadata blocks back to back (of all three kinds,
+    /// in a mixed order) must all be skipped before the real body is
+    /// found -- a single `if` (rather than a loop) would only handle one.
+    #[test]
+    fn skips_multiple_leading_metadata_blocks_in_a_row() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+
+        push_debug_block(&mut buf, 1);
+        push_name_block(&mut buf, 1);
+        push_symbol_block(&mut buf, &["foo", "bar"]);
+        push_debug_block(&mut buf, 2);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x4E71_4E71);
+        push_u32(&mut buf, HUNK_END);
+
+        let file =
+            parse(&buf).expect("multiple leading metadata blocks in a row should be skipped");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].data, 0x4E71_4E71u32.to_be_bytes());
+    }
+
+    /// `HUNK_NAME` in the trailing position (after a body, alongside its
+    /// long-standing `HUNK_SYMBOL`/`HUNK_DEBUG` siblings) must also be
+    /// skipped -- it wasn't recognized there at all before this fix.
+    #[test]
+    fn skips_trailing_name_block_after_hunk_body() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x4E71_4E71);
+
+        push_name_block(&mut buf, 2);
+
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("trailing HUNK_NAME should be skipped");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].data, 0x4E71_4E71u32.to_be_bytes());
+    }
+
+    /// Several trailing metadata blocks in a row, interleaved with a real
+    /// `HUNK_RELOC32` block, must all be skipped -- matching the leading
+    /// case's "more than one in a row" coverage but after both a body and
+    /// its relocations.
+    #[test]
+    fn skips_multiple_trailing_metadata_blocks_after_relocations() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 1); // hunk 0 size: 1 longword
+        push_u32(&mut buf, 1); // hunk 1 size: 1 longword
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0); // addend placeholder
+        push_u32(&mut buf, HUNK_RELOC32);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 1); // target hunk 1
+        push_u32(&mut buf, 0); // offset 0
+        push_u32(&mut buf, 0); // terminate reloc groups
+
+        push_debug_block(&mut buf, 1);
+        push_symbol_block(&mut buf, &["one", "two"]);
+        push_name_block(&mut buf, 1);
+
+        push_u32(&mut buf, HUNK_END);
+
+        push_u32(&mut buf, HUNK_DATA);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0xCAFE_BABE);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("trailing metadata blocks after relocations should skip");
+        assert_eq!(file.hunks.len(), 2);
+        assert_eq!(file.hunks[0].relocs.len(), 1);
+        assert_eq!(file.hunks[0].relocs[0].target_hunk, 1);
+        assert_eq!(file.hunks[1].data, 0xCAFE_BABEu32.to_be_bytes());
     }
 
     #[test]

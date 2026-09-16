@@ -965,6 +965,47 @@ fn permit_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     Ok(())
 }
 
+/// `exec.library`'s `Disable`/`Enable` (LVO -120/-126, no args, no
+/// return value): real `Disable` masks all hardware interrupts (down to
+/// but not including NMI) until a matching `Enable`, protecting a
+/// critical section from being interrupted at the hardware level rather
+/// than just from being task-switched away from (that's `Forbid`/
+/// `Permit`, just above). This runtime has no interrupt sources at all
+/// -- there's no timer tick, no hardware, nothing async that could ever
+/// fire during a "disabled" window -- so exactly the same reasoning that
+/// makes `Forbid`/`Permit` no-ops applies here: both are true no-ops.
+/// Found missing running the real 1998 `LawBreaker` binary (37.72),
+/// which calls `Disable` immediately after `Forbid`.
+///
+/// Deliberately *not* maintaining `ExecBase.IDNestCnt` (real NDK
+/// `exec/execbase.h` offset 0x126, a signed byte, `-1` meaning "not
+/// nested", incremented per `Disable` and decremented per `Enable`)
+/// despite that field existing at a real, reserved offset in this
+/// runtime's `ExecBase` layout (see
+/// [`crate::dispatch::EXEC_BASE_ATTNFLAGS_OFFSET`]'s doc, which derives
+/// `IDNestCnt`/`TDNestCnt`'s offsets as part of the same field-by-field
+/// walk). The tempting argument for maintaining it is that a guest
+/// reading `SysBase->IDNestCnt` directly (rather than calling `Disable`/
+/// `Enable`) would see something coherent instead of a stuck `0`.
+/// Rejected: `Forbid`/`Permit` already don't maintain the exactly
+/// parallel `TDNestCnt`, and giving `Disable`/`Enable` a real counter
+/// while their sibling pair stays a no-op would be an inconsistency
+/// with no real payoff -- nothing in this runtime ever branches on
+/// either nest count (there's no scheduler and no interrupt delivery to
+/// gate), so a maintained counter would only be a guest-visible number,
+/// not an actual guarantee. A guest that inspects the field directly
+/// instead of trusting `Disable`/`Enable`'s return contract is already
+/// relying on behavior this API-level runtime doesn't promise; matching
+/// `Forbid`/`Permit`'s existing precedent is the more defensible answer.
+fn disable_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
+/// See [`disable_handler`].
+fn enable_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    Ok(())
+}
+
 /// Checks `a7` against the current task's `tc_SPLower`/`tc_SPUpper`
 /// bounds, read fresh from guest memory (so this sees whatever
 /// [`stack_swap_handler`] last set them to). Called once per dispatched
@@ -1303,7 +1344,7 @@ fn read_eclock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 
 /// Registers every implemented task/signal handler: `exec.library`'s
 /// `FindTask`/`SetSignal`/`SetExcept`/`Wait`/`Signal`/`AllocSignal`/
-/// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`/`OpenDevice`/
+/// `FreeSignal`/`StackSwap`/`Forbid`/`Permit`/`Disable`/`Enable`/`OpenDevice`/
 /// `CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/`CheckIO`/`AbortIO`, plus
 /// `dos.library`'s `CheckSignal` (registered from here rather than
 /// `dosfile.rs`, so that file needs no edits at all -- see the module
@@ -1345,6 +1386,8 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("RemTask", rem_task_handler::<C>);
     reg_exec!("Forbid", forbid_handler::<C>);
     reg_exec!("Permit", permit_handler::<C>);
+    reg_exec!("Disable", disable_handler::<C>);
+    reg_exec!("Enable", enable_handler::<C>);
     reg_exec!("OpenDevice", open_device_handler::<C>);
     reg_exec!("CloseDevice", close_device_handler::<C>);
     reg_exec!("DoIO", do_io_handler::<C>);
@@ -2328,6 +2371,47 @@ mod tests {
             code, 42,
             "Forbid/Permit should leave D0 untouched by anyone else"
         );
+    }
+
+    // --- Disable/Enable ---
+
+    #[test]
+    fn disable_then_enable_is_a_harmless_no_op() {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        words.extend_from_slice(&jsr_disp16_a6(-120)); // Disable
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // Enable
+        words.push(0x7000 | 0x2A); // moveq #42,d0
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 42,
+            "Disable/Enable should leave D0 untouched by anyone else"
+        );
+    }
+
+    #[test]
+    fn nested_disable_enable_pairs_do_not_fail() {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        // Mimic a guest nesting Disable/Forbid critical sections, e.g.
+        // Disable(); Forbid(); ...; Permit(); Enable();
+        words.extend_from_slice(&jsr_disp16_a6(-120)); // Disable
+        words.extend_from_slice(&jsr_disp16_a6(-120)); // Disable (nested)
+        words.extend_from_slice(&jsr_disp16_a6(-132)); // Forbid
+        words.extend_from_slice(&jsr_disp16_a6(-138)); // Permit
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // Enable
+        words.extend_from_slice(&jsr_disp16_a6(-126)); // Enable (matching)
+        words.push(0x7000 | 0x2A); // moveq #42,d0
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42, "nested Disable/Enable pairs should not fail");
     }
 
     // --- OpenDevice ---
