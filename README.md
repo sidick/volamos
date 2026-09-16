@@ -68,13 +68,23 @@ and volumes/assigns, and `exec.library`/`utility.library` essentials.
 Since then, substantial empirical hardening against a real Workbench
 3.1.4 `C:` command corpus (`List`, `Copy`, `Delete`, `Rename`, `Sort`,
 `Search`, `Join`, `CPU`, `Date`, `SetDate`, `Wait`, `Break`, `Info`, and
-more) plus real third-party binaries (the PhxAss assembler, and
-Simon's own AmiSnap project) has closed many further gaps beyond
-Phase 3's original scope, and a full audit against
-[`vamos`](https://github.com/cnvogelg/amitools)'s own library/device
-coverage closed the remaining ones it flagged. Phase 4 (the
-three-oracle parity harness against `vamos`/real Kickstart) hasn't
-formally started yet.
+more) plus real third-party binaries (the PhxAss assembler, the pLhA
+archiver, the SAS/C 6.58 compiler, and Simon's own AmiSnap project) has
+closed many further gaps beyond Phase 3's original scope, and a full
+audit against [`vamos`](https://github.com/cnvogelg/amitools)'s own
+library/device coverage closed the remaining ones it flagged.
+
+A three-oracle comparison harness (`tools/compare_three_way.py`) runs
+the same binaries under volamos, `vamos` and a **real Kickstart** via
+[Copperline](https://github.com/sidick/copperline), booting a real
+Workbench 3.1.4 filesystem and reading the guest's own redirected
+output back off the host. It's local-only — it needs a real ROM and
+real Workbench media, neither of which can live in this repo — and it
+takes a `--model` matching the ROM you give it. Where it and `vamos`
+disagree with volamos, the differences that turned out to be `vamos`'s
+are documented in
+[Differences from vamos](userdocs/Differences-from-vamos.md), each one
+verified against real hardware.
 
 The runtime loads an AmigaOS hunk executable, runs it on an interpreted
 m68k CPU (the [`m68k`](https://crates.io/crates/m68k) crate behind a
@@ -92,6 +102,7 @@ cargo run -p volamos -- fixtures/exectest
 cargo run -p volamos -- --stack 4096 fixtures/recurse  # demonstrates overflow detection
 cargo run -p volamos -- -V TEST:/tmp/some-hostdir fixtures/runcmdtest  # LoadSeg+RunCommand+UnLoadSeg
 cargo run -p volamos -- --sanitize fixtures/memtest overrun  # catches a 1-byte heap overrun
+cargo run -p volamos -- --sanitize fixtures/stacktest smash  # catches a smashed return address
 ```
 
 Implemented so far:
@@ -146,29 +157,62 @@ Implemented so far:
 ## Finding bugs in guest programs
 
 `m68k-amigaos-gcc` has no `-fsanitize=address`, and MMU-based tools like
-MuForce work at page granularity, so a one-byte overrun or a read just
-past the end of an allocation is invisible to them. `--sanitize` gives
-volamos a valgrind/ASan-style detector instead, which it can do cheaply
-because it *is* the allocator and every guest memory access already
-funnels through one place:
+Enforcer and MuForce work at MMU-page granularity, so a one-byte overrun
+or a read just past the end of an allocation is invisible to them.
+`--sanitize` gives volamos a valgrind/ASan-style detector instead, which
+it can do cheaply because it *is* the allocator and every guest memory
+access already funnels through one place.
 
-```sh
-$ cargo run -p volamos -- --sanitize fixtures/memtest overrun
-overrun: writing 1 byte past a 32-byte block
-sanitizer: 1 distinct violation(s):
-  invalid 1-byte write at 0x00002ee0 (heap redzone) from PC 0x00002af6
+A classic stack buffer overflow in a real C program, built with
+`m68k-amigaos-gcc -g` and run under `--sanitize`:
+
+```console
+$ volamos --sanitize smash
+sanitizer: 1 site(s), 1 violation(s):
+  return address corrupted at stack slot 0x00ffffe0:
+    expected 0x00002b40, found 0x41414141 from PC 0x00002b10 (at ___main+0x3c)
 ```
 
-It catches heap overruns and underruns down to a single byte,
-use-after-free, accesses below the stack pointer, and return-address
-corruption (stack smashing, via a shadow call stack — something
-valgrind itself doesn't offer). Bad buffers handed to `dos.library`
-calls come for free, since host-side handlers write guest memory through
-the same checked path. Real PhxAss, real pLhA and the real SAS/C 6.58
-compiler all run clean under it, with `sc`'s output object file
-byte-identical to an unsanitized run's. Overflows *within* a single
-stack frame need compiler instrumentation and remain invisible, as they
-are to valgrind. See the
+`found 0x41414141` is the ASCII `AAAA` that overflowed the buffer, and
+`___main+0x3c` comes from the binary's own symbol table. What it detects:
+
+- **Heap overruns and underruns**, either direction, down to a single
+  byte — poisoned redzones either side of every `AllocMem`/`AllocVec`/
+  `AllocPooled` block, including the padding between the size a program
+  asked for and the size it actually got.
+- **Use-after-free**, via a free quarantine that keeps a freed address
+  out of circulation, so the bug can't hide behind an address nothing
+  happened to reuse yet.
+- **Accesses below the stack pointer**, and **return-address
+  corruption** through a shadow call stack — stack-smash detection,
+  which valgrind itself doesn't offer.
+- **Bad buffers handed to `dos.library` calls**, for free: host-side
+  handlers write guest memory through the same checked path, so no
+  per-function instrumentation was needed.
+- **Uninitialized reads**, byte-granular, behind the opt-in
+  `--sanitize-uninit` (a partially-initialized structure is caught, not
+  waved through because something in it was written).
+
+Violations are grouped by PC, annotated with `file:line` when the
+binary carries `HUNK_DEBUG` source-line info (SAS/C's `DEBUG=LINE`,
+PhxAss's `LINEDEBUG`) and with `symbol+offset` otherwise, and never
+abort the guest — it's a detector, not an enforcer, so one run surfaces
+every bug rather than dying at the first.
+
+`--dirty-heap` complements it by filling every non-`MEMF_CLEAR`
+allocation with `0xA5` instead of the zeros volamos's memory happens to
+start as, so a program that relies on uncleared memory being zero fails
+here the way it can on real hardware.
+
+Real PhxAss, real pLhA and the real SAS/C 6.58 compiler all run under
+`--sanitize` with `sc`'s output object file byte-identical to an
+unsanitized run — the detector doesn't perturb what it watches. (PhxAss
+does report one genuine two-byte over-read of its own `timerequest`,
+found this way.) Two things it can't see: overflows *within* a single
+stack frame, which need compiler instrumentation and are invisible to
+valgrind too; and `malloc` inside a C runtime's own pool, which
+sub-allocates via `exec.library/Allocate` rather than through the
+allocators volamos guards. See the
 [CLI reference](https://sidick.github.io/volamos/latest/CLI-Reference/)
 for the full details.
 
