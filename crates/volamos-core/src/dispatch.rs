@@ -2559,6 +2559,22 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// allocations `Runtime::new` itself has made by then are the
     /// runtime's own internal guest structures, which no guest bug can
     /// overrun from the outside anyway.
+    /// Turns on `--dirty-heap` (issue #80): every subsequent
+    /// non-`MEMF_CLEAR` allocation has its user range filled with
+    /// [`crate::guestmem::DIRTY_HEAP_FILL_BYTE`] by `crate::execmem`'s
+    /// alloc handlers.
+    ///
+    /// Deliberately independent of [`Runtime::enable_heap_sanitizer`]
+    /// and of the shadow map: this one *changes guest-visible
+    /// behaviour* rather than observing it, so it is useful on its own
+    /// as a bug-shaker (with no shadow map and no slowdown), and
+    /// folding it into `--sanitize` would cost that mode its property
+    /// of never perturbing the program it watches.
+    pub fn enable_dirty_heap(&mut self) {
+        self.heap
+            .set_dirty_fill(Some(crate::guestmem::DIRTY_HEAP_FILL_BYTE));
+    }
+
     pub fn enable_heap_sanitizer(&mut self) {
         self.heap
             .set_redzone_size(crate::guestmem::DEFAULT_REDZONE_SIZE);
@@ -2568,6 +2584,15 @@ impl<C: Cpu + 'static> Runtime<C> {
 
     /// Direct access to guest memory (e.g. for tests that want to inspect
     /// state after a run).
+    /// Mutable access to guest memory. Narrower in practice than
+    /// [`Runtime::memory`]: it exists so a caller can install a
+    /// [`crate::sanitize::ShadowMap`] (or otherwise prepare memory) on
+    /// an already-built `Runtime`, which the CLI does before `run` and
+    /// which tests need in order to exercise the sanitizer at all.
+    pub fn memory_mut(&mut self) -> &mut C::Memory {
+        &mut self.mem
+    }
+
     pub fn memory(&self) -> &C::Memory {
         &self.mem
     }

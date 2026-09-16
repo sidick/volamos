@@ -494,9 +494,9 @@ line carries -- both matter for correctly recognising a keyword's end).
 
 A small `strmatch` subroutine (`bsr`'d once per candidate keyword,
 `A1`=command-line cursor/`A0`=candidate keyword, returns `D0`=1/0) picks
-one of eight modes by comparing the leading command-line word against
+one of nine modes by comparing the leading command-line word against
 `"clean"`/`"overrun"`/`"underrun"`/`"uaf"`/`"uninit"`/`"uninitpartial"`/
-`"written"`/`"cleared"`, requiring a space or newline immediately after
+`"written"`/`"cleared"`/`"zerodep"`, requiring a space or newline immediately after
 the match (so `"clean"` can't spuriously match a hypothetical
 `"cleanup"` -- and, since `"uninit"` is a literal prefix of
 `"uninitpartial"`, the same rule is what stops `"uninit"`'s own
@@ -569,6 +569,47 @@ it lands -- not something observed directly.
 
 Run e.g. `volamos fixtures/memtest uninit` or
 `volamos --sanitize fixtures/memtest uninitpartial`.
+
+### `--dirty-heap` mode (issue #80): `zerodep`
+
+`uninit` (above) proves the *read* happens, but under volamos today that
+read is always zero, so it can't show whether a guest program actually
+*acts* on an uninitialized value differently depending on what garbage
+was there -- the exact question issue #80's `--dirty-heap` flag exists
+to answer. `zerodep` closes that gap: same `AllocMem(32, 0)` (no
+`MEMF_CLEAR`) as `uninit`, but it reads a **longword** at offset 0
+without ever writing it and **branches** on the value, `PutStr`ing a
+different line down each path:
+
+| path | condition | line printed |
+|---|---|---|
+| zero | read value `== 0` | `zerodep: read 0 -- took the zero path (this is the bug: it only works because the memory happened to be zero)` |
+| non-zero | read value `!= 0` | `zerodep: read non-zero -- took the garbage path` |
+
+Either way it then `FreeMem`s the block and exits 0 -- the sanitizer's
+(or `--dirty-heap`'s) job is to make the difference visible, not to
+crash the fixture.
+
+Since volamos's `FlatMemory` starts zeroed regardless of `MEMF_CLEAR`,
+`zerodep` takes the **zero path** under plain volamos today, every time
+-- that's the latent bug `--dirty-heap` (not implemented as of this
+writing) is meant to expose: a program that happens to work today
+because volamos is more generous than real AmigaOS. Once `--dirty-heap`
+fills non-`MEMF_CLEAR` allocations with a poison pattern (`0xA5A5A5A5`,
+per the issue), the exact same binary should take the **garbage path**
+instead -- a different line of output, trivially assertable from an
+integration test.
+
+Under `--sanitize-uninit`, `zerodep`'s longword read at offset 0 should
+still report one uninitialized-read violation there, exactly like
+`uninit` does -- `--dirty-heap`'s fill is required (per the issue) to
+bypass the shadow map rather than heal it to `Valid`, so `--dirty-heap`
+and `--sanitize-uninit` are meant to **compose**: run together, the read
+sees `0xA5A5A5A5` (garbage path) *and* is still flagged as
+uninitialized, rather than the two features cancelling each other out.
+
+Run e.g. `volamos fixtures/memtest zerodep` or
+`volamos --sanitize-uninit fixtures/memtest zerodep`.
 
 ### New `amiga_asm.py` encoders
 
@@ -654,6 +695,21 @@ under plain `volamos` and produced byte-identical stdout and exit code
 free-quarantine violations, and the four new modes reported nothing
 (expected, since `--sanitize-uninit` doesn't exist yet -- see the
 "Uninitialized-read modes" section above).
+
+Re-verified again for issue #80's `zerodep` mode: PhxAss reported "0
+errors" and "Bytes gained by optimization: 42" (`gen_memtest.py`: 1824
+bytes total; PhxAss: 1792 bytes -- code 746 bytes/data 882 bytes on the
+PhxAss side). All eleven command lines (the prior ten plus `zerodep`)
+were run against both builds under plain `volamos` and produced
+byte-identical stdout and exit code 0 in every case; `zerodep` itself
+printed the "zero path" line on both builds, matching the fact that
+`--dirty-heap` doesn't exist yet. Both builds were also run under
+`--sanitize-uninit`: `zerodep` reported one uninitialized 4-byte read
+on both, at an address offset by the same fixed delta as every other
+mode's report (the two builds' heap blocks land at different absolute
+addresses purely because PhxAss's smaller code hunk shifts everything
+after it -- same relationship documented for `overrun`/`underrun`/`uaf`
+above, not a discrepancy).
 
 ## issue #65 increment 2 fixture: `stacktest`
 

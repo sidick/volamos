@@ -30,7 +30,7 @@ filetest.s/dirtest.s/echoargs.s):
    command-line cursor, A0 = the candidate keyword's data label,
    D0/D1/D2/D3 scratch; returns D0=1/0) is `bsr`'d once per candidate
    keyword ("clean", "overrun", "underrun", "uaf", "uninit",
-   "uninitpartial", "written", "cleared"), each time re-copying
+   "uninitpartial", "written", "cleared", "zerodep"), each time re-copying
    A2 into A1 first (the subroutine consumes A1 via postincrement).
    `strmatch` requires the keyword to be followed immediately by a space
    or newline, so "clean" doesn't spuriously match a hypothetical
@@ -100,6 +100,7 @@ def build_program() -> bytes:
     data.cstr("kw_uninitpartial", "uninitpartial")
     data.cstr("kw_written", "written")
     data.cstr("kw_cleared", "cleared")
+    data.cstr("kw_zerodep", "zerodep")
 
     data.cstr("msg_clean", "clean: alloc 32 bytes, write+read all 32, free\n")
     data.cstr("msg_overrun", "overrun: writing 1 byte past a 32-byte block\n")
@@ -122,9 +123,23 @@ def build_program() -> bytes:
         "cleared: alloc 32 bytes with MEMF_CLEAR, read offset 0 unwritten\n",
     )
     data.cstr(
+        "msg_zerodep",
+        "zerodep: alloc 32 bytes without MEMF_CLEAR, read+branch on offset "
+        "0 unwritten\n",
+    )
+    data.cstr(
+        "msg_zerodep_zero",
+        "zerodep: read 0 -- took the zero path (this is the bug: it only "
+        "works because the memory happened to be zero)\n",
+    )
+    data.cstr(
+        "msg_zerodep_nonzero",
+        "zerodep: read non-zero -- took the garbage path\n",
+    )
+    data.cstr(
         "msg_usage",
         "usage: memtest clean|overrun|underrun|uaf|uninit|uninitpartial|"
-        "written|cleared\n",
+        "written|cleared|zerodep\n",
     )
     data.cstr("msg_allocfail", "AllocMem failed\n")
 
@@ -150,6 +165,7 @@ def build_program() -> bytes:
         ("kw_uninitpartial", "mode_uninitpartial"),
         ("kw_written", "mode_written"),
         ("kw_cleared", "mode_cleared"),
+        ("kw_zerodep", "mode_zerodep"),
     ):
         code.move_l_a_to_a(A1, A2)  # fresh cursor -- strmatch consumes it
         code.move_l_label_to_a(A0, keyword)
@@ -425,6 +441,55 @@ def build_program() -> bytes:
 
     code.move_b_disp_a_to_d(A2, 0, D0)  # read of MEMF_CLEAR'd, never-written byte
 
+    code.move_l_a_to_a(A6, A4)
+    code.move_l_a_to_a(A1, A2)
+    code.moveq(D0, BLOCK_SIZE)
+    code.jsr_disp16_a(A6, LVO_FREEMEM)
+    code.moveq(D0, 0)
+    code.rts()
+
+    # --- zerodep: alloc 32 bytes *without* MEMF_CLEAR, read a longword at
+    # offset 0 without ever writing it, and BRANCH on the value -- unlike
+    # `uninit` (which only reads), this mode actually *acts* on the
+    # uninitialized value, so it can demonstrate --dirty-heap's whole
+    # point: today, under plain volamos, the read is always zero (volamos's
+    # FlatMemory starts zeroed regardless of MEMF_CLEAR), so this mode
+    # always takes the zero path and prints the "bug" line below. Once
+    # --dirty-heap fills non-MEMF_CLEAR allocations with a poison pattern,
+    # the same binary takes the garbage path instead -- a different line
+    # of output, trivially assertable from an integration test. Under
+    # --sanitize-uninit this read should still report one
+    # uninitialized-read violation at block+0, exactly like `uninit`
+    # (--dirty-heap's fill must not mark the bytes initialized, so the two
+    # features compose rather than cancel -- see issue #80). ---
+    code.label("mode_zerodep")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_zerodep")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+    code.move_l_a_to_a(A6, A4)
+    code.moveq(D0, BLOCK_SIZE)
+    code.moveq(D1, 0)  # no MEMF_CLEAR -- block starts fully Uninit
+    code.jsr_disp16_a(A6, LVO_ALLOCMEM)
+    code.tst_l_d(D0)
+    code.branch(CodeBuilder.BEQ, "allocfail")
+    code.move_l_d_to_a(A2, D0)
+
+    code.move_l_disp_a_to_d(A2, 0, D0)  # the uninitialized read itself
+    code.tst_l_d(D0)
+    code.branch(CodeBuilder.BEQ, "zerodep_zero")
+
+    code.label("zerodep_nonzero")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_zerodep_nonzero")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+    code.branch(CodeBuilder.BRA, "zerodep_done")
+
+    code.label("zerodep_zero")
+    code.move_l_a_to_a(A6, A3)
+    code.move_l_label_to_d(D1, "msg_zerodep_zero")
+    code.jsr_disp16_a(A6, LVO_PUTSTR)
+
+    code.label("zerodep_done")
     code.move_l_a_to_a(A6, A4)
     code.move_l_a_to_a(A1, A2)
     code.moveq(D0, BLOCK_SIZE)

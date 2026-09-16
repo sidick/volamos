@@ -104,17 +104,24 @@ const DEFAULT_RAM_SIZE: u32 = 16 * 1024 * 1024;
 /// bytes.
 const MIN_HEAP_HEADROOM: u32 = 4096;
 
-/// The `--sanitize` family, kept together and **CLI-only** -- see
+/// The CLI-only instrumentation family, kept together -- see
 /// [`Options::sanitize`]'s doc for why instrumentation flags
 /// deliberately aren't part of `config::Overrides` (a stale config file
 /// silently enabling a debugging mode is a surprise nobody wants).
 ///
-/// Grouped into a struct rather than threaded as three more positional
+/// Grouped into a struct rather than threaded as more positional
 /// arguments: `parse_args_raw`/`resolve` already carry a four-element
-/// tuple, and growing it to six interchangeable `bool`s is exactly how
-/// arguments end up swapped at a call site.
+/// tuple, and growing it to a handful of interchangeable `bool`s is
+/// exactly how arguments end up swapped at a call site.
+///
+/// Note `dirty_heap` living here is a *packaging* decision, not a
+/// behavioural one: it is deliberately independent of `enabled` and
+/// works with no shadow map installed at all (see its own doc). These
+/// flags share a home because they share a lifecycle -- all CLI-only,
+/// all applied to a freshly-built `Runtime` -- not because one implies
+/// another.
 #[derive(Debug, Default, Clone)]
-struct SanitizeOptions {
+struct InstrumentationOptions {
     /// `--sanitize`: install the shadow map and check every guest access.
     enabled: bool,
     /// `--sanitize-uninit`: additionally report reads of memory that was
@@ -127,9 +134,21 @@ struct SanitizeOptions {
     /// suppressed, for silencing a site that has already been triaged
     /// without needing a suppression file.
     ignore_pcs: Vec<u32>,
+    /// `--dirty-heap` (issue #80): fill every non-`MEMF_CLEAR`
+    /// allocation with a poison pattern instead of leaving it as the
+    /// zeros volamos's memory happens to start as, so a guest relying
+    /// on uncleared memory being zero fails here the way it can on real
+    /// hardware.
+    ///
+    /// Independent of [`Self::enabled`] in both directions: this one
+    /// *changes what the guest sees* rather than observing it, which is
+    /// why it is not folded into `--sanitize` (whose
+    /// never-perturb-the-program property is worth protecting), and it
+    /// is useful on its own with no shadow map and no slowdown.
+    dirty_heap: bool,
 }
 
-impl SanitizeOptions {
+impl InstrumentationOptions {
     /// Applies these options to a freshly-installed shadow map. A no-op
     /// when sanitizing is off (there is no shadow map to configure).
     fn apply(&self, mem: &mut FlatMemory) {
@@ -166,8 +185,8 @@ struct Options {
     /// `config::Overrides` deliberately, so enabling extra diagnostic
     /// overhead/behavior-changing instrumentation is always an explicit,
     /// per-invocation choice rather than something a stale config file
-    /// silently turns on. See [`SanitizeOptions`] for the family.
-    sanitize: SanitizeOptions,
+    /// silently turns on. See [`InstrumentationOptions`] for the family.
+    sanitize: InstrumentationOptions,
     net: bool,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
@@ -208,8 +227,8 @@ fn print_usage(program_name: &str) {
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--defaults|--no-defaults] [--volumes-dir HOSTDIR] \
          [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] [--sanitize-uninit]\n\
-         [--sanitize-ignore-pc ADDR] [--net] <program> [args...]"
+         [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] [--sanitize-uninit] \
+         [--sanitize-ignore-pc ADDR] [--dirty-heap] [--net] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -320,6 +339,22 @@ fn print_usage(program_name: &str) {
     eprintln!(
         "                            have already triaged, without needing a suppression file"
     );
+    eprintln!(
+        "  --dirty-heap              fill every AllocMem/AllocVec/AllocPooled block made without"
+    );
+    eprintln!(
+        "                            MEMF_CLEAR with 0xA5 instead of leaving it zeroed, so a guest"
+    );
+    eprintln!(
+        "                            relying on uncleared memory being zero fails here the way it"
+    );
+    eprintln!(
+        "                            can on real hardware (where AllocMem returns whatever debris"
+    );
+    eprintln!(
+        "                            was there). Independent of --sanitize: this one changes what"
+    );
+    eprintln!("                            the guest sees, rather than just observing it");
     eprintln!("  --net                     enable bsdsocket.library: real host network access for");
     eprintln!("                            the guest (socket/connect/send/recv/... via real host");
     eprintln!("                            sockets). Off by default and CLI-only -- not settable");
@@ -510,11 +545,19 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// test) actually want.
 fn parse_args_raw(
     mut args: impl Iterator<Item = String>,
-) -> Result<(config::Overrides, SanitizeOptions, String, Vec<String>), String> {
+) -> Result<
+    (
+        config::Overrides,
+        InstrumentationOptions,
+        String,
+        Vec<String>,
+    ),
+    String,
+> {
     let mut overrides = config::Overrides::default();
     // CLI-only, unlike every other flag here -- see `Options::sanitize`'s
     // doc for why this deliberately isn't part of `config::Overrides`.
-    let mut sanitize = SanitizeOptions::default();
+    let mut sanitize = InstrumentationOptions::default();
     let mut program = None;
     let mut guest_args = Vec::new();
 
@@ -579,6 +622,7 @@ fn parse_args_raw(
             "--jit" => overrides.jit = Some(true),
             "--no-jit" => overrides.jit = Some(false),
             "--sanitize" => sanitize.enabled = true,
+            "--dirty-heap" => sanitize.dirty_heap = true,
             // Implies --sanitize: asking for uninitialized-read
             // reporting without the shadow map installed could only be
             // a mistake, and silently doing nothing would be worse than
@@ -622,7 +666,7 @@ fn parse_args_raw(
 /// merging CLI overrides with `~/.volamos`/`.volamos`).
 fn resolve(
     overrides: config::Overrides,
-    sanitize: SanitizeOptions,
+    sanitize: InstrumentationOptions,
     program: String,
     guest_args: Vec<String>,
 ) -> Options {
@@ -799,7 +843,7 @@ fn run_nested_program(
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
-    sanitize: SanitizeOptions,
+    sanitize: InstrumentationOptions,
     net: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
@@ -844,6 +888,9 @@ fn run_nested_program(
     // nested run never even attempts the JIT path in the first place).
     cpu.set_jit(jit && !sanitize.enabled);
     let mut runtime = Runtime::new(cpu, mem, config);
+    if sanitize.dirty_heap {
+        runtime.enable_dirty_heap();
+    }
     if sanitize.enabled {
         // The shadow map installed on `mem` above only records what it
         // is told to poison; this is what makes the heap actually
@@ -902,6 +949,9 @@ fn build_runtime_with_vfs(
         // to poison. Done here rather than in each branch so the
         // overlay and flat loading paths can't drift apart.
         runtime.enable_heap_sanitizer();
+    }
+    if opts.sanitize.dirty_heap {
+        runtime.enable_dirty_heap();
     }
     Ok(runtime)
 }
@@ -989,6 +1039,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_fpu = opts.fpu;
     let nested_jit = opts.jit;
     let nested_sanitize = opts.sanitize.clone();
+
     let nested_net = opts.net;
     runtime.set_system_runner(move |req| {
         run_nested_program(
@@ -1561,6 +1612,24 @@ mod tests {
             !opts.sanitize.uninit,
             "--sanitize alone must not turn on uninitialized-read reporting"
         );
+    }
+
+    #[test]
+    fn dirty_heap_is_independent_of_sanitize() {
+        // --dirty-heap must NOT imply --sanitize: it changes what the
+        // guest sees and is useful with no shadow map at all.
+        let opts = parse_args(args(&["--dirty-heap", "prog"])).unwrap();
+        assert!(opts.sanitize.dirty_heap);
+        assert!(
+            !opts.sanitize.enabled,
+            "--dirty-heap must not turn the sanitizer on"
+        );
+
+        // ...and --sanitize must not imply --dirty-heap, or the
+        // detector would start perturbing the program it watches.
+        let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
+        assert!(opts.sanitize.enabled);
+        assert!(!opts.sanitize.dirty_heap);
     }
 
     #[test]

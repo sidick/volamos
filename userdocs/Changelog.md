@@ -5,6 +5,23 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **Added `--dirty-heap`** (issue #80): fills every allocation made
+  without `MEMF_CLEAR` with `0xA5` instead of leaving it zeroed, so a
+  guest that relies on uncleared memory being zero fails here the way it
+  can on real hardware — where `AllocMem` returns whatever debris was
+  there. `MEMF_CLEAR` allocations are untouched. Deliberately
+  independent of `--sanitize`, because this one changes what the guest
+  sees rather than only observing it, and `--sanitize`'s
+  never-perturb-the-program property is worth protecting (re-verified:
+  the real SAS/C compiler's output object file is still byte-identical
+  under `--sanitize`).
+
+  This also settled a verdict `--sanitize-uninit` had to leave open: the
+  real PhxAss assembler reads an uninitialized field from a ~568-slot
+  table, and with the fill on its output is byte-identical (checked on a
+  60-symbol source as well as a trivial one), so it does not act on
+  those values. Benign, not a latent bug.
+
 - **Added `--sanitize-uninit`** (issue #68): opt-in uninitialized-read
   detection on top of `--sanitize`, plus `--sanitize-ignore-pc` for
   silencing a site you have already triaged. Byte-granular, so a

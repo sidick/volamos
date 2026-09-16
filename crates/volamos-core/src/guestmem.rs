@@ -162,6 +162,16 @@ pub const DEFAULT_REDZONE_SIZE: u32 = 32;
 /// unless a caller explicitly opts in.
 pub const DEFAULT_QUARANTINE_BUDGET: u32 = 64 * 1024;
 
+/// The pattern `--dirty-heap` fills non-`MEMF_CLEAR` allocations with
+/// (issue #80). `0xA5` repeated is the conventional debug poison, and it
+/// is a deliberate choice over `0x00` or `0xFF` for two reasons: it is
+/// unmistakable in a memory dump, and `0xA5A5A5A5` is an **odd**
+/// address, so a guest that reads it out of an uninitialized field and
+/// then dereferences it as a pointer takes an address error on a 68000
+/// immediately rather than quietly reading somewhere plausible. A bug
+/// that announces itself beats one that limps on.
+pub const DIRTY_HEAP_FILL_BYTE: u8 = 0xA5;
+
 /// A bound on how many recently-freed allocations [`GuestHeap`] remembers
 /// for [`GuestHeap::recently_freed_info`], independent of whether the
 /// free quarantine itself is enabled. This is a plain ring buffer over a
@@ -320,6 +330,19 @@ pub struct GuestHeap {
     /// plain counter rather than a wall-clock timestamp -- see
     /// `FreedAllocInfo::serial`'s doc.
     next_free_serial: u64,
+    /// The byte every non-`MEMF_CLEAR` allocation's user range should be
+    /// filled with, or `None` (the default) to leave it alone -- issue
+    /// #80's `--dirty-heap`.
+    ///
+    /// This is **policy only**. `GuestHeap` deliberately never reads or
+    /// writes guest memory itself (see this type's own doc), so it
+    /// stores the pattern but never applies it; `crate::execmem`'s alloc
+    /// handlers, which already hold both the memory and the
+    /// `MEMF_CLEAR` requirement bits, do the filling. Keeping the flag
+    /// here rather than threading a bool through `HandlerContext` is
+    /// what makes it reachable from all three of `AllocMem`/`AllocVec`/
+    /// `AllocPooled` without a new plumbing parameter.
+    dirty_fill: Option<u8>,
 }
 
 impl GuestHeap {
@@ -354,7 +377,23 @@ impl GuestHeap {
             quarantine_bytes: 0,
             recently_freed: VecDeque::new(),
             next_free_serial: 0,
+            dirty_fill: None,
         }
+    }
+
+    /// Sets the byte that `crate::execmem`'s alloc handlers should fill
+    /// every non-`MEMF_CLEAR` allocation's user range with, or `None` to
+    /// leave fresh allocations as they are (the default). See
+    /// [`GuestHeap::dirty_fill`]'s field doc for why this heap stores
+    /// the policy but never applies it, and
+    /// [`DIRTY_HEAP_FILL_BYTE`] for the conventional value.
+    pub fn set_dirty_fill(&mut self, fill: Option<u8>) {
+        self.dirty_fill = fill;
+    }
+
+    /// The configured `--dirty-heap` fill byte, if any.
+    pub fn dirty_fill(&self) -> Option<u8> {
+        self.dirty_fill
     }
 
     /// Builder-style: enables redzones at `redzone_size` bytes (rounded
