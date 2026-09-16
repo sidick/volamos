@@ -1359,6 +1359,11 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     for i in 0..struct_size {
         ctx.mem.write_u8(addr.wrapping_add(i), 0);
     }
+    // After the zeroing, never before -- those writes heal shadow
+    // bytes, so poisoning first would flag this handler's own
+    // initialisation. `false` because the block is zeroed, hence
+    // initialised. See `crate::execmem::poison_allocation_edges`.
+    crate::execmem::poison_allocation_edges(ctx, addr, false);
     ctx.cpu.set_data_register(DataRegister(0), addr);
     Ok(())
 }
@@ -1390,6 +1395,8 @@ fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         });
     }
 
+    // Before the free, while the extent is still queryable.
+    crate::execmem::poison_freed_block(ctx, addr);
     ctx.heap
         .free(addr)
         .map_err(|e| DispatchError::HandlerFailed {
