@@ -50,6 +50,7 @@ pub mod intuition;
 pub mod loader;
 pub mod locale;
 pub mod lvos;
+pub mod m68kops;
 pub mod mathlibs;
 pub mod memory;
 pub mod sanitize;

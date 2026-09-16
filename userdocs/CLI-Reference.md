@@ -302,10 +302,44 @@ What it catches:
   too-small buffer to a `dos.library` call is caught without any
   per-function instrumentation.
 
+It also catches two classes of stack bug:
+
+- **Accesses below the stack pointer** — reading or writing memory a
+  program has already released, or running off the bottom of the live
+  stack. Accesses within 64 bytes below the stack pointer are forgiven,
+  because on m68k a push *writes* below the stack pointer by definition
+  (`move.l d0,-(sp)` decrements as part of the store, and `MOVEM` can
+  move 64 bytes at once), so a stricter rule reports every subroutine
+  call any program makes. valgrind forgives the same window for the
+  same reason.
+- **Return-address corruption**, via a shadow call stack that records
+  the address each `JSR`/`BSR` pushes and verifies it at the matching
+  return:
+
+  ```
+  return address corrupted at stack slot 0x00fffff8: expected 0x00002ace, found 0x00002ada from PC 0x00002ad8
+  ```
+
+  This is stack-smash detection, and it is something valgrind does not
+  offer. It stays quiet on the legitimate `move.l #target,-(sp)` + `rts`
+  computed-jump idiom, which has no matching call, and it survives
+  `StackSwap` (a program moving to an entirely different stack).
+
 Violations are reported to stderr after the run, deduplicated by
 (PC, address, kind) with a hit count, and the guest is left to continue
 — this is a detector, not an enforcer, so one run surfaces every bug
-rather than dying at the first.
+rather than dying at the first. A multi-byte access that straddles into
+poisoned memory reports once, at the first offending byte, rather than
+once per byte.
+
+!!! note "Verified against real software"
+    `--sanitize` runs the real PhxAss assembler, real pLhA listing a
+    102-file archive, and the real SAS/C 6.58 compiler with **zero**
+    violations, and `sc`'s output object file is byte-identical to an
+    unsanitized run's. Getting there took fixing several false-positive
+    sources that unit tests could never have surfaced — a sanitizer that
+    flags correct code is worse than no sanitizer, so if you do see a
+    report from a program you believe is correct, it is worth filing.
 
 !!! note "It forces the interpreter"
     `--sanitize` turns the JIT off even if `--jit` was also given. The
@@ -318,8 +352,9 @@ rather than dying at the first.
     Overflows *within* a stack frame — a 16-byte local overflowing into
     the local next to it — need compiler instrumentation to detect, and
     are invisible here for the same reason they're invisible to
-    valgrind. Stack corruption becomes visible only once it reaches
-    something tracked, such as a return address or a heap block.
+    valgrind. Such corruption becomes visible only once it reaches
+    something tracked: a return address, a heap redzone, or memory below
+    the stack pointer.
 
     `AvailMem` also legitimately reports less free memory under
     `--sanitize`, because redzone and quarantined bytes genuinely aren't

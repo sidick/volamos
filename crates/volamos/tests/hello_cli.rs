@@ -34,6 +34,75 @@ fn sanitize_memtest(mode: &str) -> String {
     String::from_utf8(output.stderr).unwrap()
 }
 
+/// Path to `fixtures/stacktest`, the stack-bug fixture (issue #65
+/// increment 2). See `fixtures/README.md` for its modes.
+const STACKTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/stacktest");
+
+/// As [`sanitize_memtest`], for `fixtures/stacktest`.
+fn sanitize_stacktest(mode: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg("--sanitize")
+        .arg(STACKTEST_PATH)
+        .arg(mode)
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(
+        output.status.success(),
+        "stacktest {mode} exited with {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn sanitize_reports_nothing_for_legitimate_stack_use() {
+    // Three false-positive guards, and they matter more than the two
+    // detection tests below. `clean` is ordinary nested calls with
+    // LINK/UNLK frames; `deep` is 64 levels of recursion with MOVEM
+    // saves, so a lot of stack-pointer movement; `pushret` is the
+    // `move.l #target,-(sp)` + `rts` computed-jump idiom, which is
+    // legitimate, common Amiga code that has no matching JSR/BSR at
+    // all. `pushret` genuinely regressed once during development --
+    // volamos performs library-call returns itself, which left a stale
+    // shadow frame sitting at exactly the slot the idiom's push reused
+    // -- so this is a real guard, not a theoretical one.
+    for mode in ["clean", "deep", "pushret"] {
+        let stderr = sanitize_stacktest(mode);
+        assert!(
+            !stderr.contains("sanitizer:"),
+            "expected stacktest {mode} to report nothing, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn sanitize_catches_a_read_below_the_stack_pointer() {
+    // 128 bytes below SP -- deliberately past the grace band that
+    // forgives the push-writes-below-SP window every call makes (see
+    // volamos_core::sanitize::BELOW_SP_GRACE_BYTES).
+    let stderr = sanitize_stacktest("below");
+    assert!(
+        stderr.contains("invalid 1-byte read") && stderr.contains("below stack pointer"),
+        "expected a below-stack-pointer read violation, got: {stderr}"
+    );
+}
+
+#[test]
+fn sanitize_catches_a_corrupted_return_address() {
+    // Stack smashing, caught precisely -- something valgrind itself
+    // does not offer. The report must name both addresses, since
+    // "expected X, found Y" is the whole diagnostic value.
+    let stderr = sanitize_stacktest("smash");
+    assert!(
+        stderr.contains("return address corrupted")
+            && stderr.contains("expected")
+            && stderr.contains("found"),
+        "expected a return-address-corruption violation naming both \
+         addresses, got: {stderr}"
+    );
+}
+
 #[test]
 fn sanitize_reports_nothing_for_memtests_clean_mode() {
     // The false-positive guard, and the most important of these four: a

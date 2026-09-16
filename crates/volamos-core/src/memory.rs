@@ -140,6 +140,40 @@ impl FlatMemory {
         &mut self.bytes
     }
 
+    /// Reads a big-endian 16-bit value **without** consulting the
+    /// sanitizer shadow map, returning `0` for an out-of-range address
+    /// exactly as [`AddressSpace::read_u16`] does.
+    ///
+    /// This exists for the sanitizer's own use, and using it anywhere
+    /// else would silently create a hole in the checking. The run loop
+    /// has to look at the opcode word at `PC` before every instruction
+    /// (to classify calls and returns for the shadow call stack, see
+    /// `crate::m68kops`) and at the return-address slot the stack
+    /// pointer points to. Those are the sanitizer *inspecting* guest
+    /// memory on its own behalf, not the guest accessing it: routing
+    /// them through the checked path would attribute the sanitizer's own
+    /// reads to the guest -- inventing violations that never happened
+    /// and, worse, healing `Uninit` bytes the guest has not actually
+    /// written yet, which would mask real bugs.
+    pub fn peek_u16(&self, addr: u32) -> u16 {
+        let addr = addr as usize;
+        match self.bytes.get(addr..addr + 2) {
+            Some(slice) => u16::from_be_bytes(slice.try_into().unwrap()),
+            None => 0,
+        }
+    }
+
+    /// Reads a big-endian 32-bit value without consulting the shadow
+    /// map -- see [`Self::peek_u16`] for why this exists and why it must
+    /// not be used outside the sanitizer.
+    pub fn peek_u32(&self, addr: u32) -> u32 {
+        let addr = addr as usize;
+        match self.bytes.get(addr..addr + 4) {
+            Some(slice) => u32::from_be_bytes(slice.try_into().unwrap()),
+            None => 0,
+        }
+    }
+
     /// Installs a fresh [`ShadowMap`] sized to this memory's length, so
     /// every subsequent access is checked against it -- see this
     /// module's doc and the CLI's `--sanitize` flag.
@@ -308,6 +342,34 @@ mod tests {
     use crate::sanitize::PoisonReason;
 
     #[test]
+    fn peek_bypasses_the_shadow_map_entirely() {
+        // The sanitizer's own inspection of guest memory (opcode words,
+        // return-address slots) must not be attributed to the guest --
+        // see peek_u16's doc. Poison a range, peek it, and confirm
+        // nothing was recorded and no Uninit byte was healed.
+        let mut mem = FlatMemory::new(64);
+        mem.enable_sanitizer();
+        let shadow = mem.shadow_mut().unwrap();
+        shadow.mark_unaddressable(0, 8, PoisonReason::Redzone);
+        shadow.mark_uninit(8, 8);
+
+        assert_eq!(mem.peek_u16(0), 0);
+        assert_eq!(mem.peek_u32(8), 0);
+
+        let shadow = mem.shadow().unwrap();
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "peeking must never record a violation"
+        );
+        assert_eq!(
+            shadow.state(8),
+            crate::sanitize::ShadowState::Uninit,
+            "peeking must not heal Uninit bytes the guest hasn't written"
+        );
+    }
+
+    #[test]
     fn without_enable_sanitizer_shadow_is_none_and_fast_mem_stays_available() {
         let mem = FlatMemory::new(16);
         assert!(mem.shadow().is_none());
@@ -345,7 +407,9 @@ mod tests {
 
         mem.write_u32(6, 0xAABB_CCDD);
 
-        assert_eq!(mem.shadow().unwrap().violation_count(), 2);
+        // One violation, not one per straddled byte -- see
+        // ShadowMap::check_write's doc on reporting once per access.
+        assert_eq!(mem.shadow().unwrap().violation_count(), 1);
         // The write still proceeds (detector, not enforcer) -- see
         // crate::sanitize's module doc.
         assert_eq!(mem.read_u8(6), 0xAA);

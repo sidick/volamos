@@ -601,3 +601,211 @@ exactly as expected for "same program, different assembler
 optimization level," not a logic bug. If you change `memtest.s`, update
 `gen_memtest.py` to match (or vice versa), and re-run both builds plus
 the `vamos`/`volamos` mode sweep above before trusting the result.
+
+## issue #65 increment 2 fixture: `stacktest`
+
+Source: `stacktest.s`; generator: `gen_stacktest.py` (same dual
+convention, shared `strmatch` dispatch idiom, and `amiga_asm.py`
+assembler as `memtest.s`/`gen_memtest.py`). Added to validate
+volamos's `--sanitize` mode's two **stack** detectors, on top of
+`memtest`'s heap coverage (kept separate rather than growing `memtest`,
+since `memtest`'s own two build paths are already in sync and this is a
+distinct concern):
+
+1. **Below-stack-pointer accesses** -- everything below the current SP
+   is dead memory; reading or writing there means a program is using a
+   released stack frame or overrunning downward.
+2. **Return-address corruption** -- a shadow call stack records the
+   return address each `JSR`/`BSR` pushes and verifies it at the
+   matching `RTS`.
+
+### What it does
+
+Real startup (`AbsExecBase` -> `OpenLibrary("dos.library", 0)` via
+`-552(a6)`, unchecked), identical command-line-cursor-in-`A2` and
+`strmatch` dispatch mechanism as `memtest.s` (see that section above for
+the full derivation -- copied verbatim into `stacktest.s`, not
+re-derived). `A3` = dos.library base, `A4` = `ExecBase` (read but
+otherwise unused -- this fixture makes no `exec.library` calls; that's
+`memtest`'s job), `A6` swapped to the target library base immediately
+before every `jsr` (the `exectest.s`/issue #6 convention), `A5` used as
+the frame pointer for `clean`'s `LINK`/`UNLK` frames (deliberately not
+`A6`, which stays reserved for library-base swapping).
+
+### Modes and expected `--sanitize` behaviour
+
+| mode | what it does | expected sanitizer report |
+|---|---|---|
+| `below` | read 1 byte at `sp-128`, without moving `sp` | below-stack-pointer **read** violation at `sp-128` |
+| `smash` | `bsr` into a subroutine that overwrites its own just-pushed return address with the address of a real label, then `rts`'s | return-address-corruption violation reported at the matching `rts`, **and** the process still completes normally (see design note below) |
+| `clean` | three nested `bsr`/`rts` levels, each a `link`/`unlk` frame with a local variable written and read at a fixed frame-pointer-relative displacement | **zero violations** -- ordinary, textbook-correct code |
+| `pushret` | `move.l #target,-(sp)` / `rts`, the classic m68k computed-jump idiom, with **no matching `jsr`/`bsr` anywhere** | **zero violations** -- the single most important false-positive guard in this fixture; the shadow call stack must recognise an `rts` with nothing to match on the call stack as legitimate, not as corruption |
+| `deep` | `bsr`-recurse 64 levels deep (each level also `movem.l`-pushes/pops `D0`, so real `SP` movement happens at every level), unwind cleanly | **zero violations** -- exercises call-stack depth bookkeeping and below-SP delta tracking under a lot of genuine, fully-balanced `SP` movement |
+
+(no argument, or an unrecognised one) prints a usage line and exits 0.
+Every mode exits `0` via a plain `rts` (`--sanitize`'s stack detectors
+don't exist yet as of this writing -- this fixture and the table above
+are what a future `crates/volamos/tests/` case will assert against once
+they land; **not observed firing**, only reasoned about from the
+program's own construction).
+
+Run e.g. `volamos fixtures/stacktest clean` (no `-V`/`-a` needed --
+nothing here touches the filesystem). Verbatim output for every mode,
+from the current build:
+
+```
+$ ./target/debug/volamos fixtures/stacktest
+usage: stacktest below|smash|clean|pushret|deep
+$ ./target/debug/volamos fixtures/stacktest below
+below: reading 128 bytes below the current stack pointer
+$ ./target/debug/volamos fixtures/stacktest smash
+smash: corrupting a return address, landing on valid code
+$ ./target/debug/volamos fixtures/stacktest clean
+clean: three nested link/unlk frames with locals
+$ ./target/debug/volamos fixtures/stacktest pushret
+pushret: move.l #target,-(sp) / rts, no matching bsr
+$ ./target/debug/volamos fixtures/stacktest deep
+deep: 64 levels of clean bsr/rts recursion
+```
+
+Every invocation above exits `0`, including `smash` -- confirming the
+overwritten return address really did land on `smash_landing` rather
+than falling through to the canary exit code 98 that only runs if the
+overwrite silently failed.
+
+### The `smash` design constraint
+
+`smash`'s corrupted return address is the address of a real code label
+(`smash_landing`), never garbage like `$DEADBEEF`. Overwriting a return
+address with an arbitrary/invalid address would send the CPU's PC into
+unmapped or nonsense memory and likely crash the run before it
+finished -- useless for an automated test that wants to assert *both*
+"the process ran to completion and exited 0" *and* "the sanitizer
+reported a violation for the corrupted slot." Landing on a real label
+keeps the *program* well-behaved while still corrupting the *return
+address slot* the shadow call stack is watching -- exactly the shape the
+detector needs to catch, and the only shape a fully-automated test can
+assert against without also racing a segfault.
+
+### New `amiga_asm.py` encoders
+
+Five new `CodeBuilder` instructions, added in the same style/rigor as
+their neighbours:
+
+- `link_a`/`unlk_a` -- `LINK An,#disp16`/`UNLK An`, for `clean`'s stack
+  frames.
+- `move_l_imm_to_disp_a` -- `move.l #imm,<disp16>(An)`, the long-sized
+  sibling of the existing `move_w_imm_to_disp_a`/`move_b_imm_to_disp_a`
+  (same extension-word order: immediate first, then displacement), for
+  writing a `link`-frame local.
+- `move_l_codelabel_to_ind_a` -- `move.l #label,(An)`, where `label` is
+  a **code** label (resolved against the CODE hunk itself, hunk 0,
+  unlike every earlier `move_l_label_to_*` helper's DATA-hunk, hunk 1,
+  labels). Used by `smash` to overwrite a just-pushed return address in
+  place.
+- `move_l_codelabel_to_predec_a` -- `move.l #label,-(An)`, same
+  code-label-pointer mechanism with predecrement addressing; for `An=7`
+  this is the well-known `0x2F3C <imm32>` encoding real Amiga
+  trampolines use. Used by `pushret`.
+
+Since two of these need an absolute pointer into the *code* hunk rather
+than the data hunk, `CodeBuilder.resolve`/`build_hunk_executable` were
+generalized (backward-compatibly -- every existing fixture generator
+was re-run and produces byte-identical output, see below) to support
+`HUNK_RELOC32` groups targeting more than one hunk, since the format
+already supports multiple `(count, hunk, offsets...)` groups before the
+terminating zero count.
+
+**Verified byte-identical against real PhxAss's own output**, per this
+issue's own requirement (same cross-check discipline as `memtest`'s
+encoders). A tiny probe source exercising all five new instructions was
+assembled through PhxAss under `volamos`:
+
+```
+        section code
+start:
+        link    a5,#-8
+        move.l  #$11111111,-8(a5)
+        move.l  #target,(a7)
+        move.l  #target,-(a7)
+        unlk    a5
+        rts
+target:
+        moveq   #0,d0
+        rts
+        section data,data
+dummy:
+        dc.b    0
+        even
+```
+
+PhxAss's code-hunk payload (32 bytes, offset `0x24` of the output file):
+
+```
+4e55 fff8 2b7c 1111 1111 fff8 2ebc 0000 001c 2f3c 0000 001c 4e5d 4e75 7000 4e75
+```
+
+`amiga_asm.py`'s `CodeBuilder` (`link_a(5,-8)`,
+`move_l_imm_to_disp_a(5,-8,0x11111111)`,
+`move_l_codelabel_to_ind_a(7,"target")`,
+`move_l_codelabel_to_predec_a(7,"target")`, `unlk_a(5)`, `rts()`,
+`moveq(0,0)`, `rts()`), run through the same `build_hunk_executable`,
+produced the identical 32-byte code-hunk payload byte-for-byte:
+
+```
+4e55 fff8 2b7c 1111 1111 fff8 2ebc 0000 001c 2f3c 0000 001c 4e5d 4e75 7000 4e75
+```
+
+`4e55`=`link a5,#-8`; `2b7c`=`move.l #imm,-8(a5)` (long-size MOVE with
+dest mode `d16(An)`); `2ebc`/`2f3c`=`move.l #imm,(a7)`/`move.l
+#imm,-(a7)` respectively, both pointing at the same `target` offset
+(`0x1c` bytes into the hunk, confirming the code-label fixup resolved
+correctly); `4e5d`=`unlk a5`. Match confirmed with a byte-for-byte
+Python comparison, not eyeballing.
+
+### Regenerating
+
+`stacktest.s` is written for, and was actually assembled with, the real
+**PhxAss 4.40** assembler running *under `volamos` itself*, same
+convention as `memtest.s`:
+
+```sh
+mkdir -p /tmp/phx && cp fixtures/stacktest.s /tmp/phx/
+./target/debug/volamos -V work:/tmp/phx ~/amiga/PhxAss/PhxAss work:stacktest.s
+cp /tmp/phx/stacktest fixtures/stacktest
+```
+
+PhxAss emits a hunk **executable** directly (no linker or `EXE/S`
+switch needed, since this program has no external references).
+PhxAss reported "Bytes gained by optimization: 36" for this source, no
+errors.
+
+Since PhxAss isn't part of this repo and can't be relied on in CI (or
+on a machine without it fetched from Aminet), `gen_stacktest.py` (via
+`amiga_asm.py`) remains the authoritative, byte-identical (for its own
+instruction encodings; see below), toolchain-free build actually
+committed as `fixtures/stacktest`:
+
+```sh
+python3 fixtures/gen_stacktest.py
+```
+
+**Cross-checked, not byte-identical, confirmed equivalent** -- same
+relationship as `memtest`'s two builds. Both paths were built and every
+mode run through `volamos` for this issue; they agree on every mode's
+output and exit code (including `smash` exiting `0`, not its canary 98,
+under both builds). The raw bytes differ for the same reason as
+`memtest`: PhxAss's optimizer collapses several word-form `bra`/`beq`/
+`bne`/`bsr` branches into short 8-bit-displacement forms that
+`amiga_asm.py`'s `CodeBuilder.branch` never emits. Structurally the two
+binaries are identical -- same hunk count and order
+(`HUNK_HEADER`/`CODE`/`RELOC32`/`END`/`DATA`/`END`), same 90-longword
+(360-byte) data hunk, and the exact same `HUNK_RELOC32` group split (2
+pointers targeting hunk 0 -- the two code-label pointers `smash`/
+`pushret` need -- and 12 pointers targeting hunk 1, the data hunk) --
+only the code hunk's own size (`gen_stacktest.py`: 98 longwords/392
+bytes; PhxAss: 90 longwords/360 bytes) differs, exactly as expected for
+"same program, different assembler optimization level." If you change
+`stacktest.s`, update `gen_stacktest.py` to match (or vice versa), and
+re-run both builds plus the mode sweep above before trusting the
+result.

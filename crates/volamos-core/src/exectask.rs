@@ -920,6 +920,29 @@ fn stack_swap_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     ctx.mem.write_u32(new_sp, return_addr);
     ctx.cpu.set_address_register(AddressRegister(7), new_sp);
 
+    // Tell the sanitizer's shadow map about the switch, if one is
+    // active (`--sanitize`). This has to be `new_sp` -- the *post-push*
+    // A7, not `new_pointer` (the "nothing pending" value read from the
+    // struct) -- because `new_sp` is where the live stack pointer
+    // actually ends up and what every subsequent instruction will be
+    // checked against; passing `new_pointer` instead would poison
+    // `[new_lower, new_pointer)` as BelowStackPointer, which includes
+    // `new_sp` itself -- the very slot this handler just wrote the real,
+    // live return address into. The generic post-dispatch `rts` (see
+    // this module's `StackSwap` doc) reads that slot before this
+    // function's caller ever gets a chance to run another
+    // update_stack_pointer call, so poisoning it here would report a
+    // false "invalid read (below stack pointer)" on volamos's own
+    // bookkeeping, for every single StackSwap call. Using
+    // `reset_stack_tracking` (rather than plumbing this through the
+    // generic per-instruction `update_stack_pointer` path) matters too:
+    // see that method's doc for why a StackSwap needs eager,
+    // handler-driven cleanup instead of waiting for the run loop to
+    // eventually notice the SP left the old region.
+    if let Some(shadow) = ctx.mem.shadow_mut() {
+        shadow.reset_stack_tracking(new_lower, new_upper, new_sp);
+    }
+
     Ok(())
 }
 
