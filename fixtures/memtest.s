@@ -48,6 +48,25 @@
 ;                MEMF_CLEAR, then read offset 0 without ever writing
 ;                it. MEMF_CLEAR memory is genuinely initialized, so
 ;                this must report NOTHING even under --sanitize-uninit.
+;   zerodep   -- issue #80 fixture for volamos's `--dirty-heap` flag.
+;                AllocMem 32 bytes *without* MEMF_CLEAR, read a
+;                LONGWORD at offset 0 without ever writing it, and
+;                BRANCH on the value -- unlike `uninit` (which only
+;                reads), this mode actually ACTS on the uninitialized
+;                value, printing one of two different lines depending
+;                on which way the branch went. Under plain volamos
+;                today (no --dirty-heap yet) the read is always zero
+;                (volamos's memory starts zeroed regardless of
+;                MEMF_CLEAR), so this mode always takes the "zero
+;                path" and prints the line documenting that as the
+;                bug. Once --dirty-heap fills non-MEMF_CLEAR
+;                allocations with a poison pattern, the same binary
+;                should take the "garbage path" instead -- a different
+;                line of output. Under --sanitize-uninit this read
+;                should still report one uninitialized-read violation
+;                at block+0, exactly like `uninit` (--dirty-heap's
+;                fill must not mark the bytes initialized, so the two
+;                features compose rather than cancel).
 ;
 ; No argument, or an unrecognised one, prints a usage line and exits 0.
 ; Every mode PutStr's a short self-describing line before doing its
@@ -175,6 +194,12 @@ start:
         bsr     strmatch
         tst.l   d0
         bne     mode_cleared
+
+        move.l  a2,a1
+        move.l  #kw_zerodep,a0
+        bsr     strmatch
+        tst.l   d0
+        bne     mode_zerodep
 
         bra     mode_usage
 
@@ -436,6 +461,44 @@ mode_cleared:
         moveq   #0,d0
         rts
 
+; --- zerodep: alloc 32 bytes *without* MEMF_CLEAR, read a longword at
+; offset 0 without ever writing it, and BRANCH on the value -- see the
+; header comment above for the full rationale. ---
+mode_zerodep:
+        move.l  a3,a6
+        move.l  #msg_zerodep,d1
+        jsr     -948(a6)                 ; PutStr
+        move.l  a4,a6
+        moveq   #32,d0
+        moveq   #0,d1                    ; no MEMF_CLEAR -- block starts fully Uninit
+        jsr     -198(a6)                 ; AllocMem(32,0) -> D0
+        tst.l   d0
+        beq     allocfail
+        move.l  d0,a2
+
+        move.l  0(a2),d0                 ; the uninitialized read itself
+        tst.l   d0
+        beq     zerodep_zero
+
+zerodep_nonzero:
+        move.l  a3,a6
+        move.l  #msg_zerodep_nonzero,d1
+        jsr     -948(a6)                 ; PutStr
+        bra     zerodep_done
+
+zerodep_zero:
+        move.l  a3,a6
+        move.l  #msg_zerodep_zero,d1
+        jsr     -948(a6)                 ; PutStr
+
+zerodep_done:
+        move.l  a4,a6
+        move.l  a2,a1
+        moveq   #32,d0
+        jsr     -210(a6)                 ; FreeMem(block,32)
+        moveq   #0,d0
+        rts
+
 ; --- usage: no argument, or an unrecognised one ---
 mode_usage:
         move.l  a3,a6
@@ -482,6 +545,9 @@ kw_written:
 kw_cleared:
         dc.b    "cleared",0
         even
+kw_zerodep:
+        dc.b    "zerodep",0
+        even
 
 msg_clean:
         dc.b    "clean: alloc 32 bytes, write+read all 32, free",10,0
@@ -507,8 +573,17 @@ msg_written:
 msg_cleared:
         dc.b    "cleared: alloc 32 bytes with MEMF_CLEAR, read offset 0 unwritten",10,0
         even
+msg_zerodep:
+        dc.b    "zerodep: alloc 32 bytes without MEMF_CLEAR, read+branch on offset 0 unwritten",10,0
+        even
+msg_zerodep_zero:
+        dc.b    "zerodep: read 0 -- took the zero path (this is the bug: it only works because the memory happened to be zero)",10,0
+        even
+msg_zerodep_nonzero:
+        dc.b    "zerodep: read non-zero -- took the garbage path",10,0
+        even
 msg_usage:
-        dc.b    "usage: memtest clean|overrun|underrun|uaf|uninit|uninitpartial|written|cleared",10,0
+        dc.b    "usage: memtest clean|overrun|underrun|uaf|uninit|uninitpartial|written|cleared|zerodep",10,0
         even
 msg_allocfail:
         dc.b    "AllocMem failed",10,0

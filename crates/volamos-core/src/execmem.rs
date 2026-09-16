@@ -173,6 +173,33 @@ fn round_up_8(value: u32) -> u32 {
 /// section.
 const ALLOCVEC_HEADER_SIZE: u32 = 8;
 
+/// Fills a freshly-allocated block's user range with the
+/// `--dirty-heap` poison pattern, if one is configured on the heap
+/// (issue #80). A no-op otherwise.
+///
+/// Real `AllocMem` without `MEMF_CLEAR` returns whatever debris was in
+/// that memory. volamos's guest memory starts zeroed, so an uncleared
+/// allocation reads as zeros and a guest that relies on that takes the
+/// lucky path every time -- masking a bug that fails sporadically on
+/// real hardware. This makes the debris real.
+///
+/// **Call this at exactly the same point the `MEMF_CLEAR` zeroing
+/// happens, i.e. before `poison_allocation_edges`.** The ordering is
+/// what makes `--dirty-heap` and `--sanitize-uninit` compose instead of
+/// cancelling out: these writes go through the checked path and so heal
+/// their shadow bytes to valid, and `poison_allocation_edges` then
+/// re-marks the user range uninitialized afterwards. Filling *after*
+/// the poison step would instead mark every byte initialized and
+/// silence uninitialized-read reporting entirely.
+fn apply_dirty_fill<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32, len: u32) {
+    let Some(byte) = ctx.heap.dirty_fill() else {
+        return;
+    };
+    for i in 0..len {
+        ctx.mem.write_u8(addr.wrapping_add(i), byte);
+    }
+}
+
 /// Poisons the sanitizer shadow map around a freshly-created allocation
 /// at `addr` (issue #65). A no-op unless both a shadow map is installed
 /// (`--sanitize`) and the allocation actually exists in the heap.
@@ -276,9 +303,12 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
                 for i in 0..rounded {
                     ctx.mem.write_u8(addr.wrapping_add(i), 0);
                 }
+            } else {
+                apply_dirty_fill(ctx, addr, rounded);
             }
-            // After the MEMF_CLEAR loop, never before -- see
-            // `poison_allocation_edges`' doc comment.
+            // After the MEMF_CLEAR loop and the dirty fill, never
+            // before -- see `poison_allocation_edges`' and
+            // `apply_dirty_fill`'s doc comments.
             poison_allocation_edges(ctx, addr, !cleared);
             ctx.cpu.set_data_register(DataRegister(0), addr);
         }
@@ -391,6 +421,14 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
                 for i in 0..user_rounded {
                     ctx.mem.write_u8(user_ptr.wrapping_add(i), 0);
                 }
+            } else {
+                // The *user* range only, deliberately not the 8-byte
+                // header written just above: that header is this
+                // runtime's own bookkeeping (`FreeVec` needs it), not
+                // memory the guest asked for, and poisoning it would
+                // corrupt the allocation rather than the guest's view
+                // of it.
+                apply_dirty_fill(ctx, user_ptr, user_rounded);
             }
             // Poison the redzones around the *whole* block (header
             // included -- the header is ours, not the guest's, but it
@@ -546,6 +584,8 @@ fn alloc_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
                 for i in 0..rounded {
                     ctx.mem.write_u8(addr.wrapping_add(i), 0);
                 }
+            } else {
+                apply_dirty_fill(ctx, addr, rounded);
             }
             poison_allocation_edges(ctx, addr, !cleared);
             ctx.cpu.set_data_register(DataRegister(0), addr);
@@ -816,6 +856,106 @@ mod tests {
         let mut full = movea_exec_base_to_a6().to_vec();
         full.extend_from_slice(words);
         runtime_with_program(&full)
+    }
+
+    #[test]
+    fn dirty_heap_fills_a_non_memf_clear_block_with_the_poison_pattern() {
+        // Issue #80: without --dirty-heap a fresh block reads as the
+        // zeros volamos's memory starts as, so a guest relying on
+        // uncleared memory being zero takes the lucky path every time
+        // and its bug stays hidden. With the fill on, the debris is
+        // real -- as it is on hardware.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // D1 = 0, i.e. NO MEMF_CLEAR
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-198));
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.enable_dirty_heap();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0, "AllocMem(64) should not return NULL");
+
+        for i in 0..64u32 {
+            assert_eq!(
+                rt.memory().read_u8(addr + i),
+                crate::guestmem::DIRTY_HEAP_FILL_BYTE,
+                "byte {i} of a non-MEMF_CLEAR block should carry the poison pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_heap_does_not_override_memf_clear() {
+        // MEMF_CLEAR is a documented guarantee of zeroed memory. A
+        // guest that asks for it is entitled to zeros whatever
+        // debugging flags the host was given, so --dirty-heap must not
+        // touch those allocations.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1));
+        words.push((MEMF_CLEAR >> 16) as u16);
+        words.push(MEMF_CLEAR as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-198));
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.enable_dirty_heap();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+
+        for i in 0..64u32 {
+            assert_eq!(rt.memory().read_u8(addr + i), 0, "MEMF_CLEAR still wins");
+        }
+    }
+
+    #[test]
+    fn dirty_heap_and_uninit_reporting_compose_instead_of_cancelling() {
+        // The trap issue #80 flagged: the fill's writes go through the
+        // checked path and so heal their own shadow bytes to valid. If
+        // the fill ran *after* `poison_allocation_edges` every byte
+        // would end up marked initialised and --sanitize-uninit would
+        // report nothing at all -- two features that each look correct
+        // in isolation, silently neutralising each other. The fill
+        // therefore happens at the same point as the MEMF_CLEAR
+        // zeroing, before the poison step re-marks the user range.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // no MEMF_CLEAR
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-198));
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.enable_dirty_heap();
+        // `program()` doesn't install a shadow map, so do it explicitly
+        // -- the point of this test is the interaction between the two
+        // features, which needs both switched on.
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+
+        let shadow = rt.memory().shadow().expect("sanitizer was enabled above");
+        assert_eq!(
+            shadow.state(addr),
+            crate::sanitize::ShadowState::Uninit,
+            "the filled bytes must still read as uninitialised, or --dirty-heap \
+             would silence --sanitize-uninit entirely"
+        );
     }
 
     #[test]

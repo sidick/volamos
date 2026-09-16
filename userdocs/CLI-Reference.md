@@ -411,6 +411,51 @@ noise, but a single violation's detail (for a corrupted return address,
 the expected and actual addresses) is the whole diagnostic value and is
 never collapsed away.
 
+## `--dirty-heap`
+
+Fills every `AllocMem`/`AllocVec`/`AllocPooled` block allocated
+**without** `MEMF_CLEAR` with the byte `0xA5`, instead of leaving it as
+the zeros volamos's guest memory happens to start as.
+
+```console
+$ volamos fixtures/memtest zerodep
+zerodep: read 0 -- took the zero path (this is the bug: it only works because the memory happened to be zero)
+
+$ volamos --dirty-heap fixtures/memtest zerodep
+zerodep: read non-zero -- took the garbage path
+```
+
+Real `AllocMem` without `MEMF_CLEAR` returns whatever debris was in
+that memory — usually a previous allocation's leftovers. volamos's
+memory starts zeroed, so a program that relies on uncleared memory
+being zero works perfectly here while failing sporadically on real
+hardware, depending on what ran before it. This flag makes that debris
+real, so the bug shows up as a reproducible failure instead of hiding.
+
+`MEMF_CLEAR` allocations are untouched: that is a documented guarantee
+of zeroed memory, and a program that asks for it gets zeros whatever
+debugging flags the host was given.
+
+`0xA5` is the conventional debug poison, and it is chosen over `0x00`
+or `0xFF` for two reasons: it is unmistakable in a memory dump, and
+`0xA5A5A5A5` is an **odd** address — so a guest that reads it out of an
+uninitialized field and dereferences it as a pointer takes an address
+error on a 68000 immediately, rather than quietly reading somewhere
+plausible. A bug that announces itself beats one that limps on.
+
+!!! note "Independent of `--sanitize`"
+    This flag **changes what the guest sees**, whereas everything under
+    `--sanitize` only observes. That distinction is deliberate and
+    worth keeping: `--sanitize` can be trusted not to alter a program's
+    behaviour (the real SAS/C compiler's output object file is
+    byte-identical under it), so a behaviour change does not belong
+    inside it.
+
+    The two compose, though — `--dirty-heap --sanitize-uninit` both
+    fills the memory *and* reports the reads — and `--dirty-heap` works
+    on its own as a plain bug-shaker, with no shadow map and no
+    slowdown.
+
 !!! warning "What it cannot see"
     Overflows *within* a stack frame — a 16-byte local overflowing into
     the local next to it — need compiler instrumentation to detect, and

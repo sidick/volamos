@@ -120,6 +120,76 @@ fn sanitize_uninit_memtest(mode: &str) -> String {
     String::from_utf8(output.stderr).unwrap()
 }
 
+/// Runs `fixtures/memtest <mode>` with the given extra flags, returning
+/// its captured stdout. Used by the `--dirty-heap` tests, which assert
+/// on what the *guest* printed rather than on a sanitizer report.
+fn memtest_stdout(flags: &[&str], mode: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .args(flags)
+        .arg(MEMTEST_PATH)
+        .arg(mode)
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(
+        output.status.success(),
+        "memtest {mode} exited {:?}",
+        output.status
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn dirty_heap_changes_which_branch_a_zero_dependent_guest_takes() {
+    // The whole point of --dirty-heap (issue #80): `zerodep` reads an
+    // unwritten AllocMem block and *branches* on the value. Without the
+    // flag volamos hands it zeros, so it takes the lucky path and its
+    // bug stays invisible -- which is what real hardware would not do.
+    // With the flag the debris is real and the other branch runs.
+    let plain = memtest_stdout(&[], "zerodep");
+    assert!(
+        plain.contains("took the zero path"),
+        "without --dirty-heap the guest should see zeros, got: {plain}"
+    );
+
+    let dirty = memtest_stdout(&["--dirty-heap"], "zerodep");
+    assert!(
+        dirty.contains("took the garbage path"),
+        "with --dirty-heap the guest should see poison, got: {dirty}"
+    );
+}
+
+#[test]
+fn dirty_heap_and_uninit_reporting_compose() {
+    // Filling writes through the checked path and so heals the shadow
+    // bytes it touches; the poison step re-marks them afterwards. If
+    // that ordering were wrong these two flags would cancel out and the
+    // report would be empty -- see execmem's own unit test for the
+    // shadow-state half of this.
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .args(["--dirty-heap", "--sanitize-uninit"])
+        .arg(MEMTEST_PATH)
+        .arg("uninit")
+        .output()
+        .expect("failed to run the volamos binary");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("uninitialized 1-byte read"),
+        "--dirty-heap must not silence --sanitize-uninit, got: {stderr}"
+    );
+}
+
+#[test]
+fn dirty_heap_is_off_by_default_and_memf_clear_still_wins() {
+    // MEMF_CLEAR is a documented guarantee; `cleared` reads an
+    // unwritten block it asked to be zeroed, so it must take the zero
+    // path even with the fill on.
+    let dirty = memtest_stdout(&["--dirty-heap"], "cleared");
+    assert!(
+        !dirty.contains("garbage"),
+        "MEMF_CLEAR memory must stay zeroed under --dirty-heap, got: {dirty}"
+    );
+}
+
 #[test]
 fn sanitize_uninit_catches_a_read_of_never_written_heap() {
     let stderr = sanitize_uninit_memtest("uninit");
