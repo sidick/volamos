@@ -3,7 +3,7 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## 0.5
+## 0.6
 
 - **Added `--sanitize`, a valgrind/ASan-style memory sanitizer**
   (issue #65). `m68k-amigaos-gcc` has no `-fsanitize=address`, and
@@ -45,6 +45,8 @@ version scheme in `Cargo.toml`.
   real SAS/C 6.58 compiler now all run clean, with `sc`'s object file
   byte-identical to an unsanitized run's. New `fixtures/stacktest`
   covers both detectors plus three false-positive guards.
+
+## 0.5
 
 - **Fixed the guest command-line buffer's missing trailing space**
   (issue #63): whenever a launched program has at least one argument,

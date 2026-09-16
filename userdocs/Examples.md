@@ -108,6 +108,36 @@ specific call is implemented, or `-v`/`--verbose` for the full
 per-call trace (library, LVO, handler) if something still isn't
 behaving as expected.
 
+## Hunting a memory bug
+
+When a program misbehaves in ways that smell like memory corruption —
+output that changes run to run, a crash that moves when you add a
+`printf` — `--sanitize` checks every guest memory access against a
+shadow map:
+
+```console
+$ volamos --sanitize fixtures/memtest overrun
+overrun: writing 1 byte past a 32-byte block
+sanitizer: 1 distinct violation(s):
+  invalid 1-byte write at 0x00002ee0 (heap redzone) from PC 0x00002af6
+```
+
+The `fixtures/memtest` and `fixtures/stacktest` fixtures each take a
+mode argument and misbehave deliberately, so they're a quick way to see
+what each detector's output looks like: `overrun`, `underrun` and `uaf`
+for heap bugs, `below` and `smash` for stack ones. Their `clean` modes
+report nothing, which is the property that makes the flag worth
+trusting on your own programs.
+
+A violation report gives you the faulting PC, so pair it with a
+disassembly (or `-v`/`--verbose` to see which library call was in
+flight) to find the code responsible. Note that `--sanitize` forces the
+interpreter, so a sanitized run is slower — it's a debugging mode, not
+something to leave on.
+
+See [CLI Reference](CLI-Reference.md#-sanitize) for what each detector
+catches and the one class it can't see.
+
 ## Giving a program more room to run
 
 Some programs (deep recursion, large buffers, a bigger toolchain
