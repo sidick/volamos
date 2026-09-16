@@ -81,8 +81,198 @@
 //! useful thing to report, since that's the guest instruction a
 //! developer would actually want to look at.
 
+//! # Stack-pointer tracking (increment 2)
+//!
+//! Everything below the guest stack pointer is dead: a real Amiga has no
+//! guard page there either, but AmigaOS convention (like every m68k
+//! stack-based ABI) treats it as unreserved, so a read or write there
+//! means a program is reusing a frame it already released, or has
+//! overrun its stack downward. [`ShadowMap::begin_stack_tracking`]/
+//! [`ShadowMap::update_stack_pointer`] keep `[stack_base, sp)` poisoned
+//! as [`PoisonReason::BelowStackPointer`] as the guest runs.
+//!
+//! The update is deliberately **incremental**: it is called once per
+//! instruction by the run loop, so re-poisoning the whole tracked region
+//! on every call (as a naive "poison `[stack_base, sp)` from scratch"
+//! implementation would) turns an O(1) per-instruction operation into an
+//! O(stack size) one, which would make `--sanitize` unusably slow on any
+//! program that isn't trivial. Instead only the delta between the last
+//! seen SP and the new one is touched: growth (`sp` decreased) marks the
+//! newly-used bytes [`ShadowState::Uninit`] rather than
+//! [`ShadowState::Valid`] -- this is deliberate, not an oversight, since
+//! it means a later increment gets uninitialized-stack-read detection
+//! for free, and it's harmless today because [`ShadowMap::report_uninit`]
+//! defaults to off. Shrinkage (`sp` increased) marks the newly-released
+//! bytes [`PoisonReason::BelowStackPointer`]. An unchanged SP -- by far
+//! the most common case, since most instructions don't touch A7 at all
+//! -- does no work beyond the one comparison that detects this.
+//!
+//! The tricky part is that the SP can legitimately leave the tracked
+//! region entirely: `exec.library`'s `StackSwap` (see `exectask.rs`)
+//! hands a task a completely different stack with its own
+//! `tc_SPLower`/`tc_SPUpper` bounds, and supervisor mode runs on a
+//! separate supervisor stack pointer. Neither of those is a bug, so
+//! when a new SP falls outside `[stack_base, stack_top]`,
+//! [`ShadowMap::update_stack_pointer`] stops tracking -- it doesn't
+//! poison some huge bogus range trying to reach the new SP, and it
+//! doesn't panic.
+//!
+//! It used to *also* not report or clean up anything at all, on the
+//! theory that "no claims" is strictly better than "wrong claims" while
+//! we have no reliable way to know what happens to the abandoned
+//! region. That theory was only half right: doing nothing does avoid
+//! inventing new claims, but it leaves the *old* ones -- the
+//! [`PoisonReason::BelowStackPointer`] poison already written over
+//! `[stack_base, sp)` -- sitting in the shadow map indefinitely. That
+//! memory doesn't stop existing just because tracking looked away, and
+//! once some *other* stack happens to reuse the same guest addresses
+//! (which a heap-allocated `StackSwap` stack routinely does, since it
+//! comes from the same `AllocMem` pool as everything else), every
+//! ordinary access to it reports a violation against poison that no
+//! longer describes anything real. This is exactly what running the
+//! real SAS/C `sc` compiler under `--sanitize` hit: `sc` calls
+//! `StackSwap` onto its own larger heap-allocated stack and back, and
+//! the moment it did, plain reads and writes on that heap-allocated
+//! stack came back as "invalid access (below stack pointer)" -- stale
+//! poison from the *original* stack, landmining an address it no longer
+//! had anything to do with.
+//!
+//! So suspending now also **cleans up**: [`Self::update_stack_pointer`]
+//! clears the stale poison back to [`ShadowState::Valid`] over the
+//! *entire* previously-tracked region and empties the shadow call stack
+//! (see the next section) before setting `sp` to `None`. Neither action
+//! requires knowing anything about what will happen to that memory next
+//! -- retracting a claim is always safe, unlike inventing one, so this
+//! doesn't reintroduce the false-positive risk the original
+//! do-nothing design was guarding against. Tracking resumes the next
+//! time the SP is observed back inside `[stack_base, stack_top]`; unlike
+//! the old behavior of silently adopting the new SP with **no shadow-map
+//! mutation at all** (which left detection quietly off for the rest of
+//! the run for any task that ever left its stack region even once),
+//! resumption now re-poisons `[stack_base, sp)` exactly as
+//! [`Self::begin_stack_tracking`] would, so a below-SP access after
+//! resuming is caught again instead of staying invisible.
+//!
+//! `exec.library`'s `StackSwap` handler doesn't rely on this generic
+//! suspend-then-resume path at all, though: `exectask.rs`'s
+//! `stack_swap_handler` calls [`Self::reset_stack_tracking`] directly,
+//! right after completing the swap, because a *known*, atomic stack
+//! switch shouldn't have to wait for [`Self::update_stack_pointer`] to
+//! eventually notice the SP is somewhere new on some later instruction
+//! -- see that method's own doc for why the two paths, despite ending
+//! up in a similar place, are worth keeping separate.
+//!
+//! Every range this machinery ever poisons is a subset of `[stack_base,
+//! stack_top]` by construction (both the old and new SP are checked to
+//! lie in that range before a delta is computed at all), and
+//! [`ShadowMap::mark_uninit`]/[`ShadowMap::mark_unaddressable`] clamp to
+//! the map's own bounds regardless (see [`ShadowMap::clamp_range`]), so
+//! there's no path by which a stray delta -- however large -- can mark
+//! an absurd range or panic.
+//!
+//! # The shadow call stack (increment 2)
+//!
+//! Heap redzones and stack-underflow detection catch corruption near
+//! the *data* a guest program manipulates; they say nothing about a
+//! guest bug that overwrites its own return address (a classic stack
+//! buffer overflow). [`ShadowMap::record_call`]/[`ShadowMap::
+//! check_return`] add exactly that check -- something even Valgrind's
+//! memcheck doesn't offer, since it has no notion of "this stack slot
+//! holds a return address" at all.
+//!
+//! The state (a small bounded stack of `(slot address, expected return
+//! address)` pairs) lives directly on [`ShadowMap`] rather than in a
+//! separate top-level type, for the same reason the shadow bytes and
+//! the stack-pointer tracking do: the run loop already threads a
+//! `&mut ShadowMap` through call/return handling for the stack-pointer
+//! update, and a second free-standing type would just be more state for
+//! `backend.rs`/`dispatch.rs` to carry around and keep in sync for no
+//! benefit -- there's exactly one shadow-call-stack per guest run, same
+//! as there's exactly one shadow byte map.
+//!
+//! **The reconciliation rule is the important part of this design, not
+//! the happy path**, because a m68k program has several completely
+//! legitimate ways to make a return address slot disappear without ever
+//! executing a matching `RTS`:
+//!
+//! - `longjmp`-style non-local unwinding, which restores a saved SP and
+//!   simply abandons every frame between it and the current one.
+//! - A handler that manually pops its own return address off the stack
+//!   (`addq.l #4,sp` before falling through, etc).
+//! - volamos's own library-call mechanism: [`crate::dispatch`] resolves
+//!   a `JSR`-to-a-library-vector itself and performs the `RTS` in host
+//!   code -- it pops the return address the guest's `JSR` pushed and
+//!   resumes there directly, without ever executing a real `RTS`
+//!   instruction that could ask this module to check anything.
+//!
+//! So before every check, recorded frames are reconciled against the
+//! *current* SP: any frame whose slot address is below the current SP
+//! has, by definition, already had its stack space reclaimed (see the
+//! stack-pointer tracking section above -- "below SP" is exactly the
+//! region that tracking treats as dead), regardless of *how* that
+//! happened, and is discarded without comment. Only after that
+//! reconciliation does [`ShadowMap::check_return`] look at what's left:
+//!
+//! - If the top recorded frame's slot address is exactly the current
+//!   SP, this `RTS` is popping that frame's return address, so the
+//!   value actually found there is compared against what was recorded.
+//!   A mismatch is genuine corruption -- something overwrote that stack
+//!   slot after the call but before the return -- and is reported with
+//!   both the expected and the actual address, deliberately the two
+//!   most useful numbers such a report can contain.
+//! - If no recorded frame's slot matches the current SP (including the
+//!   case where there's no frame at all), **nothing is reported**. This
+//!   is not a gap in coverage, it's required correctness: `move.l
+//!   #target,-(sp)` followed by `rts` is a common, entirely legitimate
+//!   m68k idiom for a computed jump that was never a "call" in the
+//!   first place, and volamos itself arranges a return address at
+//!   process startup that no `JSR` ever pushed -- so the very first
+//!   `RTS` a guest program executes is *guaranteed* to have no matching
+//!   frame. Reporting on a non-match would make every single guest
+//!   program's first instruction sequence a false positive.
+//!
+//! There's one more way a recorded frame can become permanently
+//! unreachable that this SP-based reconciliation can't catch on its
+//! own, because it isn't a matter of the *current* SP moving past a
+//! slot: `StackSwap` (see `exectask.rs`) hands the task a completely
+//! different stack, so a frame recorded while running on the *old*
+//! stack has a `slot_sp` that has nothing to do with the *new* stack's
+//! address range at all. Reconciliation only ever compares recorded
+//! slots against the current SP, so a stale cross-stack frame simply
+//! sits in the log -- right up until the new stack happens to reuse the
+//! very same guest address for one of its own calls (unremarkable for
+//! two heap-allocated `StackSwap` stacks drawn from the same pool).
+//! At that point [`Self::check_return`] finds a slot-address match and
+//! compares the *new* stack's actual return address against the *old*
+//! stack's recorded one -- a spurious [`ViolationKind::
+//! ReturnAddressCorrupted`] for two calls that share nothing but a
+//! coincidentally-reused address. This isn't hypothetical: it's exactly
+//! what the real SAS/C `sc` compiler triggered under `--sanitize` (see
+//! the "stack-pointer tracking" doc above for the matching below-SP
+//! half of the same `StackSwap` bug). It's a different failure mode
+//! from `fixtures/stacktest`'s `pushret` case above -- that one is
+//! about *never* recording a frame for a computed jump in the first
+//! place; this one is about a frame that *was* legitimately recorded,
+//! then outlived the stack it was recorded on.
+//!
+//! [`Self::reset_stack_tracking`] closes this the same way it closes
+//! the stale-poison half: it clears the shadow call stack entirely
+//! whenever the task is known to have switched to a new stack, since no
+//! frame recorded against an abandoned stack can ever be validly
+//! returned to, and keeping it around risks exactly this collision for
+//! no benefit.
+//!
+//! Recursion means the stack can grow without bound, and a host process
+//! can't; [`MAX_CALL_STACK_DEPTH`] caps how many frames are retained,
+//! discarding the oldest (outermost) frame once the cap is hit rather
+//! than refusing the new one (the innermost, most-recently-made call is
+//! the one most likely to be relevant to whatever the guest is doing
+//! right now). Frames dropped this way are counted (see [`ShadowMap::
+//! dropped_call_frames`]) rather than silently vanishing, so a report
+//! can at least say "N frames were never checked" instead of implying a
+//! false all-clear for arbitrarily deep recursion.
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 /// The maximum number of distinct violations [`ShadowMap`] will retain.
@@ -205,6 +395,14 @@ pub enum ViolationKind {
     /// reliably mark freshly-allocated memory `Uninit` first, which
     /// this change doesn't attempt to audit for.
     UninitRead,
+    /// [`ShadowMap::check_return`] found a stack slot it had previously
+    /// recorded (via [`ShadowMap::record_call`]) a return address in,
+    /// but the value now stored there doesn't match -- something wrote
+    /// over the return address between the call and the return. See
+    /// this module's "shadow call stack" doc for the reconciliation
+    /// rule that keeps this from firing on legitimate non-`RTS`
+    /// unwinding.
+    ReturnAddressCorrupted,
 }
 
 /// One distinct kind of bad access, deduplicated by `(pc, addr, kind)`
@@ -231,6 +429,14 @@ pub struct Violation {
     /// [`ViolationKind::UninitRead`] (there's no "poison reason" for
     /// merely-uninitialized memory).
     pub reason: Option<PoisonReason>,
+    /// For [`ViolationKind::ReturnAddressCorrupted`] only: the return
+    /// address that [`ShadowMap::record_call`] recorded for this slot.
+    /// `None` for every other kind.
+    pub expected_return_addr: Option<u32>,
+    /// For [`ViolationKind::ReturnAddressCorrupted`] only: the value
+    /// [`ShadowMap::check_return`] actually found in that slot. `None`
+    /// for every other kind.
+    pub actual_return_addr: Option<u32>,
     /// How many times this exact `(pc, addr, kind)` combination has
     /// been recorded.
     pub hits: u64,
@@ -238,23 +444,41 @@ pub struct Violation {
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let access = match self.kind {
-            ViolationKind::InvalidRead => "invalid",
-            ViolationKind::InvalidWrite => "invalid",
-            ViolationKind::UninitRead => "uninitialized",
-        };
-        let verb = match self.kind {
-            ViolationKind::InvalidRead | ViolationKind::UninitRead => "read",
-            ViolationKind::InvalidWrite => "write",
-        };
-        write!(
-            f,
-            "{access} {size}-byte {verb} at {addr:#010x}",
-            size = self.size,
-            addr = self.addr,
-        )?;
-        if let Some(reason) = self.reason {
-            write!(f, " ({reason})")?;
+        if self.kind == ViolationKind::ReturnAddressCorrupted {
+            // Deliberately not folded into the generic "N-byte
+            // read/write at ADDR" phrasing below: this isn't an access
+            // against a poisoned byte, it's a value mismatch, and the
+            // two addresses being compared are the single most useful
+            // thing such a report can print (see this module's "shadow
+            // call stack" doc).
+            write!(
+                f,
+                "return address corrupted at stack slot {addr:#010x}: expected {expected:#010x}, found {actual:#010x}",
+                addr = self.addr,
+                expected = self.expected_return_addr.unwrap_or(0),
+                actual = self.actual_return_addr.unwrap_or(0),
+            )?;
+        } else {
+            let access = match self.kind {
+                ViolationKind::InvalidRead => "invalid",
+                ViolationKind::InvalidWrite => "invalid",
+                ViolationKind::UninitRead => "uninitialized",
+                ViolationKind::ReturnAddressCorrupted => unreachable!(),
+            };
+            let verb = match self.kind {
+                ViolationKind::InvalidRead | ViolationKind::UninitRead => "read",
+                ViolationKind::InvalidWrite => "write",
+                ViolationKind::ReturnAddressCorrupted => unreachable!(),
+            };
+            write!(
+                f,
+                "{access} {size}-byte {verb} at {addr:#010x}",
+                size = self.size,
+                addr = self.addr,
+            )?;
+            if let Some(reason) = self.reason {
+                write!(f, " ({reason})")?;
+            }
         }
         write!(f, " from PC {pc:#010x}", pc = self.pc)?;
         if self.hits > 1 {
@@ -311,6 +535,53 @@ const VALID_BYTE: u8 = 0;
 const UNINIT_BYTE: u8 = 1;
 const UNADDRESSABLE_TAG: u8 = 0x80;
 
+/// The tracked guest stack region and the last SP [`ShadowMap::
+/// update_stack_pointer`] observed inside it -- see this module's
+/// "stack-pointer tracking" doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StackRegion {
+    /// Lowest tracked address -- the far end of the stack, reached only
+    /// by a runaway overflow.
+    base: u32,
+    /// Highest tracked address (inclusive) -- where the stack started
+    /// out empty, e.g. a task's `tc_SPUpper`.
+    top: u32,
+    /// The last SP seen while it was inside `[base, top]`, or `None` if
+    /// the most recently observed SP was outside that range (tracking
+    /// is suspended -- see [`ShadowMap::update_stack_pointer`]).
+    sp: Option<u32>,
+}
+
+/// The maximum number of outstanding call frames [`ShadowMap`]'s shadow
+/// call stack retains -- see this module's "shadow call stack" doc for
+/// why the *oldest* frame is dropped once this is exceeded, and
+/// [`ShadowMap::dropped_call_frames`] for how the drop is surfaced
+/// rather than silently forgotten. Comfortably deeper than any
+/// realistic non-pathological guest call depth, while still bounding
+/// host memory against runaway/infinite guest recursion.
+pub const MAX_CALL_STACK_DEPTH: usize = 4096;
+
+/// How far below the tracked stack pointer an access is still forgiven,
+/// in bytes -- see
+/// [`ShadowMap::below_sp_violation_is_within_grace_band`] for the full
+/// reasoning. Sized to cover the largest single-instruction stack push
+/// on this CPU family (`movem.l` with all sixteen registers, 64 bytes);
+/// anything deeper than one instruction's worth of push is a genuine
+/// use of released or never-reserved stack.
+pub const BELOW_SP_GRACE_BYTES: u32 = 64;
+
+/// One outstanding call recorded by [`ShadowMap::record_call`] -- the
+/// stack slot a return address was pushed to, and the value that was
+/// pushed there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallFrame {
+    /// The guest address of the stack slot holding the return address
+    /// (i.e. the SP immediately after the call's `JSR` pushed it).
+    slot_sp: u32,
+    /// The return address that was pushed there.
+    return_addr: u32,
+}
+
 /// A per-guest-byte shadow memory used to detect invalid/uninitialized
 /// accesses. See this module's doc for the full design rationale.
 ///
@@ -356,6 +627,18 @@ pub struct ShadowMap {
     /// Whether [`ViolationKind::UninitRead`] is reported at all. Off by
     /// default -- see [`ViolationKind::UninitRead`]'s doc.
     pub report_uninit: bool,
+    /// The tracked stack region and last-seen SP, or `None` until
+    /// [`Self::begin_stack_tracking`] is called -- see this module's
+    /// "stack-pointer tracking" doc.
+    stack: Option<StackRegion>,
+    /// Outstanding call frames recorded by [`Self::record_call`],
+    /// oldest first -- see this module's "shadow call stack" doc.
+    /// Bounded at [`MAX_CALL_STACK_DEPTH`].
+    call_stack: VecDeque<CallFrame>,
+    /// How many call frames were discarded because [`Self::record_call`]
+    /// was invoked while the stack was already at
+    /// [`MAX_CALL_STACK_DEPTH`] -- see [`Self::dropped_call_frames`].
+    dropped_call_frames: u64,
 }
 
 impl ShadowMap {
@@ -369,6 +652,9 @@ impl ShadowMap {
             suppressed: Cell::new(0),
             current_pc: 0,
             report_uninit: false,
+            stack: None,
+            call_stack: VecDeque::new(),
+            dropped_call_frames: 0,
         }
     }
 
@@ -541,6 +827,54 @@ impl ShadowMap {
     fn record(&self, addr: u32, size: u8, kind: ViolationKind, reason: Option<PoisonReason>) {
         let pc = self.current_pc;
         let key: ViolationKey = (pc, addr, kind);
+        self.push_violation(
+            key,
+            Violation {
+                pc,
+                addr,
+                size,
+                kind,
+                reason,
+                expected_return_addr: None,
+                actual_return_addr: None,
+                hits: 1,
+            },
+        );
+    }
+
+    /// Records one [`ViolationKind::ReturnAddressCorrupted`] at stack
+    /// slot `addr`, where `expected` was recorded by [`Self::
+    /// record_call`] and `actual` is what [`Self::check_return`] found
+    /// there instead. Shares dedup/cap bookkeeping with [`Self::record`]
+    /// via [`Self::push_violation`], but builds a [`Violation`] with the
+    /// `expected_return_addr`/`actual_return_addr` fields populated
+    /// instead of `reason`, since this isn't an access against a
+    /// poisoned byte.
+    fn record_return_corruption(&self, addr: u32, expected: u32, actual: u32) {
+        let pc = self.current_pc;
+        let kind = ViolationKind::ReturnAddressCorrupted;
+        let key: ViolationKey = (pc, addr, kind);
+        self.push_violation(
+            key,
+            Violation {
+                pc,
+                addr,
+                size: 4,
+                kind,
+                reason: None,
+                expected_return_addr: Some(expected),
+                actual_return_addr: Some(actual),
+                hits: 1,
+            },
+        );
+    }
+
+    /// Shared dedup/cap logic for [`Self::record`]/[`Self::
+    /// record_return_corruption`]: bumps an existing entry's `hits` on a
+    /// repeat of `key`, otherwise appends `violation` unless the log is
+    /// already at [`MAX_VIOLATIONS`], in which case the miss is only
+    /// counted (see [`Self::suppressed_count`]).
+    fn push_violation(&self, key: ViolationKey, violation: Violation) {
         let mut index = self.index.borrow_mut();
         let mut violations = self.violations.borrow_mut();
         if let Some(&i) = index.get(&key) {
@@ -552,14 +886,7 @@ impl ShadowMap {
             return;
         }
         let i = violations.len();
-        violations.push(Violation {
-            pc,
-            addr,
-            size,
-            kind,
-            reason,
-            hits: 1,
-        });
+        violations.push(violation);
         index.insert(key, i);
     }
 
@@ -574,6 +901,11 @@ impl ShadowMap {
         match self.state(addr) {
             ShadowState::Unaddressable => {
                 let reason = self.poison_reason(addr);
+                if reason == Some(PoisonReason::BelowStackPointer)
+                    && self.below_sp_violation_is_within_grace_band(addr)
+                {
+                    return;
+                }
                 self.record(addr, size, ViolationKind::InvalidRead, reason);
             }
             ShadowState::Uninit if self.report_uninit => {
@@ -596,6 +928,11 @@ impl ShadowMap {
         match self.state(addr) {
             ShadowState::Unaddressable => {
                 let reason = self.poison_reason(addr);
+                if reason == Some(PoisonReason::BelowStackPointer)
+                    && self.below_sp_violation_is_within_grace_band(addr)
+                {
+                    return;
+                }
                 self.record(addr, size, ViolationKind::InvalidWrite, reason);
             }
             ShadowState::Uninit => {
@@ -607,6 +944,42 @@ impl ShadowMap {
         }
     }
 
+    /// Whether a below-stack-pointer poison at `addr` should be
+    /// forgiven because it falls in the grace band just under the
+    /// tracked stack pointer.
+    ///
+    /// This exists because of an ordering problem that is structural,
+    /// not incidental: **every stack push writes below the current
+    /// stack pointer by definition.** `move.l d0,-(sp)` decrements A7
+    /// as part of the store, and `MOVEM`/`LINK`/`JSR` do the same, so
+    /// the store lands at an address the shadow map still believes is
+    /// below SP -- the run loop cannot republish the new SP until the
+    /// instruction has finished. Poisoning strictly below the last-seen
+    /// SP therefore reports a violation for every single subroutine
+    /// call and register save a normal program makes; running
+    /// `fixtures/hello` (which does nothing but one `PutStr`) produced
+    /// exactly that before this band existed.
+    ///
+    /// The band is [`BELOW_SP_GRACE_BYTES`] wide, which comfortably
+    /// covers the largest push any one instruction can perform
+    /// (`movem.l d0-d7/a0-a7,-(sp)` moves 64 bytes). Accesses further
+    /// below SP than that are still reported, which is the bug class
+    /// worth catching: a released stack frame being read after the fact,
+    /// or a wild pointer well past the live stack. valgrind takes the
+    /// same approach for the same reason.
+    ///
+    /// The check is `O(1)` and only runs once a byte has *already* been
+    /// found poisoned, so it costs nothing on the hot path.
+    fn below_sp_violation_is_within_grace_band(&self, addr: u32) -> bool {
+        let Some(region) = self.stack else {
+            return false;
+        };
+        let Some(sp) = region.sp else {
+            return false;
+        };
+        addr < sp && sp - addr <= BELOW_SP_GRACE_BYTES
+    }
+
     /// Checks every byte of a `size`-byte access starting at `addr`
     /// before it happens, for a read. A 2- or 4-byte access straddling
     /// into a poisoned range is caught even if its first byte is fine
@@ -615,17 +988,353 @@ impl ShadowMap {
     /// [`crate::memory::AddressSpace::read_u8`]'s signature this
     /// ultimately serves.
     pub(crate) fn check_read(&self, addr: u32, size: u8) {
+        // Stop at the first byte that reports. A 4-byte access running
+        // into a redzone would otherwise log four violations at four
+        // consecutive addresses -- they all describe one access and one
+        // bug, and the dedup key is (pc, addr, kind), so the per-byte
+        // addresses defeat deduplication precisely when it is most
+        // wanted. Reporting the first offending byte keeps the address
+        // in the message the one a reader can act on.
         for i in 0..u32::from(size) {
+            let before = self.violation_count();
             self.check_read_byte(addr.wrapping_add(i), size);
+            if self.violation_count() != before {
+                return;
+            }
         }
     }
 
     /// Checks and updates every byte of a `size`-byte access starting
     /// at `addr`, for a write.
     pub(crate) fn check_write(&mut self, addr: u32, size: u8) {
+        // As `check_read`: report at most once per access. Every byte is
+        // still *visited*, because a write has to heal each `Uninit`
+        // byte it covers even after one of them has reported.
+        let mut reported = false;
         for i in 0..u32::from(size) {
-            self.check_write_byte(addr.wrapping_add(i), size);
+            let before = self.violation_count();
+            if reported {
+                self.heal_uninit_byte(addr.wrapping_add(i));
+            } else {
+                self.check_write_byte(addr.wrapping_add(i), size);
+                reported = self.violation_count() != before;
+            }
         }
+    }
+
+    /// Promotes a single `Uninit` byte to `Valid` without any checking
+    /// -- the tail of a write whose violation has already been
+    /// reported. See [`Self::check_write`].
+    fn heal_uninit_byte(&mut self, addr: u32) {
+        if self.state(addr) == ShadowState::Uninit
+            && let Some(slot) = self.bytes.get_mut(addr as usize)
+        {
+            *slot = VALID_BYTE;
+        }
+    }
+
+    /// Begins tracking the guest stack, poisoning `[stack_base, sp)` as
+    /// [`PoisonReason::BelowStackPointer`] (the region below the
+    /// initial SP is exactly as dead as any subsequent access below a
+    /// later SP -- see this module's "stack-pointer tracking" doc).
+    /// `stack_base`/`stack_top` are remembered for every future call to
+    /// [`Self::update_stack_pointer`], which needs them both to compute
+    /// deltas and to detect the SP leaving the region entirely.
+    ///
+    /// If `sp` itself is outside `[stack_base, stack_top]`, no
+    /// poisoning happens and tracking starts in the same "suspended"
+    /// state [`Self::update_stack_pointer`] would put it in for any
+    /// other out-of-region SP -- there's nothing unusual about a task
+    /// being constructed with its stack pointer not yet inside what
+    /// will become its tracked region.
+    pub fn begin_stack_tracking(&mut self, stack_base: u32, stack_top: u32, sp: u32) {
+        let in_region = stack_base <= sp && sp <= stack_top;
+        if in_region {
+            self.poison_below_sp(stack_base, sp);
+        }
+        self.stack = Some(StackRegion {
+            base: stack_base,
+            top: stack_top,
+            sp: in_region.then_some(sp),
+        });
+    }
+
+    /// Marks `[stack_base, sp)` [`PoisonReason::BelowStackPointer`] --
+    /// the poisoning half shared by [`Self::begin_stack_tracking`] and
+    /// every place that re-establishes a baseline (a resume in
+    /// [`Self::update_stack_pointer`], or a fresh region in
+    /// [`Self::reset_stack_tracking`]). A no-op if `sp <= stack_base`
+    /// (an empty stack has nothing below its pointer yet to poison).
+    fn poison_below_sp(&mut self, stack_base: u32, sp: u32) {
+        if sp > stack_base {
+            self.mark_unaddressable(stack_base, sp - stack_base, PoisonReason::BelowStackPointer);
+        }
+    }
+
+    /// Clears every byte of `[base, top]` (inclusive, as
+    /// [`StackRegion::top`] is stored) back to [`ShadowState::Valid`],
+    /// wiping out any [`PoisonReason::BelowStackPointer`] poison left
+    /// over from tracking that region. Used when tracking stops caring
+    /// about a stack region (a `StackSwap`-driven
+    /// [`Self::reset_stack_tracking`], or the generic suspend path in
+    /// [`Self::update_stack_pointer`]) -- see this module's "stack-
+    /// pointer tracking" doc for why leaving stale poison behind is
+    /// worse than having no claim on the region at all.
+    ///
+    /// `top.saturating_sub(base).saturating_add(1)` rather than plain
+    /// arithmetic: `top` is allowed to be `u32::MAX` (an empty map's
+    /// nominal upper bound), and computing an exact byte count for
+    /// `[base, u32::MAX]` would need one more value than `u32` can hold.
+    /// Saturating instead of overflow-panicking loses at most the single
+    /// byte at `u32::MAX` in that extreme, never-hit-in-practice corner
+    /// (this crate's guest address spaces are megabytes, not 4
+    /// gigabytes); [`Self::clamp_range`] (via [`Self::mark_valid`])
+    /// clamps to the map's real length regardless.
+    fn clear_stack_region(&mut self, base: u32, top: u32) {
+        let len = top.saturating_sub(base).saturating_add(1);
+        self.mark_valid(base, len);
+    }
+
+    /// Updates the tracked stack pointer to `sp`, called once per
+    /// instruction by the run loop. Does nothing if [`Self::
+    /// begin_stack_tracking`] hasn't been called. See this module's
+    /// "stack-pointer tracking" doc for the full design rationale;
+    /// summary:
+    ///
+    /// - Unchanged SP (the overwhelmingly common case): does nothing
+    ///   beyond the one comparison that detects this.
+    /// - SP decreased (stack grew): marks `[sp, old_sp)`
+    ///   [`ShadowState::Uninit`].
+    /// - SP increased (stack shrank): marks `[old_sp, sp)`
+    ///   [`PoisonReason::BelowStackPointer`].
+    /// - New SP outside `[stack_base, stack_top]`: suspends tracking --
+    ///   no report -- but first clears the stale
+    ///   [`PoisonReason::BelowStackPointer`] poison over the whole
+    ///   previously-tracked region and empties the shadow call stack,
+    ///   so neither becomes a landmine for whatever guest addresses get
+    ///   reused next (see this module's "stack-pointer tracking" and
+    ///   "shadow call stack" docs -- this is the generic path;
+    ///   [`Self::reset_stack_tracking`] is the direct one `StackSwap`
+    ///   itself uses). This is the normal case for supervisor-mode
+    ///   execution (or any other unforeseen route the SP takes outside
+    ///   the tracked region), not a bug.
+    /// - New SP back inside `[stack_base, stack_top]` after being
+    ///   suspended: resumes tracking, adopting `sp` as the new baseline
+    ///   and re-poisoning `[stack_base, sp)` exactly as
+    ///   [`Self::begin_stack_tracking`] would, so detection actually
+    ///   comes back instead of staying silently off for the rest of the
+    ///   run.
+    pub fn update_stack_pointer(&mut self, sp: u32) {
+        let Some(region) = self.stack else {
+            return;
+        };
+        if region.sp == Some(sp) {
+            return; // hot path: nothing moved.
+        }
+        let StackRegion {
+            base,
+            top,
+            sp: last_sp,
+        } = region;
+        let in_region = base <= sp && sp <= top;
+        match last_sp {
+            Some(old_sp) => {
+                if !in_region {
+                    // Leaving the region we were tracking: nothing else
+                    // ever lives inside a stack region (see
+                    // reset_stack_tracking's doc), so retracting every
+                    // claim over it -- the poison and the call frames
+                    // recorded against it -- is always safe, and leaving
+                    // either behind is exactly the stale-claim bug this
+                    // module's docs describe.
+                    self.clear_stack_region(base, top);
+                    self.call_stack.clear();
+                    self.stack = Some(StackRegion {
+                        base,
+                        top,
+                        sp: None,
+                    });
+                    return;
+                }
+                // Both old_sp and sp are within [base, top] here, so
+                // the ranges marked below are too -- no separate clamp
+                // needed (mark_uninit/mark_unaddressable also clamp to
+                // the map's own bounds regardless; see clamp_range).
+                if sp < old_sp {
+                    self.mark_uninit(sp, old_sp - sp);
+                } else {
+                    self.mark_unaddressable(old_sp, sp - old_sp, PoisonReason::BelowStackPointer);
+                }
+                self.stack = Some(StackRegion {
+                    base,
+                    top,
+                    sp: Some(sp),
+                });
+            }
+            None => {
+                if in_region {
+                    // Resuming: re-establish poisoning from the new
+                    // baseline rather than adopting it with a silent,
+                    // permanently-blind shadow map (see this module's
+                    // "stack-pointer tracking" doc).
+                    self.poison_below_sp(base, sp);
+                    self.stack = Some(StackRegion {
+                        base,
+                        top,
+                        sp: Some(sp),
+                    });
+                }
+                // else: still outside the tracked region, remain
+                // suspended.
+            }
+        }
+    }
+
+    /// Tears down tracking of whatever stack region was previously
+    /// tracked (if any) and begins tracking a brand new one from `sp` --
+    /// the operation `exec.library`'s `StackSwap` handler
+    /// ([`crate::exectask`]'s `stack_swap_handler`) needs right after it
+    /// finishes swapping a task onto a different stack.
+    ///
+    /// This exists as a distinct entry point rather than relying on
+    /// [`Self::update_stack_pointer`]'s generic "SP left the region"
+    /// path because a `StackSwap` is a *known*, atomic switch, not an
+    /// SP that gradually wanders off: the handler teleports `A7`
+    /// straight from the old stack to the new one in a single step (see
+    /// `exectask.rs`'s `StackSwap` doc), so there is no sequence of
+    /// per-instruction [`Self::update_stack_pointer`] calls that would
+    /// ever ask this module to notice the old region being abandoned --
+    /// only calls describing the *new* stack, which
+    /// [`Self::update_stack_pointer`] would otherwise happily (and
+    /// wrongly) treat as ordinary growth/shrinkage of whatever region it
+    /// still thinks is live, or -- if the new stack happens to fall
+    /// entirely outside the old tracked bounds -- as an ordinary
+    /// suspend, leaving the *old* stack's poison and call frames
+    /// dangling until the generic path (never called again for that
+    /// region) would have cleaned them up. Calling this directly the
+    /// moment the swap completes cleans up eagerly instead of relying on
+    /// that coincidence.
+    ///
+    /// Concretely:
+    ///
+    /// 1. Clears the stale [`PoisonReason::BelowStackPointer`] poison
+    ///    over the *entire* previously-tracked `[base, top]`, not just
+    ///    the sub-range that happened to be poisoned at the moment of
+    ///    the switch. A narrower "precise" clear (say, just
+    ///    `[base, last_seen_sp)`) would be just as correct -- this
+    ///    module's own stack-tracking machinery never poisons anything
+    ///    else inside a stack region -- but would need to thread the
+    ///    last-seen SP through here for no real benefit: **nothing else
+    ///    ever lives inside `[base, top]`**. A stack region is
+    ///    exclusively reserved for one task's frames; it is never shared
+    ///    with the heap allocator's redzones or any other bookkeeping
+    ///    this module tracks, so a blanket clear over the whole region
+    ///    can never accidentally un-poison something unrelated that
+    ///    happens to overlap it. The extra byte-writes this costs are
+    ///    `O(stack region)`, but only on a stack switch -- a handful of
+    ///    times per run (`sc`, the motivating case below, does it four
+    ///    times for a whole compile), nothing like the per-instruction
+    ///    frequency [`Self::update_stack_pointer`] itself has to stay
+    ///    `O(1)` for.
+    /// 2. Clears the shadow call stack entirely -- see this module's
+    ///    "shadow call stack" doc for why a frame recorded against an
+    ///    abandoned stack is a landmine (a future slot-address
+    ///    collision with the new stack), not a merely-stale-but-harmless
+    ///    entry.
+    /// 3. Begins tracking `[stack_base, stack_top]` from `sp`, via
+    ///    [`Self::begin_stack_tracking`] (shared, not duplicated: both
+    ///    ultimately just need to poison `[stack_base, sp)` and record
+    ///    the new region as current).
+    ///
+    /// Two concrete bugs motivated this, both filed against the same
+    /// `StackSwap` gap: `fixtures/stacktest`'s `pushret` case already
+    /// established that a *never-recorded* frame (a computed jump) must
+    /// not be flagged; this closes the sibling failure mode, a frame
+    /// that *was* legitimately recorded and then outlived the stack it
+    /// was recorded on. And running the real SAS/C `sc` compiler under
+    /// `--sanitize` hit both halves of this at once -- `sc` calls
+    /// `StackSwap` onto its own larger heap-allocated stack and back,
+    /// which produced both a `ReturnAddressCorrupted` false positive
+    /// (the call-stack half) and stray below-SP read/write reports
+    /// against the abandoned original stack (the poison half) -- see
+    /// this module's top-of-file "stack-pointer tracking" doc for that
+    /// half's own detailed writeup.
+    pub fn reset_stack_tracking(&mut self, stack_base: u32, stack_top: u32, sp: u32) {
+        if let Some(old) = self.stack {
+            self.clear_stack_region(old.base, old.top);
+        }
+        self.call_stack.clear();
+        self.begin_stack_tracking(stack_base, stack_top, sp);
+    }
+
+    /// Records a subroutine call whose `JSR` just pushed `return_addr`
+    /// at guest address `slot_sp` (i.e. `slot_sp` is the SP immediately
+    /// after the push). See this module's "shadow call stack" doc.
+    ///
+    /// Before pushing the new frame, discards every previously recorded
+    /// frame whose slot lies below `slot_sp` -- that space has since
+    /// been reclaimed (by any means; see the module doc's
+    /// reconciliation rule), so those frames could never be validly
+    /// returned to and would otherwise sit in the log forever.
+    ///
+    /// If this would exceed [`MAX_CALL_STACK_DEPTH`], the oldest
+    /// (outermost) frame is dropped to make room, and [`Self::
+    /// dropped_call_frames`]'s count is incremented -- see
+    /// [`MAX_CALL_STACK_DEPTH`]'s doc for why the oldest, not the
+    /// newest, is the one sacrificed.
+    pub fn record_call(&mut self, slot_sp: u32, return_addr: u32) {
+        self.call_stack.retain(|f| f.slot_sp >= slot_sp);
+        self.call_stack.push_back(CallFrame {
+            slot_sp,
+            return_addr,
+        });
+        if self.call_stack.len() > MAX_CALL_STACK_DEPTH {
+            self.call_stack.pop_front();
+            self.dropped_call_frames += 1;
+        }
+    }
+
+    /// Validates a return: `sp` is the stack pointer the `RTS` (or
+    /// equivalent) is returning with, `actual_return_addr` is the
+    /// address it actually jumped to (read from the stack slot at
+    /// `sp`... or wherever it isn't). See this module's "shadow call
+    /// stack" doc for the full reconciliation rule this implements;
+    /// summary:
+    ///
+    /// 1. Discards every recorded frame whose slot lies below `sp` --
+    ///    already unwound, by any means, since that's exactly the
+    ///    region [`Self::update_stack_pointer`] would also now consider
+    ///    dead.
+    /// 2. If what's left has a top frame whose slot is *exactly* `sp`,
+    ///    this return is popping that frame: compares the recorded
+    ///    return address against `actual_return_addr` and reports
+    ///    [`ViolationKind::ReturnAddressCorrupted`] on a mismatch, then
+    ///    removes the frame either way (it's been consumed).
+    /// 3. Otherwise -- no frame recorded for this exact slot -- reports
+    ///    nothing. This is not a gap: it's what makes computed jumps
+    ///    (`move.l #target,-(sp) / rts`) and volamos's own
+    ///    process-startup return address (which no `JSR` ever pushed)
+    ///    non-findings instead of false positives.
+    pub fn check_return(&mut self, sp: u32, actual_return_addr: u32) {
+        self.call_stack.retain(|f| f.slot_sp >= sp);
+        let Some(&top) = self.call_stack.back() else {
+            return;
+        };
+        if top.slot_sp != sp {
+            return;
+        }
+        self.call_stack.pop_back();
+        if top.return_addr != actual_return_addr {
+            self.record_return_corruption(sp, top.return_addr, actual_return_addr);
+        }
+    }
+
+    /// How many call frames [`Self::record_call`] has discarded because
+    /// the shadow call stack was already at [`MAX_CALL_STACK_DEPTH`] --
+    /// surfaced so a report can say "N frames were never checked"
+    /// instead of implying a false all-clear for very deep recursion.
+    pub fn dropped_call_frames(&self) -> u64 {
+        self.dropped_call_frames
     }
 
     /// A human-readable multi-line report of every recorded violation,
@@ -721,7 +1430,16 @@ mod tests {
         // (redzone) -- straddling in.
         shadow.check_read(6, 4);
 
-        assert_eq!(shadow.violation_count(), 2, "bytes 8 and 9 each flag once");
+        // One access, one violation: `check_read` stops at the first
+        // offending byte rather than logging byte 8 and byte 9
+        // separately, since both describe the same access and the same
+        // bug (and the per-byte addresses would defeat dedup, whose key
+        // includes the address). The reported address is the first byte
+        // that actually offended, not the access's base.
+        assert_eq!(shadow.violation_count(), 1, "one access reports once");
+        let v = &shadow.violations()[0];
+        assert_eq!(v.addr, 8, "reports the first offending byte");
+        assert_eq!(v.size, 4, "and remembers the whole access's size");
     }
 
     #[test]
@@ -917,5 +1635,369 @@ mod tests {
         assert!(report.contains("0x00000010"));
         assert!(report.contains("heap redzone"));
         assert!(report.contains("0x00003a1c"));
+    }
+
+    // -- Stack-pointer tracking -------------------------------------
+
+    #[test]
+    fn begin_stack_tracking_poisons_below_the_initial_sp() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+
+        assert_eq!(shadow.state(0x0fff), ShadowState::Valid, "outside stack");
+        assert_eq!(shadow.state(0x1000), ShadowState::Unaddressable);
+        assert_eq!(
+            shadow.poison_reason(0x1000),
+            Some(PoisonReason::BelowStackPointer)
+        );
+        assert_eq!(shadow.state(0x17ff), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x1800), ShadowState::Valid, "at/above sp");
+        assert_eq!(shadow.state(0x1fff), ShadowState::Valid);
+    }
+
+    #[test]
+    fn stack_growth_marks_the_new_bytes_uninit_not_valid() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+
+        // sp decreases: the stack grew by pushing 0x100 bytes.
+        shadow.update_stack_pointer(0x1700);
+
+        assert_eq!(
+            shadow.state(0x1700),
+            ShadowState::Uninit,
+            "newly-used stack is Uninit, not Valid -- see module doc"
+        );
+        assert_eq!(shadow.state(0x17ff), ShadowState::Uninit);
+        // Below the new sp is still poisoned.
+        assert_eq!(shadow.state(0x1000), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x16ff), ShadowState::Unaddressable);
+        // Reading Uninit isn't reported unless report_uninit is set.
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn stack_shrink_marks_the_released_bytes_below_stack_pointer() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1700);
+
+        // sp increases: the stack shrank, releasing [0x1700, 0x1900).
+        shadow.update_stack_pointer(0x1900);
+
+        assert_eq!(shadow.state(0x1700), ShadowState::Unaddressable);
+        assert_eq!(
+            shadow.poison_reason(0x1700),
+            Some(PoisonReason::BelowStackPointer)
+        );
+        assert_eq!(shadow.state(0x18ff), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x1900), ShadowState::Valid, "still in use");
+
+        shadow.set_current_pc(0x99);
+        shadow.check_read(0x1800, 1);
+        assert_eq!(shadow.violation_count(), 1);
+        assert_eq!(
+            shadow.violations()[0].reason,
+            Some(PoisonReason::BelowStackPointer)
+        );
+    }
+
+    #[test]
+    fn unchanged_stack_pointer_does_nothing() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+        let before = shadow.bytes.clone();
+
+        shadow.update_stack_pointer(0x1800);
+        shadow.update_stack_pointer(0x1800);
+        shadow.update_stack_pointer(0x1800);
+
+        assert_eq!(shadow.bytes, before, "no shadow byte should have moved");
+    }
+
+    #[test]
+    fn sp_leaving_the_tracked_region_clears_stale_poison_and_call_frames() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+        assert_eq!(shadow.state(0x1000), ShadowState::Unaddressable);
+        // A call frame recorded on the stack we're about to abandon.
+        shadow.record_call(0x17fc, 0x1234);
+
+        // StackSwap (or supervisor mode) hands the CPU a completely
+        // different stack, far outside [0x1000, 0x2000).
+        shadow.update_stack_pointer(0x8000);
+
+        // The abandoned region's stale BelowStackPointer poison must be
+        // retracted -- left in place, it would become a landmine for
+        // whatever later reuses those guest addresses (the real
+        // false-positive class this fixes; see this module's doc).
+        assert_eq!(shadow.state(0x1000), ShadowState::Valid);
+        assert_eq!(shadow.state(0x17ff), ShadowState::Valid);
+        shadow.check_read(0x1000, 4);
+        shadow.check_write(0x17ff, 1);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // The abandoned call frame must not be checked either.
+        shadow.check_return(0x17fc, 0x1234);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // While suspended, further moves (even ones that look like a
+        // huge "delta" against the old sp) must still be no-ops.
+        let after_leaving = shadow.bytes.clone();
+        shadow.update_stack_pointer(0x8100);
+        shadow.update_stack_pointer(0x7000);
+        assert_eq!(shadow.bytes, after_leaving);
+    }
+
+    #[test]
+    fn sp_re_entering_the_tracked_region_resumes_and_re_poisons_from_the_new_baseline() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+
+        shadow.update_stack_pointer(0x8000); // leave (e.g. supervisor mode)
+        shadow.update_stack_pointer(0x1750); // return to the original stack
+
+        // Detection must actually resume: the resumed baseline
+        // re-poisons [base, sp) exactly as begin_stack_tracking would,
+        // rather than leaving the whole region silently (and therefore
+        // undetectably) Valid for the rest of the run.
+        assert_eq!(shadow.state(0x1000), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x174f), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x1750), ShadowState::Valid);
+
+        // Tracking is active again: a subsequent move produces a normal
+        // incremental delta relative to the resumed baseline (0x1750),
+        // not relative to whatever sp was before we left (0x1800).
+        shadow.update_stack_pointer(0x1740);
+        assert_eq!(shadow.state(0x1740), ShadowState::Uninit);
+        assert_eq!(shadow.state(0x174f), ShadowState::Uninit);
+    }
+
+    #[test]
+    fn absurd_delta_is_clamped_to_the_tracked_region_not_the_whole_map() {
+        let mut shadow = ShadowMap::new(0x10000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+
+        // A jump far outside the tracked region must be treated as
+        // "left the region" (see the leaving-tracking test), never as
+        // a same-region delta that would try to poison from 0x1800 up
+        // to/through u32::MAX.
+        shadow.update_stack_pointer(u32::MAX);
+
+        assert_eq!(
+            shadow.state(0x1800),
+            ShadowState::Valid,
+            "old sp position must be untouched, not swept into a bogus poison"
+        );
+        assert_eq!(shadow.state(0xffff), ShadowState::Valid);
+
+        // A legitimate huge-but-in-region delta (grow all the way to
+        // stack_base from the freshly-resumed baseline) is still fine
+        // and stays inside [base, top].
+        shadow.update_stack_pointer(0x1900); // re-enter, new baseline
+        shadow.update_stack_pointer(0x1000); // grow to the very base
+        assert_eq!(shadow.state(0x1000), ShadowState::Uninit);
+        assert_eq!(shadow.state(0x18ff), ShadowState::Uninit);
+        // Above the resumed baseline was never part of this delta.
+        assert_eq!(shadow.state(0x1900), ShadowState::Valid);
+        // Never touched outside the map/region regardless.
+        assert_eq!(shadow.state(0x2000), ShadowState::Valid);
+    }
+
+    #[test]
+    fn reset_stack_tracking_clears_the_previous_region_stale_poison() {
+        // The below-SP half of the sc/StackSwap bug: a shadow map that
+        // still says an address is BelowStackPointer, purely because
+        // the task that used to own that stack region swapped away
+        // from it, with no other claim on the memory ever established.
+        let mut shadow = ShadowMap::new(0x4000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+        assert_eq!(shadow.state(0x1000), ShadowState::Unaddressable);
+
+        // StackSwap onto an entirely different (e.g. heap-allocated)
+        // stack region.
+        shadow.reset_stack_tracking(0x3000, 0x3800, 0x3800);
+
+        // The old region's poison must be gone -- it no longer
+        // describes anything live once the task has swapped off that
+        // stack.
+        assert_eq!(shadow.state(0x1000), ShadowState::Valid);
+        assert_eq!(shadow.state(0x17ff), ShadowState::Valid);
+        shadow.check_read(0x1500, 4);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // The new region is tracked and poisoned exactly as
+        // begin_stack_tracking would (sp == top here, so the whole
+        // region below it is poisoned).
+        assert_eq!(shadow.state(0x3000), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x37ff), ShadowState::Unaddressable);
+    }
+
+    #[test]
+    fn reset_stack_tracking_clears_pending_call_frames() {
+        // The return-address half of the sc/StackSwap bug: a frame
+        // recorded on the old stack must not survive to collide with an
+        // unrelated frame the new stack later records at the same
+        // guest address.
+        let mut shadow = ShadowMap::new(0x4000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+        // A call recorded on the old stack, never returned through --
+        // StackSwap abandons it, same as a longjmp would.
+        shadow.record_call(0x17fc, 0x1234);
+
+        // The new stack happens to reuse the exact same guest address
+        // for its own, entirely unrelated frame.
+        shadow.reset_stack_tracking(0x3000, 0x3800, 0x3800);
+        shadow.record_call(0x17fc, 0x5678);
+
+        // A return through 0x17fc now belongs to the new frame; it must
+        // be judged against 0x5678 on its own merits, not flagged as
+        // corruption against the abandoned old-stack frame's 0x1234.
+        shadow.check_return(0x17fc, 0x5678);
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "the reused slot's new frame must be judged on its own merits"
+        );
+    }
+
+    // -- Shadow call stack --------------------------------------------
+
+    #[test]
+    fn clean_call_and_return_reports_nothing() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.record_call(0x1000, 0x4000);
+
+        shadow.check_return(0x1000, 0x4000);
+
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn overwritten_return_address_is_reported_with_expected_and_actual() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.record_call(0x1000, 0x4000);
+        shadow.set_current_pc(0x3a1c);
+
+        // Something smashed the stack: the slot now holds 0x41414141
+        // instead of the recorded return address.
+        shadow.check_return(0x1000, 0x4141_4141);
+
+        assert_eq!(shadow.violation_count(), 1);
+        let v = &shadow.violations()[0];
+        assert_eq!(v.kind, ViolationKind::ReturnAddressCorrupted);
+        assert_eq!(v.addr, 0x1000);
+        assert_eq!(v.expected_return_addr, Some(0x4000));
+        assert_eq!(v.actual_return_addr, Some(0x4141_4141));
+        assert_eq!(v.pc, 0x3a1c);
+
+        let text = v.to_string();
+        assert!(text.contains("0x00004000"), "{text}");
+        assert!(text.contains("0x41414141"), "{text}");
+    }
+
+    #[test]
+    fn unwinding_a_frame_below_sp_reports_nothing() {
+        let mut shadow = ShadowMap::new(0x2000);
+        // A deep call whose frame will be abandoned by a longjmp-style
+        // unwind rather than a matching RTS.
+        shadow.record_call(0x0f00, 0x4000);
+        // An outer call that will actually return normally.
+        shadow.record_call(0x1000, 0x5000);
+
+        // Unwind straight past the inner frame (0x0f00 < 0x1000) without
+        // ever "returning" through it.
+        shadow.check_return(0x1000, 0x5000);
+
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "the abandoned inner frame must not be flagged"
+        );
+    }
+
+    #[test]
+    fn rts_with_no_matching_frame_reports_nothing() {
+        let mut shadow = ShadowMap::new(0x2000);
+        // No record_call at all -- e.g. volamos's own process-startup
+        // return address, which no JSR ever pushed.
+        shadow.check_return(0x1000, 0x1234_5678);
+
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn computed_jump_push_then_rts_idiom_reports_nothing() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.record_call(0x2000, 0x4000);
+
+        // `move.l #target,-(sp)` followed by `rts`: a slot gets a value
+        // pushed and immediately "returned" through, but record_call
+        // was never told about it, so there's no frame at this slot.
+        shadow.check_return(0x1ffc, 0xdead_beef);
+
+        assert_eq!(shadow.violation_count(), 0);
+        // The real recorded frame at 0x2000 is untouched by this.
+        shadow.check_return(0x2000, 0x4000);
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn library_dispatch_style_pop_without_rts_does_not_get_flagged_later() {
+        // volamos's own dispatch.rs pops a JSR's return address and
+        // resumes there itself, without ever executing a real RTS. The
+        // frame must simply become stale once sp has moved back past
+        // it, not linger and misfire against some unrelated later
+        // return that happens to reuse the same slot.
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.record_call(0x1000, 0x4000);
+
+        // Stack pointer moves back up past 0x1000 without a check_return
+        // ever happening for that frame (dispatch.rs's own doing).
+        shadow.record_call(0x1004, 0x9999); // a later, unrelated call reusing/near that area
+
+        // Reconciliation on this new call already dropped the stale
+        // frame at 0x1000 (0x1000 < 0x1004), so a later return matching
+        // 0x1000 again must not somehow resurrect it.
+        shadow.check_return(0x1000, 0x4000);
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn call_stack_depth_is_bounded_and_drops_are_counted() {
+        let mut shadow = ShadowMap::new(0x10_0000);
+        // Push far more frames than MAX_CALL_STACK_DEPTH, each at a
+        // strictly *decreasing* slot address -- mimicking a real
+        // downward-growing stack, where each nested call's return
+        // address lands below the previous one's, so record_call's own
+        // "below this slot" pruning doesn't reconcile any of them away.
+        let extra = 10;
+        let base_slot = 0x0080_0000u32;
+        for i in 0..(MAX_CALL_STACK_DEPTH + extra) as u32 {
+            shadow.record_call(base_slot - i * 8, 0x9000_0000 + i);
+        }
+
+        assert_eq!(shadow.dropped_call_frames(), extra as u64);
+
+        // The most recent (innermost) frame is still there and still
+        // gets checked. Checked first, since its slot is the smallest
+        // address of all recorded frames -- reconciling against it
+        // can't discard any other still-live frame.
+        let last = (MAX_CALL_STACK_DEPTH + extra - 1) as u32;
+        let last_slot = base_slot - last * 8;
+        let last_expected = 0x9000_0000 + last;
+        shadow.check_return(last_slot, last_expected.wrapping_add(1));
+        assert_eq!(shadow.violation_count(), 1);
+
+        // The oldest frame (at base_slot) was dropped for exceeding the
+        // depth cap, so a return matching its slot must not be found --
+        // even though, being the highest address of all, reconciling
+        // against it also legitimately discards every remaining frame
+        // (they're all "below" it), which is why this comes last.
+        shadow.check_return(base_slot, 0x9000_0000);
+        assert_eq!(
+            shadow.violation_count(),
+            1,
+            "dropped frame must not be checked against"
+        );
     }
 }

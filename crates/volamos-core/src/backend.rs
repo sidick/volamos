@@ -35,6 +35,7 @@
 use m68k::{AddressBus, CpuCore, StepResult};
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapInfo, TrapKind};
+use crate::m68kops::{self, ControlFlowOp};
 use crate::memory::{AddressSpace, FlatMemory};
 
 /// Re-exported so callers (the CLI's `--cpu` flag) can name a model
@@ -223,6 +224,93 @@ impl Default for M68kCpu {
     }
 }
 
+impl M68kCpu {
+    /// Pre-instruction sanitizer hook: classifies the instruction about
+    /// to execute at `pc` and, if it is a subroutine return, validates
+    /// the return address still sitting in its stack slot against the
+    /// shadow call stack. Returns the classification so
+    /// [`Self::sanitize_after_instruction`] knows whether a call just
+    /// pushed a frame. A no-op returning [`ControlFlowOp::Other`] when
+    /// no shadow map is installed.
+    ///
+    /// The return address must be checked *before* the instruction
+    /// executes, while `A7` still points at the slot holding it -- once
+    /// the return has run, the stack pointer has moved past it and the
+    /// evidence of corruption is gone.
+    ///
+    /// The opcode word and the slot are read with
+    /// [`FlatMemory::peek_u16`]/[`FlatMemory::peek_u32`], never through
+    /// [`AddressSpace`]: these are the sanitizer inspecting memory on
+    /// its own behalf, and routing them through the checked path would
+    /// both invent violations and heal `Uninit` bytes the guest never
+    /// wrote. See those methods' docs.
+    fn sanitize_before_instruction(&mut self, mem: &mut FlatMemory, pc: u32) -> ControlFlowOp {
+        if mem.shadow().is_none() {
+            return ControlFlowOp::Other;
+        }
+
+        let op = m68kops::classify(mem.peek_u16(pc));
+        // Where the return address sits relative to A7 differs per
+        // instruction, and getting it wrong would compare the wrong
+        // bytes and invent corruption reports:
+        //
+        // - `RTS`/`RTD` pop the PC straight off the top of the stack.
+        // - `RTR` pops the condition-code register first, so the return
+        //   address is one word further up.
+        // - `RTE` returns from an exception, not a subroutine: its
+        //   frame is a status word plus PC (and, on 68010+, a
+        //   format/vector word), and nothing put it there via `JSR`.
+        //   Deliberately not checked -- the shadow call stack's own
+        //   reconciliation discards the frames it unwinds.
+        let slot_offset = match op {
+            ControlFlowOp::Rts | ControlFlowOp::Rtd => Some(0),
+            ControlFlowOp::Rtr => Some(2),
+            _ => None,
+        };
+        if let Some(offset) = slot_offset {
+            let sp = self
+                .address_register(AddressRegister(7))
+                .wrapping_add(offset);
+            let actual = mem.peek_u32(sp);
+            if let Some(shadow) = mem.shadow_mut() {
+                shadow.check_return(sp, actual);
+            }
+        }
+        op
+    }
+
+    /// Post-instruction sanitizer hook: records a freshly-pushed return
+    /// address if `op` was a call, then republishes the stack pointer so
+    /// the below-SP poisoning tracks the frame that just appeared or
+    /// disappeared.
+    ///
+    /// Reading the pushed return address back off the stack here --
+    /// rather than deriving it from the instruction -- is deliberate,
+    /// and is why `crate::m68kops` needs no effective-address decoding
+    /// at all. A `JSR`'s target can be any control addressing mode,
+    /// with extension words whose length varies (and on 68020+ can nest
+    /// through memory indirection), so computing the return address
+    /// from the encoding means reimplementing a chunk of the CPU. The
+    /// CPU has just done it for us: whatever `A7` now points at *is*
+    /// the return address it pushed.
+    fn sanitize_after_instruction(&mut self, mem: &mut FlatMemory, op: ControlFlowOp) {
+        if mem.shadow().is_none() {
+            return;
+        }
+
+        let sp = self.address_register(AddressRegister(7));
+        if matches!(op, ControlFlowOp::Jsr | ControlFlowOp::Bsr) {
+            let pushed = mem.peek_u32(sp);
+            if let Some(shadow) = mem.shadow_mut() {
+                shadow.record_call(sp, pushed);
+            }
+        }
+        if let Some(shadow) = mem.shadow_mut() {
+            shadow.update_stack_pointer(sp);
+        }
+    }
+}
+
 impl Cpu for M68kCpu {
     type Memory = FlatMemory;
 
@@ -238,7 +326,10 @@ impl Cpu for M68kCpu {
         if let Some(shadow) = mem.shadow_mut() {
             shadow.set_current_pc(self.pc());
         }
-        match self.core.step(mem) {
+        let op = self.sanitize_before_instruction(mem, self.pc());
+        let result = self.core.step(mem);
+        self.sanitize_after_instruction(mem, op);
+        match result {
             StepResult::Ok { .. } => StopReason::Step,
             StepResult::Stopped => StopReason::Halted,
             StepResult::AlineTrap { opcode } => StopReason::Trap(TrapInfo {
@@ -315,7 +406,14 @@ impl Cpu for M68kCpu {
             if let Some(shadow) = mem.shadow_mut() {
                 shadow.set_current_pc(pc);
             }
+            // With a shadow map installed `max_instructions` is 1 (see
+            // above), so these per-instruction hooks really do bracket
+            // exactly one instruction here, same as in `step`. They are
+            // no-ops when no shadow map is installed, which is what
+            // keeps the unsanitized batch path untouched.
+            let op = self.sanitize_before_instruction(mem, pc);
             let result = self.core.run_batch(mem, max_instructions, &[]);
+            self.sanitize_after_instruction(mem, op);
             match result.exit {
                 BatchExit::BudgetExhausted => continue,
                 BatchExit::Stopped => return StopReason::Halted,

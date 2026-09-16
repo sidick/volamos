@@ -2342,6 +2342,20 @@ impl<C: Cpu + 'static> Runtime<C> {
         }
 
         cpu.set_address_register(AddressRegister(7), sp);
+
+        // Start below-stack-pointer tracking, if the caller installed a
+        // shadow map before handing us this memory (the CLI's
+        // `--sanitize` does exactly that, see `crate::memory::
+        // FlatMemory::enable_sanitizer`). This is the only place that
+        // knows all three of the stack region's bounds and the initial
+        // SP at once, and it has to happen *after* A7 is set above:
+        // everything below the starting stack pointer is dead memory,
+        // and poisoning it relative to the wrong SP would either miss
+        // the region entirely or poison live bytes.
+        if let Some(shadow) = mem.shadow_mut() {
+            shadow.begin_stack_tracking(stack_base, top, sp);
+        }
+
         cpu.set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
         cpu.set_address_register(AddressRegister(0), args_addr);
         cpu.set_data_register(DataRegister(0), line_len);
@@ -2659,6 +2673,30 @@ impl<C: Cpu + 'static> Runtime<C> {
                     // the guest's JSR pushed, and resume there.
                     let sp = self.cpu.address_register(AddressRegister(7));
                     let return_addr = self.mem.read_u32(sp);
+
+                    // Tell the sanitizer's shadow call stack about this
+                    // return, because no `RTS` instruction will ever
+                    // execute for it (we are the return) and so
+                    // `crate::backend`'s per-instruction hook never sees
+                    // it. Without this the frame the guest's `JSR`
+                    // pushed is never retired, and it sits at exactly
+                    // the stack slot the next push will reuse -- the
+                    // shadow call stack then compares that push against
+                    // a long-dead library call's return address and
+                    // reports corruption that never happened. Found via
+                    // `fixtures/stacktest pushret`, which false-positived
+                    // on the entirely legitimate
+                    // `move.l #target,-(sp)` + `rts` computed-jump
+                    // idiom purely because a `PutStr` had been called
+                    // beforehand.
+                    //
+                    // Note this is not merely bookkeeping: routing the
+                    // library-call return through the same check means a
+                    // return address smashed *across* a library call is
+                    // caught too.
+                    if let Some(shadow) = self.mem.shadow_mut() {
+                        shadow.check_return(sp, return_addr);
+                    }
                     self.cpu
                         .set_address_register(AddressRegister(7), sp.wrapping_add(4));
                     self.cpu.set_pc(return_addr);

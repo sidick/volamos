@@ -28,6 +28,24 @@ version scheme in `Cargo.toml`.
   and is the first fixture whose `.s` is assembled by the real PhxAss
   running under volamos itself.
 
+- **Extended `--sanitize` to stack bugs** (issue #65, increment 2):
+  accesses below the stack pointer, and return-address corruption via a
+  shadow call stack that records what each `JSR`/`BSR` pushed and
+  verifies it at the matching return — stack-smash detection valgrind
+  itself doesn't offer. Getting this to zero false positives on real
+  software was most of the work: a push writes below the stack pointer
+  by definition, so a 64-byte grace band (sized to `MOVEM`'s worst case,
+  the same window valgrind forgives) is needed or every subroutine call
+  reports; volamos performs library-call returns itself rather than
+  executing an `RTS`, so `dispatch` has to retire shadow frames
+  explicitly or a stale frame sits exactly where the next push lands;
+  and `StackSwap` abandons a whole stack, so both the stale poison and
+  the pending call frames have to be cleared or the replacement stack's
+  reused addresses produce bogus reports. Real PhxAss, real pLhA and the
+  real SAS/C 6.58 compiler now all run clean, with `sc`'s object file
+  byte-identical to an unsanitized run's. New `fixtures/stacktest`
+  covers both detectors plus three false-positive guards.
+
 - **Fixed the guest command-line buffer's missing trailing space**
   (issue #63): whenever a launched program has at least one argument,
   real AmigaOS's own command-line buffer carries a trailing space

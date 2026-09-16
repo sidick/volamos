@@ -113,6 +113,20 @@ class CodeBuilder:
         # _abs32_fixups' pointers into a separate DATA hunk. Added for
         # Phase L3's testlib fixtures (see dc_l_selfptr/resolve_self).
         self._self_abs32_fixups: list[tuple[int, str, int]] = []
+        # (word_index_of_high_half, code_label, addend) -- like
+        # _self_abs32_fixups, but resolved by the *two-hunk*
+        # `resolve`/`build_hunk_executable` path (CODE hunk 0 + DATA hunk
+        # 1), for fixtures that need an absolute pointer to one of their
+        # own code labels (e.g. a computed return address) alongside the
+        # existing pointers into the DATA hunk. Added for issue #65
+        # increment 2's `stacktest` fixture (`gen_stacktest.py`): its
+        # `smash` mode overwrites a pushed return address with the
+        # address of a real code label, and its `pushret` mode pushes one
+        # onto the stack directly. Kept as a separate list (rather than
+        # reusing `_self_abs32_fixups`, which `resolve_self` walks against
+        # a single-hunk build with no DATA hunk at all) so the two build
+        # shapes -- two-hunk vs. single-hunk -- stay independent.
+        self._code_abs32_fixups: list[tuple[int, str, int]] = []
 
     def word(self, value: int) -> int:
         self.words.append(value & 0xFFFF)
@@ -431,13 +445,94 @@ class CodeBuilder:
         mode 000)."""
         self.word(0xD080 | (dst << 9) | src)
 
+    # --- added for fixtures/gen_stacktest.py (issue #65 increment 2):
+    # LINK/UNLK stack frames, a long-sized immediate-to-displaced-An MOVE
+    # (the `move_w_imm_to_disp_a`/`move_b_imm_to_disp_a` shape at MOVE's
+    # long size), and two "pointer to one of this program's own code
+    # labels" MOVE variants -- (An) indirect and predecrement -- used to
+    # smash a return address in place and to push a computed return
+    # address the classic Amiga way. Each derived directly from the
+    # M68000 PRM's tables, same style/rigor as every helper above; cross-
+    # checked against real PhxAss's own output (see fixtures/README.md's
+    # "stacktest" section).
+
+    def link_a(self, an: int, disp: int) -> None:
+        """`link An,#disp16` -- pushes An, then An = A7, then A7 += disp
+        (disp is normally negative, reserving `-disp` bytes of locals).
+        Opcode `0100 1110 0101 0aaa` (LINK, word form); the 16-bit
+        displacement is a plain sign-extended extension word, not an
+        `<ea>` field, so there's nothing to compute beyond `An`'s three
+        low bits."""
+        self.word(0x4E50 | an)
+        self.word(disp & 0xFFFF)
+
+    def unlk_a(self, an: int) -> None:
+        """`unlk An` -- A7 = An, then An is popped. Opcode `0100 1110
+        0101 1aaa`, i.e. `link_a`'s opcode with bit 3 set."""
+        self.word(0x4E58 | an)
+
+    def move_l_imm_to_disp_a(self, an: int, disp: int, imm: int) -> None:
+        """`move.l #imm,<disp16>(An)`. Same shape as
+        [`move_w_imm_to_disp_a`]/[`move_b_imm_to_disp_a`] (dest=d16(An)
+        mode `101`, src=immediate mode `111`/reg `100`) at MOVE's *long*
+        size (`10` -> top nibble `0x2000`, vs. word's `0x3000`/byte's
+        `0x1000`): `0x2000 | (an<<9) | 0x17C`. Extension words are
+        source-then-destination, so the 32-bit immediate (hi word, then
+        lo word) comes first, then the displacement word -- same order as
+        the word/byte forms, just with one extra immediate word. Added
+        for `gen_stacktest.py`'s `clean` mode: writing a local variable
+        into a `link`-established stack frame at a fixed displacement off
+        the frame pointer."""
+        self.word(0x2000 | (an << 9) | 0x17C)
+        self.word((imm >> 16) & 0xFFFF)
+        self.word(imm & 0xFFFF)
+        self.word(disp & 0xFFFF)
+
+    def move_l_codelabel_to_ind_a(self, an: int, label: str, addend: int = 0) -> None:
+        """`move.l #label,(An)` -- `label` is a **code** label (resolved
+        against this same CODE hunk, hunk 0, unlike
+        [`move_l_label_to_a`]/[`move_l_label_to_d`]'s DATA-hunk, hunk 1,
+        labels). Dest mode is plain `(An)` indirect (`010` -> `0x080` in
+        bits 8-6, no displacement word needed), source is immediate long
+        (`0x3C`): `0x2000 | (an<<9) | 0x080 | 0x3C == 0x2000 | (an<<9) |
+        0xBC`. Added for `gen_stacktest.py`'s `smash` mode: overwriting
+        the return address a preceding `bsr` just pushed at `(a7)` in
+        place, with the address of a real, valid landing label, so the
+        corrupted `rts` still lands somewhere the program can exit
+        cleanly from (see the module docstring for why that matters)."""
+        idx = self.word(0x2000 | (an << 9) | 0xBC)
+        self.word(0)
+        self.word(0)
+        self._code_abs32_fixups.append((idx + 1, label, addend))
+
+    def move_l_codelabel_to_predec_a(self, an: int, label: str, addend: int = 0) -> None:
+        """`move.l #label,-(An)` -- as
+        [`move_l_codelabel_to_ind_a`], but dest mode is predecrement
+        (`100` -> `0x100`): `0x2000 | (an<<9) | 0x100 | 0x3C == 0x2000 |
+        (an<<9) | 0x13C`. For `an=7` this is the well-known `0x2F3C
+        <imm32>` encoding real Amiga trampolines use to push a computed
+        return/jump address (e.g. a library-base pointer) before an
+        `rts`. Added for `gen_stacktest.py`'s `pushret` mode: the classic
+        `move.l #target,-(sp)` / `rts` computed-jump idiom, with no
+        matching `jsr`/`bsr` anywhere -- legitimate, common code the
+        shadow call stack must not flag."""
+        idx = self.word(0x2000 | (an << 9) | 0x13C)
+        self.word(0)
+        self.word(0)
+        self._code_abs32_fixups.append((idx + 1, label, addend))
+
     # --- resolution ---
 
     def resolve(self, data: DataBuilder) -> list[tuple[int, int]]:
         """Patches every placeholder word. Returns the list of
         `(byte_offset_in_code_hunk, target_hunk)` HUNK_RELOC32 entries
-        `build_hunk_executable` should emit (target_hunk is always `1`,
-        the data hunk, for these fixtures)."""
+        `build_hunk_executable` should emit: target hunk `1` (the data
+        hunk) for `_abs32_fixups`, as in every earlier fixture, plus
+        target hunk `0` (this same code hunk) for `_code_abs32_fixups' --
+        pointers to one of this program's own code labels, added for
+        `gen_stacktest.py` (see `move_l_codelabel_to_ind_a`'s docstring).
+        `build_hunk_executable` groups these by target hunk into separate
+        HUNK_RELOC32 groups."""
         relocs: list[tuple[int, int]] = []
         for word_idx, label, addend in self._abs32_fixups:
             # word_idx is the index of the *high* half of the 32-bit
@@ -447,6 +542,15 @@ class CodeBuilder:
             self.words[word_idx] = (target >> 16) & 0xFFFF
             self.words[word_idx + 1] = target & 0xFFFF
             relocs.append((word_idx * 2, 1))
+        for word_idx, label, addend in self._code_abs32_fixups:
+            # Same shape, but resolved against this builder's own labels
+            # (hunk-local byte offset -- the loader adds hunk 0's own
+            # load address at load time, same mechanism as the DATA-hunk
+            # case above) and targeting hunk 0.
+            target = self.labels[label] * 2 + addend
+            self.words[word_idx] = (target >> 16) & 0xFFFF
+            self.words[word_idx + 1] = target & 0xFFFF
+            relocs.append((word_idx * 2, 0))
         for word_idx, label in self._branch_fixups:
             target_addr = self.labels[label] * 2
             disp_word_addr = word_idx * 2
@@ -515,11 +619,24 @@ def build_hunk_executable(code: CodeBuilder, data: DataBuilder) -> bytes:
     out += u32(code_longwords)
     out += code_bytes
     if relocs:
+        # Group by target hunk: ordinarily every fixup targets hunk 1
+        # (the data hunk), but gen_stacktest.py's code-label pointers
+        # (move_l_codelabel_to_ind_a/_predec_a) target hunk 0 (this same
+        # code hunk) instead. HUNK_RELOC32's format already supports
+        # multiple (count, hunk, offsets...) groups before the
+        # terminating zero count, so this is a strict generalization --
+        # existing single-target-hunk callers still emit exactly one
+        # group, byte-identical to before.
+        by_hunk: dict[int, list[int]] = {}
+        for offset, target_hunk in relocs:
+            by_hunk.setdefault(target_hunk, []).append(offset)
         out += u32(HUNK_RELOC32)
-        out += u32(len(relocs))
-        out += u32(1)  # target hunk (data) -- all fixups target hunk 1
-        for offset, _target_hunk in relocs:
-            out += u32(offset)
+        for target_hunk in sorted(by_hunk):
+            offsets = by_hunk[target_hunk]
+            out += u32(len(offsets))
+            out += u32(target_hunk)
+            for offset in offsets:
+                out += u32(offset)
         out += u32(0)  # terminate RELOC32 groups
     out += u32(HUNK_END)
 
