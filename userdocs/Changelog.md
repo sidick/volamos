@@ -5,6 +5,28 @@ version scheme in `Cargo.toml`.
 
 ## Unreleased
 
+- **The heap detectors now cover four more allocators** (issue #83,
+  tier 0): `utility.library`'s `AllocateTagItems`, `dos.library`'s
+  `AllocDosObject`, and `exec.library`'s `CreateIORequest` and
+  `CreateMsgPort`, plus their matching free calls. All four carve from
+  the same guest heap as `AllocMem`, so redzone *space* was already
+  being reserved for them whenever `--sanitize` was on — only the
+  shadow marking was missing, which meant a guest overrunning a
+  `FileInfoBlock`, an `RDArgs`, a `MsgPort` or a `TagItem` array that
+  volamos handed it went unreported.
+
+  It found a real bug on the first sweep: the PhxAss assembler asks
+  `CreateIORequest` for 40 bytes (`sizeof(struct timerequest)`) and then
+  reads two bytes one past the end. Harmless on real hardware, where
+  that read lands in whatever follows on the heap, which is exactly the
+  class of latent bug this exists to surface. So **PhxAss is no longer
+  silent under `--sanitize`** — that one report is expected;
+  `--sanitize-ignore-pc` silences it if you want a clean baseline.
+
+  Still not covered: `exec.library/Allocate`, where the guest owns the
+  memory pool, and which is where a C runtime's `malloc` actually
+  sub-allocates.
+
 - **Diagnostics now name the source location** (issue #74). Sanitizer
   violations are annotated with `file:line` when the program carries a
   `HUNK_DEBUG` `LINE` block (SAS/C's `DEBUG=LINE`, PhxAss's
