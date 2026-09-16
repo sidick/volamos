@@ -91,6 +91,7 @@ cargo run -p volamos -- fixtures/echoargs foo bar
 cargo run -p volamos -- fixtures/exectest
 cargo run -p volamos -- --stack 4096 fixtures/recurse  # demonstrates overflow detection
 cargo run -p volamos -- -V TEST:/tmp/some-hostdir fixtures/runcmdtest  # LoadSeg+RunCommand+UnLoadSeg
+cargo run -p volamos -- --sanitize fixtures/memtest overrun  # catches a 1-byte heap overrun
 ```
 
 Implemented so far:
@@ -141,6 +142,35 @@ Implemented so far:
   `~/.volamos`/`.volamos` config file can supply default values for
   any of the above, for repeated-use projects. Run `cargo run -p
   volamos -- --help` for the full CLI surface.
+
+## Finding bugs in guest programs
+
+`m68k-amigaos-gcc` has no `-fsanitize=address`, and MMU-based tools like
+MuForce work at page granularity, so a one-byte overrun or a read just
+past the end of an allocation is invisible to them. `--sanitize` gives
+volamos a valgrind/ASan-style detector instead, which it can do cheaply
+because it *is* the allocator and every guest memory access already
+funnels through one place:
+
+```sh
+$ cargo run -p volamos -- --sanitize fixtures/memtest overrun
+overrun: writing 1 byte past a 32-byte block
+sanitizer: 1 distinct violation(s):
+  invalid 1-byte write at 0x00002ee0 (heap redzone) from PC 0x00002af6
+```
+
+It catches heap overruns and underruns down to a single byte,
+use-after-free, accesses below the stack pointer, and return-address
+corruption (stack smashing, via a shadow call stack — something
+valgrind itself doesn't offer). Bad buffers handed to `dos.library`
+calls come for free, since host-side handlers write guest memory through
+the same checked path. Real PhxAss, real pLhA and the real SAS/C 6.58
+compiler all run clean under it, with `sc`'s output object file
+byte-identical to an unsanitized run's. Overflows *within* a single
+stack frame need compiler instrumentation and remain invisible, as they
+are to valgrind. See the
+[CLI reference](https://sidick.github.io/volamos/latest/CLI-Reference/)
+for the full details.
 
 The three-oracle parity harness against `vamos`/real Kickstart is
 Phase 4+. See [`docs/plan.md`](docs/plan.md) for the full phase

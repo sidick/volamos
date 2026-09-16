@@ -32,6 +32,13 @@ console-tool use case.
   CPU as fast as the host allows. That's the right trade-off for a
   compiler/assembler/linker you're running as part of a build, not a
   game that depends on real-time hardware behavior.
+- **It can find bugs a real Amiga can't.** Because volamos is the
+  allocator and every guest memory access funnels through one place,
+  `--sanitize` offers valgrind/ASan-style detection — byte-granular heap
+  overruns, use-after-free, and return-address corruption — which
+  `m68k-amigaos-gcc` (no `-fsanitize=address`) and page-granular MMU
+  tools like MuForce cannot provide.
+
 - **Headless and CI-first.** No dependency on a display, windowing
   system, or Amiga hardware at all — running an original Amiga
   toolchain as part of a host build (cross-compilation the other way
