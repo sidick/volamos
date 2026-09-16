@@ -150,7 +150,11 @@ fn a_binary_with_line_debug_info_still_runs_normally() {
         .arg(LINETEST_PATH)
         .output()
         .expect("failed to run the volamos binary");
-    assert!(output.status.success(), "linetest exited {:?}", output.status);
+    assert!(
+        output.status.success(),
+        "linetest exited {:?}",
+        output.status
+    );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("linetest"),
         "expected linetest's own message"
