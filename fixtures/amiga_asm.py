@@ -488,6 +488,24 @@ class CodeBuilder:
         self.word(imm & 0xFFFF)
         self.word(disp & 0xFFFF)
 
+    def lea_disp_a_to_a(self, an_dest: int, disp: int, an_src: int) -> None:
+        """`lea <disp16>(An_src),An_dest` -- LEA, computing an address
+        (never dereferencing it) into an address register. Opcode `0100
+        nnn111 mmmrrr` (M68000 PRM): bits 15-12 = `0100`, bits 11-9 =
+        the destination register, bits 8-6 = `111` (LEA's fixed opmode),
+        bits 5-0 = the source `<ea>` (mode `101` = d16(An), register =
+        the source An). Base with both register fields zeroed:
+        `0x4000 | (0b111<<6) | (0b101<<3) == 0x4000 | 0x1C0 | 0x28 ==
+        0x41E8`; verified by hand-deriving `lea 5(a5),a1` (`an_dest=1`,
+        `an_src=5`) as `0x4000 | (1<<9) | 0x1C0 | 0x28 | 5 == 0x43ED`,
+        matching bit-for-bit `0100 001 111 101 101`. Added for
+        `gen_matchflags.py` (issue #58): computing `&AnchorPath.ap_Info.
+        fib_FileName` and `&AnchorPath.ap_Buf` -- both a fixed
+        displacement off the AllocMem'd (so only known at runtime)
+        AnchorPath base -- without dereferencing through it."""
+        self.word(0x41E8 | (an_dest << 9) | an_src)
+        self.word(disp & 0xFFFF)
+
     def move_l_codelabel_to_ind_a(self, an: int, label: str, addend: int = 0) -> None:
         """`move.l #label,(An)` -- `label` is a **code** label (resolved
         against this same CODE hunk, hunk 0, unlike
