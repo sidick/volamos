@@ -279,6 +279,13 @@ fn allocate_tag_items_handler<C: Cpu>(
             for i in 0..byte_size {
                 ctx.mem.write_u8(addr.wrapping_add(i), 0);
             }
+            // After the zeroing, never before -- the writes above heal
+            // shadow bytes, so poisoning first would make this handler
+            // report a violation against its own initialisation. Same
+            // ordering rule as `crate::execmem`'s `MEMF_CLEAR` path;
+            // see `poison_allocation_edges`' doc. `false` because the
+            // block *is* initialised: it was just zeroed.
+            crate::execmem::poison_allocation_edges(ctx, addr, false);
             ctx.cpu.set_data_register(DataRegister(0), addr);
         }
         Err(_) => {
@@ -325,6 +332,8 @@ fn free_tag_items_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
     }
 
     let byte_size = count.saturating_mul(TAG_ITEM_SIZE);
+    // Before the free, while the extent is still queryable.
+    crate::execmem::poison_freed_block(ctx, list);
     ctx.heap
         .free(list)
         .map_err(|e| DispatchError::HandlerFailed {
@@ -956,6 +965,91 @@ mod tests {
     /// `move.l D0,An`.
     fn move_d0_to_a(n: u16) -> u16 {
         0x2040 | (n << 9)
+    }
+
+    /// `move.l Dsrc,Ddst` -- MOVE.L with both operands in data-register
+    /// direct mode (`0010 ddd 000 000 sss`), for stashing an address
+    /// across a library call that clobbers D0.
+    fn move_d_to_d(dst: u16, src: u16) -> u16 {
+        0x2000 | (dst << 9) | src
+    }
+
+    #[test]
+    fn freed_tag_items_block_is_poisoned_for_use_after_free() {
+        // The other half: `FreeTagItems` now marks the block freed, so
+        // a guest still holding the pointer is caught reading it.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(3);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // AllocateTagItems -> D0
+        words.push(move_d0_to_a(0)); // A0 = the array
+        words.push(move_d_to_d(2, 0)); // stash the address in D2
+        words.extend_from_slice(&jsr_disp16_a6(-78)); // FreeTagItems(A0)
+        words.push(move_d_to_d(0, 2)); // D0 = the now-freed address
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0, "expected the freed block's address back in D0");
+
+        let shadow = rt.memory().shadow().expect("sanitizer enabled above");
+        assert_eq!(
+            shadow.state(addr),
+            crate::sanitize::ShadowState::Unaddressable,
+            "a freed TagItem array should read as unaddressable"
+        );
+        assert_eq!(
+            shadow.poison_reason(addr),
+            Some(crate::sanitize::PoisonReason::Freed),
+            "and specifically as freed, not as a redzone"
+        );
+    }
+
+    #[test]
+    fn allocate_tag_items_block_gets_redzones_under_the_sanitizer() {
+        // `AllocateTagItems` carves from the same `GuestHeap` as
+        // `AllocMem`, so redzone *space* was already being reserved for
+        // it whenever the sanitizer was on -- only the shadow marking
+        // was missing, which meant a guest overrunning a TagItem array
+        // volamos handed it went unreported. This asserts the guard
+        // bytes either side of the block are now actually poisoned.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = numTags
+        words.push(0);
+        words.push(3);
+        words.extend_from_slice(&jsr_disp16_a6(-66)); // AllocateTagItems
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0);
+
+        let shadow = rt.memory().shadow().expect("sanitizer enabled above");
+        let size = 3 * TAG_ITEM_SIZE;
+        assert_eq!(
+            shadow.state(addr.wrapping_sub(1)),
+            crate::sanitize::ShadowState::Unaddressable,
+            "the byte before the block should be a poisoned redzone"
+        );
+        assert_eq!(
+            shadow.state(addr + size),
+            crate::sanitize::ShadowState::Unaddressable,
+            "the byte just past the block should be a poisoned redzone"
+        );
+        assert_eq!(
+            shadow.state(addr),
+            crate::sanitize::ShadowState::Valid,
+            "the block itself was zeroed by the handler, so it is initialised"
+        );
     }
 
     #[test]

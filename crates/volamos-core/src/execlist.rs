@@ -506,6 +506,11 @@ fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         }
     };
     init_msg_port_fields(ctx.mem, port, ctx.current_task);
+    // After the field initialisation, never before: those writes heal
+    // shadow bytes, so poisoning first would flag this handler's own
+    // setup. `false` because the block is initialised by the time we
+    // get here. See `crate::execmem::poison_allocation_edges`.
+    crate::execmem::poison_allocation_edges(ctx, port, false);
     ctx.cpu.set_data_register(DataRegister(0), port);
     Ok(())
 }
@@ -540,6 +545,7 @@ fn delete_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     if port == 0 {
         return Ok(());
     }
+    crate::execmem::poison_freed_block(ctx, port);
     ctx.heap
         .free(port)
         .map_err(|e| DispatchError::HandlerFailed {
@@ -565,6 +571,13 @@ fn create_io_request_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
     let port = ctx.cpu.address_register(AddressRegister(0));
     let size = ctx.cpu.data_register(DataRegister(0));
     let addr = create_io_request(ctx.heap, ctx.mem, port, size).unwrap_or(0);
+    if addr != 0 {
+        // Poisoned here rather than inside `create_io_request`, which
+        // takes `heap`/`mem` separately and so has no `HandlerContext`
+        // to reach the shadow map through. After its zeroing and field
+        // writes, per `poison_allocation_edges`' ordering rule.
+        crate::execmem::poison_allocation_edges(ctx, addr, false);
+    }
     ctx.cpu.set_data_register(DataRegister(0), addr);
     Ok(())
 }
@@ -595,6 +608,7 @@ fn delete_io_request_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
     if addr == 0 {
         return Ok(());
     }
+    crate::execmem::poison_freed_block(ctx, addr);
     ctx.heap
         .free(addr)
         .map_err(|e| DispatchError::HandlerFailed {

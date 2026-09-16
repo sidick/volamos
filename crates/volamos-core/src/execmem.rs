@@ -204,6 +204,17 @@ fn apply_dirty_fill<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32, len: u32
 /// at `addr` (issue #65). A no-op unless both a shadow map is installed
 /// (`--sanitize`) and the allocation actually exists in the heap.
 ///
+/// `pub(crate)` because `AllocMem`/`AllocVec`/`AllocPooled` are not the
+/// only handlers that carve guest-visible blocks out of
+/// [`crate::guestmem::GuestHeap`]: `utility.library`'s
+/// `AllocateTagItems`, `dos.library`'s `AllocDosObject` and
+/// `exec.library`'s `CreateIORequest`/`CreateMsgPort` all do too, and
+/// every one of them hands the guest a block it can overrun. Since they
+/// allocate from the same heap, redzone *space* is already being
+/// reserved for them whenever `--sanitize` is on -- only the shadow
+/// marking was missing, which is why sharing this one helper is the
+/// whole fix rather than a per-module reimplementation.
+///
 /// Marks the leading and trailing redzones and the alignment slack
 /// unaddressable, so any guest access that runs off either end of the
 /// block -- including into the padding between the size it asked for
@@ -224,7 +235,7 @@ fn apply_dirty_fill<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32, len: u32
 /// default -- see `crate::sanitize`). Pass `false` when the handler has
 /// already zeroed the block for `MEMF_CLEAR`, since those bytes are
 /// then genuinely initialized.
-fn poison_allocation_edges<C: Cpu>(
+pub(crate) fn poison_allocation_edges<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     addr: u32,
     mark_data_uninit: bool,
@@ -262,7 +273,7 @@ fn poison_allocation_edges<C: Cpu>(
 /// the other half is `crate::guestmem`'s free quarantine holding the
 /// address out of circulation, so a subsequent allocation doesn't
 /// immediately re-mark these same bytes valid and hide the bug.
-fn poison_freed_block<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32) {
+pub(crate) fn poison_freed_block<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32) {
     let Some(extent) = ctx.heap.extent_of_live_alloc(addr) else {
         return;
     };
