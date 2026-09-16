@@ -14,7 +14,10 @@ spiritual successor to [`vamos`](https://github.com/cnvogelg/amitools),
 the Python implementation of the same idea from the `amitools` package
 — volamos aims for the same job, done in Rust, and (per its own gap
 audit against vamos's coverage) at least as complete for the
-console-tool use case.
+console-tool use case. Where the two runtimes genuinely behave
+differently, see [Differences from vamos](Differences-from-vamos.md) —
+each entry there is one volamos has verified against real Amiga
+hardware.
 
 ## Why volamos, not full emulation
 
