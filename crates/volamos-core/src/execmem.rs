@@ -110,6 +110,7 @@ use crate::dispatch::{
 };
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
+use crate::sanitize::PoisonReason;
 
 // --- MEMF_* flags (a subset of the real `<exec/memory.h>` bits; this
 // runtime is flat memory -- everything is simultaneously "chip" and
@@ -172,6 +173,82 @@ fn round_up_8(value: u32) -> u32 {
 /// section.
 const ALLOCVEC_HEADER_SIZE: u32 = 8;
 
+/// Poisons the sanitizer shadow map around a freshly-created allocation
+/// at `addr` (issue #65). A no-op unless both a shadow map is installed
+/// (`--sanitize`) and the allocation actually exists in the heap.
+///
+/// Marks the leading and trailing redzones and the alignment slack
+/// unaddressable, so any guest access that runs off either end of the
+/// block -- including into the padding between the size it asked for
+/// and the 8-byte-rounded size it actually got -- is recorded instead
+/// of silently landing on a neighboring allocation.
+///
+/// **Call this *after* any `MEMF_CLEAR` zeroing and after any header
+/// the handler writes.** Those writes go through
+/// [`AddressSpace::write_u8`]/`write_u32`, which heal shadow bytes to
+/// valid as they go; poisoning first would make the handler's own
+/// legitimate zeroing of the alignment slack report a violation against
+/// itself. Ordering this last is what keeps the runtime's own writes
+/// out of the report.
+///
+/// `mark_data_uninit` requests that the caller-visible bytes be marked
+/// as allocated-but-never-written, which only surfaces in a report when
+/// uninitialized-read reporting is explicitly turned on (it is off by
+/// default -- see `crate::sanitize`). Pass `false` when the handler has
+/// already zeroed the block for `MEMF_CLEAR`, since those bytes are
+/// then genuinely initialized.
+fn poison_allocation_edges<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    addr: u32,
+    mark_data_uninit: bool,
+) {
+    let Some(extent) = ctx.heap.extent_of_live_alloc(addr) else {
+        return;
+    };
+    let Some(shadow) = ctx.mem.shadow_mut() else {
+        return;
+    };
+
+    let data_end = extent.user_start + extent.requested_size;
+    let user_end = extent.user_start + extent.user_size;
+
+    shadow.mark_unaddressable(
+        extent.block_start,
+        extent.user_start - extent.block_start,
+        PoisonReason::Redzone,
+    );
+    if mark_data_uninit {
+        shadow.mark_uninit(extent.user_start, extent.requested_size);
+    }
+    shadow.mark_unaddressable(data_end, user_end - data_end, PoisonReason::AlignmentSlack);
+    shadow.mark_unaddressable(user_end, extent.block_end - user_end, PoisonReason::Redzone);
+}
+
+/// Poisons the whole underlying block of an allocation that is about to
+/// be freed, so a later use-after-free read or write is recorded rather
+/// than quietly succeeding. A no-op unless `--sanitize` installed a
+/// shadow map.
+///
+/// **Call this *before* `GuestHeap::free`**, while the allocation is
+/// still live and its extent still queryable. Marking the block
+/// unaddressable is only half of what makes use-after-free detectable;
+/// the other half is `crate::guestmem`'s free quarantine holding the
+/// address out of circulation, so a subsequent allocation doesn't
+/// immediately re-mark these same bytes valid and hide the bug.
+fn poison_freed_block<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32) {
+    let Some(extent) = ctx.heap.extent_of_live_alloc(addr) else {
+        return;
+    };
+    let Some(shadow) = ctx.mem.shadow_mut() else {
+        return;
+    };
+    shadow.mark_unaddressable(
+        extent.block_start,
+        extent.block_end - extent.block_start,
+        PoisonReason::Freed,
+    );
+}
+
 /// `AllocMem` (LVO -198): `D0` = requested byte size, `D1` = requirements
 /// (`MEMF_*`). `D0` = the allocated block's address, or `0` on failure --
 /// real `AllocMem` never errors out of the call, it just returns `NULL`
@@ -187,13 +264,22 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     }
 
     let rounded = round_up_8(byte_size);
-    match ctx.heap.alloc(rounded) {
+    // `alloc_with_requested` (rather than plain `alloc`) so the heap
+    // records the guest's *true* byteSize alongside the 8-byte-rounded
+    // reservation: the difference is alignment slack the guest has no
+    // business touching, and this handler is the last place that still
+    // knows the unrounded number.
+    match ctx.heap.alloc_with_requested(rounded, byte_size) {
         Ok(addr) => {
-            if requirements & MEMF_CLEAR != 0 {
+            let cleared = requirements & MEMF_CLEAR != 0;
+            if cleared {
                 for i in 0..rounded {
                     ctx.mem.write_u8(addr.wrapping_add(i), 0);
                 }
             }
+            // After the MEMF_CLEAR loop, never before -- see
+            // `poison_allocation_edges`' doc comment.
+            poison_allocation_edges(ctx, addr, !cleared);
             ctx.cpu.set_data_register(DataRegister(0), addr);
         }
         Err(_) => {
@@ -223,6 +309,9 @@ fn free_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let recorded = ctx.heap.size_of_live_alloc(addr);
     match recorded {
         Some(actual) if actual == rounded => {
+            // Before the free, while the extent is still queryable --
+            // see `poison_freed_block`'s doc comment.
+            poison_freed_block(ctx, addr);
             ctx.heap
                 .free(addr)
                 .map_err(|e| DispatchError::HandlerFailed {
@@ -297,11 +386,22 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
             ctx.mem.write_u32(block.wrapping_add(4), 0);
 
             let user_ptr = block.wrapping_add(ALLOCVEC_HEADER_SIZE);
-            if requirements & MEMF_CLEAR != 0 {
+            let cleared = requirements & MEMF_CLEAR != 0;
+            if cleared {
                 for i in 0..user_rounded {
                     ctx.mem.write_u8(user_ptr.wrapping_add(i), 0);
                 }
             }
+            // Poison the redzones around the *whole* block (header
+            // included -- the header is ours, not the guest's, but it
+            // sits inside the same heap block, so the redzones bracket
+            // both). Done after the header write and the MEMF_CLEAR
+            // loop above, per `poison_allocation_edges`' doc. The data
+            // bytes are left un-marked rather than marked uninit: the
+            // block address the heap knows is `block`, not `user_ptr`,
+            // so an uninit range starting at `block` would wrongly
+            // cover the header this handler just wrote.
+            poison_allocation_edges(ctx, block, false);
             ctx.cpu.set_data_register(DataRegister(0), user_ptr);
         }
         Err(_) => {
@@ -339,6 +439,7 @@ fn free_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
         });
     }
 
+    poison_freed_block(ctx, block);
     ctx.heap
         .free(block)
         .map_err(|e| DispatchError::HandlerFailed {
@@ -438,13 +539,15 @@ fn alloc_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 
     let requirements = ctx.mem.read_u32(pool);
     let rounded = round_up_8(byte_size);
-    match ctx.heap.alloc(rounded) {
+    match ctx.heap.alloc_with_requested(rounded, byte_size) {
         Ok(addr) => {
-            if requirements & MEMF_CLEAR != 0 {
+            let cleared = requirements & MEMF_CLEAR != 0;
+            if cleared {
                 for i in 0..rounded {
                     ctx.mem.write_u8(addr.wrapping_add(i), 0);
                 }
             }
+            poison_allocation_edges(ctx, addr, !cleared);
             ctx.cpu.set_data_register(DataRegister(0), addr);
         }
         Err(_) => ctx.cpu.set_data_register(DataRegister(0), 0),
@@ -470,6 +573,7 @@ fn free_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let rounded = round_up_8(byte_size);
     match ctx.heap.size_of_live_alloc(addr) {
         Some(actual) if actual == rounded => {
+            poison_freed_block(ctx, addr);
             ctx.heap
                 .free(addr)
                 .map_err(|e| DispatchError::HandlerFailed {

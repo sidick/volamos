@@ -5,6 +5,29 @@ version scheme in `Cargo.toml`.
 
 ## 0.5
 
+- **Added `--sanitize`, a valgrind/ASan-style memory sanitizer**
+  (issue #65). `m68k-amigaos-gcc` has no `-fsanitize=address`, and
+  MMU-based tools like MuForce are page-granular, so single-byte heap
+  overruns and use-after-free went undetected. volamos can do better
+  because it *is* the allocator and every guest access already funnels
+  through one trait: a shadow byte per guest byte now backs poisoned
+  redzones either side of every `AllocMem`/`AllocVec`/`AllocPooled`
+  block (including the alignment padding), plus a free quarantine that
+  keeps a freed address out of circulation so use-after-free can't hide
+  behind an address nothing happened to reuse. Host-side library
+  handlers write guest memory through the same checked path, so bad
+  buffers passed to `dos.library` calls are caught with no
+  per-function instrumentation. Violations are reported to stderr,
+  deduplicated with hit counts, and never abort the guest -- a detector,
+  not an enforcer. Two things worth knowing: `--sanitize` forces the
+  JIT off, because its raw-pointer fast path bypasses the checks
+  entirely (a sanitized JIT run would look clean no matter what the
+  program did); and overflows *within* a single stack frame remain
+  invisible, exactly as they are to valgrind, since catching those needs
+  compiler instrumentation. New `fixtures/memtest` exercises all of it,
+  and is the first fixture whose `.s` is assembled by the real PhxAss
+  running under volamos itself.
+
 - **Fixed the guest command-line buffer's missing trailing space**
   (issue #63): whenever a launched program has at least one argument,
   real AmigaOS's own command-line buffer carries a trailing space

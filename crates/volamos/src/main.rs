@@ -119,6 +119,16 @@ struct Options {
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
+    /// `--sanitize`: installs a [`volamos_core::sanitize::ShadowMap`] on
+    /// the guest [`FlatMemory`] and forces the JIT off (see [`run`]) --
+    /// see `volamos_core::sanitize`'s module doc for the detector
+    /// itself. Off by default; CLI-only, like `net` below (not a
+    /// `~/.volamos`/`.volamos` config key) -- kept out of
+    /// `config::Overrides` deliberately, so enabling extra diagnostic
+    /// overhead/behavior-changing instrumentation is always an explicit,
+    /// per-invocation choice rather than something a stale config file
+    /// silently turns on.
+    sanitize: bool,
     net: bool,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
@@ -159,7 +169,7 @@ fn print_usage(program_name: &str) {
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--defaults|--no-defaults] [--volumes-dir HOSTDIR] \
          [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] [--jit|--no-jit] [--net] <program> [args...]"
+         [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] [--net] <program> [args...]"
     );
     eprintln!();
     eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
@@ -234,6 +244,19 @@ fn print_usage(program_name: &str) {
         "                            reference); every library-call trap boundary is identical"
     );
     eprintln!("                            either way");
+    eprintln!("  --sanitize                enable shadow-memory checking of guest accesses (heap");
+    eprintln!(
+        "                            redzones, freed blocks, below-stack-pointer reads/writes);"
+    );
+    eprintln!(
+        "                            reports violations to stderr after the run. Off by default;"
+    );
+    eprintln!(
+        "                            forces --no-jit regardless of --jit/--no-jit, since the"
+    );
+    eprintln!(
+        "                            JIT's fast memory path would otherwise bypass every check"
+    );
     eprintln!("  --net                     enable bsdsocket.library: real host network access for");
     eprintln!("                            the guest (socket/connect/send/recv/... via real host");
     eprintln!("                            sockets). Off by default and CLI-only -- not settable");
@@ -424,8 +447,11 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// test) actually want.
 fn parse_args_raw(
     mut args: impl Iterator<Item = String>,
-) -> Result<(config::Overrides, String, Vec<String>), String> {
+) -> Result<(config::Overrides, bool, String, Vec<String>), String> {
     let mut overrides = config::Overrides::default();
+    // CLI-only, unlike every other flag here -- see `Options::sanitize`'s
+    // doc for why this deliberately isn't part of `config::Overrides`.
+    let mut sanitize = false;
     let mut program = None;
     let mut guest_args = Vec::new();
 
@@ -489,6 +515,7 @@ fn parse_args_raw(
             "--no-fpu" => overrides.fpu = Some(false),
             "--jit" => overrides.jit = Some(true),
             "--no-jit" => overrides.jit = Some(false),
+            "--sanitize" => sanitize = true,
             "--net" => overrides.net = Some(true),
             "--defaults" => overrides.standard_volumes = Some(true),
             "--no-defaults" => overrides.standard_volumes = Some(false),
@@ -503,14 +530,19 @@ fn parse_args_raw(
     }
 
     let program = program.ok_or_else(|| "missing <program> argument".to_string())?;
-    Ok((overrides, program, guest_args))
+    Ok((overrides, sanitize, program, guest_args))
 }
 
 /// Fills every unset field of `overrides` with its built-in default,
 /// producing the final [`Options`] `run` consumes. Used both by
 /// [`parse_args`] (CLI-only, no config files) and by `main` (after
 /// merging CLI overrides with `~/.volamos`/`.volamos`).
-fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String>) -> Options {
+fn resolve(
+    overrides: config::Overrides,
+    sanitize: bool,
+    program: String,
+    guest_args: Vec<String>,
+) -> Options {
     Options {
         verbose: overrides.verbose.unwrap_or(false),
         snoop: overrides.snoop.unwrap_or(false),
@@ -525,6 +557,7 @@ fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String
         cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
         fpu: overrides.fpu.unwrap_or(false),
         jit: overrides.jit.unwrap_or(false),
+        sanitize,
         net: overrides.net.unwrap_or(false),
         // Only ever non-empty when `overrides` already includes
         // `config::built_in_defaults`'s own layer -- `main` merges that
@@ -544,8 +577,8 @@ fn resolve(overrides: config::Overrides, program: String, guest_args: Vec<String
 /// module wants instead.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let (overrides, program, guest_args) = parse_args_raw(args)?;
-    Ok(resolve(overrides, program, guest_args))
+    let (overrides, sanitize, program, guest_args) = parse_args_raw(args)?;
+    Ok(resolve(overrides, sanitize, program, guest_args))
 }
 
 /// Works out the initial guest current directory per the defaulting rule
@@ -633,6 +666,22 @@ fn program_name_from_path(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// Prints a `--sanitize` run's shadow-map violations (if any) to
+/// stderr, in the same "diagnostics go to stderr" style as `--verbose`/
+/// `--snoop`'s per-call tracing (see [`run`]'s `trace` closure). A
+/// no-op if `--sanitize` wasn't given (`runtime.memory().shadow()` is
+/// `None`) or the run was clean (no violations recorded). Called once
+/// per top-level or nested run, right after it finishes -- so a
+/// `System()`/`Execute()`-spawned nested program's own violations are
+/// reported too, not just the top-level program's.
+fn report_sanitizer_violations(runtime: &Runtime<M68kCpu>) {
+    if let Some(shadow) = runtime.memory().shadow()
+        && shadow.violation_count() > 0
+    {
+        eprint!("{}", shadow.report());
+    }
+}
+
 /// Checks that `stack_size` plus [`MIN_HEAP_HEADROOM`] actually fits
 /// between `load_end` (the loaded program's own end address) and
 /// `ram_size` (the top of the guest address space) -- see
@@ -667,6 +716,7 @@ fn run_nested_program(
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
+    sanitize: bool,
     net: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
@@ -676,6 +726,13 @@ fn run_nested_program(
         return -1;
     };
     let mut mem = FlatMemory::new(ram_size as usize);
+    // Right after construction, before `loader::load` populates it --
+    // harmless either way (see `FlatMemory::enable_sanitizer`'s doc for
+    // why the default `Valid` shadow state makes the ordering a
+    // non-issue), this is just the more obvious place to put the call.
+    if sanitize {
+        mem.enable_sanitizer();
+    }
     let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
         return -1;
     };
@@ -693,8 +750,22 @@ fn run_nested_program(
         program_name: program_name_from_path(host_path),
     };
     let mut cpu = M68kCpu::with_config(cpu_type, fpu);
-    cpu.set_jit(jit);
+    // The sanitizer's shadow-map checks only run through
+    // `FlatMemory`'s own `AddressSpace` methods; the JIT's `fast_mem`
+    // raw-pointer path bypasses them entirely, so `--sanitize` forces
+    // the JIT off here regardless of `jit` -- see
+    // `AddressBus::fast_mem`'s doc comment on `FlatMemory` for why this
+    // is belt-and-braces (that impl already returns `None` once a
+    // shadow map is installed, but making it explicit here means a
+    // nested run never even attempts the JIT path in the first place).
+    cpu.set_jit(jit && !sanitize);
     let mut runtime = Runtime::new(cpu, mem, config);
+    if sanitize {
+        // The shadow map installed on `mem` above only records what it
+        // is told to poison; this is what makes the heap actually
+        // reserve and report redzones around guest allocations.
+        runtime.enable_heap_sanitizer();
+    }
 
     if let Some(vfs_config) = vfs_config {
         match Vfs::new(vfs_config) {
@@ -711,7 +782,9 @@ fn run_nested_program(
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    runtime.run(&mut out, None).unwrap_or(-1)
+    let result = runtime.run(&mut out, None).unwrap_or(-1);
+    report_sanitizer_violations(&runtime);
+    result
 }
 
 /// Builds a [`Runtime`] and installs its `Vfs`/`PROGDIR:` from `opts`
@@ -737,6 +810,15 @@ fn build_runtime_with_vfs(
     if opts.net {
         runtime.enable_bsdsocket();
     }
+    if opts.sanitize {
+        // Pairs with the `mem.enable_sanitizer()` both of `run`'s
+        // loading strategies already did: that installs the shadow map,
+        // this makes the heap reserve redzones and quarantine freed
+        // blocks so there is something for `crate::execmem`'s handlers
+        // to poison. Done here rather than in each branch so the
+        // overlay and flat loading paths can't drift apart.
+        runtime.enable_heap_sanitizer();
+    }
     Ok(runtime)
 }
 
@@ -749,7 +831,10 @@ fn run(opts: &Options) -> Result<i32, String> {
     })?;
 
     let mut cpu = M68kCpu::with_config(opts.cpu_type, opts.fpu);
-    cpu.set_jit(opts.jit);
+    // See run_nested_program's matching comment: --sanitize always wins
+    // over --jit, since the JIT's fast_mem path would otherwise bypass
+    // every shadow-map check.
+    cpu.set_jit(opts.jit && !opts.sanitize);
     let program_name = program_name_from_path(std::path::Path::new(&opts.program));
     let vfs_config = vfs_config_from_opts(opts);
 
@@ -763,7 +848,14 @@ fn run(opts: &Options) -> Result<i32, String> {
     // found running a real overlay-linked binary. See
     // Runtime::load_top_level_program's doc for the full story.
     let mut runtime = if hunk_file.overlay.is_some() {
-        let mem = FlatMemory::new(opts.ram_size as usize);
+        let mut mem = FlatMemory::new(opts.ram_size as usize);
+        // Right after construction, before anything is loaded into it
+        // -- harmless either way, see FlatMemory::enable_sanitizer's
+        // doc on why the default Valid shadow state makes the ordering
+        // a non-issue; this is simply the more obvious place to put it.
+        if opts.sanitize {
+            mem.enable_sanitizer();
+        }
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
             load_end: TRAP_TABLE_END,
@@ -780,6 +872,9 @@ fn run(opts: &Options) -> Result<i32, String> {
         runtime
     } else {
         let mut mem = FlatMemory::new(opts.ram_size as usize);
+        if opts.sanitize {
+            mem.enable_sanitizer();
+        }
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
             .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
         check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
@@ -807,6 +902,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
     let nested_jit = opts.jit;
+    let nested_sanitize = opts.sanitize;
     let nested_net = opts.net;
     runtime.set_system_runner(move |req| {
         run_nested_program(
@@ -819,6 +915,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_cpu_type,
             nested_fpu,
             nested_jit,
+            nested_sanitize,
             nested_net,
         )
     });
@@ -836,9 +933,11 @@ fn run(opts: &Options) -> Result<i32, String> {
         }
     };
 
-    runtime
+    let result = runtime
         .run(&mut out, Some(&mut trace))
-        .map_err(|e| format!("{}: {e}", opts.program))
+        .map_err(|e| format!("{}: {e}", opts.program));
+    report_sanitizer_violations(&runtime);
+    result
 }
 
 fn main() -> ExitCode {
@@ -855,7 +954,7 @@ fn main() -> ExitCode {
     // -h/--help and any CLI parse error short-circuit here, before
     // ~/.volamos/.volamos are even read -- neither is relevant to
     // those paths (see parse_args_raw's doc).
-    let (cli_overrides, program, guest_args) = match parse_args_raw(args) {
+    let (cli_overrides, sanitize, program, guest_args) = match parse_args_raw(args) {
         Ok(v) => v,
         Err(msg) => {
             if !msg.is_empty() {
@@ -895,7 +994,7 @@ fn main() -> ExitCode {
         base
     };
 
-    let opts = resolve(merged, program, guest_args);
+    let opts = resolve(merged, sanitize, program, guest_args);
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same
@@ -1360,6 +1459,29 @@ mod tests {
         assert!(!opts.jit);
     }
 
+    #[test]
+    fn default_sanitize_is_off() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.sanitize);
+    }
+
+    #[test]
+    fn sanitize_flag_enables_sanitize() {
+        let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
+        assert!(opts.sanitize);
+    }
+
+    #[test]
+    fn sanitize_flag_does_not_disable_the_jit_flag_itself() {
+        // --sanitize forces the *effective* JIT off at the CPU (see
+        // `run`/`run_nested_program`), but `Options::jit` itself just
+        // records what --jit/--no-jit said -- the two are independent
+        // settings, combined only where the CPU is actually configured.
+        let opts = parse_args(args(&["--jit", "--sanitize", "prog"])).unwrap();
+        assert!(opts.jit);
+        assert!(opts.sanitize);
+    }
+
     // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---
     //
     // `standard_volumes`/`volumes_dir` are consumed by `main` before
@@ -1370,13 +1492,13 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
+        let (overrides, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
+        let (overrides, _, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
 
@@ -1386,13 +1508,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _) =
+        let (overrides, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }

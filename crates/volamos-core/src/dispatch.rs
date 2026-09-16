@@ -2524,6 +2524,34 @@ impl<C: Cpu + 'static> Runtime<C> {
         self.heap = heap;
     }
 
+    /// Turns on the guest heap's sanitizer bookkeeping: redzones either
+    /// side of every subsequent allocation, and a free quarantine that
+    /// delays reusing freed addresses (see `crate::guestmem`'s
+    /// sanitizer-mode docs). Pairs with
+    /// [`crate::memory::FlatMemory::enable_sanitizer`], which installs
+    /// the shadow map the redzones get poisoned in -- this method only
+    /// arranges for the *address space* to be reserved; `crate::execmem`'s
+    /// `AllocMem`/`FreeMem` handlers do the poisoning, since they are
+    /// the ones that know an allocation just came into existence.
+    ///
+    /// Deliberately a method on the already-built `Runtime` rather than
+    /// a [`StartConfig`] field: the heap is created inside
+    /// [`Runtime::new`] from `load_end` and the computed stack base, and
+    /// threading a flag through `StartConfig` would mean touching every
+    /// one of its construction sites (including a great many tests) for
+    /// a setting only the CLI's `--sanitize` path ever sets. Calling
+    /// this straight after `Runtime::new` costs nothing: the redzone and
+    /// quarantine settings apply to subsequent allocations, and the only
+    /// allocations `Runtime::new` itself has made by then are the
+    /// runtime's own internal guest structures, which no guest bug can
+    /// overrun from the outside anyway.
+    pub fn enable_heap_sanitizer(&mut self) {
+        self.heap
+            .set_redzone_size(crate::guestmem::DEFAULT_REDZONE_SIZE);
+        self.heap
+            .set_quarantine_budget(crate::guestmem::DEFAULT_QUARANTINE_BUDGET);
+    }
+
     /// Direct access to guest memory (e.g. for tests that want to inspect
     /// state after a run).
     pub fn memory(&self) -> &C::Memory {

@@ -120,7 +120,29 @@ impl AddressBus for FlatMemory {
     /// harmless to expose unconditionally since `step`/`execute` never
     /// call this hook regardless of feature flags (see
     /// [`m68k::AddressBus::fast_mem`]'s doc comment).
+    ///
+    /// **Except** when a sanitizer shadow map is installed
+    /// ([`FlatMemory::shadow`] is `Some`, see the CLI's `--sanitize`
+    /// flag and `crate::sanitize`'s module doc): this returns `None` in
+    /// that case, unconditionally, and this is the single most
+    /// important correctness detail in the whole sanitizer feature.
+    /// `fast_mem` hands the `m68k` crate a raw pointer straight into the
+    /// backing `Vec<u8>`; `run_batch`'s trace-JIT fast path reads and
+    /// writes guest memory through that pointer directly, completely
+    /// bypassing `read_byte`/`write_byte`/`read_word`/... above -- which
+    /// is exactly where every shadow-map check lives. If `fast_mem` kept
+    /// returning `Some` once sanitizing was turned on, the JIT would
+    /// silently defeat every single check this feature exists to
+    /// perform, and a `--sanitize` run would look clean no matter what
+    /// the guest actually did. `crate::memory`'s `--sanitize` wiring
+    /// also forces the JIT off outright (`M68kCpu::set_jit(false)`) for
+    /// the same reason, belt-and-braces; this `None` is what makes that
+    /// actually load-bearing rather than merely a hint the JIT could
+    /// ignore.
     fn fast_mem(&mut self) -> Option<m68k::FastMem> {
+        if self.shadow().is_some() {
+            return None;
+        }
         let len = AddressSpace::len(self) as u32;
         Some(m68k::FastMem {
             ptr: self.as_mut_slice().as_mut_ptr(),
@@ -205,6 +227,17 @@ impl Cpu for M68kCpu {
     type Memory = FlatMemory;
 
     fn step(&mut self, mem: &mut Self::Memory) -> StopReason {
+        // Publish the PC about to execute into the sanitizer shadow map
+        // (a no-op when no shadow map is installed) -- see
+        // `crate::sanitize::ShadowMap::set_current_pc`'s doc for why
+        // this is the run loop's job: this is the one place that knows
+        // "this PC is about to execute" *before* the instruction (and
+        // any host-side library call it traps into) makes its memory
+        // accesses, so every violation from here until the next step
+        // is attributed to it.
+        if let Some(shadow) = mem.shadow_mut() {
+            shadow.set_current_pc(self.pc());
+        }
         match self.core.step(mem) {
             StepResult::Ok { .. } => StopReason::Step,
             StepResult::Stopped => StopReason::Halted,
@@ -255,12 +288,32 @@ impl Cpu for M68kCpu {
     fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
         use m68k::BatchExit;
 
-        let max_instructions = if self.jit { u32::MAX } else { 1 };
+        // An installed shadow map forces batches of one instruction even
+        // with the JIT requested. `fast_mem` returning `None` already
+        // keeps the *checks* correct under a large batch, but the PC
+        // published below is only republished once per batch, so a
+        // multi-instruction batch would attribute every violation in it
+        // to the batch's first PC -- a silently misleading report, which
+        // for a debugging tool is worse than a slow one. The CLI also
+        // forces `--sanitize` to turn the JIT off, but deriving it here
+        // too means a caller that installs a shadow map directly
+        // (bypassing the CLI) still gets precise attribution rather
+        // than depending on remembering to pair the two flags.
+        let max_instructions = if self.jit && mem.shadow().is_none() {
+            u32::MAX
+        } else {
+            1
+        };
 
         loop {
             let pc = self.pc();
             if pc as usize >= AddressSpace::len(mem) {
                 return StopReason::PcOutOfBounds { pc };
+            }
+            // See `Cpu::step`'s matching comment -- same "publish before
+            // executing" reasoning applies per batch here.
+            if let Some(shadow) = mem.shadow_mut() {
+                shadow.set_current_pc(pc);
             }
             let result = self.core.run_batch(mem, max_instructions, &[]);
             match result.exit {
@@ -404,6 +457,21 @@ mod tests {
         cpu.set_pc(TRAP_TABLE_END);
         cpu.set_address_register(AddressRegister(7), size as u32);
         (cpu, mem)
+    }
+
+    #[test]
+    fn fast_mem_returns_none_once_the_sanitizer_is_enabled() {
+        // The single most important correctness detail in the sanitizer
+        // feature: fast_mem must stop handing out a raw pointer once a
+        // shadow map is installed, or the JIT's fast path would bypass
+        // every check -- see AddressBus::fast_mem's doc comment on
+        // FlatMemory.
+        let mut mem = FlatMemory::new(0x100);
+        assert!(AddressBus::fast_mem(&mut mem).is_some());
+
+        mem.enable_sanitizer();
+
+        assert!(AddressBus::fast_mem(&mut mem).is_none());
     }
 
     #[test]
