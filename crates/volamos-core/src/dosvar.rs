@@ -81,14 +81,22 @@ fn global_set(vfs: Option<&Vfs>, name: &[u8], content: &[u8]) -> Result<(), i32>
     std::fs::write(&resolved.host_path, content).map_err(|e| map_io_error(&e))
 }
 
-/// Deletes global variable `name`'s `ENV:name` file on `vfs`.
+/// Deletes global variable `name`'s `ENV:name` file on `vfs`. Real
+/// `SetVar(name, NULL, 0, flags)` succeeds silently when the variable
+/// doesn't exist (verified against real Kickstart), so a missing file
+/// is not an error here.
 fn global_delete(vfs: Option<&Vfs>, name: &[u8]) -> Result<(), i32> {
     let vfs = vfs.ok_or(ERROR_OBJECT_NOT_FOUND)?;
     let amiga_path = format!("ENV:{}", String::from_utf8_lossy(name));
-    let resolved = vfs
-        .resolve_with_amiga_path(&amiga_path, ResolveMode::MustExist)
-        .map_err(|e| map_vfs_error(&e))?;
-    std::fs::remove_file(&resolved.host_path).map_err(|e| map_io_error(&e))
+    let resolved = match vfs.resolve_with_amiga_path(&amiga_path, ResolveMode::MustExist) {
+        Ok(resolved) => resolved,
+        Err(_) => return Ok(()),
+    };
+    match std::fs::remove_file(&resolved.host_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(map_io_error(&e)),
+    }
 }
 
 const DOSTRUE: u32 = 0xFFFF_FFFF;
@@ -134,11 +142,8 @@ fn set_var(
             global_delete(dos.vfs.as_ref(), &raw_name)
         } else {
             let key = String::from_utf8_lossy(&raw_name).to_ascii_uppercase();
-            if dos.local_vars.remove(&key).is_some() {
-                Ok(())
-            } else {
-                Err(ERROR_OBJECT_NOT_FOUND)
-            }
+            dos.local_vars.remove(&key);
+            Ok(())
         };
     }
 
@@ -383,11 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_missing_var_is_an_error() {
+    fn delete_missing_var_succeeds_silently() {
+        // Real SetVar(name, NULL, 0, flags) on a variable that doesn't
+        // exist succeeds (verified against real Kickstart), it doesn't
+        // raise ERROR_OBJECT_NOT_FOUND.
         let (mut mem, mut dos) = setup();
         write_c_string(&mut mem, 0x100, b"NOPE");
-        let err = set_var(&mem, &mut dos, 0x100, 0, 0, 0).unwrap_err();
-        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+        set_var(&mem, &mut dos, 0x100, 0, 0, 0).expect("delete of missing var should succeed");
     }
 
     #[test]
@@ -438,6 +445,14 @@ mod tests {
             .expect("get should succeed");
         assert_eq!(len, 5);
         assert_eq!(read_c_string(&mem, 0x300), b"hello");
+    }
+
+    #[test]
+    fn global_delete_of_missing_var_succeeds_silently() {
+        let (mut mem, mut dos, _tmp) = setup_with_env();
+        write_c_string(&mut mem, 0x100, b"NOPE");
+        set_var(&mem, &mut dos, 0x100, 0, 0, GVF_GLOBAL_ONLY)
+            .expect("delete of missing global var should succeed");
     }
 
     #[test]
