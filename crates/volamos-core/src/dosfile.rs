@@ -1285,15 +1285,15 @@ fn get_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
-/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- one of the two
+/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- one of the three
 /// `AllocDosObject` `type`s this runtime implements (see
-/// [`alloc_dos_object_handler`]'s doc for why). The other three
-/// documented types (`DOS_FILEHANDLE` 0, `DOS_FIB` 2, `DOS_STDPKT` 3,
-/// `DOS_CLI` 4) aren't -- `DOS_FILEHANDLE`/`DOS_CLI` in particular
-/// would need real integration with this runtime's own `FileHandle`/
-/// `pr_CLI` bookkeeping to be genuinely usable, not just a same-shaped
-/// zeroed block, so a real implementation of those is deferred until a
-/// corpus binary actually needs one.
+/// [`alloc_dos_object_handler`]'s doc for why). The other documented
+/// types (`DOS_FILEHANDLE` 0, `DOS_STDPKT` 3, `DOS_CLI` 4) aren't --
+/// `DOS_FILEHANDLE`/`DOS_CLI` in particular would need real
+/// integration with this runtime's own `FileHandle`/`pr_CLI`
+/// bookkeeping to be genuinely usable, not just a same-shaped zeroed
+/// block, so a real implementation of those is deferred until a corpus
+/// binary actually needs one.
 const DOS_RDARGS: u32 = 5;
 /// `DOS_EXALLCONTROL` (1): the `struct ExAllControl` that `ExAll`
 /// requires to be allocated through `AllocDosObject` (see
@@ -1302,6 +1302,18 @@ const DOS_RDARGS: u32 = 5;
 /// size -- `eac_LastKey == 0` is exactly the required
 /// before-the-first-`ExAll`-call state.
 const DOS_EXALLCONTROL: u32 = 1;
+/// `DOS_FIB` (2): a `struct FileInfoBlock` (`<dos/dos.h>`), the same
+/// shape [`crate::doslock`]'s `Examine`/`ExNext` already fill in guest
+/// memory -- reuses that module's own [`crate::doslock::FIB_SIZE`]
+/// rather than a second, possibly-drifting copy of the constant. Per
+/// the NDK autodoc, `AllocDosObject(DOS_FIB, ...)` is just a zeroed
+/// `sizeof(struct FileInfoBlock)` block, same as [`DOS_RDARGS`]/
+/// [`DOS_EXALLCONTROL`] -- the caller passes it straight into
+/// `Examine`/`ExNext`, which populate every field themselves. Found
+/// running the real `sidick/micropython` Amiga port's `os.walk()`,
+/// which allocates its own `FileInfoBlock` this way instead of using
+/// `ExAll`.
+const DOS_FIB: u32 = 2;
 /// `sizeof(struct RDArgs)` per `<dos/rdargs.h>`: `RDA_Source` (a
 /// `struct CSource`: `CS_Buffer`/`CS_Length`/`CS_CurChr`, 4 each = 12)
 /// plus `RDA_DAList`/`RDA_Buffer`/`RDA_BufSiz`/`RDA_ExtHelp`/
@@ -1331,15 +1343,16 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     let struct_size = match object_type {
         DOS_RDARGS => RDARGS_STRUCT_SIZE,
         DOS_EXALLCONTROL => crate::dosexall::EXALLCONTROL_SIZE,
+        DOS_FIB => crate::doslock::FIB_SIZE,
         _ => {
             return Err(DispatchError::HandlerFailed {
                 library: "dos.library".to_string(),
                 lvo: -228,
                 handler_name: "AllocDosObject".to_string(),
                 message: format!(
-                    "AllocDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) and \
-                     DOS_EXALLCONTROL ({DOS_EXALLCONTROL}) are implemented -- see DOS_RDARGS's \
-                     doc for why the other types aren't"
+                    "AllocDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}), \
+                     DOS_EXALLCONTROL ({DOS_EXALLCONTROL}), and DOS_FIB ({DOS_FIB}) are \
+                     implemented -- see DOS_RDARGS's doc for why the other types aren't"
                 ),
             });
         }
@@ -1369,11 +1382,11 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
 }
 
 /// `FreeDosObject` (`D1` = `type`, `D2` = the object). No return value.
-/// Frees a [`DOS_RDARGS`] or [`DOS_EXALLCONTROL`] block allocated by
-/// [`alloc_dos_object_handler`]; a `NULL` object is a documented-legal
-/// no-op (matches every other free-half-of-a-pair convention in this
-/// runtime, e.g. `crate::execmem`'s `FreeVec`). Any other `type`
-/// fails loudly, same as the allocation side.
+/// Frees a [`DOS_RDARGS`], [`DOS_EXALLCONTROL`], or [`DOS_FIB`] block
+/// allocated by [`alloc_dos_object_handler`]; a `NULL` object is a
+/// documented-legal no-op (matches every other free-half-of-a-pair
+/// convention in this runtime, e.g. `crate::execmem`'s `FreeVec`). Any
+/// other `type` fails loudly, same as the allocation side.
 fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let object_type = ctx.cpu.data_register(DataRegister(1));
     let addr = ctx.cpu.data_register(DataRegister(2));
@@ -1382,15 +1395,15 @@ fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         return Ok(());
     }
 
-    if object_type != DOS_RDARGS && object_type != DOS_EXALLCONTROL {
+    if object_type != DOS_RDARGS && object_type != DOS_EXALLCONTROL && object_type != DOS_FIB {
         return Err(DispatchError::HandlerFailed {
             library: "dos.library".to_string(),
             lvo: -234,
             handler_name: "FreeDosObject".to_string(),
             message: format!(
-                "FreeDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}) and \
-                 DOS_EXALLCONTROL ({DOS_EXALLCONTROL}) are implemented -- see DOS_RDARGS's doc \
-                 for why the other types aren't"
+                "FreeDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}), \
+                 DOS_EXALLCONTROL ({DOS_EXALLCONTROL}), and DOS_FIB ({DOS_FIB}) are implemented \
+                 -- see DOS_RDARGS's doc for why the other types aren't"
             ),
         });
     }
@@ -2728,6 +2741,60 @@ mod tests {
                 rt.memory().read_u8(addr + i),
                 0,
                 "byte {i} of a fresh DOS_RDARGS block should be zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_alloc_and_free_dos_object_fib_round_trip() {
+        // Found running the real `sidick/micropython` Amiga port's
+        // `os.walk()`, which allocates its own `FileInfoBlock` this
+        // way (rather than via `ExAll`).
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = DOS_FIB (2)
+            0,
+            2,
+            move_imm_to_d(2), // D2 = NULL (no tags)
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-228i16) as u16]); // AllocDosObject(a6)
+        words.push(move_d0_to_d(3)); // D3 = the FileInfoBlock* (save before D2 gets reused)
+        words.push(move_imm_to_d(1)); // D1 = DOS_FIB again
+        words.push(0);
+        words.push(2);
+        words.push(0x2E02); // move.l d3,d2 (the FileInfoBlock* -> D2, FreeDosObject's arg)
+        words.extend_from_slice(&[jsr_disp16(6), (-234i16) as u16]); // FreeDosObject(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+    }
+
+    #[test]
+    fn end_to_end_alloc_dos_object_returns_a_real_zeroed_fib() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = DOS_FIB (2)
+            0,
+            2,
+            move_imm_to_d(2), // D2 = NULL (no tags)
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-228i16) as u16]); // AllocDosObject(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+        assert_ne!(addr, 0);
+        for i in 0..crate::doslock::FIB_SIZE {
+            assert_eq!(
+                rt.memory().read_u8(addr + i),
+                0,
+                "byte {i} of a fresh DOS_FIB block should be zeroed"
             );
         }
     }
