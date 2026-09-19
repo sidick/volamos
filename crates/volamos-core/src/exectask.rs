@@ -321,6 +321,23 @@ pub const PR_CLI_OFFSET: u32 = 172;
 /// called once from `crates/volamos/src/main.rs` after `set_vfs`).
 /// Found needed running the real SAS/C `sc` compiler (issue #17).
 pub const PR_HOMEDIR_OFFSET: u32 = 188;
+/// `pr_Arguments`: `STRPTR`, offset 204 (`pr_HomeDir` 188 + 4, `pr_Flags`
+/// 192, `pr_ExitCode` 196, `pr_ExitData` 200, `pr_Arguments` 204). Per
+/// `<dos/dosextens.h>`: "Arguments passed to the process at start".
+/// This runtime already builds the exact same command-line buffer for
+/// `A0`/`D0` at process entry (see `crate::dispatch::Runtime::new`) --
+/// `pr_Arguments` just needs to point at it too, since a real
+/// AmigaOS process (via `RunCommand`/`CreateNewProc`) gets both: A0/D0
+/// are the entry-time convention a `crt0` reads once at startup, but
+/// `pr_Arguments` is the same string surviving in the process struct
+/// for any code to re-read later (e.g. after `A0`/`D0` have long since
+/// been clobbered). Found running the real `sidick/micropython`
+/// Amiga port (its own startup reads argv from `pr_Arguments`, not
+/// A0/D0): left at 0/NULL, it always decided "no arguments" and fell
+/// back to its REPL even when a script path was passed, regardless of
+/// A0/D0 being correct -- confirmed by cross-checking against vamos,
+/// which does set this field (`amitools`' `Process.init_args()`).
+pub const PR_ARGUMENTS_OFFSET: u32 = 204;
 /// `sizeof(struct Process)` per `<dos/dosextens.h>` -- `pr_CLI`'s own
 /// offset (172) plus every field after it (`pr_ReturnAddr`/
 /// `pr_PktWait`/`pr_WindowPtr`/`pr_HomeDir` 4 each = 16, `pr_Flags` 4,
