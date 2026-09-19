@@ -2361,6 +2361,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         cpu.set_data_register(DataRegister(0), line_len);
         cpu.set_pc(config.entry);
 
+        // pr_Arguments: the same command-line buffer A0/D0 just got,
+        // also reachable later via the process struct -- see
+        // `exectask::PR_ARGUMENTS_OFFSET`'s doc for why a real guest
+        // startup may read this instead of (or in addition to) A0/D0.
+        mem.write_u32(task + exectask::PR_ARGUMENTS_OFFSET, args_addr);
+
         // ReadArgs's default source (rdargs == NULL): the same
         // command-line buffer just built above, per crate::dosargs's
         // module docs. Registers hold this too, but a guest program is
@@ -3735,6 +3741,29 @@ mod tests {
         let d0 = rt.cpu.data_register(DataRegister(0));
         let bytes: Vec<u8> = (0..d0).map(|i| rt.mem.read_u8(a0 + i)).collect();
         assert_eq!(bytes, b"COMMENT \"a whole sentence\" \n");
+    }
+
+    #[test]
+    fn pr_arguments_points_at_the_same_command_line_buffer_as_a0() {
+        // Found running the real `sidick/micropython` Amiga port:
+        // its own startup reads argv from `pr_Arguments` (the
+        // `struct Process` field), not from A0/D0 -- left at NULL, it
+        // always decided "no arguments" and fell back to its REPL
+        // even with a real script path passed on the command line.
+        // See `exectask::PR_ARGUMENTS_OFFSET`'s doc.
+        let rt = runtime_with_program_and_args(&[RTS], vec!["script.py".to_string()]);
+        let a0 = rt.cpu.address_register(AddressRegister(0));
+        let pr_arguments = rt
+            .mem
+            .read_u32(rt.task + crate::exectask::PR_ARGUMENTS_OFFSET);
+        assert_eq!(
+            pr_arguments, a0,
+            "pr_Arguments should point at the same buffer A0 does"
+        );
+        assert_eq!(
+            crate::guestmem::read_c_string(&rt.mem, pr_arguments),
+            b"script.py \n"
+        );
     }
 
     #[test]
