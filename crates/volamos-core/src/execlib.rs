@@ -740,14 +740,21 @@ fn after_init<C: Cpu>(
         pending.alloc_addr,
     );
 
+    // Real Kickstart checks `lib_Version` with a 68000 `CMP.W`, so only
+    // the low word of the requested-version register is ever inspected
+    // -- garbage in the high word (e.g. a caller passing $30000000) is
+    // silently ignored rather than causing a spurious refusal (see the
+    // AROS "Frontier 2" fix this mirrors). D0 itself is left untouched
+    // for the trampoline into `Open` below, matching real hardware.
     let lib_version = u32::from(ctx.mem.read_u16(base.wrapping_add(LIB_VERSION_OFFSET)));
-    if lib_version < pending.requested_version {
+    let requested_version_word = pending.requested_version as u16 as u32;
+    if lib_version < requested_version_word {
         ctx.cpu
             .set_address_register(AddressRegister(6), pending.caller_a6);
         ctx.cpu.set_data_register(DataRegister(0), 0);
         *ctx.call_detail = Some(format!(
             "library {:?} -> NULL (version {lib_version} < requested {})",
-            pending.name, pending.requested_version
+            pending.name, requested_version_word
         ));
         return Ok(());
     }
@@ -809,12 +816,15 @@ pub fn reopen<C: Cpu>(
 ) -> Result<(), DispatchError> {
     let caller_a6 = ctx.cpu.address_register(AddressRegister(6));
 
+    // See `after_init`'s matching comment: real Kickstart's version check
+    // is a `CMP.W`, so only the low word of `requested_version` matters.
     let lib_version = u32::from(ctx.mem.read_u16(base.wrapping_add(LIB_VERSION_OFFSET)));
-    if lib_version < requested_version {
+    let requested_version_word = requested_version as u16 as u32;
+    if lib_version < requested_version_word {
         ctx.cpu.set_address_register(AddressRegister(6), caller_a6);
         ctx.cpu.set_data_register(DataRegister(0), 0);
         *ctx.call_detail = Some(format!(
-            "library {name:?} -> NULL (version {lib_version} < requested {requested_version})"
+            "library {name:?} -> NULL (version {lib_version} < requested {requested_version_word})"
         ));
         return Ok(());
     }
@@ -1999,6 +2009,39 @@ mod loaded_library_e2e {
             result.expect("run should succeed") as u32,
             EXEC_LIBRARY_BASE,
             "A6 must be restored to the caller's own value after a version-refused open"
+        );
+    }
+
+    /// Test 4 continued: real Kickstart checks `lib_Version` with a
+    /// 68000 `CMP.W`, so garbage in the high word of the requested-
+    /// version register is ignored -- `OpenLibrary(name, $30000000)`
+    /// must succeed against `test.library`'s real `lib_Version` (1)
+    /// exactly as `OpenLibrary(name, 0)` would, because only the low
+    /// word ($0000) is ever compared. This mirrors a real AROS bug fix
+    /// (a caller passing `$30000000` in D0 that real ROMs accept but a
+    /// naive full-32-bit-compare implementation -- like AROS's, and
+    /// like this runtime's before this test was added -- wrongly
+    /// refuses).
+    #[test]
+    fn version_check_ignores_high_word_garbage() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        move_imm_dn(&mut words, 0, 0x3000_0000); // low word 0 <= lib_Version 1
+        jsr(&mut words, 6, -552); // OpenLibrary(name, $30000000) -> D0 (exit code)
+        words.push(RTS);
+
+        let (result, _rt) = run_against_library(
+            "version-high-word-garbage",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        assert_ne!(
+            result.expect("run should succeed"),
+            0,
+            "a CMP.W-style version check must ignore D0's high word and succeed"
         );
     }
 
