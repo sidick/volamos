@@ -52,7 +52,11 @@
 //! [`run_nested_program`] check this upfront and fail with a clear
 //! error (rather than letting [`volamos_core::dispatch::Runtime::new`]
 //! panic deep inside guest-heap setup) if `--stack` is too close to or
-//! exceeds `--ram`.
+//! exceeds `--ram`. `--ram` must also be an address space the `--cpu`
+//! model can actually reach: a 68000/68010 has a 24-bit address bus, so
+//! anything above 16 MiB puts the guest stack at an address the CPU
+//! cannot express, and [`check_ram_addressable`] refuses that
+//! combination up front too.
 //!
 //! `--cpu MODEL` picks the emulated [`CpuType`] (default `68000`, the
 //! lowest common denominator every Kickstart 3.1 machine shares -- see
@@ -78,7 +82,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END};
+use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END, addressable_bytes};
 use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
 use volamos_core::exectask::install_host_break_handler;
 use volamos_core::loader::Location;
@@ -283,7 +287,8 @@ fn print_usage(program_name: &str) {
     );
     eprintln!("                            same K/M suffix syntax as --stack. --stack must leave");
     eprintln!("                            real room within this for the loaded program and the");
-    eprintln!("                            runtime's own guest heap");
+    eprintln!("                            runtime's own guest heap. Above 16M needs --cpu 68020");
+    eprintln!("                            or later: a 68000/68010 cannot address more than that");
     eprintln!("  --cpu MODEL               emulated CPU (default 68000): 68000, 68010, 68020,");
     eprintln!("                            68ec020, 68030, 68ec030, 68040, 68ec040, 68lc040,");
     eprintln!("                            68060, or scc68070");
@@ -428,6 +433,31 @@ fn parse_cpu_type(s: &str) -> Result<CpuType, String> {
             "--cpu expects one of 68000, 68010, 68020, 68ec020, 68030, 68ec030, 68040, \
              68ec040, 68lc040, 68060, scc68070, got {s:?}"
         )),
+    }
+}
+
+/// The `--cpu MODEL` spelling for `cpu_type` -- the inverse of
+/// [`parse_cpu_type`], so a diagnostic can name the model the way the
+/// user wrote it rather than as a Rust enum variant.
+fn cpu_model_name(cpu_type: CpuType) -> &'static str {
+    match cpu_type {
+        CpuType::M68000 => "68000",
+        CpuType::M68010 => "68010",
+        CpuType::M68020 => "68020",
+        CpuType::M68EC020 => "68ec020",
+        CpuType::M68030 => "68030",
+        CpuType::M68EC030 => "68ec030",
+        CpuType::M68040 => "68040",
+        CpuType::M68EC040 => "68ec040",
+        CpuType::M68LC040 => "68lc040",
+        CpuType::M68060 => "68060",
+        CpuType::SCC68070 => "scc68070",
+        // `CpuType` is the `m68k` crate's, so it can grow a variant (or
+        // hand back its `Invalid` sentinel) without this match knowing.
+        other => {
+            debug_assert!(false, "unnamed CpuType {other:?}");
+            "CPU"
+        }
     }
 }
 
@@ -841,6 +871,36 @@ fn report_sanitizer_violations(
     }
 }
 
+/// Checks that `ram_size` is an address space the configured CPU can
+/// actually reach (issue #98).
+///
+/// The guest stack lives at the top of the address space, so a `--ram`
+/// larger than the CPU's address bus can express puts `A7` at an
+/// address that wraps: the `JSR` into a library pushes its return
+/// address into low memory instead, and the `RTS` pops whatever was
+/// there. That is what real hardware does, and it manifests as the
+/// baffling "continuation stub trapped at 0x000000c4 with no pending
+/// continuation" several calls into a run rather than as a complaint
+/// about the flags -- so, like an oversized `--stack` (see
+/// [`check_ram_fits`]), it is refused up front instead.
+///
+/// Only bites someone who raises `--ram` past 16 MiB without also
+/// asking for a 32-bit CPU, since the default is exactly 16 MiB.
+fn check_ram_addressable(ram_size: u32, cpu_type: CpuType) -> Result<(), String> {
+    let addressable = addressable_bytes(cpu_type);
+    if u64::from(ram_size) <= addressable {
+        return Ok(());
+    }
+    let model = cpu_model_name(cpu_type);
+    Err(format!(
+        "--ram {ram_size} is more address space than a {model} can reach: that CPU has a \
+         24-bit address bus, so it can only address {addressable} bytes, and the guest \
+         stack at the top of a larger space would be at an address it cannot express -- \
+         ask for a 32-bit address bus with --cpu 68020 (or any later model), or lower the \
+         size to {addressable} or less (--ram on the command line, RAM= in a config file)"
+    ))
+}
+
 /// Checks that `stack_size` plus [`MIN_HEAP_HEADROOM`] actually fits
 /// between `load_end` (the loaded program's own end address) and
 /// `ram_size` (the top of the guest address space) -- see
@@ -992,6 +1052,11 @@ fn build_runtime_with_vfs(
 }
 
 fn run(opts: &Options) -> Result<i32, String> {
+    // Before anything is read or loaded: this one depends only on the
+    // flags, and a run that violates it fails much later in a way that
+    // does not point at them.
+    check_ram_addressable(opts.ram_size, opts.cpu_type)?;
+
     let bytes = std::fs::read(&opts.program)
         .map_err(|e| format!("couldn't read '{}': {e}", opts.program))?;
 
@@ -1564,6 +1629,73 @@ mod tests {
     #[test]
     fn check_ram_fits_rejects_on_overflowing_sum() {
         assert!(check_ram_fits(u32::MAX, u32::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn the_default_ram_size_is_exactly_what_a_68000_can_address() {
+        // Issue #98: the two constants have to agree, or the default
+        // configuration is either broken or needlessly small. If a
+        // future `DEFAULT_RAM_SIZE` bump ever wants more, it has to come
+        // with a `--cpu` default change (or a clamp) as well.
+        assert_eq!(
+            u64::from(DEFAULT_RAM_SIZE),
+            addressable_bytes(CpuType::M68000)
+        );
+        assert!(check_ram_addressable(DEFAULT_RAM_SIZE, CpuType::M68000).is_ok());
+    }
+
+    #[test]
+    fn check_ram_addressable_rejects_over_16m_on_a_24_bit_cpu() {
+        // One byte over is enough: the guest stack sits at the top of
+        // the address space, so this is not a "close enough" situation.
+        for cpu in [CpuType::M68000, CpuType::M68010] {
+            let err = check_ram_addressable(DEFAULT_RAM_SIZE + 1, cpu).unwrap_err();
+            assert!(err.contains("24-bit address bus"), "{err}");
+            assert!(err.contains(cpu_model_name(cpu)), "{err}");
+            assert!(err.contains("--cpu 68020"), "{err}");
+        }
+    }
+
+    #[test]
+    fn check_ram_addressable_accepts_any_size_on_a_32_bit_cpu() {
+        for cpu in [
+            CpuType::M68020,
+            CpuType::M68EC020,
+            CpuType::M68030,
+            CpuType::M68EC030,
+            CpuType::M68040,
+            CpuType::M68EC040,
+            CpuType::M68LC040,
+            CpuType::M68060,
+            CpuType::SCC68070,
+        ] {
+            assert!(
+                check_ram_addressable(u32::MAX, cpu).is_ok(),
+                "{} should take any u32 address space",
+                cpu_model_name(cpu)
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_model_name_round_trips_through_parse_cpu_type() {
+        // Keeps the diagnostic spelling honest: whatever name an error
+        // message shows has to be a name the user could have typed.
+        for cpu in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68020,
+            CpuType::M68EC020,
+            CpuType::M68030,
+            CpuType::M68EC030,
+            CpuType::M68040,
+            CpuType::M68EC040,
+            CpuType::M68LC040,
+            CpuType::M68060,
+            CpuType::SCC68070,
+        ] {
+            assert_eq!(parse_cpu_type(cpu_model_name(cpu)), Ok(cpu));
+        }
     }
 
     #[test]

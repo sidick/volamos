@@ -5,6 +5,43 @@ version scheme in `Cargo.toml`.
 
 ## 0.7
 
+- **`--ram` above 16 MiB is now refused on a 68000/68010** (issue #98)
+  instead of producing a program that dies confusingly later. Those CPUs
+  have a 24-bit address bus, and the guest stack sits at the top of the
+  address space, so `--ram 32M` on the default `--cpu 68000` put the
+  stack pointer at an address the CPU cannot express: it wrapped, a
+  `JSR` into a library pushed its return address into low memory, and
+  the `RTS` popped whatever was there — surfacing several calls later as
+  "continuation stub trapped at 0x000000c4 with no pending continuation",
+  which points at nothing useful. It now fails up front naming both
+  flags, the way an oversized `--stack` already did. Pass `--cpu 68020`
+  (or later) for a 32-bit address bus. The default `--ram` is exactly
+  16 MiB, so only a raised `--ram` was ever affected.
+
+- **`--sanitize` no longer reports a recycled heap block as
+  use-after-free** (issue #95, reported by Bernie Innocenti). Once a run
+  freed a block and the heap handed those same addresses back out, every
+  write into the *new* allocation was reported against the *old* one's
+  poison — one violation per byte, which slowed a BenchWork run from 10
+  seconds to 6 minutes and looked like a hang.
+
+  The clearing now happens inside the guest heap, at the single point
+  where a block leaves its control, and the allocator takes the address
+  space as a parameter so a new allocation site cannot compile without
+  it. That matters because `AllocMem`/`AllocVec`/`AllocPooled` are only
+  3 of some four dozen places that carve guest structures out of that
+  heap — the `FileHandle` a `dos` `Open` returns, the `FileLock` a `Lock`
+  returns, a `ReadArgs` argument buffer and many more — and any of them
+  can be handed a poisoned block. Fixing only the exec allocators left a
+  guest that freed a large block and then opened a file still reporting
+  46 phantom use-after-free writes.
+
+  Separately, `--sanitize`'s slowdown on a violation-heavy run is gone:
+  the per-byte access check was deciding "did that byte report?" by
+  summing the hit counts of every violation already logged, so the cost
+  grew with the log. A 400,000-violation run goes from 1.33s to 0.03s,
+  with identical output.
+
 - **The heap detectors now cover four more allocators** (issue #83,
   tier 0): `utility.library`'s `AllocateTagItems`, `dos.library`'s
   `AllocDosObject`, and `exec.library`'s `CreateIORequest` and
