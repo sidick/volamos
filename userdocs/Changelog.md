@@ -3,20 +3,7 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## 0.7
-
-- **`--ram` above 16 MiB is now refused on a 68000/68010** (issue #98)
-  instead of producing a program that dies confusingly later. Those CPUs
-  have a 24-bit address bus, and the guest stack sits at the top of the
-  address space, so `--ram 32M` on the default `--cpu 68000` put the
-  stack pointer at an address the CPU cannot express: it wrapped, a
-  `JSR` into a library pushed its return address into low memory, and
-  the `RTS` popped whatever was there — surfacing several calls later as
-  "continuation stub trapped at 0x000000c4 with no pending continuation",
-  which points at nothing useful. It now fails up front naming both
-  flags, the way an oversized `--stack` already did. Pass `--cpu 68020`
-  (or later) for a 32-bit address bus. The default `--ram` is exactly
-  16 MiB, so only a raised `--ram` was ever affected.
+## 0.8
 
 - **`--sanitize` no longer reports a recycled heap block as
   use-after-free** (issue #95, reported by Bernie Innocenti). Once a run
@@ -41,6 +28,50 @@ version scheme in `Cargo.toml`.
   summing the hit counts of every violation already logged, so the cost
   grew with the log. A 400,000-violation run goes from 1.33s to 0.03s,
   with identical output.
+
+- **`--ram` above 16 MiB is now refused on a 68000/68010** (issue #98)
+  instead of producing a program that dies confusingly later. Those CPUs
+  have a 24-bit address bus, and the guest stack sits at the top of the
+  address space, so `--ram 32M` on the default `--cpu 68000` put the
+  stack pointer at an address the CPU cannot express: it wrapped, a
+  `JSR` into a library pushed its return address into low memory, and
+  the `RTS` popped whatever was there — surfacing several calls later as
+  "continuation stub trapped at 0x000000c4 with no pending continuation",
+  which points at nothing useful. It now fails up front naming both
+  flags, the way an oversized `--stack` already did. Pass `--cpu 68020`
+  (or later) for a 32-bit address bus. The default `--ram` is exactly
+  16 MiB, so only a raised `--ram` was ever affected.
+
+- **`pr_Arguments` is now populated on the fake `struct Process`.** `A0`/`D0`
+  carry the command-line buffer at process entry, but real AmigaOS exposes
+  the same string again through `pr_Arguments`, and volamos left that field
+  permanently `NULL`. Found running the real
+  [sidick/micropython](https://github.com/sidick/micropython) Amiga port,
+  whose startup reads `argv` from `pr_Arguments` rather than `A0`/`D0`: it
+  saw "no arguments" and dropped into its REPL even when a script path was
+  passed.
+
+- **`AllocDosObject`/`FreeDosObject` now support `DOS_FIB`** — a zeroed
+  `struct FileInfoBlock`, the same shape as the already-supported
+  `DOS_RDARGS` and `DOS_EXALLCONTROL`. Also found via the micropython port,
+  whose `os.walk()` allocates its own `FileInfoBlock` this way instead of
+  using `ExAll`.
+
+- **`SetVar(name, NULL, ...)` on a variable that does not exist now succeeds
+  silently**, as real `SetVar` does — and so does `DeleteVar`, which is
+  implemented in terms of it. Both the local-variable path and the
+  `ENV:`-backed global one were returning `ERROR_OBJECT_NOT_FOUND`. Verified
+  against real Kickstart.
+
+- **`OpenLibrary` now ignores garbage in the high word of the requested
+  version**, matching the `CMP.W` real ROMs use: a caller passing
+  `$30000000` in `D0` gets the library, where volamos previously compared
+  all 32 bits and refused. Found via a recent AROS fix ("Frontier 2") that
+  identified the same divergence in AROS; volamos had been reproducing the
+  bug rather than the hardware. `D0` itself is left untouched for the `Open`
+  vector, as on real hardware.
+
+## 0.7
 
 - **The heap detectors now cover four more allocators** (issue #83,
   tier 0): `utility.library`'s `AllocateTagItems`, `dos.library`'s
