@@ -291,7 +291,7 @@ pub(crate) fn build_seglist(
     let mut alloc_addrs: Vec<u32> = Vec::with_capacity(file.hunks.len());
     for hunk in &file.hunks {
         let total = SEG_HEADER_SIZE.wrapping_add(hunk.reserved_size as u32);
-        match heap.alloc(total) {
+        match heap.alloc(&mut *mem, total) {
             Ok(addr) => alloc_addrs.push(addr),
             Err(e) => {
                 // Unwind: free everything allocated so far for this
@@ -432,7 +432,7 @@ fn build_overlay_root_seglist(
     // (not a BPTR -- the manager indexes into it with byte offsets
     // directly, per the disassembly-confirmed convention).
     let ovtab_bytes = overlay.table.raw.len() as u32 * 4;
-    let ovtab_addr = match heap.alloc(ovtab_bytes.max(4)) {
+    let ovtab_addr = match heap.alloc(&mut *mem, ovtab_bytes.max(4)) {
         Ok(a) => a,
         Err(e) => {
             for &addr in &seglist.alloc_addrs {
@@ -448,7 +448,7 @@ fn build_overlay_root_seglist(
     // oh_Segments: one BPTR slot per hunk in the whole tree, zeroed for
     // not-yet-loaded overlay-node hunks, filled in for the root's own.
     let segments_bytes = overlay.total_hunks as u32 * 4;
-    let segments_addr = match heap.alloc(segments_bytes.max(4)) {
+    let segments_addr = match heap.alloc(&mut *mem, segments_bytes.max(4)) {
         Ok(a) => a,
         Err(e) => {
             let _ = heap.free(ovtab_addr);
@@ -694,7 +694,7 @@ impl DosState {
         let mut alloc_addrs: Vec<u32> = Vec::with_capacity(node.hunks.len());
         for hunk in &node.hunks {
             let total = SEG_HEADER_SIZE.wrapping_add(hunk.reserved_size as u32);
-            match heap.alloc(total) {
+            match heap.alloc(&mut *mem, total) {
                 Ok(addr) => alloc_addrs.push(addr),
                 Err(_) => {
                     for &addr in &alloc_addrs {

@@ -505,7 +505,7 @@ pub fn create_current_task<M: AddressSpace>(
     input_addr: u32,
 ) -> u32 {
     let task = heap
-        .alloc(PROCESS_STRUCT_SIZE)
+        .alloc(&mut *mem, PROCESS_STRUCT_SIZE)
         .expect("guest heap has room for the fake current task struct");
 
     // Zero the whole struct first -- every field this module doesn't
@@ -525,7 +525,7 @@ pub fn create_current_task<M: AddressSpace>(
     // here).
     mem.write_u8(task + LN_TYPE, NT_TASK);
     let name_addr = heap
-        .alloc(PROCESS_NAME.len() as u32 + 1)
+        .alloc(&mut *mem, PROCESS_NAME.len() as u32 + 1)
         .expect("guest heap has room for the process name string");
     write_c_string(mem, name_addr, PROCESS_NAME);
     mem.write_u32(task + LN_NAME, name_addr);
@@ -547,7 +547,7 @@ pub fn create_current_task<M: AddressSpace>(
     // CommandLineInterface, written as a BPTR -- see PR_CLI_OFFSET's doc
     // for why this must be non-NULL.
     let cli_addr = heap
-        .alloc(CLI_STRUCT_SIZE)
+        .alloc(&mut *mem, CLI_STRUCT_SIZE)
         .expect("guest heap has room for the fake CLI struct");
     for i in 0..CLI_STRUCT_SIZE {
         mem.write_u8(cli_addr.wrapping_add(i), 0);
@@ -560,7 +560,7 @@ pub fn create_current_task<M: AddressSpace>(
     // data to read instead of NUL/zero bytes.
     let name_bytes = program_name.as_bytes();
     let cli_command_name_addr = heap
-        .alloc(1 + (name_bytes.len().min(255) as u32))
+        .alloc(&mut *mem, 1 + (name_bytes.len().min(255) as u32))
         .expect("guest heap has room for the fake cli_CommandName BSTR");
     write_bstr(mem, cli_command_name_addr, name_bytes);
     mem.write_u32(

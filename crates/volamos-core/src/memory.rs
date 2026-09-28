@@ -51,16 +51,18 @@ pub trait AddressSpace {
     fn write_u8(&mut self, addr: u32, value: u8);
 
     /// Clears any sanitizer poison over `[addr, addr + len)`, a block the
-    /// guest heap has just handed out.
+    /// guest heap has just handed out (issue #95).
     ///
-    /// Call this as soon as an allocation succeeds, *before* the handler
-    /// writes a header or zeroes the block: the heap recycles addresses,
-    /// so those bytes may still carry the `PoisonReason::Freed` marking
-    /// of the previous allocation, and writing over them does not clear
-    /// it -- the shadow map heals `Uninit` bytes but keeps
-    /// `Unaddressable` ones. Without this, the handler's own
-    /// initialization is reported as a use-after-free, and so is every
-    /// write the guest then makes.
+    /// **Called by [`crate::guestmem::GuestHeap::alloc_with_requested`],
+    /// which is the only place that should:** the heap recycles
+    /// addresses, so a fresh block may still carry the
+    /// `PoisonReason::Freed` marking of the previous allocation, and
+    /// writing over it does not clear that (the shadow map heals
+    /// `Uninit` bytes but records and keeps `Unaddressable` ones). Doing
+    /// it at the one point where a block leaves the heap's control --
+    /// rather than in each of the four dozen handlers that allocate --
+    /// is what keeps a new allocation site from silently reintroducing
+    /// the bug; see that method's doc for the full reasoning.
     ///
     /// Default: nothing to do, for address spaces with no shadow map.
     fn clear_fresh_block(&mut self, _addr: u32, _len: u32) {}

@@ -129,7 +129,7 @@ fn lock_dos_list(
 ) -> u32 {
     let mut allocated = Vec::new();
     let header = heap
-        .alloc(DOSLIST_SIZE)
+        .alloc(&mut *mem, DOSLIST_SIZE)
         .expect("LockDosList: heap exhausted allocating header");
     zero_doslist(mem, header);
     // DLT_PRIVATE, not a real entry type: this node is a scan starting
@@ -148,7 +148,7 @@ fn lock_dos_list(
             .unwrap_or_default();
         for name in volumes {
             let addr = heap
-                .alloc(DOSLIST_SIZE)
+                .alloc(&mut *mem, DOSLIST_SIZE)
                 .expect("LockDosList: heap exhausted allocating a DosList entry");
             zero_doslist(mem, addr);
             mem.write_u32(addr + DOL_TYPE_OFFSET, DLT_VOLUME as u32);
@@ -163,7 +163,7 @@ fn lock_dos_list(
             let name_bytes = name.as_bytes();
             // +1 length byte, +1 NUL courtesy byte (see module docs).
             let name_addr = heap
-                .alloc(name_bytes.len() as u32 + 2)
+                .alloc(&mut *mem, name_bytes.len() as u32 + 2)
                 .expect("LockDosList: heap exhausted allocating dol_Name");
             let written = write_bstr(mem, name_addr, name_bytes);
             mem.write_u8(name_addr + 1 + written as u32, 0);

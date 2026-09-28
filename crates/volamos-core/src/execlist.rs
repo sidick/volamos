@@ -495,7 +495,7 @@ fn reply_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// heap is exhausted. See the module docs for the `mp_Flags`/`mp_SigBit`/
 /// `mp_SigTask` simplifications.
 fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    let port = match ctx.heap.alloc(MSGPORT_SIZE) {
+    let port = match ctx.heap.alloc(&mut *ctx.mem, MSGPORT_SIZE) {
         Ok(addr) => addr,
         Err(_) => {
             // Real CreateMsgPort returns NULL on failure (e.g.
@@ -505,7 +505,6 @@ fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
             return Ok(());
         }
     };
-    ctx.mem.clear_fresh_block(port, MSGPORT_SIZE);
     init_msg_port_fields(ctx.mem, port, ctx.current_task);
     // After the field initialisation, never before: those writes heal
     // shadow bytes, so poisoning first would flag this handler's own
@@ -591,8 +590,7 @@ fn create_io_request(
     port: u32,
     size: u32,
 ) -> Option<u32> {
-    let addr = heap.alloc(size).ok()?;
-    mem.clear_fresh_block(addr, size);
+    let addr = heap.alloc(&mut *mem, size).ok()?;
     for i in 0..size {
         mem.write_u8(addr.wrapping_add(i), 0);
     }

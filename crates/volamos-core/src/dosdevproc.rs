@@ -97,7 +97,7 @@ fn get_device_proc(
     };
 
     let lock_bptr = dos.lock(heap, mem, &dir_part, SHARED_LOCK)?;
-    match heap.alloc(DEVPROC_SIZE) {
+    match heap.alloc(&mut *mem, DEVPROC_SIZE) {
         Ok(addr) => {
             mem.write_u32(addr + DVP_PORT_OFFSET, 0);
             mem.write_u32(addr + DVP_LOCK_OFFSET, lock_bptr);

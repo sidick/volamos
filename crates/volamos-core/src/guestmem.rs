@@ -450,8 +450,13 @@ impl GuestHeap {
     /// start) stays aligned; a request for `0` bytes still consumes a
     /// (minimal, 0-sized) accounted block so a subsequent `free` on it is
     /// well-defined.
-    pub fn alloc(&mut self, size: u32) -> Result<u32, GuestHeapError> {
-        self.alloc_with_requested(size, size)
+    ///
+    /// `mem` is the guest address space the block is being handed out
+    /// *in*, and is required rather than optional: see
+    /// [`Self::alloc_with_requested`]'s doc for why every allocation has
+    /// to touch it.
+    pub fn alloc(&mut self, mem: &mut dyn AddressSpace, size: u32) -> Result<u32, GuestHeapError> {
+        self.alloc_with_requested(mem, size, size)
     }
 
     /// Like [`GuestHeap::alloc`], but additionally records the caller's
@@ -470,11 +475,63 @@ impl GuestHeap {
     /// exactly `alloc_with_requested(size, size)`, i.e. "no distinct
     /// requested size, treat the two rounding steps this module already
     /// does as the only slack there is."
+    ///
+    /// # Why this takes the address space (issue #95)
+    ///
+    /// The heap recycles addresses, and under `--sanitize` the block it
+    /// is about to hand out may still carry the previous tenant's
+    /// [`crate::sanitize::PoisonReason::Freed`] marking -- writing over
+    /// a byte does not clear that (the shadow map heals
+    /// [`crate::sanitize::ShadowState::Uninit`] bytes but records and
+    /// keeps [`crate::sanitize::ShadowState::Unaddressable`] ones). Left
+    /// in place, the allocating handler's own header write or
+    /// `MEMF_CLEAR` zeroing is reported as a use-after-free, and so is
+    /// every subsequent write the guest makes into its brand-new buffer
+    /// -- one violation per byte, which is slow enough to look like a
+    /// hang.
+    ///
+    /// Clearing it belongs *here*, at the one point where a block leaves
+    /// the heap's control, rather than in each caller: `AllocMem`/
+    /// `AllocVec`/`AllocPooled` are only 3 of some four dozen sites
+    /// across `dosfile`, `doslock`, `dosargs`, `dosseg`, `dosanchor`,
+    /// `bsdsocket`, `intuition`, `graphics`, `locale` and more that
+    /// carve guest structures out of this heap, *any* of which can be
+    /// handed a block that `FreeMem`/`FreeVec`/`FreePooled` poisoned.
+    /// Taking `mem` as a parameter is what makes that impossible to
+    /// forget: a new allocation site cannot compile without supplying
+    /// it. The whole *block* is cleared, redzones included -- nothing
+    /// about the previous tenant applies to these addresses any more --
+    /// and callers that want redzone/alignment-slack protection re-poison
+    /// afterwards via `execmem::poison_allocation_edges`, which has to
+    /// run after the handler's own initializing writes anyway.
     pub fn alloc_with_requested(
         &mut self,
+        mem: &mut dyn AddressSpace,
         size: u32,
         requested: u32,
     ) -> Result<u32, GuestHeapError> {
+        let (user_start, block_start, block_end) = self.alloc_untracked(size, requested)?;
+        mem.clear_fresh_block(block_start, block_end - block_start);
+        Ok(user_start)
+    }
+
+    /// The allocator proper: the bookkeeping half of
+    /// [`Self::alloc_with_requested`], with no sanitizer involvement.
+    /// Returns `(user_start, block_start, block_end)` so its caller can
+    /// clear the shadow map over the whole block without a follow-up
+    /// [`Self::extent_of_live_alloc`] lookup.
+    ///
+    /// Private, and deliberately so: every allocation a guest can ever
+    /// see has to go through [`Self::alloc_with_requested`] to get its
+    /// shadow bytes cleared, and a caller that could reach this directly
+    /// could skip that. Within the module, the test-only `alloc_bare`
+    /// shorthands use it for the placement/coalescing tests, which have
+    /// no address space in play.
+    fn alloc_untracked(
+        &mut self,
+        size: u32,
+        requested: u32,
+    ) -> Result<(u32, u32, u32), GuestHeapError> {
         let aligned_size = align_up(size);
 
         // Clamp `requested` to what was actually reserved. A caller that
@@ -541,7 +598,7 @@ impl GuestHeap {
                 block_end,
             },
         );
-        Ok(user_start)
+        Ok((user_start, block_start, block_end))
     }
 
     /// Frees a block previously returned by [`GuestHeap::alloc`].
@@ -831,19 +888,41 @@ pub fn write_bstr(mem: &mut dyn AddressSpace, addr: u32, bytes: &[u8]) -> u8 {
     len
 }
 
+/// Test-only shorthands for [`GuestHeap::alloc`]/
+/// [`GuestHeap::alloc_with_requested`] without an address space.
+///
+/// The allocator's own unit tests are about placement, rounding,
+/// coalescing and the quarantine -- none of which involve the sanitizer.
+/// The shadow-clearing half that `alloc` adds on top is covered where it
+/// can be observed, against a real `FlatMemory`: see
+/// `alloc_clears_a_recycled_blocks_freed_poison` below and
+/// `execmem::tests::a_recycled_alloc_vec_block_is_no_longer_a_freed_block`.
+#[cfg(test)]
+impl GuestHeap {
+    fn alloc_bare(&mut self, size: u32) -> Result<u32, GuestHeapError> {
+        self.alloc_bare_req(size, size)
+    }
+
+    fn alloc_bare_req(&mut self, size: u32, requested: u32) -> Result<u32, GuestHeapError> {
+        self.alloc_untracked(size, requested)
+            .map(|(addr, _, _)| addr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::FlatMemory;
+    use crate::sanitize::{PoisonReason, ShadowState};
 
     #[test]
     fn alloc_returns_4_byte_aligned_addresses() {
         let mut heap = GuestHeap::new(0x1001, 0x2000);
         // start rounds up to 0x1004.
-        let a = heap.alloc(3).unwrap();
+        let a = heap.alloc_bare(3).unwrap();
         assert_eq!(a % 4, 0);
         assert_eq!(a, 0x1004);
-        let b = heap.alloc(1).unwrap();
+        let b = heap.alloc_bare(1).unwrap();
         assert_eq!(b % 4, 0);
         // 3 rounds up to 4, so b should be right after a's 4-byte block.
         assert_eq!(b, 0x1008);
@@ -852,32 +931,73 @@ mod tests {
     #[test]
     fn alloc_free_realloc_reuses_freed_block() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
-        let b = heap.alloc(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert_eq!(a, b, "freed block should be reused by a same-size alloc");
+    }
+
+    #[test]
+    fn alloc_clears_a_recycled_blocks_freed_poison() {
+        // Issue #95, at the one place the fix lives. Every guest-visible
+        // allocation in the runtime -- `AllocMem` and `AllocVec`, but
+        // equally the `FileHandle` a dos `Open` carves out, the
+        // `FileLock` a `Lock` carves out, a `ReadArgs` argument buffer
+        // and three dozen more -- comes out of here, and any of them can
+        // be handed a block that `FreeMem`/`FreeVec` poisoned. Clearing
+        // it here is what makes that true for all of them at once
+        // (`alloc` cannot even be called without an address space to
+        // clear), so this test works the heap directly rather than
+        // through any one handler.
+        let mut mem = FlatMemory::new(0x2000);
+        mem.enable_sanitizer();
+        let mut heap = GuestHeap::new(0x1000, 0x2000).with_redzone_size(DEFAULT_REDZONE_SIZE);
+
+        let a = heap.alloc(&mut mem, 16).unwrap();
+        // Exactly what `execmem::poison_freed_block` does before a
+        // `FreeVec`, then release the block for immediate reuse (the
+        // quarantine is off, so `free` puts it straight back).
+        let extent = heap.extent_of_live_alloc(a).unwrap();
+        mem.shadow_mut().unwrap().mark_unaddressable(
+            extent.block_start,
+            extent.block_end - extent.block_start,
+            PoisonReason::Freed,
+        );
+        heap.free(a).unwrap();
+
+        let b = heap.alloc(&mut mem, 16).unwrap();
+        assert_eq!(a, b, "the test needs the block to actually be recycled");
+        let shadow = mem.shadow().unwrap();
+        for addr in extent.block_start..extent.block_end {
+            assert_eq!(
+                shadow.state(addr),
+                ShadowState::Valid,
+                "{addr:#x}: nothing about the previous tenant of a recycled \
+                 block applies to it any more, redzone bytes included"
+            );
+        }
     }
 
     #[test]
     fn alloc_free_coalesces_adjacent_blocks() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(16).unwrap();
-        let b = heap.alloc(16).unwrap();
-        let c = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
+        let c = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
         heap.free(c).unwrap();
         heap.free(b).unwrap();
         // Everything freed and coalesced back into one block: a single
         // alloc of the whole managed region should now succeed.
-        let big = heap.alloc(0x1000 - 16 * 3).unwrap();
+        let big = heap.alloc_bare(0x1000 - 16 * 3).unwrap();
         assert_eq!(big, a);
     }
 
     #[test]
     fn alloc_exhaustion_returns_out_of_memory_err() {
         let mut heap = GuestHeap::new(0x1000, 0x1010); // 16 bytes total
-        heap.alloc(16).unwrap();
-        let err = heap.alloc(4).unwrap_err();
+        heap.alloc_bare(16).unwrap();
+        let err = heap.alloc_bare(4).unwrap_err();
         match err {
             GuestHeapError::OutOfMemory { requested, .. } => assert_eq!(requested, 4),
             other => panic!("expected OutOfMemory, got {other:?}"),
@@ -887,7 +1007,7 @@ mod tests {
     #[test]
     fn double_free_is_detected_as_an_error() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
         let err = heap.free(a).unwrap_err();
         assert_eq!(err, GuestHeapError::DoubleOrInvalidFree { addr: a });
@@ -903,7 +1023,7 @@ mod tests {
     #[test]
     fn empty_heap_range_always_out_of_memory() {
         let mut heap = GuestHeap::new(0x2000, 0x1000); // end <= start
-        assert!(heap.alloc(1).is_err());
+        assert!(heap.alloc_bare(1).is_err());
     }
 
     #[test]
@@ -955,9 +1075,9 @@ mod tests {
     fn total_free_sums_disjoint_free_blocks() {
         let mut heap = GuestHeap::new(0x1000, 0x1000 + 48);
         assert_eq!(heap.total_free(), 48);
-        let a = heap.alloc(16).unwrap();
-        let _b = heap.alloc(16).unwrap();
-        let _c = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
+        let _b = heap.alloc_bare(16).unwrap();
+        let _c = heap.alloc_bare(16).unwrap();
         assert_eq!(heap.total_free(), 0);
         heap.free(a).unwrap();
         assert_eq!(heap.total_free(), 16);
@@ -966,9 +1086,9 @@ mod tests {
     #[test]
     fn largest_free_finds_the_biggest_block_even_when_fragmented() {
         let mut heap = GuestHeap::new(0x1000, 0x1000 + 48);
-        let a = heap.alloc(16).unwrap();
-        let _b = heap.alloc(16).unwrap();
-        let _c = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
+        let _b = heap.alloc_bare(16).unwrap();
+        let _c = heap.alloc_bare(16).unwrap();
         assert_eq!(heap.largest_free(), 0);
         // Free the first and third blocks (non-adjacent to each other,
         // so they don't coalesce into one bigger block): two 16-byte
@@ -989,7 +1109,7 @@ mod tests {
     #[test]
     fn size_of_live_alloc_reports_the_rounded_size_and_none_when_unknown() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(13).unwrap(); // rounds up to 16
+        let a = heap.alloc_bare(13).unwrap(); // rounds up to 16
         assert_eq!(heap.size_of_live_alloc(a), Some(16));
         assert_eq!(heap.size_of_live_alloc(0x1234), None);
         heap.free(a).unwrap();
@@ -1015,13 +1135,13 @@ mod tests {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
         assert_eq!(heap.redzone_size(), 0);
         assert_eq!(heap.quarantine_budget(), 0);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         assert_eq!(a, 0x1000);
         assert_eq!(heap.size_of_live_alloc(a), Some(16));
-        let b = heap.alloc(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert_eq!(b, 0x1010, "no redzone gap between consecutive allocs");
         heap.free(a).unwrap();
-        let c = heap.alloc(16).unwrap();
+        let c = heap.alloc_bare(16).unwrap();
         assert_eq!(
             c, a,
             "freed block reused immediately, as before quarantine existed"
@@ -1031,7 +1151,7 @@ mod tests {
     #[test]
     fn redzones_on_return_user_address_past_leading_redzone_with_plain_reported_size() {
         let mut heap = GuestHeap::new(0x1000, 0x3000).with_redzone_size(32);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         // The whole block reserved is redzone(32) + user(16) + redzone(32),
         // starting at the heap base 0x1000, so the user address sits 32
         // bytes in.
@@ -1044,8 +1164,8 @@ mod tests {
     #[test]
     fn consecutive_allocations_with_redzones_are_separated_by_at_least_two_redzones() {
         let mut heap = GuestHeap::new(0x1000, 0x4000).with_redzone_size(32);
-        let a = heap.alloc(16).unwrap();
-        let b = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert!(b > a, "b should be allocated after a");
         // Between the end of a's user bytes and the start of b's user
         // bytes there must be at least a's trailing redzone plus b's
@@ -1063,7 +1183,7 @@ mod tests {
         // 32-byte redzone on each side it needs 80 bytes and must fail
         // cleanly rather than handing out an unguarded block.
         let mut heap = GuestHeap::new(0x1000, 0x1010).with_redzone_size(32);
-        let err = heap.alloc(16).unwrap_err();
+        let err = heap.alloc_bare(16).unwrap_err();
         match err {
             GuestHeapError::OutOfMemory { requested, .. } => assert_eq!(requested, 16),
             other => panic!("expected OutOfMemory, got {other:?}"),
@@ -1075,7 +1195,7 @@ mod tests {
         let mut heap = GuestHeap::new(0x1000, 0x2000).with_redzone_size(32);
         // Near-u32::MAX size plus two redzones would overflow u32 if
         // computed naively; it must fail cleanly instead.
-        let err = heap.alloc(u32::MAX - 8).unwrap_err();
+        let err = heap.alloc_bare(u32::MAX - 8).unwrap_err();
         match err {
             GuestHeapError::OutOfMemory { .. } => {}
             other => panic!("expected OutOfMemory, got {other:?}"),
@@ -1085,12 +1205,12 @@ mod tests {
     #[test]
     fn quarantine_holds_a_freed_address_back_from_immediate_reuse() {
         let mut heap = GuestHeap::new(0x1000, 0x2000).with_quarantine_budget(1024);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
         // The freed block is still within budget (16 bytes << 1024), so
         // it should not have been released back to the free list yet: a
         // same-size alloc must land somewhere else.
-        let b = heap.alloc(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert_ne!(
             a, b,
             "quarantined address must not be handed out immediately"
@@ -1102,14 +1222,14 @@ mod tests {
         // Budget holds exactly one 16-byte block; a second free must
         // push the first back out to the free list (oldest first).
         let mut heap = GuestHeap::new(0x1000, 0x2000).with_quarantine_budget(16);
-        let a = heap.alloc(16).unwrap();
-        let b = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap(); // quarantine now holds exactly 16 bytes (at budget, not over)
         heap.free(b).unwrap(); // pushes quarantine to 32 bytes, over budget: drains `a` first
 
         // `a`'s block should now be back in the free list and coalesced
         // with any adjacent space, so it's allocatable again.
-        let c = heap.alloc(16).unwrap();
+        let c = heap.alloc_bare(16).unwrap();
         assert_eq!(
             c, a,
             "drained block should be released in FIFO order and reusable"
@@ -1119,23 +1239,23 @@ mod tests {
     #[test]
     fn zero_quarantine_budget_behaves_like_immediate_free() {
         let mut heap = GuestHeap::new(0x1000, 0x2000).with_quarantine_budget(0);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
-        let b = heap.alloc(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert_eq!(a, b, "budget 0 disables quarantining entirely");
     }
 
     #[test]
     fn lowering_quarantine_budget_drains_blocks_that_no_longer_fit() {
         let mut heap = GuestHeap::new(0x1000, 0x2000).with_quarantine_budget(1024);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
         // Still well within the free list as "not free" (quarantined).
         assert_eq!(heap.total_free(), heap.free_bytes());
         // Shrinking the budget below what's queued must drain it
         // immediately, not just on the next free.
         heap.set_quarantine_budget(0);
-        let b = heap.alloc(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert_eq!(
             a, b,
             "shrinking the budget should have drained the queued block"
@@ -1145,7 +1265,7 @@ mod tests {
     #[test]
     fn recently_freed_info_answers_for_a_freed_address_and_not_for_a_stranger() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         assert_eq!(
             heap.recently_freed_info(a),
             None,
@@ -1162,10 +1282,10 @@ mod tests {
     #[test]
     fn recently_freed_info_reports_the_most_recent_free_serial_order() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         heap.free(a).unwrap();
         let first = heap.recently_freed_info(a).unwrap();
-        let b = heap.alloc(16).unwrap();
+        let b = heap.alloc_bare(16).unwrap();
         assert_eq!(a, b, "immediately reusable: quarantine is off by default");
         heap.free(b).unwrap();
         let second = heap.recently_freed_info(a).unwrap();
@@ -1181,7 +1301,7 @@ mod tests {
         // Request 13 (true "requested" size) which aligns up to 16: 3
         // bytes of alignment slack between the requested data and the
         // trailing redzone.
-        let a = heap.alloc_with_requested(13, 13).unwrap();
+        let a = heap.alloc_bare_req(13, 13).unwrap();
         let extent = heap.extent_of_live_alloc(a).expect("a is live");
         assert_eq!(extent.user_start, a);
         assert_eq!(extent.user_size, 16);
@@ -1216,7 +1336,7 @@ mod tests {
         // underflow. The guest can never legitimately touch more than
         // was reserved, so clamping is the only well-ordered answer.
         let mut heap = GuestHeap::new(0x1000, 0x3000).with_redzone_size(32);
-        let a = heap.alloc_with_requested(16, 999).unwrap();
+        let a = heap.alloc_bare_req(16, 999).unwrap();
         let extent = heap.extent_of_live_alloc(a).expect("a is live");
         assert_eq!(extent.user_size, 16);
         assert_eq!(extent.requested_size, 16, "clamped down to the reservation");
@@ -1231,7 +1351,7 @@ mod tests {
     #[test]
     fn extent_of_live_alloc_has_empty_redzone_ranges_when_redzones_disabled() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
-        let a = heap.alloc(16).unwrap();
+        let a = heap.alloc_bare(16).unwrap();
         let extent = heap.extent_of_live_alloc(a).unwrap();
         assert_eq!(extent.block_start, extent.user_start);
         assert_eq!(extent.block_end, extent.user_start + extent.user_size);
@@ -1244,12 +1364,12 @@ mod tests {
         assert_eq!(plain.total_free(), total);
 
         let mut redzoned = GuestHeap::new(0x1000, 0x1000 + total).with_redzone_size(16);
-        let a = redzoned.alloc(16).unwrap();
+        let a = redzoned.alloc_bare(16).unwrap();
         // 16 (redzone) + 16 (user) + 16 (redzone) = 48 bytes consumed.
         assert_eq!(redzoned.total_free(), total - 48);
 
         let mut quarantined = GuestHeap::new(0x1000, 0x1000 + total).with_quarantine_budget(1024);
-        let b = quarantined.alloc(16).unwrap();
+        let b = quarantined.alloc_bare(16).unwrap();
         quarantined.free(b).unwrap();
         assert_eq!(
             quarantined.total_free(),

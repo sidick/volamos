@@ -528,7 +528,7 @@ impl DosState {
             return Ok(addr);
         }
         let addr = heap
-            .alloc(crate::execlist::MSGPORT_SIZE)
+            .alloc(&mut *mem, crate::execlist::MSGPORT_SIZE)
             .map_err(|_| ERROR_NO_FREE_STORE)?;
         for i in 0..crate::execlist::MSGPORT_SIZE {
             mem.write_u8(addr.wrapping_add(i), 0);
@@ -562,7 +562,7 @@ impl DosState {
             self.fs_port_addr(heap, mem)?
         };
         let addr = heap
-            .alloc(FILE_HANDLE_SIZE)
+            .alloc(&mut *mem, FILE_HANDLE_SIZE)
             .map_err(|_| ERROR_NO_FREE_STORE)?;
         for i in 0..FILE_HANDLE_SIZE {
             mem.write_u8(addr.wrapping_add(i), 0);
@@ -1358,18 +1358,17 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
         }
     };
 
-    let addr = ctx
-        .heap
-        .alloc(struct_size)
-        .map_err(|e| DispatchError::HandlerFailed {
-            library: "dos.library".to_string(),
-            lvo: -228,
-            handler_name: "AllocDosObject".to_string(),
-            message: format!(
-                "AllocDosObject(type={object_type}): guest heap allocation failed: {e}"
-            ),
-        })?;
-    ctx.mem.clear_fresh_block(addr, struct_size);
+    let addr =
+        ctx.heap
+            .alloc(&mut *ctx.mem, struct_size)
+            .map_err(|e| DispatchError::HandlerFailed {
+                library: "dos.library".to_string(),
+                lvo: -228,
+                handler_name: "AllocDosObject".to_string(),
+                message: format!(
+                    "AllocDosObject(type={object_type}): guest heap allocation failed: {e}"
+                ),
+            })?;
     for i in 0..struct_size {
         ctx.mem.write_u8(addr.wrapping_add(i), 0);
     }

@@ -1951,15 +1951,15 @@ fn inet_ntoa_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
         None => {
             // "###.###.###.###\0" -- 16 bytes is enough for any IPv4
             // dotted-decimal string plus its NUL terminator.
-            let addr = ctx
-                .heap
-                .alloc(16)
-                .map_err(|e| DispatchError::HandlerFailed {
-                    library: "bsdsocket.library".to_string(),
-                    lvo: -174,
-                    handler_name: "Inet_NtoA".to_string(),
-                    message: format!("Inet_NtoA: guest heap allocation failed: {e}"),
-                })?;
+            let addr =
+                ctx.heap
+                    .alloc(&mut *ctx.mem, 16)
+                    .map_err(|e| DispatchError::HandlerFailed {
+                        library: "bsdsocket.library".to_string(),
+                        lvo: -174,
+                        handler_name: "Inet_NtoA".to_string(),
+                        message: format!("Inet_NtoA: guest heap allocation failed: {e}"),
+                    })?;
             ctx.bsdsocket.ntoa_buf = Some(addr);
             addr
         }
@@ -2097,15 +2097,14 @@ fn build_hostent<C: Cpu>(
 
     let mut allocs = Vec::new();
     let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
-        let addr = ctx
-            .heap
-            .alloc(size.max(4))
-            .map_err(|e| DispatchError::HandlerFailed {
+        let addr = ctx.heap.alloc(&mut *ctx.mem, size.max(4)).map_err(|e| {
+            DispatchError::HandlerFailed {
                 library: "bsdsocket.library".to_string(),
                 lvo,
                 handler_name: handler_name.to_string(),
                 message: format!("{handler_name}: guest heap allocation failed: {e}"),
-            })?;
+            }
+        })?;
         allocs.push(addr);
         Ok(addr)
     };
@@ -2325,15 +2324,14 @@ fn build_servent<C: Cpu>(
     }
     let mut allocs = Vec::new();
     let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
-        let addr = ctx
-            .heap
-            .alloc(size.max(4))
-            .map_err(|e| DispatchError::HandlerFailed {
+        let addr = ctx.heap.alloc(&mut *ctx.mem, size.max(4)).map_err(|e| {
+            DispatchError::HandlerFailed {
                 library: "bsdsocket.library".to_string(),
                 lvo,
                 handler_name: handler_name.to_string(),
                 message: format!("{handler_name}: guest heap allocation failed: {e}"),
-            })?;
+            }
+        })?;
         allocs.push(addr);
         Ok(addr)
     };
@@ -2459,15 +2457,14 @@ fn build_protoent<C: Cpu>(
     }
     let mut allocs = Vec::new();
     let mut alloc = |ctx: &mut HandlerContext<'_, C>, size: u32| -> Result<u32, DispatchError> {
-        let addr = ctx
-            .heap
-            .alloc(size.max(4))
-            .map_err(|e| DispatchError::HandlerFailed {
+        let addr = ctx.heap.alloc(&mut *ctx.mem, size.max(4)).map_err(|e| {
+            DispatchError::HandlerFailed {
                 library: "bsdsocket.library".to_string(),
                 lvo,
                 handler_name: handler_name.to_string(),
                 message: format!("{handler_name}: guest heap allocation failed: {e}"),
-            })?;
+            }
+        })?;
         allocs.push(addr);
         Ok(addr)
     };
@@ -2701,17 +2698,16 @@ fn socket_base_tag_list_handler<C: Cpu>(
                     let ptr = match ctx.bsdsocket.errno_ptr {
                         Some(ptr) => ptr,
                         None => {
-                            let addr =
-                                ctx.heap
-                                    .alloc(4)
-                                    .map_err(|e| DispatchError::HandlerFailed {
-                                        library: "bsdsocket.library".to_string(),
-                                        lvo: -294,
-                                        handler_name: "SocketBaseTagList".to_string(),
-                                        message: format!(
-                                            "SocketBaseTagList: guest heap allocation failed: {e}"
-                                        ),
-                                    })?;
+                            let addr = ctx.heap.alloc(&mut *ctx.mem, 4).map_err(|e| {
+                                DispatchError::HandlerFailed {
+                                    library: "bsdsocket.library".to_string(),
+                                    lvo: -294,
+                                    handler_name: "SocketBaseTagList".to_string(),
+                                    message: format!(
+                                        "SocketBaseTagList: guest heap allocation failed: {e}"
+                                    ),
+                                }
+                            })?;
                             ctx.mem.write_u32(addr, ctx.bsdsocket.last_errno as u32);
                             ctx.bsdsocket.errno_ptr = Some(addr);
                             addr
@@ -2733,17 +2729,16 @@ fn socket_base_tag_list_handler<C: Cpu>(
                     let ptr = match ctx.bsdsocket.herrno_ptr {
                         Some(ptr) => ptr,
                         None => {
-                            let addr =
-                                ctx.heap
-                                    .alloc(4)
-                                    .map_err(|e| DispatchError::HandlerFailed {
-                                        library: "bsdsocket.library".to_string(),
-                                        lvo: -294,
-                                        handler_name: "SocketBaseTagList".to_string(),
-                                        message: format!(
-                                            "SocketBaseTagList: guest heap allocation failed: {e}"
-                                        ),
-                                    })?;
+                            let addr = ctx.heap.alloc(&mut *ctx.mem, 4).map_err(|e| {
+                                DispatchError::HandlerFailed {
+                                    library: "bsdsocket.library".to_string(),
+                                    lvo: -294,
+                                    handler_name: "SocketBaseTagList".to_string(),
+                                    message: format!(
+                                        "SocketBaseTagList: guest heap allocation failed: {e}"
+                                    ),
+                                }
+                            })?;
                             ctx.mem.write_u32(addr, ctx.bsdsocket.last_herrno as u32);
                             ctx.bsdsocket.herrno_ptr = Some(addr);
                             addr
@@ -2795,17 +2790,16 @@ fn socket_base_tag_list_handler<C: Cpu>(
                     let buf = match ctx.bsdsocket.release_str_buf {
                         Some(addr) => addr,
                         None => {
-                            let addr =
-                                ctx.heap
-                                    .alloc(32)
-                                    .map_err(|e| DispatchError::HandlerFailed {
-                                        library: "bsdsocket.library".to_string(),
-                                        lvo: -294,
-                                        handler_name: "SocketBaseTagList".to_string(),
-                                        message: format!(
-                                            "SocketBaseTagList: guest heap allocation failed: {e}"
-                                        ),
-                                    })?;
+                            let addr = ctx.heap.alloc(&mut *ctx.mem, 32).map_err(|e| {
+                                DispatchError::HandlerFailed {
+                                    library: "bsdsocket.library".to_string(),
+                                    lvo: -294,
+                                    handler_name: "SocketBaseTagList".to_string(),
+                                    message: format!(
+                                        "SocketBaseTagList: guest heap allocation failed: {e}"
+                                    ),
+                                }
+                            })?;
                             crate::guestmem::write_c_string(
                                 ctx.mem,
                                 addr,

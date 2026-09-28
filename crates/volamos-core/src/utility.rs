@@ -274,9 +274,8 @@ fn allocate_tag_items_handler<C: Cpu>(
     }
 
     let byte_size = num_tags.saturating_mul(TAG_ITEM_SIZE);
-    match ctx.heap.alloc(byte_size) {
+    match ctx.heap.alloc(&mut *ctx.mem, byte_size) {
         Ok(addr) => {
-            ctx.mem.clear_fresh_block(addr, byte_size);
             for i in 0..byte_size {
                 ctx.mem.write_u8(addr.wrapping_add(i), 0);
             }

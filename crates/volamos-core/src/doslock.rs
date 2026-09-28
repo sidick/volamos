@@ -623,7 +623,7 @@ fn alloc_lock_struct(
     key: u32,
     access: i32,
 ) -> Result<u32, crate::guestmem::GuestHeapError> {
-    let addr = heap.alloc(FILE_LOCK_SIZE)?;
+    let addr = heap.alloc(&mut *mem, FILE_LOCK_SIZE)?;
     for i in 0..FILE_LOCK_SIZE {
         mem.write_u8(addr.wrapping_add(i), 0);
     }

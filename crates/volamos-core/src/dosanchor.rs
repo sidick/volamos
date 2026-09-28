@@ -248,7 +248,7 @@ fn set_flag_bit(mem: &mut dyn AddressSpace, ap_addr: u32, bit: u8, set: bool) {
 
 fn alloc_achain(heap: &mut GuestHeap, mem: &mut dyn AddressSpace) -> Result<u32, i32> {
     let addr = heap
-        .alloc(ACHAIN_SIZE)
+        .alloc(&mut *mem, ACHAIN_SIZE)
         .map_err(|_| crate::dosfile::ERROR_NO_FREE_STORE)?;
     for i in 0..ACHAIN_SIZE {
         mem.write_u8(addr + i, 0);
@@ -825,7 +825,7 @@ mod tests {
     /// `ap_Buf` tail, setting `ap_Strlen` accordingly.
     fn alloc_ap(heap: &mut GuestHeap, mem: &mut FlatMemory, strlen: u16) -> u32 {
         let size = AP_BUF_OFFSET + u32::from(strlen);
-        let addr = heap.alloc(size).unwrap();
+        let addr = heap.alloc(&mut *mem, size).unwrap();
         for i in 0..size {
             mem.write_u8(addr + i, 0);
         }
