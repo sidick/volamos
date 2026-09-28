@@ -307,7 +307,10 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     // reservation: the difference is alignment slack the guest has no
     // business touching, and this handler is the last place that still
     // knows the unrounded number.
-    match ctx.heap.alloc_with_requested(rounded, byte_size) {
+    match ctx
+        .heap
+        .alloc_with_requested(&mut *ctx.mem, rounded, byte_size)
+    {
         Ok(addr) => {
             let cleared = requirements & MEMF_CLEAR != 0;
             if cleared {
@@ -419,7 +422,7 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 
     let user_rounded = round_up_8(byte_size);
     let total = user_rounded + ALLOCVEC_HEADER_SIZE;
-    match ctx.heap.alloc(total) {
+    match ctx.heap.alloc(&mut *ctx.mem, total) {
         Ok(block) => {
             // Header: total block size (u32) followed by 4 bytes of
             // reserved padding (see the module docs).
@@ -445,12 +448,22 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
             // included -- the header is ours, not the guest's, but it
             // sits inside the same heap block, so the redzones bracket
             // both). Done after the header write and the MEMF_CLEAR
-            // loop above, per `poison_allocation_edges`' doc. The data
-            // bytes are left un-marked rather than marked uninit: the
-            // block address the heap knows is `block`, not `user_ptr`,
-            // so an uninit range starting at `block` would wrongly
-            // cover the header this handler just wrote.
+            // loop above, per `poison_allocation_edges`' doc. `false`
+            // because the data range cannot be described from `block`:
+            // that is what the heap knows, so an uninit range starting
+            // there would cover the header this handler just wrote.
             poison_allocation_edges(ctx, block, false);
+            // Which leaves the guest's own range valid -- `GuestHeap::
+            // alloc` cleared the whole block on the way out, which is
+            // right for the header but loses the uninitialized state of
+            // the part the guest owns. Mark that from `user_ptr`, the
+            // one address that excludes the header. (With `MEMF_CLEAR`
+            // the block genuinely *is* initialized, so valid -- already
+            // the case -- is the correct state and there is nothing to
+            // do.)
+            if !cleared && let Some(shadow) = ctx.mem.shadow_mut() {
+                shadow.mark_uninit(user_ptr, user_rounded);
+            }
             ctx.cpu.set_data_register(DataRegister(0), user_ptr);
         }
         Err(_) => {
@@ -530,7 +543,7 @@ fn create_pool_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // D1 (puddleSize) and D2 (threshSize) are intentionally unused --
     // see this handler's doc comment.
 
-    match ctx.heap.alloc(POOL_HEADER_SIZE) {
+    match ctx.heap.alloc(&mut *ctx.mem, POOL_HEADER_SIZE) {
         Ok(pool) => {
             ctx.mem.write_u32(pool, requirements);
             ctx.cpu.set_data_register(DataRegister(0), pool);
@@ -588,7 +601,10 @@ fn alloc_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 
     let requirements = ctx.mem.read_u32(pool);
     let rounded = round_up_8(byte_size);
-    match ctx.heap.alloc_with_requested(rounded, byte_size) {
+    match ctx
+        .heap
+        .alloc_with_requested(&mut *ctx.mem, rounded, byte_size)
+    {
         Ok(addr) => {
             let cleared = requirements & MEMF_CLEAR != 0;
             if cleared {
@@ -967,6 +983,111 @@ mod tests {
             "the filled bytes must still read as uninitialised, or --dirty-heap \
              would silence --sanitize-uninit entirely"
         );
+    }
+
+    #[test]
+    fn a_recycled_alloc_vec_block_is_no_longer_a_freed_block() {
+        // Issue #95: FreeVec poisons the block, and the heap hands the
+        // same addresses back out once the free quarantine releases
+        // them. If the allocation path leaves that poison in place,
+        // both the handler's own AllocVec header write and every write
+        // the guest makes into its brand-new buffer are reported as
+        // use-after-free -- and at one violation per byte the run slows
+        // to a crawl.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = byteSize
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // D1 = 0, no MEMF_CLEAR
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-684)); // AllocVec
+        words.push(0x2240); // movea.l d0,a1 (A1 = the block to free)
+        words.extend_from_slice(&jsr_disp16_a6(-690)); // FreeVec
+        words.push(move_imm_to_d(0)); // same size again
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-684)); // AllocVec
+        words.push(0x2040); // movea.l d0,a0
+        words.push(0x10bc); // move.b #1,(a0) -- the guest's first write
+        words.push(0x0001);
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        // No quarantine, so the second AllocVec is handed the block the
+        // FreeVec just poisoned -- the whole point of the test. With the
+        // default budget a block this small is held back instead, and
+        // the run never recycles anything.
+        rt.heap_mut().set_quarantine_budget(0);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let addr = code as u32;
+
+        assert_ne!(
+            addr, 0,
+            "both allocations must succeed for this to test anything"
+        );
+        let shadow = rt.memory().shadow().expect("sanitizer was enabled above");
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "writing into a freshly allocated block must not be reported, \
+             whatever that memory was used for before"
+        );
+        assert_ne!(
+            shadow.state(addr),
+            crate::sanitize::ShadowState::Unaddressable,
+            "the recycled block must not still be marked as freed"
+        );
+    }
+
+    #[test]
+    fn a_genuine_use_after_free_is_still_reported() {
+        // The guard rail on the issue #95 fix: `GuestHeap::alloc` clears
+        // the whole block it hands out, so it must be the *handing out*
+        // that clears the poison and not, say, the free-list bookkeeping
+        // -- a block that has been freed and not yet reallocated has to
+        // stay poisoned, or `--sanitize` would have stopped detecting
+        // use-after-free altogether. 64 bytes is far below the default
+        // quarantine budget, so this block is held back rather than
+        // recycled and the dangling pointer really does point at poison.
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = byteSize
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // D1 = 0, no MEMF_CLEAR
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-684)); // AllocVec
+        words.push(move_d0_to_d(2)); // keep the pointer in D2
+        words.push(move_d0_to_a(1)); // A1 = the block to free
+        words.extend_from_slice(&jsr_disp16_a6(-690)); // FreeVec
+        words.push(0x2242); // movea.l d2,a1 -- the now-dangling pointer
+        words.push(0x12bc); // move.b #1,(a1) -- use after free
+        words.push(0x0001);
+        words.push(move_d0_to_d(0));
+        words.push(RTS);
+
+        let mut rt = program(&words);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        let shadow = rt.memory().shadow().expect("sanitizer was enabled above");
+        assert_eq!(
+            shadow.violation_count(),
+            1,
+            "writing through a pointer whose block was freed must still be reported"
+        );
+        let violation = &shadow.violations()[0];
+        assert_eq!(violation.kind, crate::sanitize::ViolationKind::InvalidWrite);
+        assert_eq!(violation.reason, Some(crate::sanitize::PoisonReason::Freed));
     }
 
     #[test]

@@ -283,12 +283,12 @@ fn ensure_default_screen<M: AddressSpace>(
         return addr;
     }
     let screen = heap
-        .alloc(SCREEN_SIZE)
+        .alloc(&mut *mem, SCREEN_SIZE)
         .expect("guest heap has room for the one default Screen");
 
     let title_bytes = b"Workbench Screen";
     let title_addr = heap
-        .alloc(title_bytes.len() as u32 + 1)
+        .alloc(&mut *mem, title_bytes.len() as u32 + 1)
         .expect("guest heap has room for the screen title string");
     write_c_string(mem, title_addr, title_bytes);
 
@@ -489,18 +489,18 @@ fn open_window_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         requested_screen
     };
 
-    let Ok(window) = ctx.heap.alloc(WINDOW_SIZE) else {
+    let Ok(window) = ctx.heap.alloc(&mut *ctx.mem, WINDOW_SIZE) else {
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
     };
-    let Ok(rport) = ctx.heap.alloc(RASTPORT_SIZE) else {
+    let Ok(rport) = ctx.heap.alloc(&mut *ctx.mem, RASTPORT_SIZE) else {
         ctx.heap
             .free(window)
             .expect("just-allocated Window is live");
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
     };
-    let Ok(user_port) = ctx.heap.alloc(MSGPORT_SIZE) else {
+    let Ok(user_port) = ctx.heap.alloc(&mut *ctx.mem, MSGPORT_SIZE) else {
         ctx.heap
             .free(rport)
             .expect("just-allocated RastPort is live");

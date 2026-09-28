@@ -460,7 +460,9 @@ pub fn make_library(
 
     let negsize = round_up_longword(vectors.len() as u32 * LIB_VECTSIZE);
     let total = negsize.saturating_add(d_size);
-    let alloc_addr = heap.alloc(total).map_err(MakeLibraryError::Heap)?;
+    let alloc_addr = heap
+        .alloc(&mut *mem, total)
+        .map_err(MakeLibraryError::Heap)?;
     let base = alloc_addr.wrapping_add(negsize);
 
     for i in 0..d_size {

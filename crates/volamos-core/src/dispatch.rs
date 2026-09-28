@@ -1568,15 +1568,15 @@ fn open_library_common<C: Cpu>(
     }
 
     let size = FAKE_LIB_JUMP_TABLE_SIZE;
-    let block =
-        ctx.heap
-            .alloc(size + LIB_STRUCT_SIZE)
-            .map_err(|e| DispatchError::HandlerFailed {
-                library: "exec.library".to_string(),
-                lvo: -552,
-                handler_name: "OpenLibrary".to_string(),
-                message: format!("couldn't auto-create fake library {name:?}: {e}"),
-            })?;
+    let block = ctx
+        .heap
+        .alloc(&mut *ctx.mem, size + LIB_STRUCT_SIZE)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -552,
+            handler_name: "OpenLibrary".to_string(),
+            message: format!("couldn't auto-create fake library {name:?}: {e}"),
+        })?;
     let base = block.wrapping_add(size);
 
     let mut addr = block;
@@ -2330,7 +2330,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         };
         let line_len = line.len() as u32;
         let args_addr = heap
-            .alloc(line_len + 1)
+            .alloc(&mut mem, line_len + 1)
             .expect("guest heap has room for the command-line buffer");
         {
             let mut a = args_addr;

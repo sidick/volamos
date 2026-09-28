@@ -148,7 +148,7 @@ fn open_font_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
         return Ok(());
     }
 
-    let Ok(font) = ctx.heap.alloc(TEXTFONT_SIZE) else {
+    let Ok(font) = ctx.heap.alloc(&mut *ctx.mem, TEXTFONT_SIZE) else {
         ctx.cpu.set_data_register(crate::cpu::DataRegister(0), 0);
         return Ok(());
     };
@@ -196,7 +196,7 @@ fn open_font_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// the font's own identity -- a fresh copy per `OpenFont` call, freed
 /// by [`close_font_handler`] alongside the rest.
 fn alloc_font_name<M: AddressSpace>(heap: &mut GuestHeap, mem: &mut M) -> Option<u32> {
-    let addr = heap.alloc(TOPAZ_NAME.len() as u32 + 1).ok()?;
+    let addr = heap.alloc(&mut *mem, TOPAZ_NAME.len() as u32 + 1).ok()?;
     crate::guestmem::write_c_string(mem, addr, TOPAZ_NAME);
     Some(addr)
 }

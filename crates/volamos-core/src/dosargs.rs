@@ -483,7 +483,7 @@ fn alloc_c_string(
     allocations: &mut Vec<u32>,
     bytes: &[u8],
 ) -> Result<u32, GuestHeapError> {
-    let addr = heap.alloc(bytes.len() as u32 + 1)?;
+    let addr = heap.alloc(&mut *mem, bytes.len() as u32 + 1)?;
     allocations.push(addr);
     write_c_string(mem, addr, bytes);
     Ok(addr)
@@ -508,7 +508,7 @@ fn materialize(
                 ArgKind::Switch | ArgKind::Toggle => u32::from(slot.bool_val),
                 ArgKind::Number => match slot.number {
                     Some(n) => {
-                        let addr = heap.alloc(4)?;
+                        let addr = heap.alloc(&mut *mem, 4)?;
                         allocations.push(addr);
                         mem.write_u32(addr, n as u32);
                         addr
@@ -528,7 +528,7 @@ fn materialize(
                             ptrs.push(alloc_c_string(heap, mem, &mut allocations, item)?);
                         }
                         ptrs.push(0);
-                        let table_addr = heap.alloc(ptrs.len() as u32 * 4)?;
+                        let table_addr = heap.alloc(&mut *mem, ptrs.len() as u32 * 4)?;
                         allocations.push(table_addr);
                         for (j, ptr) in ptrs.iter().enumerate() {
                             mem.write_u32(table_addr.wrapping_add((j as u32) * 4), *ptr);
@@ -583,7 +583,7 @@ fn read_args(
     let (anchor_addr, owns_anchor) = if rdargs_ptr != 0 {
         (rdargs_ptr, false)
     } else {
-        let addr = heap.alloc(RDARGS_ANCHOR_SIZE).map_err(|_| {
+        let addr = heap.alloc(&mut *mem, RDARGS_ANCHOR_SIZE).map_err(|_| {
             for a in &allocations {
                 let _ = heap.free(*a);
             }
@@ -736,7 +736,7 @@ mod tests {
         let mut heap = GuestHeap::new(0x100, 0x3000);
         let mut line = cmdline.join(" ").into_bytes();
         line.push(b'\n');
-        let addr = heap.alloc(line.len() as u32).unwrap();
+        let addr = heap.alloc(&mut mem, line.len() as u32).unwrap();
         for (i, &b) in line.iter().enumerate() {
             mem.write_u8(addr + i as u32, b);
         }
@@ -754,7 +754,7 @@ mod tests {
         template: &str,
         slot_count: u32,
     ) -> (u32, u32) {
-        let array_addr = heap.alloc(slot_count * 4).unwrap();
+        let array_addr = heap.alloc(&mut *mem, slot_count * 4).unwrap();
         for i in 0..slot_count {
             mem.write_u32(array_addr + i * 4, 0);
         }
@@ -772,7 +772,7 @@ mod tests {
         template: &str,
         slot_count: u32,
     ) -> i32 {
-        let array_addr = heap.alloc(slot_count * 4).unwrap();
+        let array_addr = heap.alloc(&mut *mem, slot_count * 4).unwrap();
         for i in 0..slot_count {
             mem.write_u32(array_addr + i * 4, 0);
         }
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn caller_supplied_rdargs_anchor_is_not_freed() {
         let (mut heap, mut mem, mut dos) = setup(&["value"]);
-        let array_addr = heap.alloc(4).unwrap();
+        let array_addr = heap.alloc(&mut mem, 4).unwrap();
         mem.write_u32(array_addr, 0);
         let caller_rdargs = 0x2000; // not a heap allocation; FreeArgs must not touch it
         let anchor = read_args(

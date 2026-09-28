@@ -106,7 +106,7 @@ const LOCALE_STRUCT_SIZE: u32 = 168;
 fn open_locale_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let addr = ctx
         .heap
-        .alloc(LOCALE_STRUCT_SIZE)
+        .alloc(&mut *ctx.mem, LOCALE_STRUCT_SIZE)
         .map_err(|e| DispatchError::HandlerFailed {
             library: "locale.library".to_string(),
             lvo: -156,
