@@ -170,13 +170,33 @@ suffixed `K`/`k` (KiB) or `M`/`m` (MiB):
 
 ```sh
 volamos --ram 4M fixtures/hello
-volamos --ram 64M --stack 1M fixtures/hello   # room for a much larger stack
+volamos --ram 8M --stack 1M fixtures/hello   # room for a much larger stack
 ```
 
 The default comfortably covers the tiny CLI binaries volamos currently
 targets, with plenty of headroom for a larger-than-default `--stack`.
 Raise it if a guest program needs more address space than that (e.g. a
 larger `--stack`, or a program that allocates a lot via `AllocMem`).
+
+**Above 16 MiB needs `--cpu 68020` or later.** A 68000 or 68010 has a
+24-bit address bus, so 16 MiB is all it can address at all. Since the
+guest stack sits at the top of the address space, a larger `--ram` would
+put the stack pointer at an address the CPU cannot express — so volamos
+refuses the combination rather than letting the program fail confusingly
+later on:
+
+```sh
+$ volamos --ram 64M fixtures/hello
+volamos: --ram 67108864 is more address space than a 68000 can reach: that
+CPU has a 24-bit address bus, so it can only address 16777216 bytes, and the
+guest stack at the top of a larger space would be at an address it cannot
+express -- ask for a 32-bit address bus with --cpu 68020 (or any later
+model), or lower the size to 16777216 or less (--ram on the command line,
+RAM= in a config file)
+
+$ volamos --ram 64M --cpu 68020 fixtures/hello
+Hello from volamos
+```
 
 ## `--cpu MODEL`
 

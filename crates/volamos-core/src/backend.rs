@@ -218,6 +218,37 @@ impl M68kCpu {
     }
 }
 
+/// How many bytes of guest address space `cpu_type` can actually reach
+/// (issue #98): `0x100_0000` (16 MiB) for the models with a 24-bit
+/// address bus -- the 68000 and 68010 -- and the full `0x1_0000_0000`
+/// for the 32-bit ones.
+///
+/// This exists because an address space *larger* than this is not merely
+/// wasteful, it is broken: the guest stack sits at the top of the
+/// address space, so a 32 MiB space on a 68000 puts `A7` somewhere the
+/// CPU cannot express. The address wraps to 24 bits, a `JSR` into a
+/// library pushes its return address into low memory instead, and the
+/// `RTS` pops whatever happened to be there -- which is faithful to the
+/// hardware, and useless. The CLI rejects that combination up front
+/// rather than letting a program die several calls later with a
+/// baffling "continuation stub trapped" message; see the `--ram` doc in
+/// `main.rs`.
+///
+/// **Asked of the `m68k` crate rather than hardcoded here.** The crate
+/// owns `CpuCore::address_mask` and sets it per model, so the one
+/// authority on which models wrap is the emulator that does the
+/// wrapping. A table duplicated here would be a second source of truth
+/// that silently goes stale the next time the crate refines a model --
+/// the 68EC020, for instance, has a 24-bit *external* bus on real
+/// silicon, which the crate does not currently model, and volamos
+/// should follow the crate's behavior rather than reject a
+/// configuration that demonstrably works today.
+pub fn addressable_bytes(cpu_type: CpuType) -> u64 {
+    let mut core = CpuCore::new();
+    core.set_cpu_type(cpu_type);
+    u64::from(core.address_mask) + 1
+}
+
 impl Default for M68kCpu {
     fn default() -> Self {
         Self::new()

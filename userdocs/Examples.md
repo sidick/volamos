@@ -147,7 +147,11 @@ fails cleanly rather than crashing if `--stack` doesn't actually fit
 inside `--ram`:
 
 ```sh
-volamos --stack 1M --ram 64M fixtures/hello
+volamos --stack 1M --ram 8M fixtures/hello
+
+# Past 16 MiB of RAM, ask for a 32-bit CPU too -- a 68000 cannot address
+# more than that, so volamos refuses the pairing rather than misbehaving.
+volamos --stack 1M --ram 64M --cpu 68020 fixtures/hello
 ```
 
 See [CLI Reference](CLI-Reference.md#-stack-size) and
