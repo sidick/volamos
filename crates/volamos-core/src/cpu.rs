@@ -240,6 +240,26 @@ pub trait Cpu {
         0
     }
 
+    /// Instructions retired over the same span [`Cpu::emulated_cycles`]
+    /// counts cycles over -- `0` by default, for the same reason and with
+    /// the same caveat: only [`Cpu::run`] accumulates, never
+    /// [`Cpu::step`].
+    ///
+    /// Reported next to the cycle count so a run's *memory intensity* is
+    /// visible from the run itself. Cycles alone cannot distinguish a
+    /// workload whose time is arithmetic from one whose time is bus
+    /// traffic, and that distinction decides whether this runtime's
+    /// timing means anything for a given workload: it bills no bus wait
+    /// states, so a memory-bound workload's emulated time is optimistic
+    /// by a wide and workload-dependent margin (volamos/issues/105
+    /// measured 1.02x to 25x against cycle-paced hardware, monotonic in
+    /// memory intensity). Cycles-per-instruction and accesses-per-
+    /// instruction are what let a caller place a workload on that scale
+    /// without a second runtime to compare against.
+    fn emulated_instructions(&self) -> u64 {
+        0
+    }
+
     /// The clock rate ([`Cpu::emulated_cycles`] is being counted at (in
     /// Hz), if this backend is currently deriving guest-visible elapsed
     /// time from emulated cycles rather than the host wall clock --

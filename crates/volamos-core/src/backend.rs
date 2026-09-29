@@ -92,26 +92,32 @@ pub const TRAP_TABLE_END: u32 = TRAP_TABLE_BASE + TRAP_TABLE_SIZE;
 
 impl AddressBus for FlatMemory {
     fn read_byte(&mut self, address: u32) -> u8 {
+        self.count_read();
         AddressSpace::read_u8(self, address)
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
+        self.count_read();
         AddressSpace::read_u16(self, address)
     }
 
     fn read_long(&mut self, address: u32) -> u32 {
+        self.count_read();
         AddressSpace::read_u32(self, address)
     }
 
     fn write_byte(&mut self, address: u32, value: u8) {
+        self.count_write();
         AddressSpace::write_u8(self, address, value);
     }
 
     fn write_word(&mut self, address: u32, value: u16) {
+        self.count_write();
         AddressSpace::write_u16(self, address, value);
     }
 
     fn write_long(&mut self, address: u32, value: u32) {
+        self.count_write();
         AddressSpace::write_u32(self, address, value);
     }
 
@@ -185,6 +191,12 @@ pub struct M68kCpu {
     /// [`Cpu::emulated_cycles`]'s documented "0 means never asked"
     /// default.
     cycles: u64,
+    /// Instructions retired so far by [`Self::run_via_cycles`] -- see
+    /// [`Cpu::emulated_instructions`]. Advanced under exactly the same
+    /// condition as [`Self::cycles`], and from the same
+    /// `CycleBatchResult`, so the two are always counted over the same
+    /// span of execution and their ratio is meaningful.
+    instructions: u64,
 }
 
 impl M68kCpu {
@@ -292,6 +304,7 @@ impl M68kCpu {
             jit: false,
             clock_hz: None,
             cycles: 0,
+            instructions: 0,
         }
     }
 }
@@ -495,6 +508,9 @@ impl M68kCpu {
             // `max(0)` is just cheap insurance against ever underflowing
             // the u64 accumulator if that documented behavior changes.
             self.cycles = self.cycles.saturating_add(result.cycles.max(0) as u64);
+            self.instructions = self
+                .instructions
+                .saturating_add(u64::from(result.instructions));
             match result.exit {
                 CycleBatchExit::BudgetExhausted => continue,
                 // volamos's `FlatMemory` implements no `sync`/bus-
@@ -775,6 +791,10 @@ impl Cpu for M68kCpu {
         self.cycles
     }
 
+    fn emulated_instructions(&self) -> u64 {
+        self.instructions
+    }
+
     fn clock_hz(&self) -> Option<f64> {
         self.clock_hz
     }
@@ -1041,6 +1061,48 @@ mod tests {
             jit_cpu.data_register(DataRegister(0)),
         );
         assert_eq!(interp_cpu.pc(), jit_cpu.pc());
+    }
+
+    /// Test: guest-CPU bus accesses are counted through the
+    /// `m68k::AddressBus` impl, and volamos's *own* access to guest memory
+    /// through `AddressSpace` is not.
+    ///
+    /// That separation is the whole meaning of the number: the CLI reports
+    /// it as the traffic the emulated CPU put on the bus, so if a native
+    /// library handler's reads and writes leaked into it the figure would
+    /// be neither guest bus traffic nor anything else useful.
+    #[test]
+    fn bus_access_counts_track_the_cpu_not_the_runtimes_own_memory_access() {
+        use m68k::AddressBus;
+
+        let mut mem = FlatMemory::new(0x1_0000);
+        assert_eq!(mem.access_counts(), (0, 0), "nothing has touched the bus");
+
+        // What volamos's own handlers do: AddressSpace, not AddressBus.
+        AddressSpace::write_u32(&mut mem, 0x100, 0xDEAD_BEEF);
+        let _ = AddressSpace::read_u32(&mem, 0x100);
+        assert_eq!(
+            mem.access_counts(),
+            (0, 0),
+            "the runtime's own AddressSpace access is not guest bus traffic"
+        );
+
+        // What the emulated CPU does: AddressBus.
+        let _ = AddressBus::read_byte(&mut mem, 0x100);
+        let _ = AddressBus::read_word(&mut mem, 0x100);
+        let _ = AddressBus::read_long(&mut mem, 0x100);
+        AddressBus::write_byte(&mut mem, 0x200, 1);
+        AddressBus::write_word(&mut mem, 0x200, 2);
+        assert_eq!(
+            mem.access_counts(),
+            (3, 2),
+            "each CPU-side access counts once, regardless of width"
+        );
+        assert_eq!(
+            AddressSpace::bus_access_counts(&mem),
+            (3, 2),
+            "the trait method reports the same counts"
+        );
     }
 
     #[test]

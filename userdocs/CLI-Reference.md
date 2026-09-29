@@ -329,8 +329,29 @@ exit, on stderr:
 ```console
 $ volamos --clock-mhz 25 ./bench
 ...program output...
-volamos: 340020 emulated cycles, 0.013601 s at 25 MHz
+volamos: 422158 emulated cycles, 0.016886 s at 25 MHz
+volamos: 36581 instructions, 83754 bus accesses (66532 read / 17222 write), 11.54 cycles/instr, 2.29 accesses/instr
 ```
+
+The second line exists to make a run's **memory intensity** visible from
+the run itself. volamos bills no bus wait states (see the warning below),
+so its emulated time is close to real hardware for arithmetic-bound code
+and very optimistic for bus-bound code — measured between 1.02x and 25x
+against cycle-paced hardware, monotonic in memory intensity
+([issue #105](https://github.com/sidick/volamos/issues/105)). Cycles and
+seconds alone don't say which end of that range a workload sits at;
+accesses per instruction does, with no second runtime to compare against.
+
+Two things to know before reading the ratios:
+
+- **`read` includes instruction fetch.** The bus methods can't tell a
+  fetch from a data read, so accesses/instr has a floor a little above
+  1.0, and it's the margin *above* that floor that indicates data
+  traffic. On two deliberately-opposite `-O2` loops: a byte-copy loop
+  measures 2.67 accesses/instr, a register-only arithmetic loop 1.27.
+- **`write` is the clean signal**, carrying no fetch component — 819308
+  writes for that copy loop against 110 for the arithmetic one. That's why
+  the two are reported separately rather than only as a total.
 
 The line goes to stderr so a harness parsing the guest program's own
 stdout never sees it, and it is printed even when the run ends in an

@@ -2627,6 +2627,26 @@ impl<C: Cpu + 'static> Runtime<C> {
             .map(|hz| (self.cpu.emulated_cycles(), hz))
     }
 
+    /// Instructions retired, and guest-CPU bus reads and writes, over the
+    /// same span [`Runtime::emulated_cycles`] reports -- `None` under the
+    /// same condition, since without a cycle count beside them these have
+    /// no denominator and, worse, the access counts are incomplete on the
+    /// default path (the JIT's `fast_mem` pointer bypasses the
+    /// `AddressBus` methods that count them; see
+    /// [`crate::memory::FlatMemory::access_counts`]).
+    ///
+    /// Together with the cycle count these make a run's memory intensity
+    /// self-evident, which matters because this runtime bills no bus wait
+    /// states: its emulated time is close to real hardware for
+    /// arithmetic-bound code and very optimistic for bus-bound code, and
+    /// accesses per instruction is the cheapest available indicator of
+    /// which a given workload is.
+    pub fn emulated_instruction_and_access_counts(&self) -> Option<(u64, u64, u64)> {
+        self.cpu.clock_hz()?;
+        let (reads, writes) = self.mem.bus_access_counts();
+        Some((self.cpu.emulated_instructions(), reads, writes))
+    }
+
     /// Runs the guest program to completion, writing anything it prints
     /// (currently just `PutStr` output) to `out`. If `trace` is set, it's
     /// called once per dispatched library call (for `--verbose` logging)

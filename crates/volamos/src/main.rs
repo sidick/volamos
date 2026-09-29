@@ -1511,6 +1511,53 @@ fn report_emulated_cycles<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime
     {
         eprintln!("volamos: {line}");
     }
+    if let Some((cycles, _)) = runtime.emulated_cycles()
+        && let Some((instructions, reads, writes)) =
+            runtime.emulated_instruction_and_access_counts()
+        && let Some(line) = format_emulated_work(cycles, instructions, reads, writes)
+    {
+        eprintln!("volamos: {line}");
+    }
+}
+
+/// Formats the second report line: the work the run actually did, and the
+/// two ratios that place it on the memory-intensity scale.
+///
+/// The ratios are the point. This runtime bills no bus wait states, so its
+/// emulated time is close to real hardware for arithmetic-bound code and
+/// very optimistic for bus-bound code -- measured at 1.02x to 25x against
+/// cycle-paced hardware, monotonic in memory intensity (issue #105).
+/// Cycles and seconds alone give a caller no way to tell which end of that
+/// range a workload sits at; accesses per instruction does, from the
+/// volamos run by itself, with no second runtime to compare against.
+///
+/// **`reads` includes instruction fetch**, which the `m68k::AddressBus`
+/// methods cannot distinguish from a data read. So accesses-per-
+/// instruction has a floor a little above 1.0 rather than 0, and it is the
+/// margin above that floor, not the absolute value, that indicates data
+/// traffic. Measured on two deliberately-opposite loops at `-O2`: a
+/// byte-copy loop reads 2.67 accesses/instr, a register-only arithmetic
+/// loop 1.27. The **write** count is the clean signal, carrying no fetch
+/// component at all -- 819308 writes for that copy loop against 110 for
+/// the arithmetic one. Both are reported rather than a single total for
+/// exactly that reason.
+///
+/// `None` when no instruction was retired: every ratio would divide by
+/// zero, and "0 instructions" is already evident from the cycle line
+/// being 0 too.
+fn format_emulated_work(cycles: u64, instructions: u64, reads: u64, writes: u64) -> Option<String> {
+    if instructions == 0 {
+        return None;
+    }
+    let accesses = reads.saturating_add(writes);
+    let cpi = cycles as f64 / instructions as f64;
+    let api = accesses as f64 / instructions as f64;
+    let counts = format!(
+        "{instructions} instructions, {accesses} bus accesses ({reads} read / {writes} write)"
+    );
+    Some(format!(
+        "{counts}, {cpi:.2} cycles/instr, {api:.2} accesses/instr"
+    ))
 }
 
 /// Formats [`report_emulated_cycles`]' one line, split out from the
@@ -2147,6 +2194,32 @@ mod tests {
             format_emulated_cycles(0, 25_000_000.0).unwrap(),
             "0 emulated cycles, 0.000000 s at 25 MHz"
         );
+    }
+
+    /// Test: the work line's counts and both derived ratios.
+    ///
+    /// Pins the wording and the arithmetic, since a benchmark harness may
+    /// parse this, and pins that reads and writes are reported separately
+    /// rather than only as a total -- the write count is the one carrying
+    /// no instruction-fetch component, so collapsing them would destroy
+    /// the line's most useful signal (see `format_emulated_work`'s doc).
+    #[test]
+    fn emulated_work_line_reports_counts_and_both_ratios() {
+        let line = format_emulated_work(1_000, 100, 180, 20).unwrap();
+        assert_eq!(
+            line,
+            "100 instructions, 200 bus accesses (180 read / 20 write), 10.00 cycles/instr, 2.00 accesses/instr"
+        );
+    }
+
+    /// Test: no work line at all when nothing retired, rather than a line
+    /// full of divide-by-zero `NaN`/`inf` ratios.
+    #[test]
+    fn emulated_work_line_is_omitted_when_no_instruction_retired() {
+        assert!(format_emulated_work(0, 0, 0, 0).is_none());
+        // Cycles and accesses without a retired instruction still has no
+        // meaningful denominator.
+        assert!(format_emulated_work(500, 0, 12, 3).is_none());
     }
 
     /// Test: a non-positive clock rate formats to nothing rather than to
