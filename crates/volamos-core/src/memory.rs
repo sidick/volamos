@@ -44,6 +44,15 @@ pub trait AddressSpace {
         self.len() == 0
     }
 
+    /// Guest-CPU bus accesses observed so far, as `(reads, writes)`.
+    /// `(0, 0)` by default, for address spaces that don't count --
+    /// counting is [`FlatMemory`]'s job and only meaningful under
+    /// `--clock-mhz`; see [`FlatMemory::access_counts`] for why the count
+    /// lives in the `m68k::AddressBus` impl rather than here.
+    fn bus_access_counts(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Reads a single byte. Returns `0` if `addr` is out of range.
     fn read_u8(&self, addr: u32) -> u8;
 
@@ -129,6 +138,10 @@ pub trait AddressSpace {
 #[derive(Debug, Clone)]
 pub struct FlatMemory {
     bytes: Vec<u8>,
+    /// Count of guest-CPU bus reads and writes, for the CLI's
+    /// `--clock-mhz` report (see [`FlatMemory::access_counts`]).
+    reads: u64,
+    writes: u64,
     /// The optional sanitizer shadow map -- see this module's doc.
     /// Boxed so the common (disabled) case doesn't pay for
     /// [`ShadowMap`]'s own `Vec`/`HashMap` fields inline in every
@@ -143,11 +156,45 @@ impl FlatMemory {
     pub fn new(size: usize) -> Self {
         Self {
             bytes: vec![0u8; size],
+            reads: 0,
+            writes: 0,
             shadow: None,
         }
     }
 
     /// Returns a read-only view of the backing bytes.
+    /// Guest-CPU bus accesses so far, as `(reads, writes)`.
+    ///
+    /// Counted in [`m68k::AddressBus`]'s impl (`crate::backend`), *not*
+    /// in the [`crate::cpu::AddressSpace`] methods, which is the
+    /// distinction that makes the number meaningful: this runtime's own
+    /// native library handlers reach guest memory through `AddressSpace`
+    /// directly, so their traffic is excluded and what remains is what
+    /// the emulated CPU itself put on the bus.
+    ///
+    /// Only complete under `--clock-mhz`. On the default execution path
+    /// the trace JIT reads and writes through the raw `fast_mem` pointer,
+    /// bypassing the `AddressBus` methods entirely, so these counts see
+    /// an arbitrary fraction of the real traffic -- the same reason no
+    /// cycle count exists there either. The CLI reports them only
+    /// alongside a cycle count, never on their own.
+    pub fn access_counts(&self) -> (u64, u64) {
+        (self.reads, self.writes)
+    }
+
+    /// Records one guest-CPU bus read. Called only from the
+    /// [`m68k::AddressBus`] impl -- see [`FlatMemory::access_counts`].
+    #[inline]
+    pub(crate) fn count_read(&mut self) {
+        self.reads = self.reads.wrapping_add(1);
+    }
+
+    /// Records one guest-CPU bus write. See [`FlatMemory::count_read`].
+    #[inline]
+    pub(crate) fn count_write(&mut self) {
+        self.writes = self.writes.wrapping_add(1);
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
@@ -230,6 +277,10 @@ impl FlatMemory {
 }
 
 impl AddressSpace for FlatMemory {
+    fn bus_access_counts(&self) -> (u64, u64) {
+        self.access_counts()
+    }
+
     fn len(&self) -> usize {
         self.bytes.len()
     }
