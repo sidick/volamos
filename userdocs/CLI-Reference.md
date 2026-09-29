@@ -323,6 +323,29 @@ Only `ReadEClock` changes. `GetSysTime`, `TR_GETSYSTIME`, `DateStamp`,
 and `CurrentTime` all still read the real host clock — a benchmark run
 under `--clock-mhz` doesn't think it's 1978.
 
+When `--clock-mhz` is active, volamos also prints the run's total at
+exit, on stderr:
+
+```console
+$ volamos --clock-mhz 25 ./bench
+...program output...
+volamos: 340020 emulated cycles, 0.013601 s at 25 MHz
+```
+
+The line goes to stderr so a harness parsing the guest program's own
+stdout never sees it, and it is printed even when the run ends in an
+error — a benchmark that died part-way still burned the cycles it
+burned. Without `--clock-mhz` nothing is printed, because on the default
+execution path no cycle count exists to print (see the warning below).
+
+This makes an *uninstrumented* binary measurable: the guest does not
+have to call `ReadEClock` and report its own elapsed time. (`vamos -v`
+has reported an equivalent `total cycles:` line for its own runs all
+along; the two agree closely — the same `ehtest` binary measures 340,020
+cycles under volamos against vamos's 339,044 at 68000, and 157,436
+against 155,855 at `--cpu 68020`, despite entirely independent cycle
+models.)
+
 !!! warning "Read this before trusting the numbers"
     - **This is the slowest execution mode volamos has.** Measured with
       [CoreMark 1.0](https://github.com/eembc/coremark)

@@ -1483,7 +1483,58 @@ fn run(opts: &Options) -> Result<i32, String> {
         .run(&mut out, Some(&mut trace))
         .map_err(|e| format!("{}: {e}", opts.program));
     report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
+    report_emulated_cycles(&runtime);
     result
+}
+
+/// Prints the run's emulated cycle count and the wall time it
+/// represents, once, at exit -- the whole point of `--clock-mhz` being a
+/// *measurement* mode, and a no-op for every run without it (see
+/// [`volamos_core::dispatch::Runtime::emulated_cycles`], which reports
+/// `None` when no clock rate was configured).
+///
+/// Printed unconditionally rather than behind `-v`, and to stderr rather
+/// than stdout. Unconditionally because a caller who passed an explicit
+/// benchmarking flag asked for exactly this number, and making them pass
+/// a second flag to see it would be a poor trade; to stderr because the
+/// guest program's own output is on stdout and a benchmark harness
+/// parsing that must not have this line spliced into it.
+///
+/// Reported even when the run ended in an error. A guest that crashed
+/// part-way still burned the cycles it burned, and for a benchmark
+/// that died half-way through, "how far did it get" is usually the
+/// first question.
+fn report_emulated_cycles<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime<C>) {
+    if let Some(line) = runtime
+        .emulated_cycles()
+        .and_then(|(cycles, clock_hz)| format_emulated_cycles(cycles, clock_hz))
+    {
+        eprintln!("volamos: {line}");
+    }
+}
+
+/// Formats [`report_emulated_cycles`]' one line, split out from the
+/// printing so the wording and the arithmetic are testable without
+/// capturing stderr.
+///
+/// `None` for a non-positive clock rate. [`parse_clock_mhz`] already
+/// rejects any rate that low, so this is unreachable from the CLI --
+/// but this function formats whatever it is handed, and emitting a
+/// silent `inf` into a benchmark log would be worse than emitting
+/// nothing.
+fn format_emulated_cycles(cycles: u64, clock_hz: f64) -> Option<String> {
+    // `is_nan` spelled out rather than `!(clock_hz > 0.0)`: the negated
+    // form covers NaN too, but only incidentally, and reads as though a
+    // NaN rate were an oversight rather than a case deliberately
+    // excluded here.
+    if clock_hz.is_nan() || clock_hz <= 0.0 {
+        return None;
+    }
+    let seconds = cycles as f64 / clock_hz;
+    Some(format!(
+        "{cycles} emulated cycles, {seconds:.6} s at {} MHz",
+        clock_hz / 1_000_000.0
+    ))
 }
 
 fn main() -> ExitCode {
@@ -2070,6 +2121,45 @@ mod tests {
     fn jit_flag_enables_jit() {
         let opts = parse_args(args(&["--jit", "prog"])).unwrap();
         assert!(opts.jit);
+    }
+
+    /// Test: the exit-time cycle report's wording and arithmetic.
+    /// Pins the seconds conversion (cycles / clock_hz) and the MHz the
+    /// line quotes back, so a future change to either is a deliberate
+    /// one -- a benchmark harness may well be parsing this line.
+    #[test]
+    fn emulated_cycles_line_reports_cycles_and_derived_seconds() {
+        // 25_000_000 cycles at 25 MHz is exactly one second, which makes
+        // the conversion checkable by inspection rather than by
+        // replicating the arithmetic the code under test performs.
+        assert_eq!(
+            format_emulated_cycles(25_000_000, 25_000_000.0).unwrap(),
+            "25000000 emulated cycles, 1.000000 s at 25 MHz"
+        );
+        // A fractional rate, as Copperline's own benchmark config uses.
+        assert_eq!(
+            format_emulated_cycles(7_093_790, 7_093_790.0).unwrap(),
+            "7093790 emulated cycles, 1.000000 s at 7.09379 MHz"
+        );
+        // A run that executed nothing still reports, rather than
+        // silently omitting the line: "zero cycles" is a result.
+        assert_eq!(
+            format_emulated_cycles(0, 25_000_000.0).unwrap(),
+            "0 emulated cycles, 0.000000 s at 25 MHz"
+        );
+    }
+
+    /// Test: a non-positive clock rate formats to nothing rather than to
+    /// an `inf`/`NaN` seconds figure. Unreachable through the CLI --
+    /// `parse_clock_mhz` rejects these well before here -- but the
+    /// formatter is responsible for what it emits regardless of who
+    /// calls it, and a bogus number in a benchmark log is worse than a
+    /// missing line.
+    #[test]
+    fn emulated_cycles_line_is_omitted_for_a_nonpositive_clock_rate() {
+        assert!(format_emulated_cycles(1_000, 0.0).is_none());
+        assert!(format_emulated_cycles(1_000, -25_000_000.0).is_none());
+        assert!(format_emulated_cycles(1_000, f64::NAN).is_none());
     }
 
     #[test]
