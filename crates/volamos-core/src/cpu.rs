@@ -202,4 +202,54 @@ pub trait Cpu {
     /// real hardware semantics, faithfully reproduced, not a bug in
     /// this method.
     fn take_hardware_exception(&mut self, mem: &mut Self::Memory, kind: TrapKind) -> bool;
+
+    /// Accumulated real m68k CPU cycles consumed so far, for a backend
+    /// that tracks them at all -- see
+    /// [`crate::backend::M68kCpu::set_clock_mhz`] (the CLI's
+    /// `--clock-mhz` flag, issue #102) for the one implementation that
+    /// does.
+    ///
+    /// **Only [`Cpu::run`] accumulates cycles, never [`Cpu::step`].**
+    /// `M68kCpu::run_via_cycles` (the method backing this) is reached
+    /// exclusively through `Cpu::run`; `M68kCpu::step` always goes
+    /// through the plain interpreter (`core.step`), which this crate's
+    /// backend never wires up to any cycle counter. This matters
+    /// because a handful of callers reach guest code through `step`
+    /// directly rather than `run`: `execfmt.rs`'s `RawDoFmt` calls a
+    /// guest-supplied `PutChProc` callback one instruction at a time
+    /// (see its step loop, `CALLOUT_STEP_BUDGET`), and its `Supervisor`
+    /// handler single-steps a guest routine the same way (see its own
+    /// step loop, `SUPERVISOR_STEP_BUDGET`). Guest instructions executed
+    /// through either of those cost *zero* emulated cycles under
+    /// `--clock-mhz`, exactly like time spent inside any other
+    /// native-Rust library handler -- consistent with, not a special
+    /// case of, the general "native handlers are free" behavior (see
+    /// `crate::exectask::read_eclock_handler`'s and the CLI's
+    /// `--clock-mhz` doc for the user-facing version of this caveat).
+    ///
+    /// Defaults to `0` so adding this method is non-breaking: every
+    /// caller that predates issue #102 already assumes execution carries
+    /// no cycle count at all (the normal `run_batch` path this runtime
+    /// has used since Phase 1 never surfaced one -- see `backend.rs`'s
+    /// module docs on why `m68k::BatchResult` has no `cycles` field),
+    /// and `0` is indistinguishable from "never asked". Only meaningful
+    /// together with [`Cpu::clock_hz`]; a caller that cares about actual
+    /// elapsed emulated time should check `clock_hz().is_some()` first
+    /// rather than trying to interpret a `0` cycle count on its own.
+    fn emulated_cycles(&self) -> u64 {
+        0
+    }
+
+    /// The clock rate ([`Cpu::emulated_cycles`] is being counted at (in
+    /// Hz), if this backend is currently deriving guest-visible elapsed
+    /// time from emulated cycles rather than the host wall clock --
+    /// `Some` exactly when [`crate::backend::M68kCpu::set_clock_mhz`]
+    /// installed a rate. `None` (the default for every backend, and for
+    /// [`crate::backend::M68kCpu`] itself unless `--clock-mhz` was
+    /// given) means "no such mode active"; callers like
+    /// [`crate::exectask::read_eclock_handler`] use that to decide
+    /// whether to fall back to the host clock.
+    fn clock_hz(&self) -> Option<f64> {
+        None
+    }
 }

@@ -1348,11 +1348,47 @@ fn get_sys_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 /// meaningful -- so deriving the tick count from the same wall clock as
 /// [`host_time_secs_micro`] (seconds-since-1978 at 709379 ticks/sec)
 /// gives correct interval arithmetic, which is the only documented use.
+///
+/// That's the default. With `--clock-mhz` (issue #102, see
+/// [`crate::backend::M68kCpu::set_clock_mhz`]) the *tick count* instead
+/// comes from `ctx.cpu`'s accumulated emulated cycle count
+/// ([`Cpu::emulated_cycles`]) divided by the configured clock rate
+/// ([`Cpu::clock_hz`]) -- real emulated seconds, converted to
+/// E-Clock-rate ticks the same way the host-clock path converts real
+/// wall-clock seconds. The point is reproducible, host-load-independent
+/// A/B benchmarking: two `ReadEClock` calls bracketing some guest work
+/// now measure *emulated* elapsed time (derived from how many m68k
+/// cycles the guest actually executed) rather than however long the
+/// host machine happened to take, which varies with scheduling noise,
+/// thermal throttling, whatever else is running, and so on.
+///
+/// **The rate reported in `D0` is always [`ECLOCK_PAL_HZ`], regardless
+/// of `--clock-mhz`.** This is deliberate, not an oversight: on real
+/// hardware the E-Clock is derived from the video/CIA timing chain, not
+/// the CPU's own clock -- a PAL Amiga's E-Clock ticks at the same
+/// 709,379 Hz whether it has a stock 68000 or an aftermarket
+/// accelerator running many times faster, because the accelerator's
+/// higher clock never touches the chipset's E-Clock source. So
+/// `--clock-mhz` (which models a faster/slower *CPU*) has no business
+/// changing the *rate value* a real program would read out of `D0` --
+/// only the numerator (how much emulated time actually elapsed) is
+/// meant to move. Reporting anything else in `D0` here would be a
+/// self-inconsistent EClockVal: a caller that (correctly, per the RKRM)
+/// divides an interval's tick delta by the rate in `D0` needs that rate
+/// to be the same one the ticks were generated at.
 fn read_eclock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let dest = ctx.cpu.address_register(AddressRegister(0));
-    let (secs, micro) = host_time_secs_micro();
-    let ticks = u64::from(secs) * u64::from(ECLOCK_PAL_HZ)
-        + u64::from(micro) * u64::from(ECLOCK_PAL_HZ) / 1_000_000;
+    let ticks = match ctx.cpu.clock_hz() {
+        Some(clock_hz) => {
+            let emulated_secs = ctx.cpu.emulated_cycles() as f64 / clock_hz;
+            (emulated_secs * f64::from(ECLOCK_PAL_HZ)) as u64
+        }
+        None => {
+            let (secs, micro) = host_time_secs_micro();
+            u64::from(secs) * u64::from(ECLOCK_PAL_HZ)
+                + u64::from(micro) * u64::from(ECLOCK_PAL_HZ) / 1_000_000
+        }
+    };
     ctx.mem.write_u32(dest, (ticks >> 32) as u32);
     ctx.mem.write_u32(dest.wrapping_add(4), ticks as u32);
     ctx.cpu.set_data_register(DataRegister(0), ECLOCK_PAL_HZ);
@@ -2930,6 +2966,145 @@ mod tests {
         assert!(
             rt.memory().read_u32(ev_addr) > 0,
             "ev_hi should be non-zero"
+        );
+    }
+
+    // --- ReadEClock under --clock-mhz (issue #102) ---
+
+    #[test]
+    fn read_eclock_reports_the_pal_rate_in_d0_even_under_clock_mhz_mode() {
+        // The single most load-bearing detail of the whole --clock-mhz
+        // feature: the *rate* ReadEClock reports in D0 must stay
+        // ECLOCK_PAL_HZ regardless of the configured clock -- see
+        // read_eclock_handler's doc comment for why (real hardware
+        // derives the E-Clock from the chipset's video/CIA timing, not
+        // the CPU's own clock, so a faster/slower emulated CPU has no
+        // business changing the reported rate, only the numerator).
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = EClockVal dest (patched)
+        let ev_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-60)); // ReadEClock -> D0 = rate
+        words.push(RTS);
+
+        let ev_addr = entry + (words.len() as u32) * 2 + 4;
+        words[ev_idx] = (ev_addr >> 16) as u16;
+        words[ev_idx + 1] = ev_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+
+        let mut cpu = M68kCpu::new();
+        cpu.set_clock_mhz(Some(7.14)); // an arbitrary, non-round rate
+        let mut rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry,
+                load_end: ev_addr + 8,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32, ECLOCK_PAL_HZ,
+            "ReadEClock's D0 rate must stay ECLOCK_PAL_HZ regardless of --clock-mhz"
+        );
+    }
+
+    #[test]
+    fn read_eclock_under_clock_mhz_mode_derives_ticks_from_emulated_cycles_not_wall_clock() {
+        // Two ReadEClock calls, bracketing a handful of ordinary guest
+        // instructions, at a deliberately very slow configured clock
+        // (100 Hz -- `set_clock_mhz`'s `mhz` argument is in MHz, so
+        // 0.0001). At that rate even the tiny number of real 68000
+        // cycles a few NOPs and their surrounding MOVEA/JSR setup cost
+        // (tens of cycles) works out to hundreds of milliseconds of
+        // *emulated* elapsed time -- hundreds of thousands of E-Clock
+        // ticks. A host wall clock, by contrast, cannot produce
+        // anywhere near that many ticks for a handful of synchronous
+        // instructions inside a single host function call (a few
+        // microseconds at most, worth low single-digit ticks at
+        // ECLOCK_PAL_HZ's ~0.71 ticks/microsecond). So a large observed
+        // delta here can only come from the cycle-derived formula, not
+        // from `host_time_secs_micro`, which is exactly what this test
+        // pins down: read_eclock_handler must actually be branching on
+        // `Cpu::clock_hz` rather than falling through to the host-clock
+        // path by accident.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = TIMER_DEVICE_BASE
+        words.push((TIMER_DEVICE_BASE >> 16) as u16);
+        words.push(TIMER_DEVICE_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = ev1 dest (patched)
+        let ev1_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-60)); // ReadEClock #1
+        words.push(0x4E71); // NOP
+        words.push(0x4E71); // NOP
+        words.push(0x4E71); // NOP -- "guest instructions between them"
+        words.push(move_imm_to_a(0)); // A0 = ev2 dest (patched)
+        let ev2_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-60)); // ReadEClock #2
+        words.push(RTS);
+
+        let ev1_addr = entry + (words.len() as u32) * 2 + 4;
+        let ev2_addr = ev1_addr + 8;
+        words[ev1_idx] = (ev1_addr >> 16) as u16;
+        words[ev1_idx + 1] = ev1_addr as u16;
+        words[ev2_idx] = (ev2_addr >> 16) as u16;
+        words[ev2_idx + 1] = ev2_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+
+        let mut cpu = M68kCpu::new();
+        cpu.set_clock_mhz(Some(0.0001)); // 100 Hz
+        let mut rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry,
+                load_end: ev2_addr + 8,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32, ECLOCK_PAL_HZ,
+            "ReadEClock's D0 rate must stay ECLOCK_PAL_HZ under --clock-mhz too"
+        );
+
+        let ev1 = (u64::from(rt.memory().read_u32(ev1_addr)) << 32)
+            | u64::from(rt.memory().read_u32(ev1_addr + 4));
+        let ev2 = (u64::from(rt.memory().read_u32(ev2_addr)) << 32)
+            | u64::from(rt.memory().read_u32(ev2_addr + 4));
+        assert!(
+            ev2 > ev1,
+            "the second ReadEClock should report a later tick count than the first"
+        );
+        let delta = ev2 - ev1;
+        assert!(
+            delta > 50_000,
+            "a handful of guest instructions at 100 Hz should be hundreds of thousands of \
+             E-Clock ticks apart if the delta is cycle-derived, not wall-clock-derived; got \
+             {delta}"
         );
     }
 

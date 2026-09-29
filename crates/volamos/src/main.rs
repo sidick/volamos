@@ -167,6 +167,31 @@ impl InstrumentationOptions {
     }
 }
 
+/// Where an `opts.jit == true` actually came from -- an explicit
+/// `--jit`/`--no-jit` on this command line, or a `JIT=true`/`JIT=false`
+/// line in a `~/.volamos`/`.volamos` config file (see
+/// [`crate::config`]'s module doc for the full precedence chain). Exists
+/// solely so [`check_clock_mhz_jit`]'s error message can name the flag
+/// the user actually needs to change, rather than always saying "drop
+/// --jit" to someone who never typed it -- a `JIT=true` sitting in a
+/// config file they may not even remember exists is a much easier
+/// mistake to make than a stray `--jit` on the command line right in
+/// front of the `--clock-mhz` that conflicts with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JitSource {
+    /// `jit` is `false` (the default, or an explicit `--no-jit`/
+    /// `JIT=false`) -- never actually consulted by
+    /// [`check_clock_mhz_jit`], since there's nothing to complain about,
+    /// but kept as the [`Options::jit_source`] default so every
+    /// `Options` value has one.
+    Default,
+    /// `jit` is `true` because of `--jit` on this command line.
+    CommandLine,
+    /// `jit` is `true` because of `JIT=true` in a config file, with no
+    /// overriding `--jit`/`--no-jit` on the command line itself.
+    ConfigFile,
+}
+
 #[derive(Debug)]
 struct Options {
     verbose: bool,
@@ -182,6 +207,10 @@ struct Options {
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
+    /// See [`JitSource`]. `Default` whenever `jit` is `false`; otherwise
+    /// names which source (`--jit` or a config file's `JIT=true`) is
+    /// responsible, for [`check_clock_mhz_jit`]'s error message.
+    jit_source: JitSource,
     /// `--sanitize`: installs a [`volamos_core::sanitize::ShadowMap`] on
     /// the guest [`FlatMemory`] and forces the JIT off (see [`run`]) --
     /// see `volamos_core::sanitize`'s module doc for the detector
@@ -192,6 +221,25 @@ struct Options {
     /// per-invocation choice rather than something a stale config file
     /// silently turns on. See [`InstrumentationOptions`] for the family.
     sanitize: InstrumentationOptions,
+    /// `--clock-mhz N` (issue #102): install an emulated clock rate of
+    /// `N` MHz and switch `timer.device`'s `ReadEClock` from host
+    /// wall-clock time to time derived from the CPU's own emulated
+    /// cycle count at that rate -- see
+    /// [`volamos_core::backend::M68kCpu::set_clock_mhz`]'s doc for the
+    /// full mechanism and [`volamos_core::exectask::read_eclock_handler`]
+    /// for why the *rate* `ReadEClock` reports in `D0` is unaffected by
+    /// this. `None` (the default) is unchanged host-clock behavior.
+    ///
+    /// CLI-only, like `sanitize`/`net` -- kept out of
+    /// `config::Overrides` deliberately: this changes what a guest
+    /// program's own timing measurements *mean* (emulated time instead
+    /// of real time), which is exactly the kind of thing a stale
+    /// `~/.volamos`/`.volamos` shouldn't be able to silently flip on for
+    /// every future run in that directory.
+    ///
+    /// Mutually exclusive with `jit` and with `sanitize.enabled`: see
+    /// [`check_clock_mhz_jit`]/[`check_clock_mhz_sanitize`].
+    clock_mhz: Option<f64>,
     net: bool,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
@@ -232,7 +280,7 @@ fn print_usage(program_name: &str) {
          [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
          [--auto-assign HOSTDIR] [--defaults|--no-defaults] [--volumes-dir HOSTDIR] \
          [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize] [--sanitize-uninit] \
+         [--fpu|--no-fpu] [--jit|--no-jit] [--clock-mhz N] [--sanitize] [--sanitize-uninit] \
          [--sanitize-ignore-pc ADDR] [--dirty-heap] [--net] <program> [args...]"
     );
     eprintln!();
@@ -309,6 +357,51 @@ fn print_usage(program_name: &str) {
         "                            reference); every library-call trap boundary is identical"
     );
     eprintln!("                            either way");
+    eprintln!(
+        "  --clock-mhz N             report timer.device's ReadEClock as emulated time derived"
+    );
+    eprintln!(
+        "                            from the CPU's own emulated cycle count at N MHz (fractional"
+    );
+    eprintln!(
+        "                            values allowed, e.g. 25 or 7.14), instead of host wall-clock"
+    );
+    eprintln!("                            time -- for reproducible, host-load-independent A/B");
+    eprintln!(
+        "                            benchmarking. Off by default. Cannot be combined with an"
+    );
+    eprintln!(
+        "                            explicit --jit (run_batch's trace JIT never tracks a cycle"
+    );
+    eprintln!(
+        "                            count, so there'd be nothing to derive emulated time from)"
+    );
+    eprintln!(
+        "                            or with --sanitize (the cycle-counted execution path skips"
+    );
+    eprintln!("                            the sanitizer's per-instruction hooks entirely, so its");
+    eprintln!("                            checks would be silently incomplete rather than merely");
+    eprintln!(
+        "                            slow). This is the slowest execution mode: measured ~2.2x"
+    );
+    eprintln!(
+        "                            slower than --no-jit and ~7x slower than --jit (CoreMark 1.0"
+    );
+    eprintln!("                            on --cpu 68020, host wall-clock throughput). volamos's");
+    eprintln!(
+        "                            memory bus has no wait states at all, so memory-bound guest"
+    );
+    eprintln!(
+        "                            code still won't match real hardware timing, and time spent"
+    );
+    eprintln!(
+        "                            inside volamos's own native-Rust library handlers (e.g."
+    );
+    eprintln!("                            CopyMem) or single-stepped guest callbacks (RawDoFmt's");
+    eprintln!(
+        "                            PutChProc, Supervisor's routine) costs zero emulated cycles"
+    );
+    eprintln!("                            and is invisible in the reported total");
     eprintln!("  --sanitize                enable shadow-memory checking of guest accesses (heap");
     eprintln!(
         "                            redzones, freed blocks, below-stack-pointer reads/writes);"
@@ -411,6 +504,70 @@ fn parse_byte_size(flag: &str, s: &str) -> Result<u32, String> {
     value
         .checked_mul(multiplier)
         .ok_or_else(|| format!("{flag} value {s:?} overflows"))
+}
+
+/// An upper bound `--clock-mhz` refuses outright (issue #102, see
+/// [`parse_clock_mhz`]). Exists purely to turn a fat-fingered entry (an
+/// extra digit, a misplaced decimal point) into a clear error instead of
+/// a silently-nonsensical "the CPU runs at a terahertz" benchmark run --
+/// real classic-Amiga hardware, up to and including the fastest
+/// Vampire-class FPGA accelerators on the market, never gets remotely
+/// close to even a tenth of this.
+const MAX_CLOCK_MHZ: f64 = 10_000.0;
+
+/// A lower bound `--clock-mhz` refuses outright, for the same reason
+/// [`MAX_CLOCK_MHZ`] exists but at the other end of the scale: without
+/// one, something like `--clock-mhz 1e-30` parses as a perfectly
+/// ordinary positive, finite `f64` and sails straight through the
+/// `is_finite() && > 0.0` check, but drives every `ReadEClock` tick
+/// count (`cycles / clock_hz * ECLOCK_PAL_HZ`, see
+/// `read_eclock_handler`) to `f64::INFINITY`, which then saturates on
+/// the `as u64` cast to `u64::MAX` -- harmless (no panic, no UB), but a
+/// benchmark silently reporting the largest possible tick count instead
+/// of a clear rejection is exactly the kind of "looks fine, isn't"
+/// result `--clock-mhz` exists to avoid. `1 Hz` is generously below any
+/// clock rate a real or realistically-slowed-down classic Amiga could
+/// plausibly model (even a 1980s calculator's clock beats it), while
+/// staying far away from the zero/underflow edge this guards against.
+const MIN_CLOCK_MHZ: f64 = 0.000_001;
+
+/// Parses a `--clock-mhz N` value: a positive clock rate in megahertz
+/// for `ReadEClock`'s cycle-derived emulated-time mode (issue #102, see
+/// [`volamos_core::backend::M68kCpu::set_clock_mhz`]). Fractional values
+/// are accepted (`N.parse::<f64>()`) rather than requiring a whole
+/// number -- Copperline, this project's own hardware-timing oracle,
+/// models an A600's 68000 as `clock_mhz = 25.0`, and a real accelerator
+/// board's rated speed is routinely a fraction (e.g. "14.28 MHz" for an
+/// early NTSC-derived clock doubler), so an integer-only parser would
+/// force a caller to round away the exact rate they're trying to model.
+///
+/// Rejects empty/non-numeric input, `0` and negative values (there is no
+/// such thing as a non-positive clock rate), `NaN`/`inf`/`-inf` (which
+/// `f64::parse` otherwise happily accepts and which would poison every
+/// downstream division in `Cpu::run_via_cycles`/`read_eclock_handler`),
+/// and anything outside [`MIN_CLOCK_MHZ`]..=[`MAX_CLOCK_MHZ`].
+fn parse_clock_mhz(s: &str) -> Result<f64, String> {
+    let value: f64 = s
+        .parse()
+        .map_err(|_| format!("--clock-mhz expects a positive number of MHz, got {s:?}"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "--clock-mhz expects a positive number of MHz, got {s:?}"
+        ));
+    }
+    if value < MIN_CLOCK_MHZ {
+        return Err(format!(
+            "--clock-mhz {value} is implausibly low (under {MIN_CLOCK_MHZ} MHz) -- check for a \
+             typo"
+        ));
+    }
+    if value > MAX_CLOCK_MHZ {
+        return Err(format!(
+            "--clock-mhz {value} is implausibly high (over {MAX_CLOCK_MHZ} MHz) -- check for a \
+             typo"
+        ));
+    }
+    Ok(value)
 }
 
 /// Parses a `--cpu MODEL` value (case-insensitive) into a [`CpuType`].
@@ -562,6 +719,19 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
     }
 }
 
+/// [`parse_args_raw`]'s return type, factored out purely to satisfy
+/// clippy's `type_complexity` lint -- see that function's doc for what
+/// each element means; `Option<f64>` is `--clock-mhz`'s CLI-only value
+/// (issue #102), threaded alongside `InstrumentationOptions` for the
+/// same reason (see `Options::clock_mhz`'s doc).
+type RawParsedArgs = (
+    config::Overrides,
+    InstrumentationOptions,
+    Option<f64>,
+    String,
+    Vec<String>,
+);
+
 /// Hand-rolled argument parsing: this CLI's surface is small enough that
 /// pulling in an argument-parsing crate isn't worth the dependency.
 ///
@@ -574,21 +744,17 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// (see `crate::config`'s module doc). [`parse_args`] is the
 /// no-config-files convenience wrapper most callers (and every existing
 /// test) actually want.
-fn parse_args_raw(
-    mut args: impl Iterator<Item = String>,
-) -> Result<
-    (
-        config::Overrides,
-        InstrumentationOptions,
-        String,
-        Vec<String>,
-    ),
-    String,
-> {
+fn parse_args_raw(mut args: impl Iterator<Item = String>) -> Result<RawParsedArgs, String> {
     let mut overrides = config::Overrides::default();
     // CLI-only, unlike every other flag here -- see `Options::sanitize`'s
     // doc for why this deliberately isn't part of `config::Overrides`.
     let mut sanitize = InstrumentationOptions::default();
+    // Also CLI-only, for the same reason -- see `Options::clock_mhz`'s
+    // doc. Kept as its own local (rather than folded into
+    // `InstrumentationOptions`) because it isn't part of that family's
+    // shadow-map-instrumentation theme; it changes what `ReadEClock`
+    // reports, not how guest memory accesses are checked.
+    let mut clock_mhz: Option<f64> = None;
     let mut program = None;
     let mut guest_args = Vec::new();
 
@@ -652,6 +818,12 @@ fn parse_args_raw(
             "--no-fpu" => overrides.fpu = Some(false),
             "--jit" => overrides.jit = Some(true),
             "--no-jit" => overrides.jit = Some(false),
+            "--clock-mhz" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--clock-mhz requires an N argument".to_string())?;
+                clock_mhz = Some(parse_clock_mhz(&value)?);
+            }
             "--sanitize" => sanitize.enabled = true,
             "--dirty-heap" => sanitize.dirty_heap = true,
             // Implies --sanitize: asking for uninitialized-read
@@ -688,7 +860,7 @@ fn parse_args_raw(
     }
 
     let program = program.ok_or_else(|| "missing <program> argument".to_string())?;
-    Ok((overrides, sanitize, program, guest_args))
+    Ok((overrides, sanitize, clock_mhz, program, guest_args))
 }
 
 /// Fills every unset field of `overrides` with its built-in default,
@@ -698,9 +870,27 @@ fn parse_args_raw(
 fn resolve(
     overrides: config::Overrides,
     sanitize: InstrumentationOptions,
+    clock_mhz: Option<f64>,
+    cli_jit: Option<bool>,
     program: String,
     guest_args: Vec<String>,
 ) -> Options {
+    let jit = overrides.jit.unwrap_or(false);
+    // See JitSource's doc: only matters when `jit` is actually `true`,
+    // in which case it's either straight from this command line's own
+    // `--jit` (`cli_jit == Some(true)`), or `overrides.jit` only ended
+    // up `true` because a config file's `JIT=true` won out over an
+    // absent CLI flag (`config::merge`'s CLI-wins-when-present rule
+    // means `cli_jit` can only be `Some(false)` or `None` here, never
+    // `Some(true)` -- if it were, `overrides.jit` would already equal
+    // it).
+    let jit_source = if !jit {
+        JitSource::Default
+    } else if cli_jit == Some(true) {
+        JitSource::CommandLine
+    } else {
+        JitSource::ConfigFile
+    };
     Options {
         verbose: overrides.verbose.unwrap_or(false),
         snoop: overrides.snoop.unwrap_or(false),
@@ -714,8 +904,10 @@ fn resolve(
         ram_size: overrides.ram_size.unwrap_or(DEFAULT_RAM_SIZE),
         cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
         fpu: overrides.fpu.unwrap_or(false),
-        jit: overrides.jit.unwrap_or(false),
+        jit,
+        jit_source,
         sanitize,
+        clock_mhz,
         net: overrides.net.unwrap_or(false),
         // Only ever non-empty when `overrides` already includes
         // `config::built_in_defaults`'s own layer -- `main` merges that
@@ -735,8 +927,11 @@ fn resolve(
 /// module wants instead.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let (overrides, sanitize, program, guest_args) = parse_args_raw(args)?;
-    Ok(resolve(overrides, sanitize, program, guest_args))
+    let (overrides, sanitize, clock_mhz, program, guest_args) = parse_args_raw(args)?;
+    let cli_jit = overrides.jit;
+    Ok(resolve(
+        overrides, sanitize, clock_mhz, cli_jit, program, guest_args,
+    ))
 }
 
 /// Works out the initial guest current directory per the defaulting rule
@@ -901,6 +1096,91 @@ fn check_ram_addressable(ram_size: u32, cpu_type: CpuType) -> Result<(), String>
     ))
 }
 
+/// Refuses `--clock-mhz` together with `jit` set (issue #102): `jit`
+/// only ever becomes `true` via an explicit override -- `--jit` on the
+/// command line, or `JIT=true` in a config file -- since
+/// [`resolve`]'s own default is `false` (see [`print_usage`]'s `--jit`/
+/// `--no-jit` doc). There is therefore no "default-on JIT" case this
+/// could spuriously trip on: every `jit == true` this ever sees really
+/// was asked for, by someone, somewhere. `jit_source` (see
+/// [`JitSource`]) says which -- used only to phrase the error message
+/// around whichever one it actually was, so a `JIT=true` sitting
+/// forgotten in a config file doesn't get blamed on a `--jit` the user
+/// never typed on this command line.
+///
+/// The combination is refused rather than one flag silently winning
+/// (the way `--sanitize` silently forces the JIT off) because there is
+/// no approximate answer to fall back to here: `run_batch` (the JIT's
+/// execution path) never surfaces a cycle count at all -- see
+/// `volamos_core::backend::M68kCpu::set_clock_mhz`'s doc -- so
+/// `--clock-mhz` would have literally nothing to derive `ReadEClock`'s
+/// reported time from. Reporting `0` or falling back to the host clock
+/// without saying so would silently give a benchmark run numbers that
+/// don't mean what `--clock-mhz` promised; an explicit error is the
+/// honest answer.
+fn check_clock_mhz_jit(
+    clock_mhz: Option<f64>,
+    jit: bool,
+    jit_source: JitSource,
+) -> Result<(), String> {
+    if !(clock_mhz.is_some() && jit) {
+        return Ok(());
+    }
+    let how_to_fix = match jit_source {
+        JitSource::CommandLine => "drop --jit (or pass --no-jit, the default)",
+        JitSource::ConfigFile => {
+            "pass --no-jit on the command line to override it, or drop JIT=true from your \
+             ~/.volamos/.volamos config file"
+        }
+        JitSource::Default => {
+            unreachable!("jit_source is Default whenever jit is false, but jit is true here")
+        }
+    };
+    Err(format!(
+        "--clock-mhz cannot be combined with --jit: the trace JIT (run_batch) never tracks a \
+         cycle count, so there is nothing for --clock-mhz to derive ReadEClock's emulated time \
+         from -- {how_to_fix} to use --clock-mhz"
+    ))
+}
+
+/// Refuses `--clock-mhz` together with `--sanitize` (issue #102 code
+/// review): `M68kCpu::run_via_cycles` -- the execution path
+/// `--clock-mhz` switches [`Cpu::run`](volamos_core::cpu::Cpu::run) to
+/// -- never calls the per-instruction sanitizer hooks
+/// (`sanitize_before_instruction`/`sanitize_after_instruction`) the
+/// ordinary `run_batch` path calls on every single instruction when a
+/// shadow map is installed: no `set_current_pc` publication, no
+/// `check_return`/`record_call` shadow-call-stack bookkeeping, no
+/// `update_stack_pointer` below-`A7` tracking. Running both flags
+/// together wouldn't merely be slower or imprecise -- key parts of the
+/// detector would be silently dead (a stale shadow call stack
+/// comparing new returns against frames from far earlier in the run)
+/// or attributing every violation in a whole cycle-budget's worth of
+/// instructions to one stale PC, while `--sanitize` still prints its
+/// normal-looking "no violations" or "N violations" summary as if
+/// everything had been checked.
+///
+/// [`check_clock_mhz_jit`]'s own doc makes the applicable argument:
+/// "an explicit error is the honest answer" beats a silently
+/// compromised result, and that applies at least as strongly to a
+/// safety/correctness tool quietly running with its instrumentation
+/// half-disabled as it does to `--clock-mhz` having no cycle count to
+/// read. Wiring the sanitizer hooks into `run_via_cycles` properly
+/// (matching `run_batch`'s shadow-map-forces-batches-of-one treatment)
+/// is future work, not something to fake with a doc-comment caveat.
+fn check_clock_mhz_sanitize(clock_mhz: Option<f64>, sanitize_enabled: bool) -> Result<(), String> {
+    if clock_mhz.is_some() && sanitize_enabled {
+        return Err(
+            "--clock-mhz cannot be combined with --sanitize: the cycle-counted execution path \
+             --clock-mhz uses (M68kCpu::run_via_cycles) does not run the sanitizer's \
+             per-instruction shadow-map hooks, so --sanitize's checks would be silently \
+             incomplete rather than merely slow -- drop one of the two flags"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Checks that `stack_size` plus [`MIN_HEAP_HEADROOM`] actually fits
 /// between `load_end` (the loaded program's own end address) and
 /// `ram_size` (the top of the guest address space) -- see
@@ -936,6 +1216,7 @@ fn run_nested_program(
     fpu: bool,
     jit: bool,
     sanitize: InstrumentationOptions,
+    clock_mhz: Option<f64>,
     net: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
@@ -979,6 +1260,13 @@ fn run_nested_program(
     // shadow map is installed, but making it explicit here means a
     // nested run never even attempts the JIT path in the first place).
     cpu.set_jit(jit && !sanitize.enabled);
+    // --clock-mhz (issue #102): the top-level run already validated
+    // this against `jit` (see `check_clock_mhz_jit`) before this
+    // nested-run closure was ever installed, so `jit`/`clock_mhz` here
+    // are the same already-consistent pair -- a nested System()/
+    // Execute() run gets its own fresh cycle counter, starting at `0`
+    // again, same as its own fresh CPU.
+    cpu.set_clock_mhz(clock_mhz);
     let mut runtime = Runtime::new(cpu, mem, config);
     if sanitize.dirty_heap {
         runtime.enable_dirty_heap();
@@ -1052,10 +1340,15 @@ fn build_runtime_with_vfs(
 }
 
 fn run(opts: &Options) -> Result<i32, String> {
-    // Before anything is read or loaded: this one depends only on the
-    // flags, and a run that violates it fails much later in a way that
-    // does not point at them.
+    // Before anything is read or loaded: these depend only on the
+    // flags, and a run that violates any of them fails much later in a
+    // way that does not point at them. --jit is checked before
+    // --sanitize (matching the doc comments' own ordering) purely so
+    // a run that somehow violates both reports the --jit conflict
+    // first -- there's no other significance to the order.
     check_ram_addressable(opts.ram_size, opts.cpu_type)?;
+    check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source)?;
+    check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled)?;
 
     let bytes = std::fs::read(&opts.program)
         .map_err(|e| format!("couldn't read '{}': {e}", opts.program))?;
@@ -1069,6 +1362,11 @@ fn run(opts: &Options) -> Result<i32, String> {
     // over --jit, since the JIT's fast_mem path would otherwise bypass
     // every shadow-map check.
     cpu.set_jit(opts.jit && !opts.sanitize.enabled);
+    // --clock-mhz (issue #102): already validated against --jit above,
+    // so this is never fighting the JIT for control of Cpu::run -- see
+    // M68kCpu::set_clock_mhz's doc for how the two would conflict if it
+    // weren't.
+    cpu.set_clock_mhz(opts.clock_mhz);
     let program_name = program_name_from_path(std::path::Path::new(&opts.program));
     let vfs_config = vfs_config_from_opts(opts);
 
@@ -1148,6 +1446,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_fpu = opts.fpu;
     let nested_jit = opts.jit;
     let nested_sanitize = opts.sanitize.clone();
+    let nested_clock_mhz = opts.clock_mhz;
 
     let nested_net = opts.net;
     runtime.set_system_runner(move |req| {
@@ -1162,6 +1461,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_fpu,
             nested_jit,
             nested_sanitize.clone(),
+            nested_clock_mhz,
             nested_net,
         )
     });
@@ -1200,7 +1500,7 @@ fn main() -> ExitCode {
     // -h/--help and any CLI parse error short-circuit here, before
     // ~/.volamos/.volamos are even read -- neither is relevant to
     // those paths (see parse_args_raw's doc).
-    let (cli_overrides, sanitize, program, guest_args) = match parse_args_raw(args) {
+    let (cli_overrides, sanitize, clock_mhz, program, guest_args) = match parse_args_raw(args) {
         Ok(v) => v,
         Err(msg) => {
             if !msg.is_empty() {
@@ -1231,6 +1531,12 @@ fn main() -> ExitCode {
     // `built_in_defaults` does no I/O itself (see its own doc) -- the
     // directories it names are created lazily, by `Vfs`, only if the
     // guest program actually uses them.
+    //
+    // Captured before `cli_overrides` is consumed by the merge below --
+    // this is the CLI's own `--jit`/`--no-jit` value alone, needed by
+    // `resolve` to tell "explicit --jit" apart from "JIT=true only in a
+    // config file" for JitSource/check_clock_mhz_jit's error message.
+    let cli_jit = cli_overrides.jit;
     let base = config::merge(cli_overrides, file_overrides);
     let defaults_enabled = base.standard_volumes.unwrap_or(true);
     let volumes_dir = base.volumes_dir.clone();
@@ -1240,7 +1546,7 @@ fn main() -> ExitCode {
         base
     };
 
-    let opts = resolve(merged, sanitize, program, guest_args);
+    let opts = resolve(merged, sanitize, clock_mhz, cli_jit, program, guest_args);
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same
@@ -1849,6 +2155,143 @@ mod tests {
         assert!(opts.sanitize.enabled);
     }
 
+    // --- --clock-mhz (issue #102) ---
+
+    #[test]
+    fn default_clock_mhz_is_off() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert_eq!(opts.clock_mhz, None);
+    }
+
+    #[test]
+    fn clock_mhz_flag_accepts_an_integer_value() {
+        let opts = parse_args(args(&["--clock-mhz", "25", "prog"])).unwrap();
+        assert_eq!(opts.clock_mhz, Some(25.0));
+    }
+
+    #[test]
+    fn clock_mhz_flag_accepts_a_fractional_value() {
+        // Copperline's own A600/Gayle configuration models a 25 MHz
+        // 68000, and a real accelerator's rated speed is routinely a
+        // fraction (e.g. an NTSC-derived clock-doubler board) -- an
+        // integer-only parser would force rounding away the exact rate
+        // a caller is trying to model, so fractional MHz must parse.
+        let opts = parse_args(args(&["--clock-mhz", "7.14", "prog"])).unwrap();
+        assert_eq!(opts.clock_mhz, Some(7.14));
+    }
+
+    #[test]
+    fn clock_mhz_flag_rejects_zero_negative_and_non_numeric() {
+        assert!(parse_args(args(&["--clock-mhz", "0", "prog"])).is_err());
+        assert!(parse_args(args(&["--clock-mhz", "-5", "prog"])).is_err());
+        assert!(parse_args(args(&["--clock-mhz", "nonsense", "prog"])).is_err());
+        assert!(parse_args(args(&["--clock-mhz"])).is_err());
+    }
+
+    #[test]
+    fn clock_mhz_flag_rejects_nan_and_infinity() {
+        // f64::parse happily accepts these spellings; --clock-mhz must
+        // not, or they'd poison every downstream division in
+        // M68kCpu::run_via_cycles/read_eclock_handler.
+        assert!(parse_args(args(&["--clock-mhz", "NaN", "prog"])).is_err());
+        assert!(parse_args(args(&["--clock-mhz", "inf", "prog"])).is_err());
+        assert!(parse_args(args(&["--clock-mhz", "-inf", "prog"])).is_err());
+    }
+
+    #[test]
+    fn clock_mhz_flag_rejects_an_absurdly_high_value() {
+        assert!(parse_args(args(&["--clock-mhz", "1000000", "prog"])).is_err());
+    }
+
+    #[test]
+    fn clock_mhz_flag_rejects_an_absurdly_low_value() {
+        // Without a floor, --clock-mhz 1e-30 parses as an ordinary
+        // positive finite f64 and drives every ReadEClock tick count to
+        // f64::INFINITY, silently saturating to u64::MAX on the cast --
+        // no panic, but a benchmark reporting the largest possible tick
+        // count instead of a clear rejection is exactly the "looks
+        // fine, isn't" result this flag exists to avoid.
+        assert!(parse_args(args(&["--clock-mhz", "1e-30", "prog"])).is_err());
+    }
+
+    #[test]
+    fn clock_mhz_with_explicit_jit_is_rejected_by_check_clock_mhz_jit() {
+        // run_batch (the JIT path) never surfaces a cycle count at all,
+        // so there is nothing for --clock-mhz to derive ReadEClock's
+        // emulated time from -- this must be a clean error, not a
+        // silent fallback to the host clock or to --no-jit behavior.
+        let opts = parse_args(args(&["--clock-mhz", "25", "--jit", "prog"])).unwrap();
+        assert_eq!(opts.jit_source, JitSource::CommandLine);
+        assert!(check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source).is_err());
+    }
+
+    #[test]
+    fn clock_mhz_with_default_jit_is_accepted_by_check_clock_mhz_jit() {
+        // --jit defaults to off (see default_jit_is_off), so an
+        // ordinary --clock-mhz run with no --jit/--no-jit mentioned at
+        // all must not spuriously trip the mutual-exclusion check --
+        // only an explicit jit=true (which can only come from an
+        // explicit --jit or a config file's JIT=true) may.
+        let opts = parse_args(args(&["--clock-mhz", "25", "prog"])).unwrap();
+        assert!(!opts.jit);
+        assert_eq!(opts.jit_source, JitSource::Default);
+        assert!(check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source).is_ok());
+    }
+
+    #[test]
+    fn clock_mhz_with_explicit_no_jit_is_accepted_by_check_clock_mhz_jit() {
+        let opts = parse_args(args(&["--clock-mhz", "25", "--no-jit", "prog"])).unwrap();
+        assert!(check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source).is_ok());
+    }
+
+    #[test]
+    fn clock_mhz_jit_error_names_no_jit_when_jit_came_from_the_command_line() {
+        let err = check_clock_mhz_jit(Some(25.0), true, JitSource::CommandLine).unwrap_err();
+        assert!(
+            err.contains("drop --jit"),
+            "error should point at the --jit the user actually typed: {err}"
+        );
+    }
+
+    #[test]
+    fn clock_mhz_jit_error_names_the_config_file_when_jit_came_from_one() {
+        // A JIT=true sitting in ~/.volamos/.volamos, with no --jit typed
+        // on this command line, must not be blamed on a --jit the user
+        // never wrote -- the message should point at --no-jit/the
+        // config file instead.
+        let err = check_clock_mhz_jit(Some(25.0), true, JitSource::ConfigFile).unwrap_err();
+        assert!(
+            !err.contains("drop --jit"),
+            "error should not blame a --jit the user never typed: {err}"
+        );
+        assert!(
+            err.contains("--no-jit") && err.contains("config"),
+            "error should mention overriding via --no-jit or editing the config file: {err}"
+        );
+    }
+
+    #[test]
+    fn clock_mhz_with_sanitize_is_rejected() {
+        // run_via_cycles (the --clock-mhz execution path) skips every
+        // per-instruction sanitizer hook -- see check_clock_mhz_sanitize's
+        // doc. Running both together must be a clean error, not a
+        // silently-incomplete "no violations" report.
+        let opts = parse_args(args(&["--clock-mhz", "25", "--sanitize", "prog"])).unwrap();
+        assert!(check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled).is_err());
+    }
+
+    #[test]
+    fn clock_mhz_without_sanitize_is_accepted_by_check_clock_mhz_sanitize() {
+        let opts = parse_args(args(&["--clock-mhz", "25", "prog"])).unwrap();
+        assert!(check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled).is_ok());
+    }
+
+    #[test]
+    fn sanitize_without_clock_mhz_is_accepted_by_check_clock_mhz_sanitize() {
+        let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
+        assert!(check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled).is_ok());
+    }
+
     // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---
     //
     // `standard_volumes`/`volumes_dir` are consumed by `main` before
@@ -1859,13 +2302,13 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
 
@@ -1875,13 +2318,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _, _) =
+        let (overrides, _, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }
