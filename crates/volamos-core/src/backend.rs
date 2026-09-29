@@ -170,6 +170,21 @@ pub struct M68kCpu {
     /// (see the CLI's `--jit`/`--no-jit` flags); set with
     /// [`Self::set_jit`].
     jit: bool,
+    /// The clock rate (in Hz) [`Self::run_via_cycles`] is deriving
+    /// emulated time from, if `--clock-mhz` was given -- `Some` makes
+    /// [`Cpu::run`] switch from `run_batch` to
+    /// [`m68k::CpuCore::run_for_cycles`] entirely, ignoring [`Self::jit`]
+    /// (see [`Self::set_clock_mhz`]'s doc for why the two are mutually
+    /// exclusive at the CLI layer). `None` (the default) is this
+    /// backend's behavior before issue #102: no cycle counting at all,
+    /// `run_batch` as always.
+    clock_hz: Option<f64>,
+    /// Real m68k cycles consumed so far by [`Self::run_via_cycles`] --
+    /// see [`Cpu::emulated_cycles`]. Only advanced while
+    /// [`Self::clock_hz`] is `Some`; stays `0` otherwise, matching
+    /// [`Cpu::emulated_cycles`]'s documented "0 means never asked"
+    /// default.
+    cycles: u64,
 }
 
 impl M68kCpu {
@@ -185,6 +200,48 @@ impl M68kCpu {
     /// CLI's `--jit`/`--no-jit` flags. Off by default.
     pub fn set_jit(&mut self, jit: bool) {
         self.jit = jit;
+    }
+
+    /// Installs (`Some(mhz)`) or clears (`None`) an emulated clock rate
+    /// for `timer.device`'s `ReadEClock` -- the CLI's `--clock-mhz`
+    /// flag (issue #102). `mhz` is a clock rate in megahertz (fractional
+    /// values allowed, e.g. Copperline's own A600/Gayle configuration
+    /// models a 25 MHz 68000 as `clock_mhz = 25.0`); stored internally
+    /// as a plain Hz rate so [`Self::run_via_cycles`] and
+    /// [`crate::exectask::read_eclock_handler`] don't need to repeat the
+    /// `* 1_000_000.0` conversion.
+    ///
+    /// The point of this mode is reproducible, host-load-independent
+    /// compiler A/B benchmarks: [`Cpu::run`]'s normal
+    /// [`m68k::CpuCore::run_batch`] path (`--jit` or not) never surfaces
+    /// a cycle count at all (see this module's docs on why
+    /// `m68k::BatchResult` has no `cycles` field), so with `Some` here
+    /// [`Cpu::run`] switches to [`Self::run_via_cycles`] instead, which
+    /// calls [`m68k::CpuCore::run_for_cycles`] -- the crate's
+    /// transaction-exact, `precise_bus`-stepping path -- and accumulates
+    /// the real cycle counts it returns into [`Self::cycles`]
+    /// ([`Cpu::emulated_cycles`]). `read_eclock_handler` then reports
+    /// `cycles / hz` seconds of *emulated* time instead of host
+    /// wall-clock time.
+    ///
+    /// This is unconditional and mutually exclusive with the JIT at the
+    /// CLI layer (`main.rs` refuses `--clock-mhz` together with an
+    /// explicit `--jit`), not something this method itself arbitrates:
+    /// `run_batch`'s trace JIT has nothing a cycle count could be
+    /// derived from, so there is no sensible way to honor both at once,
+    /// unlike `--sanitize`'s belt-and-braces *forcing* of the JIT off
+    /// (see [`AddressBus::fast_mem`]'s doc on `FlatMemory`) -- here
+    /// there is no approximate answer to fall back to, so the CLI
+    /// refuses the combination outright rather than silently picking a
+    /// winner.
+    ///
+    /// About 5x slower than `--no-jit` in measurement (coremark.amiga:
+    /// 105.9 iter/sec vs. 198.7), which is expected and not a bug to
+    /// chase -- `run_for_cycles` tracks cycle-accurate bus/prefetch
+    /// state that this otherwise non-cycle-accurate runtime never
+    /// needed before. Opt-in, for benchmarking only.
+    pub fn set_clock_mhz(&mut self, mhz: Option<f64>) {
+        self.clock_hz = mhz.map(|mhz| mhz * 1_000_000.0);
     }
 
     /// Creates a new core for `cpu_type`, with `fpu_present` controlling
@@ -214,7 +271,12 @@ impl M68kCpu {
         core.set_cpu_type(cpu_type);
         core.fpu_present = fpu_present;
         core.reset_soft();
-        Self { core, jit: false }
+        Self {
+            core,
+            jit: false,
+            clock_hz: None,
+            cycles: 0,
+        }
     }
 }
 
@@ -340,6 +402,102 @@ impl M68kCpu {
             shadow.update_stack_pointer(sp);
         }
     }
+
+    /// The `--clock-mhz` execution path: runs via
+    /// [`m68k::CpuCore::run_for_cycles`] instead of `run_batch`,
+    /// accumulating real emulated cycles into [`Self::cycles`] as it
+    /// goes -- see [`Self::set_clock_mhz`]'s doc for why this path
+    /// exists and what it costs. Only called from [`Cpu::run`], and only
+    /// once [`Self::clock_hz`] is `Some`.
+    ///
+    /// Every trap/halt exit this runtime cares about is surfaced
+    /// identically to the `run_batch` path in [`Cpu::run`] below --
+    /// [`m68k::CycleBatchExit`] matches [`m68k::BatchExit`] one-for-one
+    /// plus one extra variant, `BoundaryRequested` (see below).
+    ///
+    /// `run_for_cycles`'s budget parameter is a plain `i32`, unlike
+    /// `run_batch`'s `u32::MAX`-as-"unbounded" convention, so there is
+    /// no single call that can express "run until something interesting
+    /// happens" the way the JIT path's batch size does. Each call is
+    /// simply capped at `i32::MAX` cycles instead (a hair over three and
+    /// a half minutes of emulated time even at a generous 10 MHz, far
+    /// longer than any single guest instruction sequence between two
+    /// library-call traps takes in practice) and re-issued on
+    /// `BudgetExhausted`, exactly mirroring how [`Cpu::run`]'s
+    /// `run_batch` loop already treats its own `BudgetExhausted` exit as
+    /// "nothing happened yet, keep going".
+    ///
+    /// This runtime never installs the sanitizer's per-instruction hooks
+    /// ([`Self::sanitize_before_instruction`]/
+    /// [`Self::sanitize_after_instruction`]) here. `--clock-mhz` and
+    /// `--sanitize` are an untested combination -- nothing stops a
+    /// caller from requesting both, and the shadow map's own checks
+    /// (routed through ordinary [`AddressSpace`] reads/writes, which
+    /// `run_for_cycles` always uses -- it has no `fast_mem` raw-pointer
+    /// fast path to bypass them) still run, but the return-address and
+    /// below-`A7` bookkeeping that needs a strict one-instruction
+    /// granularity would see multiple instructions retire between
+    /// publications and is not something issue #102 asked for.
+    fn run_via_cycles(&mut self, mem: &mut FlatMemory) -> StopReason {
+        use m68k::CycleBatchExit;
+
+        const CYCLE_BUDGET: i32 = i32::MAX;
+
+        loop {
+            let pc = self.pc();
+            if pc as usize >= AddressSpace::len(mem) {
+                return StopReason::PcOutOfBounds { pc };
+            }
+            let result = self.core.run_for_cycles(mem, CYCLE_BUDGET);
+            // `cycles` is documented as "actual CPU cycles consumed" for
+            // a positive budget, so this is never negative in practice;
+            // `max(0)` is just cheap insurance against ever underflowing
+            // the u64 accumulator if that documented behavior changes.
+            self.cycles = self.cycles.saturating_add(result.cycles.max(0) as u64);
+            match result.exit {
+                CycleBatchExit::BudgetExhausted => continue,
+                // volamos's `FlatMemory` implements no `sync`/bus-
+                // boundary-request mechanism at all (see this module's
+                // `AddressBus` impl), so nothing volamos ever hands the
+                // `m68k` crate as a bus can actually produce this exit.
+                // If a future crate version ever raised one anyway, the
+                // only sane response is the same as `BudgetExhausted`:
+                // there is no trap/halt to report, so just keep running.
+                CycleBatchExit::BoundaryRequested => continue,
+                CycleBatchExit::Stopped => return StopReason::Halted,
+                CycleBatchExit::AlineTrap { opcode } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::ALine { opcode },
+                        pc: self.core.ppc,
+                    });
+                }
+                CycleBatchExit::FlineTrap { opcode } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::FLine { opcode },
+                        pc: self.core.ppc,
+                    });
+                }
+                CycleBatchExit::TrapInstruction { trap_num } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::Trap { trap_num },
+                        pc: self.core.ppc,
+                    });
+                }
+                CycleBatchExit::Breakpoint { bp_num } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::Breakpoint { bp_num },
+                        pc: self.core.ppc,
+                    });
+                }
+                CycleBatchExit::IllegalInstruction { opcode } => {
+                    return StopReason::Trap(TrapInfo {
+                        kind: TrapKind::Illegal { opcode },
+                        pc: self.core.ppc,
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl Cpu for M68kCpu {
@@ -408,6 +566,15 @@ impl Cpu for M68kCpu {
     /// always, in `--no-jit` mode's batch-of-1) just resumes the batch
     /// loop rather than returning early.
     fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
+        // `--clock-mhz` (issue #102) takes over the whole run loop: see
+        // `Self::run_via_cycles`'s doc for why `run_batch` (`self.jit`
+        // either way) can't participate in cycle-derived `ReadEClock`
+        // timing at all, and why the CLI refuses to let both be
+        // requested at once rather than picking a winner here.
+        if self.clock_hz.is_some() {
+            return self.run_via_cycles(mem);
+        }
+
         use m68k::BatchExit;
 
         // An installed shadow map forces batches of one instruction even
@@ -561,6 +728,14 @@ impl Cpu for M68kCpu {
             TrapKind::ALine { .. } => unreachable!("handled above"),
         }
         true
+    }
+
+    fn emulated_cycles(&self) -> u64 {
+        self.cycles
+    }
+
+    fn clock_hz(&self) -> Option<f64> {
+        self.clock_hz
     }
 }
 
@@ -825,5 +1000,104 @@ mod tests {
             jit_cpu.data_register(DataRegister(0)),
         );
         assert_eq!(interp_cpu.pc(), jit_cpu.pc());
+    }
+
+    #[test]
+    fn emulated_cycles_and_clock_hz_default_to_zero_and_none() {
+        // Every backend's default posture, per Cpu::emulated_cycles'/
+        // Cpu::clock_hz's own doc comments -- these defaults are what
+        // makes adding both trait methods non-breaking for any other
+        // Cpu implementation that predates issue #102.
+        let cpu = M68kCpu::new();
+        assert_eq!(Cpu::emulated_cycles(&cpu), 0);
+        assert_eq!(Cpu::clock_hz(&cpu), None);
+    }
+
+    #[test]
+    fn set_clock_mhz_none_leaves_run_on_the_ordinary_run_batch_path() {
+        // With no clock-mhz mode installed, `Cpu::run` must take exactly
+        // the same run_batch path it always has -- this is the "strictly
+        // additive, zero behaviour change when the flag is absent"
+        // requirement from issue #102. set_clock_mhz(None) (the same
+        // thing M68kCpu::new()/with_config() already leave it at) must
+        // not, on its own, start counting cycles.
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        cpu.set_clock_mhz(None);
+        let start = cpu.pc();
+        // MOVEQ.L #5, D0, then an A-line trap so `run` (which executes
+        // until a trap/halt, unlike `step`) has somewhere to stop.
+        load_words(&mut mem, start, &[0x7005, 0xA000]);
+
+        let reason = cpu.run(&mut mem);
+
+        assert!(matches!(
+            reason,
+            StopReason::Trap(TrapInfo {
+                kind: TrapKind::ALine { opcode: 0xA000 },
+                ..
+            })
+        ));
+        assert_eq!(cpu.data_register(DataRegister(0)), 5);
+        assert_eq!(cpu.emulated_cycles(), 0);
+        assert_eq!(cpu.clock_hz(), None);
+    }
+
+    #[test]
+    fn clock_mhz_mode_accumulates_real_cycles_and_still_reports_traps() {
+        // A DBRA-based loop, same shape as
+        // jit_batch_execution_matches_interpreter_for_a_backward_branch_loop
+        // above, run through the run_for_cycles path instead. Two
+        // things this pins down: (1) the trap the loop ends on is still
+        // reported exactly like every other execution mode, and (2)
+        // Cpu::emulated_cycles() actually goes up -- a MOVEQ/NOP/DBRA
+        // sequence executed 5 times plus the trapping opcode fetch is
+        // dozens of real 68000 cycles, so any plausible lower bound
+        // catches "never accumulated anything" without pinning this
+        // test to the m68k crate's exact per-instruction cycle counts
+        // (an internal detail of that crate, not this one).
+        let words: &[u16] = &[
+            0x7004, // MOVEQ #4, D0
+            0x4E71, // [loop] NOP
+            0x51C8, 0xFFFC, // DBRA D0, loop (disp = -4)
+            0xA000, // A-line trap: stop here
+        ];
+        let mut mem = FlatMemory::new(0x3000);
+        load_words(&mut mem, TRAP_TABLE_END, words);
+        let mut cpu = M68kCpu::new();
+        cpu.set_clock_mhz(Some(25.0));
+        cpu.set_pc(TRAP_TABLE_END);
+
+        let reason = cpu.run(&mut mem);
+
+        assert!(matches!(
+            reason,
+            StopReason::Trap(TrapInfo {
+                kind: TrapKind::ALine { opcode: 0xA000 },
+                ..
+            })
+        ));
+        // DBRA is a word-sized decrement: D0 started at 4 (from MOVEQ,
+        // zero-extended in the high word), looped 5 times down to -1 as
+        // a 16-bit value (0xFFFF), leaving the high word untouched.
+        assert_eq!(cpu.data_register(DataRegister(0)), 0x0000_FFFF);
+        assert!(
+            cpu.emulated_cycles() >= 20,
+            "expected at least 20 real 68000 cycles for a 5-iteration NOP/DBRA loop, got {}",
+            cpu.emulated_cycles()
+        );
+        assert_eq!(cpu.clock_hz(), Some(25_000_000.0));
+    }
+
+    #[test]
+    fn clock_mhz_mode_also_reports_pc_out_of_bounds() {
+        // Same guarantee as jit_mode_also_reports_pc_out_of_bounds above,
+        // for the third execution path Cpu::run can now take.
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        cpu.set_clock_mhz(Some(7.0));
+        cpu.set_pc(0xFFFF_FFD1);
+
+        let reason = cpu.run(&mut mem);
+
+        assert_eq!(reason, StopReason::PcOutOfBounds { pc: 0xFFFF_FFD1 });
     }
 }

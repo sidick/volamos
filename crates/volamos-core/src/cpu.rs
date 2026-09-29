@@ -202,4 +202,36 @@ pub trait Cpu {
     /// real hardware semantics, faithfully reproduced, not a bug in
     /// this method.
     fn take_hardware_exception(&mut self, mem: &mut Self::Memory, kind: TrapKind) -> bool;
+
+    /// Accumulated real m68k CPU cycles consumed by every [`Cpu::step`]/
+    /// [`Cpu::run`] call so far, for a backend that tracks them at all --
+    /// see [`crate::backend::M68kCpu::set_clock_mhz`] (the CLI's
+    /// `--clock-mhz` flag, issue #102) for the one implementation that
+    /// does.
+    ///
+    /// Defaults to `0` so adding this method is non-breaking: every
+    /// caller that predates issue #102 already assumes execution carries
+    /// no cycle count at all (the normal `run_batch` path this runtime
+    /// has used since Phase 1 never surfaced one -- see `backend.rs`'s
+    /// module docs on why `m68k::BatchResult` has no `cycles` field),
+    /// and `0` is indistinguishable from "never asked". Only meaningful
+    /// together with [`Cpu::clock_hz`]; a caller that cares about actual
+    /// elapsed emulated time should check `clock_hz().is_some()` first
+    /// rather than trying to interpret a `0` cycle count on its own.
+    fn emulated_cycles(&self) -> u64 {
+        0
+    }
+
+    /// The clock rate ([`Cpu::emulated_cycles`] is being counted at (in
+    /// Hz), if this backend is currently deriving guest-visible elapsed
+    /// time from emulated cycles rather than the host wall clock --
+    /// `Some` exactly when [`crate::backend::M68kCpu::set_clock_mhz`]
+    /// installed a rate. `None` (the default for every backend, and for
+    /// [`crate::backend::M68kCpu`] itself unless `--clock-mhz` was
+    /// given) means "no such mode active"; callers like
+    /// [`crate::exectask::read_eclock_handler`] use that to decide
+    /// whether to fall back to the host clock.
+    fn clock_hz(&self) -> Option<f64> {
+        None
+    }
 }

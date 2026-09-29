@@ -3,7 +3,7 @@
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
-        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] [--sanitize]
+        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-ignore-pc ADDR] <program> [args...]
 ```
 
@@ -287,6 +287,55 @@ volamos --jit fixtures/hello
     | volamos 0.2, `--jit` | 445.1 |
     | volamos 0.3, interpreter | 198.2 (~1.9x faster than 0.2) |
     | volamos 0.3, `--jit` | 537.1 (~1.2x faster than 0.2) |
+
+## `--clock-mhz N`
+
+Makes `timer.device`'s `ReadEClock` report **emulated** time — derived
+from the CPU's own emulated cycle count at `N` MHz — instead of host
+wall-clock time. `N` may be fractional (e.g. `--clock-mhz 25` or
+`--clock-mhz 7.14`). Default: off (host clock, as always). This exists
+for reproducible, host-load-independent compiler A/B benchmarks: two
+`ReadEClock` calls bracketing some guest work measure how many m68k
+cycles actually ran, not however long the host machine happened to take
+around them (which varies with scheduling noise, thermal throttling,
+whatever else is running on the box at the time).
+
+```sh
+volamos --clock-mhz 25 fixtures/hello
+```
+
+Cannot be combined with an explicit `--jit`: the trace JIT
+(`CpuCore::run_batch`) never tracks a cycle count at all, so there would
+be nothing for `--clock-mhz` to derive `ReadEClock`'s reported time
+from. `--clock-mhz` implies the plain interpreter path either way
+(equivalent to `--no-jit`, the default) — only an *explicit* `--jit` on
+top of it is refused.
+
+Only `ReadEClock` changes. `GetSysTime`, `TR_GETSYSTIME`, `DateStamp`,
+and `CurrentTime` all still read the real host clock — a benchmark run
+under `--clock-mhz` doesn't think it's 1978.
+
+!!! warning "Read this before trusting the numbers"
+    - **This is the slowest execution mode volamos has**, roughly 5x
+      slower than the default interpreter (`CpuCore::run_for_cycles`,
+      the `m68k` crate's transaction-exact, cycle-accurate path, instead
+      of `run_batch`). It's opt-in, for benchmarking, not for everyday
+      use.
+    - **volamos's memory bus has no wait states.** `FlatMemory` is a
+      flat `Vec<u8>` with no `sync`/bus-timing model at all — unlike
+      real Chip/Fast RAM, which real hardware (and
+      [Copperline](https://github.com/sidick/copperline), volamos's own
+      hardware-timing oracle) bills real contention cycles for.
+      Memory-bound guest code will still report a different emulated
+      time than real hardware for this reason, even with a
+      correctly-configured `--clock-mhz`.
+    - **Time spent inside volamos's own native-Rust library handlers is
+      free.** Every `dos.library`/`exec.library`/... call this runtime
+      implements natively (see [Supported Libraries](
+      Supported-Libraries.md)) costs *zero* emulated cycles — it's host
+      code, not guest instructions. A workload dominated by, say,
+      `CopyMem` will report an emulated time implying it spent no time
+      there at all, because from the CPU's point of view, it didn't.
 
 ## `--sanitize`
 
