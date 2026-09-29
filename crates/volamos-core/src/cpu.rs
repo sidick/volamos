@@ -203,11 +203,29 @@ pub trait Cpu {
     /// this method.
     fn take_hardware_exception(&mut self, mem: &mut Self::Memory, kind: TrapKind) -> bool;
 
-    /// Accumulated real m68k CPU cycles consumed by every [`Cpu::step`]/
-    /// [`Cpu::run`] call so far, for a backend that tracks them at all --
-    /// see [`crate::backend::M68kCpu::set_clock_mhz`] (the CLI's
+    /// Accumulated real m68k CPU cycles consumed so far, for a backend
+    /// that tracks them at all -- see
+    /// [`crate::backend::M68kCpu::set_clock_mhz`] (the CLI's
     /// `--clock-mhz` flag, issue #102) for the one implementation that
     /// does.
+    ///
+    /// **Only [`Cpu::run`] accumulates cycles, never [`Cpu::step`].**
+    /// `M68kCpu::run_via_cycles` (the method backing this) is reached
+    /// exclusively through `Cpu::run`; `M68kCpu::step` always goes
+    /// through the plain interpreter (`core.step`), which this crate's
+    /// backend never wires up to any cycle counter. This matters
+    /// because a handful of callers reach guest code through `step`
+    /// directly rather than `run`: `execfmt.rs`'s `RawDoFmt` calls a
+    /// guest-supplied `PutChProc` callback one instruction at a time
+    /// (see its step loop, `CALLOUT_STEP_BUDGET`), and its `Supervisor`
+    /// handler single-steps a guest routine the same way (see its own
+    /// step loop, `SUPERVISOR_STEP_BUDGET`). Guest instructions executed
+    /// through either of those cost *zero* emulated cycles under
+    /// `--clock-mhz`, exactly like time spent inside any other
+    /// native-Rust library handler -- consistent with, not a special
+    /// case of, the general "native handlers are free" behavior (see
+    /// `crate::exectask::read_eclock_handler`'s and the CLI's
+    /// `--clock-mhz` doc for the user-facing version of this caveat).
     ///
     /// Defaults to `0` so adding this method is non-breaking: every
     /// caller that predates issue #102 already assumes execution carries

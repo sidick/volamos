@@ -228,16 +228,32 @@ impl M68kCpu {
     /// CLI layer (`main.rs` refuses `--clock-mhz` together with an
     /// explicit `--jit`), not something this method itself arbitrates:
     /// `run_batch`'s trace JIT has nothing a cycle count could be
-    /// derived from, so there is no sensible way to honor both at once,
-    /// unlike `--sanitize`'s belt-and-braces *forcing* of the JIT off
-    /// (see [`AddressBus::fast_mem`]'s doc on `FlatMemory`) -- here
-    /// there is no approximate answer to fall back to, so the CLI
-    /// refuses the combination outright rather than silently picking a
-    /// winner.
+    /// derived from, so there is no sensible way to honor both at once.
+    /// Note this is *unlike* `--sanitize` forcing the JIT off on its own
+    /// (see [`AddressBus::fast_mem`]'s doc on `FlatMemory`) -- there,
+    /// forcing is safe because `--no-jit` is an exact, not merely
+    /// approximate, substitute for what `--sanitize` needs. Here there
+    /// is no such fallback (`run_batch` has literally no cycle count to
+    /// hand back under any configuration), so the CLI refuses the
+    /// combination outright rather than silently picking a winner.
     ///
-    /// About 5x slower than `--no-jit` in measurement (coremark.amiga:
-    /// 105.9 iter/sec vs. 198.7), which is expected and not a bug to
-    /// chase -- `run_for_cycles` tracks cycle-accurate bus/prefetch
+    /// `--clock-mhz` is *also* refused together with `--sanitize`, for
+    /// a related but distinct reason: [`Self::run_via_cycles`] (the path
+    /// this switches [`Cpu::run`] to) never calls the sanitizer's
+    /// per-instruction hooks at all, so combining the two wouldn't just
+    /// be imprecise, it would leave the shadow call stack and below-`A7`
+    /// tracking silently stale while `--sanitize` still reports as if
+    /// everything had been checked -- see `main.rs`'s
+    /// `check_clock_mhz_sanitize` for the CLI-layer refusal and
+    /// [`Self::run_via_cycles`]'s own doc for the mechanical reason.
+    ///
+    /// Roughly 2.2x slower than `--no-jit` and 7x slower than `--jit` in
+    /// measurement (CoreMark 1.0, `~/src/external/coremark/
+    /// coremark.amiga`, `--cpu 68020`, host wall-clock throughput:
+    /// ~217 iterations/sec for `--no-jit`, ~97 for `--clock-mhz 25`,
+    /// ~680 for `--jit` -- see [`Self::run_via_cycles`]'s doc for the
+    /// full measurement methodology), which is expected and not a bug
+    /// to chase -- `run_for_cycles` tracks cycle-accurate bus/prefetch
     /// state that this otherwise non-cycle-accurate runtime never
     /// needed before. Opt-in, for benchmarking only.
     pub fn set_clock_mhz(&mut self, mhz: Option<f64>) {
@@ -429,15 +445,40 @@ impl M68kCpu {
     ///
     /// This runtime never installs the sanitizer's per-instruction hooks
     /// ([`Self::sanitize_before_instruction`]/
-    /// [`Self::sanitize_after_instruction`]) here. `--clock-mhz` and
-    /// `--sanitize` are an untested combination -- nothing stops a
-    /// caller from requesting both, and the shadow map's own checks
-    /// (routed through ordinary [`AddressSpace`] reads/writes, which
+    /// [`Self::sanitize_after_instruction`]) here, which is why the CLI
+    /// (`main.rs`'s `check_clock_mhz_sanitize`) refuses `--clock-mhz`
+    /// together with `--sanitize` outright rather than letting a caller
+    /// combine them: the shadow map's own byte-level checks (routed
+    /// through ordinary [`AddressSpace`] reads/writes, which
     /// `run_for_cycles` always uses -- it has no `fast_mem` raw-pointer
-    /// fast path to bypass them) still run, but the return-address and
-    /// below-`A7` bookkeeping that needs a strict one-instruction
-    /// granularity would see multiple instructions retire between
-    /// publications and is not something issue #102 asked for.
+    /// fast path to bypass them) would still run, but the return-address
+    /// and below-`A7` bookkeeping that needs strict one-instruction
+    /// granularity would see many instructions retire between
+    /// publications -- a stale shadow call stack and PC-attributed
+    /// violations pinned to whatever address happened to be current
+    /// several cycle-batches ago, while `--sanitize` still prints a
+    /// normal-looking summary as if every instruction had been checked.
+    /// A caller that reaches this method directly (bypassing the CLI)
+    /// with a shadow map installed gets exactly that silently degraded
+    /// behavior -- this method itself does not (and, short of adopting
+    /// `run_batch`'s own shadow-map-forces-batches-of-one treatment,
+    /// cannot cheaply) guard against it; only the CLI's explicit refusal
+    /// does.
+    ///
+    /// # Measurement methodology (for [`Self::set_clock_mhz`]'s
+    ///   perf numbers)
+    ///
+    /// [CoreMark 1.0](https://github.com/eembc/coremark)
+    /// (`~/src/external/coremark/coremark.amiga`, `-O2 -m68020
+    /// -msoft-float`), run under `--cpu 68020`. CoreMark self-calibrates
+    /// its own iteration count against `ReadEClock`, and self-reports
+    /// "iterations/sec" computed from the same clock -- both entirely
+    /// valid for `--no-jit`/`--jit` (host wall-clock `ReadEClock`), but
+    /// meaningless for `--clock-mhz` (which redefines what `ReadEClock`
+    /// measures). So every figure here is host wall-clock throughput
+    /// instead: completed iterations (as CoreMark reports them) divided
+    /// by real elapsed seconds around the whole process (`time`), three
+    /// runs per mode, averaged.
     fn run_via_cycles(&mut self, mem: &mut FlatMemory) -> StopReason {
         use m68k::CycleBatchExit;
 

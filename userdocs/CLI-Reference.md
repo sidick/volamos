@@ -311,16 +311,33 @@ from. `--clock-mhz` implies the plain interpreter path either way
 (equivalent to `--no-jit`, the default) — only an *explicit* `--jit` on
 top of it is refused.
 
+Also cannot be combined with [`--sanitize`](#--sanitize): the
+cycle-counted execution path `--clock-mhz` uses
+(`M68kCpu::run_via_cycles`) doesn't run the sanitizer's per-instruction
+shadow-map hooks at all, so `--sanitize` would silently check nothing
+while still printing a normal-looking summary — refused for the same
+"an explicit error beats a silently wrong answer" reason as the `--jit`
+conflict above.
+
 Only `ReadEClock` changes. `GetSysTime`, `TR_GETSYSTIME`, `DateStamp`,
 and `CurrentTime` all still read the real host clock — a benchmark run
 under `--clock-mhz` doesn't think it's 1978.
 
 !!! warning "Read this before trusting the numbers"
-    - **This is the slowest execution mode volamos has**, roughly 5x
-      slower than the default interpreter (`CpuCore::run_for_cycles`,
-      the `m68k` crate's transaction-exact, cycle-accurate path, instead
-      of `run_batch`). It's opt-in, for benchmarking, not for everyday
-      use.
+    - **This is the slowest execution mode volamos has.** Measured with
+      [CoreMark 1.0](https://github.com/eembc/coremark)
+      (`~/src/external/coremark/coremark.amiga`, `-O2 -m68020
+      -msoft-float`, `--cpu 68020`, host wall-clock throughput —
+      completed iterations divided by real elapsed seconds, three runs
+      averaged per mode, since `--clock-mhz` redefines the `ReadEClock`
+      CoreMark itself times against, so its *self-reported*
+      iterations/sec isn't a valid host-speed comparison once
+      `--clock-mhz` is active): the default interpreter (`--no-jit`)
+      manages ~217 iterations/sec, `--clock-mhz 25` (`CpuCore::
+      run_for_cycles`, the `m68k` crate's transaction-exact,
+      cycle-accurate path) manages ~97 — about **2.2x slower** than
+      `--no-jit`, and about **7x slower** than `--jit`'s ~680. It's
+      opt-in, for benchmarking, not for everyday use.
     - **volamos's memory bus has no wait states.** `FlatMemory` is a
       flat `Vec<u8>` with no `sync`/bus-timing model at all — unlike
       real Chip/Fast RAM, which real hardware (and
@@ -336,6 +353,22 @@ under `--clock-mhz` doesn't think it's 1978.
       code, not guest instructions. A workload dominated by, say,
       `CopyMem` will report an emulated time implying it spent no time
       there at all, because from the CPU's point of view, it didn't.
+    - **So is time spent inside a guest callback volamos single-steps
+      rather than runs**, for the same reason: `RawDoFmt`'s
+      `PutChProc` callback and `Supervisor`'s routine are both executed
+      one instruction at a time through a separate, non-cycle-counting
+      path, so guest code reached that way is just as invisible to
+      `--clock-mhz` as a native library handler is.
+    - **A `System()`/`Execute()`-nested program gets its own, separate
+      cycle counter, starting back at zero.** A parent process's
+      `ReadEClock` calls bracketing a `System()` call will see that
+      child's entire run as contributing (close to) zero elapsed time,
+      since the child's cycles accumulate into its own nested runtime
+      instance, never the parent's. This is deliberate (nesting a
+      shared counter through a separately-constructed `Runtime` would
+      be significant extra plumbing for a benchmarking edge case), but
+      it means a benchmark that shells out mid-measurement will
+      under-report.
 
 ## `--sanitize`
 
