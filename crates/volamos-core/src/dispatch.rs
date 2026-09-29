@@ -2603,6 +2603,30 @@ impl<C: Cpu + 'static> Runtime<C> {
         &self.mem
     }
 
+    /// The guest's accumulated emulated cycle count, and the clock rate
+    /// it was counted at in Hz -- `None` unless the run was configured
+    /// with a clock rate (`--clock-mhz`, see
+    /// [`crate::backend::M68kCpu::set_clock_mhz`]), since no cycle count
+    /// exists at all on the default `run_batch` execution path.
+    ///
+    /// Exists so the CLI can report the measurement at exit. Without it
+    /// a cycle count is only reachable *indirectly*, by the guest itself
+    /// calling `ReadEClock` and printing its own elapsed time -- which
+    /// works for an instrumented benchmark but leaves an uninstrumented
+    /// binary unmeasurable, the gap this closes (`vamos -v` has reported
+    /// a `total cycles:` line for its own runs all along).
+    ///
+    /// Reports the *top-level* run's cycles only. A nested `System()`/
+    /// `Execute()` child builds its own CPU with its own counter from
+    /// `0` (see the CLI's nested-run closure), so its cycles are not
+    /// included here -- the same boundary `ReadEClock` already reports
+    /// across.
+    pub fn emulated_cycles(&self) -> Option<(u64, f64)> {
+        self.cpu
+            .clock_hz()
+            .map(|hz| (self.cpu.emulated_cycles(), hz))
+    }
+
     /// Runs the guest program to completion, writing anything it prints
     /// (currently just `PutStr` output) to `out`. If `trace` is set, it's
     /// called once per dispatched library call (for `--verbose` logging)
@@ -2747,6 +2771,58 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Test: `Runtime::emulated_cycles` reports `None` unless a clock
+    /// rate was configured, and the CPU's own accumulated count once one
+    /// is -- the accessor the CLI's exit-time report is built on.
+    ///
+    /// The `None` half is the load-bearing one: on the default
+    /// `run_batch` execution path no cycle count exists at all (m68k's
+    /// `BatchResult` carries only an instruction count), so reporting
+    /// `Some(0)` there would read as "this run took no time" rather than
+    /// "this run was never counted".
+    #[test]
+    fn emulated_cycles_is_none_without_a_clock_rate_and_some_with_one() {
+        let entry = 0x1000;
+        // RTS immediately: this test is about the accessor's plumbing,
+        // not about any particular cycle total.
+        let words = [0x4E75u16];
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let config = StartConfig {
+            entry,
+            load_end: entry + (words.len() as u32) * 2 + 64,
+            args: Vec::new(),
+            ..StartConfig::default()
+        };
+
+        let rt = Runtime::new(M68kCpu::new(), mem, config);
+        assert_eq!(
+            rt.emulated_cycles(),
+            None,
+            "a run with no --clock-mhz has no cycle count to report"
+        );
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut cpu = M68kCpu::new();
+        cpu.set_clock_mhz(Some(25.0));
+        let rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + (words.len() as u32) * 2 + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let (cycles, clock_hz) = rt
+            .emulated_cycles()
+            .expect("a clock rate was configured, so a count must be reported");
+        assert_eq!(clock_hz, 25_000_000.0, "the configured rate, in Hz");
+        assert_eq!(cycles, 0, "nothing has run yet");
+    }
 
     struct TempDir {
         path: PathBuf,
