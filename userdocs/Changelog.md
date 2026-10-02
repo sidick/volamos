@@ -5,6 +5,44 @@ version scheme in `Cargo.toml`.
 
 ## 0.8
 
+- **CLI argument parsing migrated to clap** (issue #101). User-visible
+  improvements:
+    - `volamos --version` works (long form only — `-V` stays
+      `--volume`), prints to stdout, so `V=$(volamos --version)` does
+      what you'd expect. Previously there was no version flag at all and
+      the token was treated as a program path.
+    - A mistyped flag before `<program>` is now a clean error with a
+      did-you-mean suggestion (exit code `2`) instead of surfacing as
+      `couldn't read '--sanitze': No such file or directory`. A program
+      file genuinely named with a leading `-` is still expressible as
+      `./-foo` or `-- -foo`.
+    - `--flag=value` spellings now parse: `--clock-mhz=25` (a reported
+      failure), `--stack=256K`, and friends previously fell through to
+      the catch-all and were treated as the program name.
+    - `--help` output is generated from the flag declarations themselves
+      (so it can't drift), grouped into Logging / Filesystem / Machine /
+      Execution / Instrumentation / Networking sections.
+
+  Everything after `<program>` still reaches the guest verbatim, even
+  tokens spelled like volamos's own flags; config-file precedence is
+  unchanged.
+
+    **Breaking** — command lines that worked before and now behave
+    differently:
+
+    - A program path given bare with a leading `-` (`volamos -foo`) is
+      now an unknown-flag error; spell it `./-foo` or `-- -foo`. (A
+      deliberate trade: every *mistyped flag* used to be silently tried
+      as a program path instead of being diagnosed.)
+    - A command-line parse error exits `2` (the conventional usage-error
+      code) instead of `1`; `1` still means the parse succeeded but the
+      run failed. Scripts testing for the specific value `1` on a bad
+      invocation need updating.
+    - `--help` prints to stdout (and still exits `0`); it used to print
+      to stderr.
+    - Diagnostic wording for parse errors is clap's, so anything
+      matching the old exact stderr text needs updating.
+
 - **`--sanitize` no longer reports a recycled heap block as
   use-after-free** (issue #95, reported by Bernie Innocenti). Once a run
   freed a block and the heap handed those same addresses back out, every

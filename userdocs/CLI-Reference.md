@@ -2,18 +2,30 @@
 
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
-        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--stack SIZE] [--ram SIZE]
-        [--cpu MODEL] [--fpu|--no-fpu] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
-        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] <program> [args...]
+        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
+        [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
+        [--fpu|--no-fpu] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
+        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--net]
+        <program> [args...]
 ```
 
-`volamos --help` prints this same reference from the binary itself.
+`volamos --help` prints this same reference from the binary itself, and
+`volamos --version` prints the version (`--version` only — `-V` is
+`--volume`, as it always has been). A value-taking flag accepts both
+spellings: `--stack 256K` and `--stack=256K` are equivalent.
+
 Everything before `<program>` is a volamos flag; `<program>` is a host
 path to an AmigaOS hunk executable; everything after it is passed
 through verbatim as the *guest* program's own command-line arguments
 (`A0`/`D0`, the real AmigaOS startup convention) — a guest program that
 parses its own arguments (e.g. via `ReadArgs`) reads them from there,
 unaffected by anything volamos itself understood before `<program>`.
+
+A token before `<program>` that looks like a flag but isn't one is an
+error (with a did-you-mean suggestion), not silently treated as the
+program path. A program file whose name genuinely starts with `-` is
+still expressible as `./-foo`, or as `-- -foo` (`--` ends flag parsing;
+the next token is `<program>` no matter what it looks like).
 
 Every flag below can also be given a default value in `~/.volamos`/
 `.volamos` instead of retyping it every run — see
@@ -26,13 +38,16 @@ run — whatever it returned in `D0` at `rts`, same as running it on a
 real Amiga would produce as its process return code. There is no
 volamos-specific exit code convention layered on top of that.
 
-volamos only ever produces its own exit code (`1`) when the guest never
-got to run at all — the program path couldn't be read, didn't parse as
-a valid hunk executable, a `-V`/`-a` argument was malformed, or the
-guest genuinely crashed the runtime (an unimplemented library call, a
-stack overflow, an invalid instruction). In every one of those cases
-volamos prints a diagnostic to stderr naming exactly what went wrong
-before exiting.
+volamos only ever produces its own exit code when the guest never got
+to run at all: `2` for a command-line parse error (an unknown or
+malformed flag, a bad `-V`/`-a` value, a missing `<program>` — the
+conventional usage-error code), and `1` when the command line parsed
+but the run couldn't start or crashed the runtime — the program path
+couldn't be read, didn't parse as a valid hunk executable, or the guest
+genuinely crashed the runtime (an unimplemented library call, a stack
+overflow, an invalid instruction). In every one of those cases volamos
+prints a diagnostic to stderr naming exactly what went wrong before
+exiting. `--help` and `--version` exit `0`.
 
 ## `-v`, `--verbose`
 

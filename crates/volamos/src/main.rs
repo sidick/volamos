@@ -25,7 +25,7 @@
 //!
 //! `-V`/`--volume`, `-a`/`--assign`, `--cwd`, and `--auto-assign` set up
 //! a [`volamos_core::vfs::Vfs`] for `dos.library`'s path-based calls
-//! (`Open`, `Lock`, `Examine`, ...) -- see [`print_usage`] for the exact
+//! (`Open`, `Lock`, `Examine`, ...) -- see [`Cli`] for the exact
 //! grammar and the `--cwd` defaulting rule. Since issue #43, a built-in
 //! standard-volume defaults layer (`SYS:`/`RAM:` and the standard
 //! `C:`/`S:`/`LIBS:`/`DEVS:`/`ENVARC:`/`T:`/`ENV:` assigns onto them,
@@ -81,6 +81,8 @@ mod config;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use clap::{ArgAction, Parser};
 
 use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END, addressable_bytes};
 use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
@@ -274,213 +276,547 @@ impl Options {
     }
 }
 
-fn print_usage(program_name: &str) {
-    eprintln!(
-        "usage: {program_name} [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... \
-         [-a NAME:target[+target...]]... [--cwd AMIGAPATH] \
-         [--auto-assign HOSTDIR] [--defaults|--no-defaults] [--volumes-dir HOSTDIR] \
-         [--stack SIZE] [--ram SIZE] [--cpu MODEL] \
-         [--fpu|--no-fpu] [--jit|--no-jit] [--clock-mhz N] [--sanitize] [--sanitize-uninit] \
-         [--sanitize-ignore-pc ADDR] [--dirty-heap] [--net] <program> [args...]"
-    );
-    eprintln!();
-    eprintln!("Runs an AmigaOS CLI hunk executable under volamos.");
-    eprintln!();
-    eprintln!("options:");
-    eprintln!("  -v, --verbose             log each emulated library call to stderr");
-    eprintln!(
-        "  -s, --snoop               SnoopDos-style: log every opened library/file to stderr"
-    );
-    eprintln!(
-        "                            (name, and whether it resolved to a real or unimplemented"
-    );
-    eprintln!("                            library, or succeeded/failed for a file)");
-    eprintln!("  -V, --volume NAME:hostdir map an Amiga volume NAME: onto a host directory");
-    eprintln!("                            (repeatable)");
-    eprintln!("  -a, --assign NAME:target[+target...]");
-    eprintln!("                            assign NAME: to one or more Amiga path targets,");
-    eprintln!("                            joined with '+' for a multi-assign search order");
-    eprintln!("                            (repeatable)");
-    eprintln!("  --cwd AMIGAPATH           initial guest current directory. Default: the");
-    eprintln!("                            first -V volume's root if any -V was given,");
-    eprintln!("                            else the first -a assign's root, else \"root:\"");
-    eprintln!("                            (relying on --auto-assign to resolve it)");
-    eprintln!("  --auto-assign HOSTDIR     fall back to <HOSTDIR>/NAME for any otherwise");
-    eprintln!("                            unknown volume/assign NAME:");
-    eprintln!("  --defaults / --no-defaults");
-    eprintln!(
-        "                            whether the built-in standard-volume defaults (SYS:/RAM:"
-    );
-    eprintln!(
-        "                            and the standard C:/S:/LIBS:/DEVS:/ENVARC:/T:/ENV: assigns"
-    );
-    eprintln!(
-        "                            onto them) apply (default: on). An explicit -V/-a for the"
-    );
-    eprintln!(
-        "                            same NAME: always overrides the matching default, exactly"
-    );
-    eprintln!("                            like any other higher-precedence source");
-    eprintln!("  --volumes-dir HOSTDIR     where the default SYS: volume lives on the host");
-    eprintln!(
-        "                            (default ~/.volamos.d/volumes); ignored with --no-defaults"
-    );
-    eprintln!(
-        "  --stack SIZE              guest stack size in bytes (default {DEFAULT_STACK_SIZE});"
-    );
-    eprintln!("                            SIZE may be suffixed K (KiB) or M (MiB), e.g. 256K");
-    eprintln!(
-        "  --ram SIZE                total guest address space in bytes (default \
-         {DEFAULT_RAM_SIZE});"
-    );
-    eprintln!("                            same K/M suffix syntax as --stack. --stack must leave");
-    eprintln!("                            real room within this for the loaded program and the");
-    eprintln!("                            runtime's own guest heap. Above 16M needs --cpu 68020");
-    eprintln!("                            or later: a 68000/68010 cannot address more than that");
-    eprintln!("  --cpu MODEL               emulated CPU (default 68000): 68000, 68010, 68020,");
-    eprintln!("                            68ec020, 68030, 68ec030, 68040, 68ec040, 68lc040,");
-    eprintln!("                            68060, or scc68070");
-    eprintln!("  --fpu / --no-fpu          whether a coprocessor FPU is fitted (default: no FPU);");
-    eprintln!("                            only meaningful for --cpu 68020 and later -- earlier");
-    eprintln!("                            models have no coprocessor interface at all, so F-line");
-    eprintln!("                            (FPU) instructions always trap on them regardless");
-    eprintln!(
-        "  --jit / --no-jit          batch-execute guest code via the m68k crate's trace JIT"
-    );
-    eprintln!(
-        "                            instead of stepping one instruction at a time (default:"
-    );
-    eprintln!(
-        "                            no JIT -- the interpreter is this runtime's correctness"
-    );
-    eprintln!(
-        "                            reference); every library-call trap boundary is identical"
-    );
-    eprintln!("                            either way");
-    eprintln!(
-        "  --clock-mhz N             report timer.device's ReadEClock as emulated time derived"
-    );
-    eprintln!(
-        "                            from the CPU's own emulated cycle count at N MHz (fractional"
-    );
-    eprintln!(
-        "                            values allowed, e.g. 25 or 7.14), instead of host wall-clock"
-    );
-    eprintln!("                            time -- for reproducible, host-load-independent A/B");
-    eprintln!(
-        "                            benchmarking. Off by default. Cannot be combined with an"
-    );
-    eprintln!(
-        "                            explicit --jit (run_batch's trace JIT never tracks a cycle"
-    );
-    eprintln!(
-        "                            count, so there'd be nothing to derive emulated time from)"
-    );
-    eprintln!(
-        "                            or with --sanitize (the cycle-counted execution path skips"
-    );
-    eprintln!("                            the sanitizer's per-instruction hooks entirely, so its");
-    eprintln!("                            checks would be silently incomplete rather than merely");
-    eprintln!(
-        "                            slow). This is the slowest execution mode: measured ~2.2x"
-    );
-    eprintln!(
-        "                            slower than --no-jit and ~7x slower than --jit (CoreMark 1.0"
-    );
-    eprintln!("                            on --cpu 68020, host wall-clock throughput). volamos's");
-    eprintln!(
-        "                            memory bus has no wait states at all, so memory-bound guest"
-    );
-    eprintln!(
-        "                            code still won't match real hardware timing, and time spent"
-    );
-    eprintln!(
-        "                            inside volamos's own native-Rust library handlers (e.g."
-    );
-    eprintln!("                            CopyMem) or single-stepped guest callbacks (RawDoFmt's");
-    eprintln!(
-        "                            PutChProc, Supervisor's routine) costs zero emulated cycles"
-    );
-    eprintln!("                            and is invisible in the reported total");
-    eprintln!("  --sanitize                enable shadow-memory checking of guest accesses (heap");
-    eprintln!(
-        "                            redzones, freed blocks, below-stack-pointer reads/writes);"
-    );
-    eprintln!(
-        "                            reports violations to stderr after the run. Off by default;"
-    );
-    eprintln!(
-        "                            forces --no-jit regardless of --jit/--no-jit, since the"
-    );
-    eprintln!(
-        "                            JIT's fast memory path would otherwise bypass every check"
-    );
-    eprintln!(
-        "  --sanitize-uninit         additionally report reads of memory that was allocated but"
-    );
-    eprintln!("                            never written. Implies --sanitize. Separate and off by");
-    eprintln!(
-        "                            default because uninitialized-read detection is the noisiest"
-    );
-    eprintln!(
-        "                            class in any sanitizer -- a whole-struct copy that includes"
-    );
-    eprintln!(
-        "                            padding, or a table scan touching unused slots, can report"
-    );
-    eprintln!("                            legitimately");
-    eprintln!(
-        "  --sanitize-ignore-pc ADDR suppress violations reported at guest PC ADDR (decimal, or"
-    );
-    eprintln!(
-        "                            hex with a 0x prefix). Repeatable. For silencing a site you"
-    );
-    eprintln!(
-        "                            have already triaged, without needing a suppression file"
-    );
-    eprintln!(
-        "  --dirty-heap              fill every AllocMem/AllocVec/AllocPooled block made without"
-    );
-    eprintln!(
-        "                            MEMF_CLEAR with 0xA5 instead of leaving it zeroed, so a guest"
-    );
-    eprintln!(
-        "                            relying on uncleared memory being zero fails here the way it"
-    );
-    eprintln!(
-        "                            can on real hardware (where AllocMem returns whatever debris"
-    );
-    eprintln!(
-        "                            was there). Independent of --sanitize: this one changes what"
-    );
-    eprintln!("                            the guest sees, rather than just observing it");
-    eprintln!("  --net                     enable bsdsocket.library: real host network access for");
-    eprintln!("                            the guest (socket/connect/send/recv/... via real host");
-    eprintln!("                            sockets). Off by default and CLI-only -- not settable");
-    eprintln!("                            via ~/.volamos/.volamos");
-    eprintln!();
-    eprintln!("[args...] is passed to the guest program's command line (A0/D0).");
-    eprintln!();
-    eprintln!(
-        "By default (see --defaults above), SYS:, C:, S:, LIBS:, DEVS:, ENVARC:, RAM:, T:, and \
-         ENV: all resolve out of the box, backed by empty host directories created only on \
-         first actual use (SYS: persists across runs under --volumes-dir; RAM:/T:/ENV: are a \
-         fresh, per-process temp directory, removed when this run ends). Any other name still \
-         fails cleanly with an IoErr -- a typo isn't silently treated as a new empty volume. \
-         With --no-defaults (or if none of -V/-a/--cwd/--auto-assign/the defaults apply), no \
-         volume/assign filesystem is installed at all: dos.library path-based calls (Open, \
-         Lock, Examine, ...) fail cleanly with an IoErr; Input/Output/PutStr/IoErr/SetIoErr \
-         work either way."
-    );
-    eprintln!();
-    eprintln!(
-        "~/.volamos supplies default values for the flags above (KEY=value lines, e.g. \
-         STACK=256K, DEFAULTS=false, VOLUMES_DIR=/path); a .volamos next to <program> (in its \
-         own directory) overrides it; a .volamos in the current directory overrides both; \
-         explicit flags on this command line win over all three. Relative VOLUME/AUTO_ASSIGN/ \
-         VOLUMES_DIR paths in a config file resolve against that file's own directory. See the \
-         Configuration page in the docs."
-    );
+/// Parses a `-V`/`--volume NAME:hostdir` argument.
+fn parse_volume_arg(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, hostdir) = split_name_value("-V", s)?;
+    Ok((name.to_string(), PathBuf::from(hostdir)))
+}
+
+/// Parses a `-a`/`--assign NAME:target[+target...]` argument.
+fn parse_assign_arg(s: &str) -> Result<(String, Vec<String>), String> {
+    let (name, targets) = split_name_value("-a", s)?;
+    Ok((
+        name.to_string(),
+        targets.split('+').map(str::to_string).collect(),
+    ))
+}
+
+/// Thin `--stack`-flavored wrapper around [`parse_byte_size`], for use as a
+/// clap `value_parser` (which only passes the value string, not a flag
+/// name).
+fn parse_stack_size_arg(s: &str) -> Result<u32, String> {
+    parse_byte_size("--stack", s)
+}
+
+/// Thin `--ram`-flavored wrapper around [`parse_byte_size`]; see
+/// [`parse_stack_size_arg`].
+fn parse_ram_size_arg(s: &str) -> Result<u32, String> {
+    parse_byte_size("--ram", s)
+}
+
+/// Parses a `--sanitize-ignore-pc ADDR` value: decimal, or hex with a `0x`/
+/// `0X` prefix.
+fn parse_ignore_pc_arg(s: &str) -> Result<u32, String> {
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
+    match hex {
+        Some(digits) => u32::from_str_radix(digits, 16),
+        None => s.parse::<u32>(),
+    }
+    .map_err(|_| format!("--sanitize-ignore-pc: '{s}' isn't a valid address"))
+}
+
+/// clap derive CLI surface. Every optional setting is deliberately
+/// `Option<T>`/absent-by-default (bool pairs resolve to `Option<bool>` by
+/// hand after parsing, see [`cli_to_raw`]) -- clap itself is never given a
+/// default value for any of these, so [`config::Overrides`]'s own
+/// "explicitly set on the CLI vs. left at its built-in default" merge
+/// semantics (see `crate::config`'s module doc and [`resolve`]) keep
+/// working unchanged.
+///
+/// `program`/`guest_args` are the one place this *isn't* true: `program` is
+/// genuinely required (clap reports a standard "required argument missing"
+/// error if it's absent), and the positional-parsing split between them is
+/// the load-bearing part of requirement 1 -- see `guest_args`'s own doc.
+#[derive(Parser, Debug)]
+#[command(
+    name = "volamos",
+    version,
+    // clap's auto-generated --version flag defaults to a `-V` short alias
+    // too, which collides with our own `-V`/`--volume` -- disable the
+    // auto flag and re-add it below as `--version` only (long form,
+    // matching this project's documented spelling -- `-V` has always
+    // meant `--volume` here).
+    disable_version_flag = true,
+    about = "Runs an AmigaOS CLI hunk executable under volamos.",
+    long_about = "Runs an AmigaOS CLI hunk executable under volamos, loading it as a classic \
+                  \"hunk\" format program and running it against volamos's own fake-library \
+                  dispatch runtime. volamos exits with the guest program's own exit code.",
+    after_long_help = "By default (see --defaults above), SYS:, C:, S:, LIBS:, DEVS:, ENVARC:, \
+                        RAM:, T:, and ENV: all resolve out of the box, backed by empty host \
+                        directories created only on first actual use (SYS: persists across runs \
+                        under --volumes-dir; RAM:/T:/ENV: are a fresh, per-process temp \
+                        directory, removed when this run ends). Any other name still fails \
+                        cleanly with an IoErr -- a typo isn't silently treated as a new empty \
+                        volume. With --no-defaults (or if none of -V/-a/--cwd/--auto-assign/the \
+                        defaults apply), no volume/assign filesystem is installed at all: \
+                        dos.library path-based calls (Open, Lock, Examine, ...) fail cleanly \
+                        with an IoErr; Input/Output/PutStr/IoErr/SetIoErr work either way.\n\n\
+                        ~/.volamos supplies default values for the flags above (KEY=value \
+                        lines, e.g. STACK=256K, DEFAULTS=false, VOLUMES_DIR=/path); a .volamos \
+                        next to <program> (in its own directory) overrides it; a .volamos in \
+                        the current directory overrides both; explicit flags on this command \
+                        line win over all three. Relative VOLUME/AUTO_ASSIGN/VOLUMES_DIR paths \
+                        in a config file resolve against that file's own directory. See the \
+                        Configuration page in the docs."
+)]
+struct Cli {
+    /// Log each emulated library call to stderr
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        action = ArgAction::SetTrue,
+        help_heading = "Logging",
+        long_help = "Log each emulated library call to stderr (library name, LVO, and handler \
+                      name)."
+    )]
+    verbose: bool,
+
+    /// SnoopDos-style: log every opened library/file to stderr
+    #[arg(
+        short = 's',
+        long = "snoop",
+        action = ArgAction::SetTrue,
+        help_heading = "Logging",
+        long_help = "SnoopDos-style lighter-weight alternative to --verbose: logs only \
+                      resource-opening calls (OpenLibrary/OldOpenLibrary, Open) -- what was \
+                      requested and whether it resolved to a real/unimplemented library or \
+                      succeeded/failed for a file. Both can be given together, in which case \
+                      --verbose wins (its per-call output already includes the same detail \
+                      inline)."
+    )]
+    snoop: bool,
+
+    /// Map an Amiga volume NAME: onto a host directory (repeatable)
+    #[arg(
+        short = 'V',
+        long = "volume",
+        value_name = "NAME:hostdir",
+        value_parser = parse_volume_arg,
+        help_heading = "Filesystem"
+    )]
+    volume: Vec<(String, PathBuf)>,
+
+    /// Assign NAME: to one or more Amiga path targets (repeatable)
+    #[arg(
+        short = 'a',
+        long = "assign",
+        value_name = "NAME:target[+target...]",
+        value_parser = parse_assign_arg,
+        help_heading = "Filesystem",
+        long_help = "Assign NAME: to one or more Amiga path targets, joined with '+' for a \
+                      multi-assign search order (repeatable)."
+    )]
+    assign: Vec<(String, Vec<String>)>,
+
+    /// Initial guest current directory
+    #[arg(
+        long = "cwd",
+        value_name = "AMIGAPATH",
+        help_heading = "Filesystem",
+        long_help = "Initial guest current directory. Default: the first -V volume's root if \
+                      any -V was given, else the first -a assign's root, else \"root:\" \
+                      (relying on --auto-assign to resolve it)."
+    )]
+    cwd: Option<String>,
+
+    /// Fall back to `<HOSTDIR>/NAME` for any otherwise unknown volume/assign NAME:
+    #[arg(
+        long = "auto-assign",
+        value_name = "HOSTDIR",
+        help_heading = "Filesystem"
+    )]
+    auto_assign: Option<PathBuf>,
+
+    /// Enable the built-in standard-volume defaults layer (default: on)
+    #[arg(
+        long = "defaults",
+        action = ArgAction::SetTrue,
+        overrides_with = "no_defaults",
+        help_heading = "Filesystem",
+        long_help = "Whether the built-in standard-volume defaults (SYS:/RAM: and the standard \
+                      C:/S:/LIBS:/DEVS:/ENVARC:/T:/ENV: assigns onto them) apply (default: on). \
+                      An explicit -V/-a for the same NAME: always overrides the matching \
+                      default, exactly like any other higher-precedence source."
+    )]
+    defaults: bool,
+
+    /// Disable the built-in standard-volume defaults layer
+    #[arg(
+        long = "no-defaults",
+        action = ArgAction::SetTrue,
+        overrides_with = "defaults",
+        help_heading = "Filesystem"
+    )]
+    no_defaults: bool,
+
+    /// Where the default SYS: volume lives on the host (default ~/.volamos.d/volumes)
+    #[arg(
+        long = "volumes-dir",
+        value_name = "HOSTDIR",
+        help_heading = "Filesystem",
+        long_help = "Where the default SYS: volume lives on the host (default \
+                      ~/.volamos.d/volumes); ignored with --no-defaults."
+    )]
+    volumes_dir: Option<PathBuf>,
+
+    /// Guest stack size in bytes (default 65536); may be suffixed K (KiB) or M (MiB)
+    #[arg(
+        long = "stack",
+        value_name = "SIZE",
+        value_parser = parse_stack_size_arg,
+        help_heading = "Machine",
+        long_help = "Guest stack size in bytes (default 65536); SIZE may be suffixed K (KiB) or \
+                      M (MiB), e.g. 256K. Values below the runtime's minimum are silently \
+                      clamped up to it, mirroring real AmigaOS's own stack-size clamp."
+    )]
+    stack: Option<u32>,
+
+    /// Total guest address space in bytes (default 16777216); same K/M suffix syntax as --stack
+    #[arg(
+        long = "ram",
+        value_name = "SIZE",
+        value_parser = parse_ram_size_arg,
+        help_heading = "Machine",
+        long_help = "Total guest address space in bytes (default 16777216); same K/M suffix \
+                      syntax as --stack. --stack must leave real room within this for the \
+                      loaded program and the runtime's own guest heap. Above 16M needs --cpu \
+                      68020 or later: a 68000/68010 cannot address more than that."
+    )]
+    ram: Option<u32>,
+
+    /// Emulated CPU (default 68000)
+    #[arg(
+        long = "cpu",
+        value_name = "MODEL",
+        value_parser = parse_cpu_type_arg,
+        help_heading = "Machine",
+        long_help = "Emulated CPU (default 68000): 68000, 68010, 68020, 68ec020, 68030, \
+                      68ec030, 68040, 68ec040, 68lc040, 68060, or scc68070."
+    )]
+    cpu: Option<CpuType>,
+
+    /// Fit a coprocessor FPU (default: no FPU; only meaningful for --cpu 68020+)
+    #[arg(
+        long = "fpu",
+        action = ArgAction::SetTrue,
+        overrides_with = "no_fpu",
+        help_heading = "Machine",
+        long_help = "Whether a coprocessor FPU is fitted (default: no FPU); only meaningful for \
+                      --cpu 68020 and later -- earlier models have no coprocessor interface at \
+                      all, so F-line (FPU) instructions always trap on them regardless."
+    )]
+    fpu: bool,
+
+    /// Don't fit a coprocessor FPU
+    #[arg(
+        long = "no-fpu",
+        action = ArgAction::SetTrue,
+        overrides_with = "fpu",
+        help_heading = "Machine"
+    )]
+    no_fpu: bool,
+
+    /// Batch-execute guest code via the trace JIT (default: no JIT)
+    #[arg(
+        long = "jit",
+        action = ArgAction::SetTrue,
+        overrides_with = "no_jit",
+        help_heading = "Execution",
+        long_help = "Batch-execute guest code via the m68k crate's trace JIT instead of \
+                      stepping one instruction at a time (default: no JIT -- the interpreter is \
+                      this runtime's correctness reference); every library-call trap boundary \
+                      is identical either way."
+    )]
+    jit: bool,
+
+    /// Step the interpreter one instruction at a time (default)
+    #[arg(
+        long = "no-jit",
+        action = ArgAction::SetTrue,
+        overrides_with = "jit",
+        help_heading = "Execution"
+    )]
+    no_jit: bool,
+
+    /// Report timer.device's ReadEClock as emulated time at N MHz (off by default)
+    #[arg(
+        long = "clock-mhz",
+        value_name = "N",
+        value_parser = parse_clock_mhz,
+        help_heading = "Execution",
+        long_help = "Report timer.device's ReadEClock as emulated time derived from the CPU's \
+                      own emulated cycle count at N MHz (fractional values allowed, e.g. 25 or \
+                      7.14), instead of host wall-clock time -- for reproducible, \
+                      host-load-independent A/B benchmarking. Off by default. Cannot be \
+                      combined with an explicit --jit (run_batch's trace JIT never tracks a \
+                      cycle count, so there'd be nothing to derive emulated time from) or with \
+                      --sanitize (the cycle-counted execution path skips the sanitizer's \
+                      per-instruction hooks entirely, so its checks would be silently \
+                      incomplete rather than merely slow). This is the slowest execution mode: \
+                      measured ~2.2x slower than --no-jit and ~7x slower than --jit (CoreMark \
+                      1.0 on --cpu 68020, host wall-clock throughput). volamos's memory bus has \
+                      no wait states at all, so memory-bound guest code still won't match real \
+                      hardware timing, and time spent inside volamos's own native-Rust library \
+                      handlers (e.g. CopyMem) or single-stepped guest callbacks (RawDoFmt's \
+                      PutChProc, Supervisor's routine) costs zero emulated cycles and is \
+                      invisible in the reported total."
+    )]
+    clock_mhz: Option<f64>,
+
+    /// Enable shadow-memory checking of guest accesses (off by default)
+    #[arg(
+        long = "sanitize",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Enable shadow-memory checking of guest accesses (heap redzones, freed \
+                      blocks, below-stack-pointer reads/writes); reports violations to stderr \
+                      after the run. Off by default; forces --no-jit regardless of \
+                      --jit/--no-jit, since the JIT's fast memory path would otherwise bypass \
+                      every check."
+    )]
+    sanitize: bool,
+
+    /// Additionally report reads of uninitialized memory. Implies --sanitize
+    #[arg(
+        long = "sanitize-uninit",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Additionally report reads of memory that was allocated but never written. \
+                      Implies --sanitize. Separate and off by default because \
+                      uninitialized-read detection is the noisiest class in any sanitizer -- a \
+                      whole-struct copy that includes padding, or a table scan touching unused \
+                      slots, can report legitimately."
+    )]
+    sanitize_uninit: bool,
+
+    /// Suppress sanitizer violations reported at guest PC ADDR (repeatable)
+    #[arg(
+        long = "sanitize-ignore-pc",
+        value_name = "ADDR",
+        value_parser = parse_ignore_pc_arg,
+        help_heading = "Instrumentation",
+        long_help = "Suppress violations reported at guest PC ADDR (decimal, or hex with a 0x \
+                      prefix). Repeatable. For silencing a site you have already triaged, \
+                      without needing a suppression file."
+    )]
+    sanitize_ignore_pc: Vec<u32>,
+
+    /// Fill uncleared allocations with a poison byte instead of zero
+    #[arg(
+        long = "dirty-heap",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Fill every AllocMem/AllocVec/AllocPooled block made without MEMF_CLEAR \
+                      with 0xA5 instead of leaving it zeroed, so a guest relying on uncleared \
+                      memory being zero fails here the way it can on real hardware (where \
+                      AllocMem returns whatever debris was there). Independent of --sanitize: \
+                      this one changes what the guest sees, rather than just observing it."
+    )]
+    dirty_heap: bool,
+
+    /// Enable bsdsocket.library: real host network access for the guest
+    #[arg(
+        long = "net",
+        action = ArgAction::SetTrue,
+        help_heading = "Networking",
+        long_help = "Enable bsdsocket.library: real host network access for the guest \
+                      (socket/connect/send/recv/... via real host sockets). Off by default and \
+                      CLI-only -- not settable via ~/.volamos/.volamos."
+    )]
+    net: bool,
+
+    /// Print version information and exit
+    #[arg(long = "version", action = ArgAction::Version)]
+    version: Option<bool>,
+
+    /// The AmigaOS hunk executable to run
+    #[arg(value_name = "program")]
+    program: String,
+
+    /// Arguments passed verbatim to the guest program's own command line
+    ///
+    /// Everything after `<program>`, including tokens that look like flags
+    /// (e.g. `volamos prog -v`), is passed through untouched -- this is
+    /// NOT re-parsed by volamos's own flag parser.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    guest_args: Vec<String>,
+}
+
+/// The `-X`/`--long` spellings of every value-taking flag in [`Cli`],
+/// derived from clap's own metadata so [`split_program_boundary`] can
+/// never drift out of sync with the flag declarations: a value-taking
+/// flag's next token must be consumed as its value rather than mistaken
+/// for `<program>` (e.g. `-V SYS:/host/sys prog` -- `/host/sys`'s half
+/// of the `-V` value must not end the scan). Positionals have no flag
+/// spelling and zero-arity flags (`SetTrue`, `Help`, `Version`) take no
+/// value, so neither appears here. Computed once per process.
+fn value_flag_spellings() -> &'static [String] {
+    use clap::CommandFactory;
+    static SPELLINGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SPELLINGS.get_or_init(|| {
+        let cmd = Cli::command();
+        let mut out = Vec::new();
+        for arg in cmd.get_arguments() {
+            if !arg.get_action().takes_values() {
+                continue;
+            }
+            if let Some(short) = arg.get_short() {
+                out.push(format!("-{short}"));
+            }
+            if let Some(long) = arg.get_long() {
+                out.push(format!("--{long}"));
+            }
+        }
+        out
+    })
+}
+
+/// Splits `args` at the `<program>` boundary (requirement -- see the
+/// crate's module doc): the first token that isn't a recognized flag (or
+/// a value already consumed by one) ends option parsing; everything after
+/// it, however flag-like it looks, is the guest program's own argv,
+/// verbatim.
+///
+/// This is *not* something clap's `trailing_var_arg` achieves on its own:
+/// empirically (clap 4.6), `trailing_var_arg` only stops an *unrecognized*
+/// token from erroring once the variadic positional starts consuming --
+/// it still happily matches a flag clap *does* know about (e.g. `--stack`)
+/// anywhere in the whole argument list, not just before `<program>`. So
+/// this function does the split by hand first: the returned
+/// `before_and_program` half (ending in `<program>` itself) is all clap
+/// ever sees; `guest_args` is set on the parsed [`Cli`] afterward by hand
+/// (see [`parse_args_raw`] and `main`) rather than ever being handed to
+/// clap at all.
+///
+/// A standalone `--` is clap's own "everything after this is positional"
+/// escape -- and clap's unknown-flag error message actively recommends it
+/// (`to pass '--foo' as a value, use '-- --foo'`) -- so the scan honors
+/// it: the token right after `--` is `<program>` (however flag-like it
+/// looks, which is the point of the escape), and everything after *that*
+/// is the guest's argv.
+///
+/// A token starting with `-` that isn't `--` and doesn't take a value is
+/// left in the "before" half rather than treated as the boundary -- whether
+/// it's a valid zero-arity flag (`-v`, `--sanitize`, ...) or genuinely
+/// unknown, clap is the authority on that, and letting it reach clap is
+/// exactly what makes an unrecognized `--flag` before `<program>` a clean
+/// error (see this crate's module doc on that intentional behavior
+/// change from the old hand-rolled parser, which silently treated it as
+/// `<program>` instead).
+fn split_program_boundary(args: impl Iterator<Item = String>) -> (Vec<String>, Vec<String>) {
+    let mut before = Vec::new();
+    let mut iter = args;
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            // clap's explicit end-of-options escape: the next token is
+            // <program> no matter what it looks like. `--` itself still
+            // goes to clap so its own positional handling agrees.
+            before.push(arg);
+            if let Some(program) = iter.next() {
+                before.push(program);
+                return (before, iter.collect());
+            }
+            return (before, Vec::new());
+        }
+        if value_flag_spellings().contains(&arg) {
+            before.push(arg);
+            if let Some(value) = iter.next() {
+                before.push(value);
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            before.push(arg);
+            continue;
+        }
+        // First non-flag token (and not a value already consumed above):
+        // this is <program>. Everything remaining is the guest's own
+        // argv, untouched.
+        before.push(arg);
+        return (before, iter.collect());
+    }
+    (before, Vec::new())
+}
+
+/// Thin wrapper so [`parse_cpu_type`] fits clap's `fn(&str) -> Result<T, E>`
+/// `value_parser` shape (clap's blanket impl already matches this exact
+/// signature, so this could be used directly, but a dedicated name keeps
+/// `#[arg(value_parser = ...)]` call sites reading the same as every other
+/// flag here).
+fn parse_cpu_type_arg(s: &str) -> Result<CpuType, String> {
+    parse_cpu_type(s)
+}
+
+/// Converts a successfully-parsed [`Cli`] into [`parse_args_raw`]'s return
+/// contract -- see that function's doc for why `<program>`/`[args...]`
+/// travel separately from [`config::Overrides`].
+fn cli_to_raw(cli: Cli) -> RawParsedArgs {
+    // Bool pairs: whichever of the two flags was actually given last wins
+    // (clap's `overrides_with` on both sides of each pair clears the
+    // other), matching the old hand-rolled parser's "later flag wins"
+    // behavior. Neither given at all leaves the setting unset (`None`),
+    // same as every other optional field here.
+    let fpu = if cli.fpu {
+        Some(true)
+    } else if cli.no_fpu {
+        Some(false)
+    } else {
+        None
+    };
+    let jit = if cli.jit {
+        Some(true)
+    } else if cli.no_jit {
+        Some(false)
+    } else {
+        None
+    };
+    let standard_volumes = if cli.defaults {
+        Some(true)
+    } else if cli.no_defaults {
+        Some(false)
+    } else {
+        None
+    };
+
+    let overrides = config::Overrides {
+        verbose: cli.verbose.then_some(true),
+        snoop: cli.snoop.then_some(true),
+        volumes: cli.volume,
+        assigns: cli.assign,
+        cwd: cli.cwd,
+        auto_assign_root: cli.auto_assign,
+        stack_size: cli.stack,
+        ram_size: cli.ram,
+        cpu_type: cli.cpu,
+        fpu,
+        jit,
+        net: cli.net.then_some(true),
+        standard_volumes,
+        volumes_dir: cli.volumes_dir,
+        ..Default::default()
+    };
+
+    // --sanitize-uninit implies --sanitize: asking for uninitialized-read
+    // reporting without the shadow map installed could only be a mistake.
+    let (sanitize_enabled, sanitize_uninit) = if cli.sanitize_uninit {
+        (true, true)
+    } else {
+        (cli.sanitize, false)
+    };
+    let sanitize = InstrumentationOptions {
+        enabled: sanitize_enabled,
+        uninit: sanitize_uninit,
+        ignore_pcs: cli.sanitize_ignore_pc,
+        dirty_heap: cli.dirty_heap,
+    };
+
+    (
+        overrides,
+        sanitize,
+        cli.clock_mhz,
+        cli.program,
+        cli.guest_args,
+    )
 }
 
 /// Parses a `SIZE` value shared by `--stack` and `--ram`: a plain
@@ -572,7 +908,7 @@ fn parse_clock_mhz(s: &str) -> Result<f64, String> {
 
 /// Parses a `--cpu MODEL` value (case-insensitive) into a [`CpuType`].
 /// Covers every real model the `m68k` crate models -- see
-/// [`print_usage`] for the accepted spellings.
+/// [`Cli`] for the accepted spellings.
 fn parse_cpu_type(s: &str) -> Result<CpuType, String> {
     match s.to_ascii_lowercase().as_str() {
         "68000" => Ok(CpuType::M68000),
@@ -732,8 +1068,8 @@ type RawParsedArgs = (
     Vec<String>,
 );
 
-/// Hand-rolled argument parsing: this CLI's surface is small enough that
-/// pulling in an argument-parsing crate isn't worth the dependency.
+/// Parses `args` (a command line's tokens, *not* including argv\[0\]) via
+/// clap's [`Cli`], returning the raw pieces [`resolve`] needs.
 ///
 /// Returns the *raw* [`config::Overrides`] rather than a fully-resolved
 /// [`Options`] -- unlike a config file, `<program>`/`[args...]` aren't
@@ -744,123 +1080,43 @@ type RawParsedArgs = (
 /// (see `crate::config`'s module doc). [`parse_args`] is the
 /// no-config-files convenience wrapper most callers (and every existing
 /// test) actually want.
-fn parse_args_raw(mut args: impl Iterator<Item = String>) -> Result<RawParsedArgs, String> {
-    let mut overrides = config::Overrides::default();
-    // CLI-only, unlike every other flag here -- see `Options::sanitize`'s
-    // doc for why this deliberately isn't part of `config::Overrides`.
-    let mut sanitize = InstrumentationOptions::default();
-    // Also CLI-only, for the same reason -- see `Options::clock_mhz`'s
-    // doc. Kept as its own local (rather than folded into
-    // `InstrumentationOptions`) because it isn't part of that family's
-    // shadow-map-instrumentation theme; it changes what `ReadEClock`
-    // reports, not how guest memory accesses are checked.
-    let mut clock_mhz: Option<f64> = None;
-    let mut program = None;
-    let mut guest_args = Vec::new();
-
-    while let Some(arg) = args.next() {
-        if program.is_some() {
-            guest_args.push(arg);
-            continue;
+///
+/// `-h`/`--help` (and clap's auto-added `--version`) are reported as
+/// `Err(String::new())`, matching the pre-clap contract: the caller is
+/// expected to treat an empty message as "already handled, exit 0"
+/// rather than printing it. `main` itself does *not* go through this
+/// function for the real binary's own invocation -- see its own doc for
+/// why it calls `Cli::try_parse()`/`ClapError::exit()` directly instead,
+/// which gets clap's own fully-formatted `--help` output for free rather
+/// than discarding it here.
+///
+/// Only ever called from tests (via [`parse_args`] or directly) in a
+/// real build of this crate -- `#[allow(dead_code)]` rather than
+/// `#[cfg(test)]` so doc links to it from non-test code (`resolve`'s own
+/// doc, `main`'s doc) keep resolving.
+#[allow(dead_code)]
+fn parse_args_raw(args: impl Iterator<Item = String>) -> Result<RawParsedArgs, String> {
+    // See `split_program_boundary`'s doc for why this split has to happen
+    // by hand before clap ever sees anything: clap's own `trailing_var_arg`
+    // doesn't stop it from matching a *recognized* flag spelling anywhere
+    // in the whole argument list, only an unrecognized one.
+    let (before, guest_args) = split_program_boundary(args);
+    // clap expects argv[0] (the program name) as the first item; our
+    // callers' iterators never include it (see `main`, which already
+    // consumed it via `args.next()` before calling this).
+    let argv = std::iter::once("volamos".to_string()).chain(before);
+    match Cli::try_parse_from(argv) {
+        Ok(mut cli) => {
+            cli.guest_args = guest_args;
+            Ok(cli_to_raw(cli))
         }
-        match arg.as_str() {
-            "-v" | "--verbose" => overrides.verbose = Some(true),
-            "-s" | "--snoop" => overrides.snoop = Some(true),
-            "-h" | "--help" => return Err(String::new()), // caller prints usage and exits 0
-            "-V" | "--volume" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("{arg} requires a NAME:hostdir argument"))?;
-                let (name, hostdir) = split_name_value(&arg, &value)?;
-                overrides
-                    .volumes
-                    .push((name.to_string(), PathBuf::from(hostdir)));
+        Err(e) => match e.kind() {
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                Err(String::new())
             }
-            "-a" | "--assign" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("{arg} requires a NAME:target[+target...] argument"))?;
-                let (name, targets) = split_name_value(&arg, &value)?;
-                let targets: Vec<String> = targets.split('+').map(str::to_string).collect();
-                overrides.assigns.push((name.to_string(), targets));
-            }
-            "--cwd" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--cwd requires an AMIGAPATH argument".to_string())?;
-                overrides.cwd = Some(value);
-            }
-            "--auto-assign" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--auto-assign requires a HOSTDIR argument".to_string())?;
-                overrides.auto_assign_root = Some(PathBuf::from(value));
-            }
-            "--stack" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--stack requires a SIZE argument".to_string())?;
-                overrides.stack_size = Some(parse_byte_size("--stack", &value)?);
-            }
-            "--ram" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--ram requires a SIZE argument".to_string())?;
-                overrides.ram_size = Some(parse_byte_size("--ram", &value)?);
-            }
-            "--cpu" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--cpu requires a MODEL argument".to_string())?;
-                overrides.cpu_type = Some(parse_cpu_type(&value)?);
-            }
-            "--fpu" => overrides.fpu = Some(true),
-            "--no-fpu" => overrides.fpu = Some(false),
-            "--jit" => overrides.jit = Some(true),
-            "--no-jit" => overrides.jit = Some(false),
-            "--clock-mhz" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--clock-mhz requires an N argument".to_string())?;
-                clock_mhz = Some(parse_clock_mhz(&value)?);
-            }
-            "--sanitize" => sanitize.enabled = true,
-            "--dirty-heap" => sanitize.dirty_heap = true,
-            // Implies --sanitize: asking for uninitialized-read
-            // reporting without the shadow map installed could only be
-            // a mistake, and silently doing nothing would be worse than
-            // the implication.
-            "--sanitize-uninit" => {
-                sanitize.enabled = true;
-                sanitize.uninit = true;
-            }
-            "--sanitize-ignore-pc" => {
-                let raw = args.next().ok_or(
-                    "--sanitize-ignore-pc needs an address, e.g. --sanitize-ignore-pc 0xe14a",
-                )?;
-                let hex = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
-                let pc = match hex {
-                    Some(digits) => u32::from_str_radix(digits, 16),
-                    None => raw.parse::<u32>(),
-                }
-                .map_err(|_| format!("--sanitize-ignore-pc: '{raw}' isn't a valid address"))?;
-                sanitize.ignore_pcs.push(pc);
-            }
-            "--net" => overrides.net = Some(true),
-            "--defaults" => overrides.standard_volumes = Some(true),
-            "--no-defaults" => overrides.standard_volumes = Some(false),
-            "--volumes-dir" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--volumes-dir requires a HOSTDIR argument".to_string())?;
-                overrides.volumes_dir = Some(PathBuf::from(value));
-            }
-            _ => program = Some(arg),
-        }
+            _ => Err(e.render().to_string()),
+        },
     }
-
-    let program = program.ok_or_else(|| "missing <program> argument".to_string())?;
-    Ok((overrides, sanitize, clock_mhz, program, guest_args))
 }
 
 /// Fills every unset field of `overrides` with its built-in default,
@@ -935,7 +1191,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
 }
 
 /// Works out the initial guest current directory per the defaulting rule
-/// documented in [`print_usage`]: an explicit `--cwd` wins; otherwise
+/// documented in [`Cli`]: an explicit `--cwd` wins; otherwise
 /// the first `-V` volume's root, else the first `-a` assign's root,
 /// else `"root:"` (meaningful only in combination with `--auto-assign`,
 /// which maps the otherwise-unknown `root:` onto `<auto-assign-root>/
@@ -1099,7 +1355,7 @@ fn check_ram_addressable(ram_size: u32, cpu_type: CpuType) -> Result<(), String>
 /// Refuses `--clock-mhz` together with `jit` set (issue #102): `jit`
 /// only ever becomes `true` via an explicit override -- `--jit` on the
 /// command line, or `JIT=true` in a config file -- since
-/// [`resolve`]'s own default is `false` (see [`print_usage`]'s `--jit`/
+/// [`resolve`]'s own default is `false` (see [`Cli`]'s `--jit`/
 /// `--no-jit` doc). There is therefore no "default-on JIT" case this
 /// could spuriously trip on: every `jit == true` this ever sees really
 /// was asked for, by someone, somewhere. `jit_source` (see
@@ -1592,26 +1848,27 @@ fn main() -> ExitCode {
     // `volamos_core::exectask`'s module docs.
     install_host_break_handler();
 
-    let mut args = std::env::args();
-    let program_name = args.next().unwrap_or_else(|| "volamos".to_string());
+    // See `split_program_boundary`'s doc: the `<program>`/`[args...]`
+    // boundary has to be found by hand before clap ever runs, since
+    // clap's `trailing_var_arg` alone doesn't stop it from matching a
+    // recognized flag spelling (e.g. `--stack`) anywhere in the whole
+    // argument list, only an unrecognized one.
+    let mut argv0_args = std::env::args();
+    let _argv0 = argv0_args.next();
+    let (before, guest_args) = split_program_boundary(argv0_args);
 
-    // -h/--help and any CLI parse error short-circuit here, before
-    // ~/.volamos/.volamos are even read -- neither is relevant to
-    // those paths (see parse_args_raw's doc).
-    let (cli_overrides, sanitize, clock_mhz, program, guest_args) = match parse_args_raw(args) {
-        Ok(v) => v,
-        Err(msg) => {
-            if !msg.is_empty() {
-                eprintln!("volamos: {msg}");
-            }
-            print_usage(&program_name);
-            return if msg.is_empty() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            };
-        }
+    // -h/--help, --version, and any CLI parse error short-circuit here,
+    // before ~/.volamos/.volamos are even read -- none of them are
+    // relevant to those paths. On error, `ClapError::exit` prints clap's
+    // own fully-formatted help/usage/error text to the right stream and
+    // exits with clap's own convention: 0 for `--help`/`--version`, 2 for
+    // an actual parse error.
+    let mut cli = match Cli::try_parse_from(std::iter::once("volamos".to_string()).chain(before)) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
     };
+    cli.guest_args = guest_args;
+    let (cli_overrides, sanitize, clock_mhz, program, guest_args) = cli_to_raw(cli);
 
     let file_overrides = match config::load_all(&program) {
         Ok(overrides) => overrides,
@@ -1826,26 +2083,35 @@ mod tests {
     #[test]
     fn volume_missing_value_is_an_error() {
         let err = parse_args(args(&["-V"])).unwrap_err();
-        assert!(err.contains("-V requires"), "unexpected message: {err}");
+        assert!(
+            err.contains("--volume") && err.contains("value is required"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
     fn assign_missing_value_is_an_error() {
         let err = parse_args(args(&["-a"])).unwrap_err();
-        assert!(err.contains("-a requires"), "unexpected message: {err}");
+        assert!(
+            err.contains("--assign") && err.contains("value is required"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
     fn cwd_missing_value_is_an_error() {
         let err = parse_args(args(&["--cwd"])).unwrap_err();
-        assert!(err.contains("--cwd requires"), "unexpected message: {err}");
+        assert!(
+            err.contains("--cwd") && err.contains("value is required"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
     fn auto_assign_missing_value_is_an_error() {
         let err = parse_args(args(&["--auto-assign"])).unwrap_err();
         assert!(
-            err.contains("--auto-assign requires"),
+            err.contains("--auto-assign") && err.contains("value is required"),
             "unexpected message: {err}"
         );
     }
@@ -1873,7 +2139,10 @@ mod tests {
     #[test]
     fn missing_program_is_an_error() {
         let err = parse_args(args(&["-v"])).unwrap_err();
-        assert_eq!(err, "missing <program> argument");
+        assert!(
+            err.contains("<program>") && err.contains("required"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -1973,7 +2242,7 @@ mod tests {
     fn stack_missing_value_is_an_error() {
         let err = parse_args(args(&["--stack"])).unwrap_err();
         assert!(
-            err.contains("--stack requires"),
+            err.contains("--stack") && err.contains("value is required"),
             "unexpected message: {err}"
         );
     }
@@ -2001,7 +2270,10 @@ mod tests {
     #[test]
     fn ram_missing_value_is_an_error() {
         let err = parse_args(args(&["--ram"])).unwrap_err();
-        assert!(err.contains("--ram requires"), "unexpected message: {err}");
+        assert!(
+            err.contains("--ram") && err.contains("value is required"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -2139,7 +2411,10 @@ mod tests {
     #[test]
     fn cpu_missing_value_is_an_error() {
         let err = parse_args(args(&["--cpu"])).unwrap_err();
-        assert!(err.contains("--cpu requires"), "unexpected message: {err}");
+        assert!(
+            err.contains("--cpu") && err.contains("value is required"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -2156,6 +2431,144 @@ mod tests {
         // makes this the natural, unsurprising behavior either way).
         let opts = parse_args(args(&["--fpu", "--no-fpu", "prog"])).unwrap();
         assert!(!opts.fpu);
+    }
+
+    #[test]
+    fn fpu_flag_after_no_fpu_wins() {
+        // The other direction of "last wins" -- clap's `overrides_with`
+        // on both sides of the pair (see `Cli::fpu`/`Cli::no_fpu`) has to
+        // actually behave symmetrically, not just suppress an earlier
+        // `--fpu` when `--no-fpu` comes second.
+        let opts = parse_args(args(&["--no-fpu", "--fpu", "prog"])).unwrap();
+        assert!(opts.fpu);
+    }
+
+    // --- clap migration: new coverage for behavior the hand-rolled
+    // parser couldn't exercise (unknown-flag handling) or that's worth
+    // pinning explicitly now that clap, not a hand-written match, is
+    // responsible for it ---
+
+    #[test]
+    fn unknown_flag_before_program_is_an_error() {
+        // Intentional behavior change from the old hand-rolled parser,
+        // which silently treated any unrecognized token (even one
+        // spelled like a flag) as <program> -- see this module's doc.
+        let err = parse_args(args(&["--typo", "prog"])).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(err.contains("--typo"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn flags_after_program_reach_the_guest_untouched_even_when_recognized() {
+        // `volamos prog -v --stack` must NOT have --stack re-parsed as
+        // this CLI's own --stack flag (which would then fail with
+        // "missing SIZE") -- everything after <program> is the guest's
+        // own argv, verbatim, regardless of whether it happens to look
+        // like one of volamos's own flags. This is the specific case
+        // `split_program_boundary` exists to get right where clap's own
+        // `trailing_var_arg` alone does not (see that function's doc).
+        let opts = parse_args(args(&["prog", "-v", "--stack"])).unwrap();
+        assert_eq!(opts.program, "prog");
+        assert_eq!(
+            opts.guest_args,
+            vec!["-v".to_string(), "--stack".to_string()]
+        );
+        assert!(!opts.verbose);
+        assert_eq!(opts.stack_size, DEFAULT_STACK_SIZE);
+    }
+
+    #[test]
+    fn double_dash_escape_marks_the_next_token_as_program() {
+        // clap's own unknown-flag error recommends `-- --foo` for a
+        // flag-like value, so the boundary scan must honor the escape:
+        // the token right after `--` is <program> even when it starts
+        // with `-`, and every later token is a guest arg. Regression
+        // test: an earlier version of `split_program_boundary` pushed
+        // the dash-leading program into the "before" half and mistook
+        // the first real guest arg for <program>, silently dropping it
+        // from the guest's argv.
+        let opts = parse_args(args(&["--", "-dashed-prog", "one", "two"])).unwrap();
+        assert_eq!(opts.program, "-dashed-prog");
+        assert_eq!(opts.guest_args, vec!["one".to_string(), "two".to_string()]);
+
+        // Flags before the escape still parse as volamos's own.
+        let opts = parse_args(args(&["-v", "--", "-dashed-prog", "one"])).unwrap();
+        assert!(opts.verbose);
+        assert_eq!(opts.program, "-dashed-prog");
+        assert_eq!(opts.guest_args, vec!["one".to_string()]);
+    }
+
+    #[test]
+    fn value_flag_spellings_cover_every_value_taking_flag() {
+        // `split_program_boundary` consumes a value-taking flag's next
+        // token; the spellings come from clap's own metadata
+        // (`value_flag_spellings`), so this pins the full expected set --
+        // if a new value-taking flag appears here unexpectedly, the
+        // boundary scan picked it up automatically and this list just
+        // needs the new spelling added.
+        let mut spellings: Vec<&str> = value_flag_spellings().iter().map(String::as_str).collect();
+        spellings.sort_unstable();
+        let mut expected = vec![
+            "-V",
+            "--volume",
+            "-a",
+            "--assign",
+            "--cwd",
+            "--auto-assign",
+            "--stack",
+            "--ram",
+            "--cpu",
+            "--clock-mhz",
+            "--sanitize-ignore-pc",
+            "--volumes-dir",
+        ];
+        expected.sort_unstable();
+        assert_eq!(spellings, expected);
+    }
+
+    #[test]
+    fn equals_form_flag_values_parse() {
+        // Regression test for a user report: the old hand-rolled parser
+        // only matched exact `--flag` tokens followed by a separate value,
+        // so `--clock-mhz=25` fell through to the catch-all and was
+        // treated as the program name. clap accepts both spellings.
+        let opts = parse_args(args(&["--clock-mhz=25", "--stack=256K", "prog"])).unwrap();
+        assert_eq!(opts.clock_mhz, Some(25.0));
+        assert_eq!(opts.stack_size, 256 * 1024);
+        assert_eq!(opts.program, "prog");
+    }
+
+    #[test]
+    fn repeated_volume_and_assign_flags_preserve_relative_order() {
+        // -V and -a accumulate independently but each must keep its own
+        // flags' command-line order -- `default_cwd`'s "first -V, else
+        // first -a" rule depends on this.
+        let opts = parse_args(args(&[
+            "-V",
+            "FIRST:/host/first",
+            "-a",
+            "A1:target1",
+            "-V",
+            "SECOND:/host/second",
+            "-a",
+            "A2:target2",
+            "prog",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.volumes,
+            vec![
+                ("FIRST".to_string(), PathBuf::from("/host/first")),
+                ("SECOND".to_string(), PathBuf::from("/host/second")),
+            ]
+        );
+        assert_eq!(
+            opts.assigns,
+            vec![
+                ("A1".to_string(), vec!["target1".to_string()]),
+                ("A2".to_string(), vec!["target2".to_string()]),
+            ]
+        );
     }
 
     #[test]
@@ -2496,7 +2909,7 @@ mod tests {
     fn volumes_dir_missing_value_is_an_error() {
         let err = parse_args_raw(args(&["--volumes-dir"])).unwrap_err();
         assert!(
-            err.contains("--volumes-dir requires"),
+            err.contains("--volumes-dir") && err.contains("value is required"),
             "unexpected message: {err}"
         );
     }
