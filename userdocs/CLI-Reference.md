@@ -346,6 +346,7 @@ $ volamos --clock-mhz 25 ./bench
 ...program output...
 volamos: 422158 emulated cycles, 0.016886 s at 25 MHz
 volamos: 36581 instructions, 83754 bus accesses (66532 read / 17222 write), 11.54 cycles/instr, 2.29 accesses/instr
+volamos: 183 native library calls ran in zero emulated cycles: exec.library/CopyMem x120, dos.library/Write x41, dos.library/Read x12, exec.library/AllocMem x6, dos.library/Open x2, and 2 more; CopyMem/CopyMemQuick moved 491520 bytes natively
 ```
 
 The second line exists to make a run's **memory intensity** visible from
@@ -356,6 +357,18 @@ against cycle-paced hardware, monotonic in memory intensity
 ([issue #105](https://github.com/sidick/volamos/issues/105)). Cycles and
 seconds alone don't say which end of that range a workload sits at;
 accesses per instruction does, with no second runtime to compare against.
+
+The third line exists because native library handlers run in **zero
+emulated cycles** (see the warning below): it reports how many library
+calls were serviced natively — the top handlers by call count, and the
+total bytes `CopyMem`/`CopyMemQuick` were asked to move, since a guest
+`memcpy` routed through exec's `CopyMem` is the classic way a
+benchmark's real work silently bypasses the cycle count. A run whose
+copying "took no time" now says so in its own output
+([issue #109](https://github.com/sidick/volamos/issues/109), prompted by
+a real GCC-patch benchmark where a memcpy test "improved" 49% under
+volamos against 5% on real hardware). The line is omitted entirely when
+the guest made no library calls at all.
 
 Two things to know before reading the ratios:
 
@@ -412,6 +425,9 @@ models.)
       code, not guest instructions. A workload dominated by, say,
       `CopyMem` will report an emulated time implying it spent no time
       there at all, because from the CPU's point of view, it didn't.
+      The native-calls line above is this caveat's counterweight: the
+      zero-cycle work is itemized, so it's visible even though it's
+      unbilled.
     - **So is time spent inside a guest callback volamos single-steps
       rather than runs**, for the same reason: `RawDoFmt`'s
       `PutChProc` callback and `Supervisor`'s routine are both executed

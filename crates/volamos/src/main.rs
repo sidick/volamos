@@ -559,7 +559,9 @@ struct Cli {
                       hardware timing, and time spent inside volamos's own native-Rust library \
                       handlers (e.g. CopyMem) or single-stepped guest callbacks (RawDoFmt's \
                       PutChProc, Supervisor's routine) costs zero emulated cycles and is \
-                      invisible in the reported total."
+                      invisible in the reported total -- the exit report's native-calls \
+                      line itemizes that unbilled work (handler call counts, CopyMem \
+                      bytes) so it's at least visible."
     )]
     clock_mhz: Option<f64>,
 
@@ -1774,6 +1776,61 @@ fn report_emulated_cycles<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime
     {
         eprintln!("volamos: {line}");
     }
+    if let Some((counts, copy_mem_bytes)) = runtime.native_call_counts()
+        && let Some(line) = format_native_calls(&counts, copy_mem_bytes)
+    {
+        eprintln!("volamos: {line}");
+    }
+}
+
+/// How many `library/handler` entries [`format_native_calls`] names
+/// individually before folding the rest into an "and N more" tail. Five
+/// keeps the line readable while still naming every handler that could
+/// plausibly dominate a benchmark's invisible work.
+const NATIVE_CALLS_TOP_N: usize = 5;
+
+/// Formats [`report_emulated_cycles`]' third line: how many library
+/// calls were serviced by native handlers -- work that runs in zero
+/// emulated cycles and is therefore invisible in the two lines above
+/// (issue #109) -- naming the top handlers by call count, with the
+/// `CopyMem`/`CopyMemQuick` pair's total bytes alongside, since a guest
+/// `memcpy` routed through exec's `CopyMem` is the classic way a
+/// benchmark's real work silently bypasses the cycle count
+/// (AmigaPorts/m68k-amigaos-gcc#89 hit exactly this: a memcpy benchmark
+/// "improved" 49% under volamos vs 5% on real hardware).
+///
+/// `None` when no library call was dispatched at all -- there is
+/// nothing to report, and an all-zero line would just be noise under
+/// every `--clock-mhz` run of a pure-computation guest.
+fn format_native_calls(counts: &[(String, u64)], copy_mem_bytes: u64) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let total: u64 = counts.iter().map(|(_, count)| count).sum();
+    let top = counts
+        .iter()
+        .take(NATIVE_CALLS_TOP_N)
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = counts.len().saturating_sub(NATIVE_CALLS_TOP_N);
+    let tail = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    // One clause for the pair's combined total, rather than a per-entry
+    // annotation -- CopyMem and CopyMemQuick are separate entries, and
+    // stamping the shared total on each would double-report it.
+    let copied = if copy_mem_bytes > 0 {
+        format!("; CopyMem/CopyMemQuick moved {copy_mem_bytes} bytes natively")
+    } else {
+        String::new()
+    };
+    let calls = if total == 1 { "call" } else { "calls" };
+    Some(format!(
+        "{total} native library {calls} ran in zero emulated cycles: {top}{tail}{copied}"
+    ))
 }
 
 /// Formats the second report line: the work the run actually did, and the
@@ -2536,6 +2593,43 @@ mod tests {
         assert_eq!(opts.clock_mhz, Some(25.0));
         assert_eq!(opts.stack_size, 256 * 1024);
         assert_eq!(opts.program, "prog");
+    }
+
+    #[test]
+    fn format_native_calls_names_top_handlers_and_the_copy_total() {
+        let counts = vec![
+            ("exec.library/CopyMem".to_string(), 1200),
+            ("dos.library/Write".to_string(), 30),
+            ("dos.library/Open".to_string(), 1),
+        ];
+        let line = format_native_calls(&counts, 480_000).unwrap();
+        assert_eq!(
+            line,
+            "1231 native library calls ran in zero emulated cycles: \
+             exec.library/CopyMem x1200, dos.library/Write x30, dos.library/Open x1; \
+             CopyMem/CopyMemQuick moved 480000 bytes natively"
+        );
+    }
+
+    #[test]
+    fn format_native_calls_folds_the_tail_and_omits_a_zero_copy_clause() {
+        let counts: Vec<(String, u64)> = (0..8)
+            .map(|i| (format!("lib/handler{i}"), 10 - i))
+            .collect();
+        let line = format_native_calls(&counts, 0).unwrap();
+        assert!(
+            line.ends_with(", and 3 more"),
+            "8 handlers, top 5 named: {line}"
+        );
+        assert!(
+            !line.contains("CopyMem"),
+            "no copy clause when nothing was copied: {line}"
+        );
+    }
+
+    #[test]
+    fn format_native_calls_reports_nothing_for_a_run_with_no_library_calls() {
+        assert_eq!(format_native_calls(&[], 0), None);
     }
 
     #[test]

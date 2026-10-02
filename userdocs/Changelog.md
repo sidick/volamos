@@ -5,6 +5,17 @@ version scheme in `Cargo.toml`.
 
 ## 0.8
 
+- **`--clock-mhz` reports native-handler call counts at exit**
+  (issue #109). Native library handlers (`CopyMem`, `Write`, ...) run in
+  zero emulated cycles — a documented limitation — but a benchmark had
+  no way to see how much of its work vanished that way. A third report
+  line now itemizes it: total native calls, the top handlers by count,
+  and the bytes `CopyMem`/`CopyMemQuick` moved. Prompted by a real
+  GCC-codegen benchmark (AmigaPorts/m68k-amigaos-gcc#89) where a memcpy
+  test "improved" 49% under volamos against 5% on real hardware —
+  exactly the signature of copies disappearing into a zero-cycle native
+  handler, and now diagnosable from volamos's own output.
+
 - **CLI argument parsing migrated to clap** (issue #101). User-visible
   improvements:
     - `volamos --version` works (long form only — `-V` stays
