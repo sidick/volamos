@@ -642,26 +642,34 @@ struct Cli {
     guest_args: Vec<String>,
 }
 
-/// Value-taking flags recognized while scanning for the `<program>`
-/// boundary -- see [`split_program_boundary`]'s doc. Kept in sync by hand
-/// with [`Cli`]'s own flag declarations: a value-taking flag listed here
-/// must have its next token consumed as its value rather than letting
-/// that token be mistaken for `<program>` (e.g. `-V SYS:/host/sys prog`
-/// -- `/host/sys`'s half of the `-V` value must not end the scan).
-const VALUE_FLAGS: &[&str] = &[
-    "-V",
-    "--volume",
-    "-a",
-    "--assign",
-    "--cwd",
-    "--auto-assign",
-    "--stack",
-    "--ram",
-    "--cpu",
-    "--clock-mhz",
-    "--sanitize-ignore-pc",
-    "--volumes-dir",
-];
+/// The `-X`/`--long` spellings of every value-taking flag in [`Cli`],
+/// derived from clap's own metadata so [`split_program_boundary`] can
+/// never drift out of sync with the flag declarations: a value-taking
+/// flag's next token must be consumed as its value rather than mistaken
+/// for `<program>` (e.g. `-V SYS:/host/sys prog` -- `/host/sys`'s half
+/// of the `-V` value must not end the scan). Positionals have no flag
+/// spelling and zero-arity flags (`SetTrue`, `Help`, `Version`) take no
+/// value, so neither appears here. Computed once per process.
+fn value_flag_spellings() -> &'static [String] {
+    use clap::CommandFactory;
+    static SPELLINGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SPELLINGS.get_or_init(|| {
+        let cmd = Cli::command();
+        let mut out = Vec::new();
+        for arg in cmd.get_arguments() {
+            if !arg.get_action().takes_values() {
+                continue;
+            }
+            if let Some(short) = arg.get_short() {
+                out.push(format!("-{short}"));
+            }
+            if let Some(long) = arg.get_long() {
+                out.push(format!("--{long}"));
+            }
+        }
+        out
+    })
+}
 
 /// Splits `args` at the `<program>` boundary (requirement -- see the
 /// crate's module doc): the first token that isn't a recognized flag (or
@@ -680,8 +688,15 @@ const VALUE_FLAGS: &[&str] = &[
 /// (see [`parse_args_raw`] and `main`) rather than ever being handed to
 /// clap at all.
 ///
-/// A token starting with `-` that *isn't* one of [`VALUE_FLAGS`] is left
-/// in the "before" half rather than treated as the boundary -- whether
+/// A standalone `--` is clap's own "everything after this is positional"
+/// escape -- and clap's unknown-flag error message actively recommends it
+/// (`to pass '--foo' as a value, use '-- --foo'`) -- so the scan honors
+/// it: the token right after `--` is `<program>` (however flag-like it
+/// looks, which is the point of the escape), and everything after *that*
+/// is the guest's argv.
+///
+/// A token starting with `-` that isn't `--` and doesn't take a value is
+/// left in the "before" half rather than treated as the boundary -- whether
 /// it's a valid zero-arity flag (`-v`, `--sanitize`, ...) or genuinely
 /// unknown, clap is the authority on that, and letting it reach clap is
 /// exactly what makes an unrecognized `--flag` before `<program>` a clean
@@ -692,7 +707,18 @@ fn split_program_boundary(args: impl Iterator<Item = String>) -> (Vec<String>, V
     let mut before = Vec::new();
     let mut iter = args;
     while let Some(arg) = iter.next() {
-        if VALUE_FLAGS.contains(&arg.as_str()) {
+        if arg == "--" {
+            // clap's explicit end-of-options escape: the next token is
+            // <program> no matter what it looks like. `--` itself still
+            // goes to clap so its own positional handling agrees.
+            before.push(arg);
+            if let Some(program) = iter.next() {
+                before.push(program);
+                return (before, iter.collect());
+            }
+            return (before, Vec::new());
+        }
+        if value_flag_spellings().contains(&arg) {
             before.push(arg);
             if let Some(value) = iter.next() {
                 before.push(value);
@@ -2449,6 +2475,67 @@ mod tests {
         );
         assert!(!opts.verbose);
         assert_eq!(opts.stack_size, DEFAULT_STACK_SIZE);
+    }
+
+    #[test]
+    fn double_dash_escape_marks_the_next_token_as_program() {
+        // clap's own unknown-flag error recommends `-- --foo` for a
+        // flag-like value, so the boundary scan must honor the escape:
+        // the token right after `--` is <program> even when it starts
+        // with `-`, and every later token is a guest arg. Regression
+        // test: an earlier version of `split_program_boundary` pushed
+        // the dash-leading program into the "before" half and mistook
+        // the first real guest arg for <program>, silently dropping it
+        // from the guest's argv.
+        let opts = parse_args(args(&["--", "-dashed-prog", "one", "two"])).unwrap();
+        assert_eq!(opts.program, "-dashed-prog");
+        assert_eq!(opts.guest_args, vec!["one".to_string(), "two".to_string()]);
+
+        // Flags before the escape still parse as volamos's own.
+        let opts = parse_args(args(&["-v", "--", "-dashed-prog", "one"])).unwrap();
+        assert!(opts.verbose);
+        assert_eq!(opts.program, "-dashed-prog");
+        assert_eq!(opts.guest_args, vec!["one".to_string()]);
+    }
+
+    #[test]
+    fn value_flag_spellings_cover_every_value_taking_flag() {
+        // `split_program_boundary` consumes a value-taking flag's next
+        // token; the spellings come from clap's own metadata
+        // (`value_flag_spellings`), so this pins the full expected set --
+        // if a new value-taking flag appears here unexpectedly, the
+        // boundary scan picked it up automatically and this list just
+        // needs the new spelling added.
+        let mut spellings: Vec<&str> = value_flag_spellings().iter().map(String::as_str).collect();
+        spellings.sort_unstable();
+        let mut expected = vec![
+            "-V",
+            "--volume",
+            "-a",
+            "--assign",
+            "--cwd",
+            "--auto-assign",
+            "--stack",
+            "--ram",
+            "--cpu",
+            "--clock-mhz",
+            "--sanitize-ignore-pc",
+            "--volumes-dir",
+        ];
+        expected.sort_unstable();
+        assert_eq!(spellings, expected);
+    }
+
+    #[test]
+    fn equals_form_flag_values_parse() {
+        // Regression test for a user report: the old hand-rolled parser
+        // only matched exact `--flag` tokens followed by a separate value,
+        // so `--clock-mhz=25` fell through to the catch-all and was
+        // treated as the program name. clap accepts both spellings.
+        let opts = parse_args(args(&["--clock-mhz=25", "--stack=256K", "prog"])).unwrap();
+        assert_eq!(opts.clock_mhz, Some(25.0));
+        assert_eq!(opts.stack_size, 256 * 1024);
+        assert_eq!(opts.program, "prog");
     }
 
     #[test]
