@@ -27,6 +27,22 @@ version scheme in `Cargo.toml`.
   tokens spelled like volamos's own flags; config-file precedence is
   unchanged.
 
+    **Breaking** — command lines that worked before and now behave
+    differently:
+
+    - A program path given bare with a leading `-` (`volamos -foo`) is
+      now an unknown-flag error; spell it `./-foo` or `-- -foo`. (A
+      deliberate trade: every *mistyped flag* used to be silently tried
+      as a program path instead of being diagnosed.)
+    - A command-line parse error exits `2` (the conventional usage-error
+      code) instead of `1`; `1` still means the parse succeeded but the
+      run failed. Scripts testing for the specific value `1` on a bad
+      invocation need updating.
+    - `--help` prints to stdout (and still exits `0`); it used to print
+      to stderr.
+    - Diagnostic wording for parse errors is clap's, so anything
+      matching the old exact stderr text needs updating.
+
 - **`--sanitize` no longer reports a recycled heap block as
   use-after-free** (issue #95, reported by Bernie Innocenti). Once a run
   freed a block and the heap handed those same addresses back out, every
