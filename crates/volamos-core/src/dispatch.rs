@@ -883,6 +883,23 @@ pub struct LibraryTable<C: Cpu> {
     /// no table to record). Used to resolve unknown-call diagnostics for
     /// that base down to a function name instead of a raw offset.
     tables: HashMap<u32, &'static [LvoEntry]>,
+    /// How many times each slot's handler has been dispatched, keyed by
+    /// slot number so the per-call cost is one integer hashmap bump (the
+    /// `library`/`handler_name` strings are resolved from [`Self::slots`]
+    /// only at report time -- see [`LibraryTable::call_counts`]). Counted
+    /// unconditionally (the dispatch path already clones two `String`s
+    /// per call for [`CallInfo`], so this is noise), consumed only by
+    /// `--clock-mhz`'s exit report (issue #109): native handlers run in
+    /// zero emulated cycles, so without these counts a benchmark has no
+    /// way to see how much of its work bypassed the cycle count.
+    dispatch_counts: HashMap<u16, u64>,
+    /// Total bytes the `CopyMem`/`CopyMemQuick` pair has been asked to
+    /// copy (`D0` at call entry, accumulated in [`LibraryTable::dispatch`]
+    /// before the handler runs) -- the motivating case for issue #109:
+    /// a guest `memcpy` routed through exec's `CopyMem` does its copying
+    /// natively, in zero emulated cycles, and this is the direct measure
+    /// of how much copying was invisible that way.
+    copy_mem_bytes: u64,
 }
 
 impl<C: Cpu> Default for LibraryTable<C> {
@@ -897,6 +914,8 @@ impl<C: Cpu> LibraryTable<C> {
         Self {
             slots: HashMap::new(),
             next_slot: UNKNOWN_SLOT + 1,
+            dispatch_counts: HashMap::new(),
+            copy_mem_bytes: 0,
             bases: HashMap::new(),
             tables: HashMap::new(),
         }
@@ -1015,6 +1034,35 @@ impl<C: Cpu> LibraryTable<C> {
     /// (this is also where `ctx.cpu`/`ctx.mem`/etc. get handed to
     /// whichever handler is dispatched to, per [`HandlerContext`]'s
     /// docs).
+    /// Every dispatched call so far, as `("library/handler", count)`
+    /// pairs sorted by descending count (ties broken by name, so the
+    /// order is deterministic). Slot numbers are resolved to names here,
+    /// at report time, rather than on the per-call hot path -- see
+    /// [`Self::dispatch_counts`]'s field doc. Consumed by `--clock-mhz`'s
+    /// exit report (issue #109).
+    pub fn call_counts(&self) -> Vec<(String, u64)> {
+        let mut counts: Vec<(String, u64)> = self
+            .dispatch_counts
+            .iter()
+            .map(|(slot, &count)| {
+                let name = self
+                    .slots
+                    .get(slot)
+                    .map(|entry| format!("{}/{}", entry.library, entry.handler_name))
+                    .unwrap_or_else(|| format!("slot {slot}"));
+                (name, count)
+            })
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts
+    }
+
+    /// Total bytes `CopyMem`/`CopyMemQuick` have been asked to copy --
+    /// see [`Self::copy_mem_bytes`]'s field doc.
+    pub fn copy_mem_bytes(&self) -> u64 {
+        self.copy_mem_bytes
+    }
+
     fn dispatch(
         &mut self,
         opcode: u16,
@@ -1053,6 +1101,18 @@ impl<C: Cpu> LibraryTable<C> {
             handler_name: entry.handler_name.clone(),
             detail: None,
         };
+
+        // Dispatch accounting for `--clock-mhz`'s exit report (issue
+        // #109): native handlers run in zero emulated cycles, so these
+        // counts are the only way a cycle-counted run can see how much
+        // of its work bypassed the cycle count. The CopyMem pair's `D0`
+        // (size in bytes) is read here, *before* the handler runs, so
+        // it's the caller's own value regardless of what the handler
+        // does to the registers.
+        *self.dispatch_counts.entry(slot).or_insert(0) += 1;
+        if entry.handler_name == "CopyMem" || entry.handler_name == "CopyMemQuick" {
+            self.copy_mem_bytes += u64::from(ctx.cpu.data_register(DataRegister(0)));
+        }
 
         // Handlers construct their own `DispatchError::HandlerFailed`
         // with accurate `library`/`lvo`/`handler_name` fields (see e.g.
@@ -2645,6 +2705,24 @@ impl<C: Cpu + 'static> Runtime<C> {
         self.cpu.clock_hz()?;
         let (reads, writes) = self.mem.bus_access_counts();
         Some((self.cpu.emulated_instructions(), reads, writes))
+    }
+
+    /// Native library-handler dispatch counts (`("library/handler",
+    /// count)`, descending) and the total bytes `CopyMem`/`CopyMemQuick`
+    /// were asked to copy, over the same top-level-run-only span as
+    /// [`Runtime::emulated_cycles`] -- and `None` under the same
+    /// condition, because the numbers exist to be read *against* a cycle
+    /// count: native handlers run in zero emulated cycles (issue #109),
+    /// so these are the measure of how much of a cycle-counted run's
+    /// work the cycle count cannot see. Found necessary in the wild:
+    /// AmigaPorts/m68k-amigaos-gcc#89 benchmarked GCC codegen patches on
+    /// real hardware vs volamos and saw a memcpy benchmark improve 5% on
+    /// hardware but 49% here, with no way to tell from volamos's own
+    /// output that the copies had vanished into a zero-cycle native
+    /// handler.
+    pub fn native_call_counts(&self) -> Option<(Vec<(String, u64)>, u64)> {
+        self.cpu.clock_hz()?;
+        Some((self.table.call_counts(), self.table.copy_mem_bytes()))
     }
 
     /// Runs the guest program to completion, writing anything it prints

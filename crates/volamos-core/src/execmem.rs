@@ -1402,6 +1402,86 @@ mod tests {
         }
     }
 
+    /// Test: `LibraryTable`'s dispatch accounting (issue #109) counts
+    /// the CopyMem call and accumulates its `D0` byte size, and
+    /// `Runtime::native_call_counts` reports both -- but only once a
+    /// clock rate is configured, since the numbers exist to be read
+    /// against a cycle count (same gating as
+    /// `Runtime::emulated_cycles`).
+    #[test]
+    fn copy_mem_dispatch_is_counted_with_its_byte_size() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_a(0)); // A0 = source (0 is fine: counting test)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_a(1)); // A1 = dest
+        words.push(0);
+        words.push(0x100);
+        words.push(move_imm_to_d(0)); // D0 = size
+        words.push(0);
+        words.push(40);
+        words.extend_from_slice(&jsr_disp16_a6(-624)); // CopyMem(a6)
+        words.extend_from_slice(&jsr_disp16_a6(-630)); // CopyMemQuick(a6), same D0
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        let mut cpu = M68kCpu::new();
+        cpu.set_clock_mhz(Some(25.0));
+        let mut rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + 0x400,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        let (counts, copy_bytes) = rt
+            .native_call_counts()
+            .expect("a clock rate was configured, so counts must be reported");
+        let copy_mem = counts
+            .iter()
+            .find(|(name, _)| name == "exec.library/CopyMem")
+            .expect("CopyMem must appear in the dispatch counts");
+        assert_eq!(copy_mem.1, 1, "CopyMem was called once");
+        let quick = counts
+            .iter()
+            .find(|(name, _)| name == "exec.library/CopyMemQuick")
+            .expect("CopyMemQuick must appear in the dispatch counts");
+        assert_eq!(quick.1, 1, "CopyMemQuick was called once");
+        assert_eq!(
+            copy_bytes, 80,
+            "both calls' D0 (40 bytes each) accumulate into the pair's shared total"
+        );
+    }
+
+    /// Test: without a clock rate, `native_call_counts` is `None` --
+    /// the counts still accumulate in the table (counting is
+    /// unconditional), but there is no cycle count for them to qualify,
+    /// so the accessor reports nothing, same as `emulated_cycles`.
+    #[test]
+    fn native_call_counts_is_none_without_a_clock_rate() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-198)); // AllocMem(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(rt.native_call_counts(), None);
+    }
+
     // --- CacheControl ---
 
     fn cache_control_program(cache_bits: u32, cache_mask: u32) -> Vec<u16> {
