@@ -14,10 +14,25 @@ const HELLO_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/he
 /// (issue #65). See `fixtures/README.md` for its four modes.
 const MEMTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/memtest");
 
+/// Returns a sanitized run's captured stderr after checking its exit
+/// status. The fixtures misbehave on purpose but always exit 0 -- noticing
+/// the bug is the sanitizer's job, not the guest's (see
+/// `fixtures/memtest.s`) -- so the status must be 0 for a clean run and
+/// volamos's own 99 for one that reported anything.
+fn sanitized_stderr(what: &str, output: std::process::Output) -> String {
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = if stderr.contains("sanitizer:") { 99 } else { 0 };
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{what} exited with {:?}; stderr: {stderr}",
+        output.status
+    );
+    stderr
+}
+
 /// Runs `fixtures/memtest <mode>` under `--sanitize` and returns its
-/// captured stderr, asserting the process itself succeeded. The fixture
-/// deliberately misbehaves but always exits 0: noticing the bug is the
-/// sanitizer's job, not the guest's (see `fixtures/memtest.s`).
+/// captured stderr (see [`sanitized_stderr`]).
 fn sanitize_memtest(mode: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
         .arg("--sanitize")
@@ -25,13 +40,7 @@ fn sanitize_memtest(mode: &str) -> String {
         .arg(mode)
         .output()
         .expect("failed to run the volamos binary");
-    assert!(
-        output.status.success(),
-        "memtest {mode} exited with {:?}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stderr).unwrap()
+    sanitized_stderr(&format!("memtest {mode}"), output)
 }
 
 /// Path to `fixtures/stacktest`, the stack-bug fixture (issue #65
@@ -46,13 +55,7 @@ fn sanitize_stacktest(mode: &str) -> String {
         .arg(mode)
         .output()
         .expect("failed to run the volamos binary");
-    assert!(
-        output.status.success(),
-        "stacktest {mode} exited with {:?}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stderr).unwrap()
+    sanitized_stderr(&format!("stacktest {mode}"), output)
 }
 
 #[test]
@@ -111,13 +114,7 @@ fn sanitize_uninit_memtest(mode: &str) -> String {
         .arg(mode)
         .output()
         .expect("failed to run the volamos binary");
-    assert!(
-        output.status.success(),
-        "memtest {mode} exited with {:?}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stderr).unwrap()
+    sanitized_stderr(&format!("memtest {mode}"), output)
 }
 
 /// Runs `fixtures/memtest <mode>` with the given extra flags, returning

@@ -1512,8 +1512,22 @@ impl ShadowMap {
     ///    (`move.l #target,-(sp) / rts`) and volamos's own
     ///    process-startup return address (which no `JSR` ever pushed)
     ///    non-findings instead of false positives.
+    ///
+    /// Step 2 is skipped when step 1 discarded anything. Every ordinary
+    /// return, library calls included, retires its own frame here, so a
+    /// frame left below `sp` means this return ends a non-local exit:
+    /// `longjmp` restoring `setjmp`'s SP and returning through the slot
+    /// `setjmp`'s own `JSR` used. A later call from the same frame can
+    /// have pushed its return address at that very slot, and its frame is
+    /// still recorded there, so comparing would report the unwinder's
+    /// legitimate rewrite of the slot as corruption (seen on gcc's
+    /// `20210505-1.c` torture test). The frame is retired unchecked
+    /// instead; a return address smashed while every callee returned
+    /// normally still discards nothing and is still caught.
     pub fn check_return(&mut self, sp: u32, actual_return_addr: u32) {
+        let recorded = self.call_stack.len();
         self.call_stack.retain(|f| f.slot_sp >= sp);
+        let unwound = self.call_stack.len() != recorded;
         let Some(&top) = self.call_stack.back() else {
             return;
         };
@@ -1521,7 +1535,7 @@ impl ShadowMap {
             return;
         }
         self.call_stack.pop_back();
-        if top.return_addr != actual_return_addr {
+        if !unwound && top.return_addr != actual_return_addr {
             self.record_return_corruption(sp, top.return_addr, actual_return_addr);
         }
     }
@@ -2425,6 +2439,45 @@ mod tests {
             0,
             "the abandoned inner frame must not be flagged"
         );
+    }
+
+    #[test]
+    fn longjmp_through_a_reused_slot_reports_nothing() {
+        // gcc's 20210505-1.c: main calls setjmp, then a function that
+        // longjmps from two calls deeper.
+        let mut shadow = ShadowMap::new(0x2000);
+        // setjmp's JSR and RTS: the slot at 0x1000 held 0x4000.
+        shadow.record_call(0x1000, 0x4000);
+        shadow.check_return(0x1000, 0x4000);
+        // The next call from main pushes its return address at the very
+        // same slot, then calls twice more.
+        shadow.record_call(0x1000, 0x5000);
+        shadow.record_call(0x0ff8, 0x6000);
+        shadow.record_call(0x0ff0, 0x7000);
+
+        // longjmp restores setjmp's SP, writes setjmp's return address
+        // into the slot and returns through it.
+        shadow.check_return(0x1000, 0x4000);
+
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "a longjmp landing on a reused slot must not be flagged"
+        );
+    }
+
+    #[test]
+    fn smashed_return_address_after_callees_returned_is_still_reported() {
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.record_call(0x1000, 0x5000);
+        // A callee (say strcpy) that returns normally...
+        shadow.record_call(0x0ff8, 0x6000);
+        shadow.check_return(0x0ff8, 0x6000);
+
+        // ...after overflowing a buffer over its caller's return address.
+        shadow.check_return(0x1000, 0x4141_4141);
+
+        assert_eq!(shadow.violation_count(), 1);
     }
 
     #[test]
