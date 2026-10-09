@@ -11,6 +11,7 @@
 //! - `HUNK_RELOC32`(0x3EC)
 //! - `HUNK_DREL32` (0x3F7)
 //! - `HUNK_RELOC32SHORT` (0x3FC)
+//! - `HUNK_RELRELOC32` (0x3FD)
 //! - `HUNK_END`    (0x3F2)
 //!
 //! `HUNK_DREL32` (found running the real `PhxAss` assembler -- itself a
@@ -26,6 +27,15 @@
 //! `uint32` fields (realigned to a 4-byte boundary after the
 //! `count == 0`-terminated list, since 16-bit entries can leave the
 //! read position mid-longword).
+//!
+//! `HUNK_RELRELOC32` (hit loading a real-world `rustc`-for-m68k-Amiga
+//! `-fPIC`-style binary that volamos initially rejected outright as an
+//! unrecognized block type): on-disk shape identical to `HUNK_RELOC32`
+//! (same `uint32` count/hunk-number/offsets list), but the arithmetic is
+//! **PC-relative, not absolute**: `mem[loc] += target_hunk_addr -
+//! (this_hunk_addr + loc)`, i.e. the patched longword becomes the
+//! *displacement* from the patch site to the target, not the target's
+//! absolute address. See [`RelocKind::PcRelative`].
 //!
 //! `HUNK_NAME` (0x3E8), `HUNK_SYMBOL` (0x3F0) and `HUNK_DEBUG` (0x3F1)
 //! blocks are recognized wherever a hunk boundary allows one to appear --
@@ -211,6 +221,7 @@ const HUNK_DEBUG: u32 = 0x3F1;
 const HUNK_END: u32 = 0x3F2;
 const HUNK_DREL32: u32 = 0x3F7;
 const HUNK_RELOC32SHORT: u32 = 0x3FC;
+const HUNK_RELRELOC32: u32 = 0x3FD;
 const HUNK_OVERLAY: u32 = 0x3F5;
 const HUNK_BREAK: u32 = 0x3F6;
 
@@ -328,18 +339,35 @@ pub enum HunkKind {
     Bss,
 }
 
+/// Whether a [`Reloc32`] patches in an absolute address or a PC-relative
+/// displacement -- see [`Reloc32::kind`]'s doc for the arithmetic each
+/// one applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocKind {
+    /// `HUNK_RELOC32`/`HUNK_DREL32`/`HUNK_RELOC32SHORT`: `mem[loc] +=
+    /// target_hunk_addr`.
+    Absolute,
+    /// `HUNK_RELRELOC32`: `mem[loc] += target_hunk_addr - (this_hunk_addr
+    /// + loc)` -- see the module docs' `HUNK_RELRELOC32` section.
+    PcRelative,
+}
+
 /// A single 32-bit relocation within a hunk: the longword at `offset`
-/// (relative to the start of the hunk it belongs to) needs the load
-/// address of `target_hunk` added to it. Built from either
-/// `HUNK_RELOC32` or `HUNK_DREL32` (see the module docs -- both apply
-/// identically despite `HUNK_DREL32`'s on-disk encoding differing).
+/// (relative to the start of the hunk it belongs to) needs fixing up
+/// against `target_hunk`'s load address, per [`Reloc32::kind`]. Built
+/// from `HUNK_RELOC32`, `HUNK_DREL32`, `HUNK_RELOC32SHORT` (all
+/// [`RelocKind::Absolute`], applied identically despite their differing
+/// on-disk encodings -- see the module docs), or `HUNK_RELRELOC32`
+/// ([`RelocKind::PcRelative`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reloc32 {
     /// Byte offset within the owning hunk of the longword to fix up.
     pub offset: u32,
-    /// Index (into [`HunkFile::hunks`]) of the hunk whose load address
-    /// should be added at `offset`.
+    /// Index (into [`HunkFile::hunks`]) of the hunk this relocation is
+    /// against.
     pub target_hunk: usize,
+    /// Which arithmetic [`load`] applies at this patch site.
+    pub kind: RelocKind,
 }
 
 /// One parsed hunk: its kind, content (empty for BSS), the size in bytes
@@ -1206,6 +1234,25 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
                         relocs.push(Reloc32 {
                             offset,
                             target_hunk,
+                            kind: RelocKind::Absolute,
+                        });
+                    }
+                },
+                // Same uint32 count/hunk-number/offsets list as
+                // HUNK_RELOC32, but PC-relative arithmetic -- see the
+                // module docs' `HUNK_RELRELOC32` section.
+                HUNK_RELRELOC32 => loop {
+                    let count = r.read_u32()?;
+                    if count == 0 {
+                        break;
+                    }
+                    let target_hunk = r.read_u32()? as usize;
+                    for _ in 0..count {
+                        let offset = r.read_u32()?;
+                        relocs.push(Reloc32 {
+                            offset,
+                            target_hunk,
+                            kind: RelocKind::PcRelative,
                         });
                     }
                 },
@@ -1233,6 +1280,7 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
                             relocs.push(Reloc32 {
                                 offset,
                                 target_hunk,
+                                kind: RelocKind::Absolute,
                             });
                         }
                     }
@@ -1451,7 +1499,15 @@ pub fn load(
             let loc = addr.wrapping_add(reloc.offset);
             let target_addr = hunk_addrs[reloc.target_hunk];
             let existing = mem.read_u32(loc);
-            mem.write_u32(loc, existing.wrapping_add(target_addr));
+            let addend = match reloc.kind {
+                RelocKind::Absolute => target_addr,
+                // See the module docs' `HUNK_RELRELOC32` section: the
+                // patched value is the *displacement* from the patch
+                // site to the target, not the target's absolute
+                // address.
+                RelocKind::PcRelative => target_addr.wrapping_sub(loc),
+            };
+            mem.write_u32(loc, existing.wrapping_add(addend));
         }
     }
 
@@ -1826,6 +1882,59 @@ mod tests {
         assert_eq!(result.hunk_addrs, vec![0x100, 0x108]);
         assert_eq!(mem.read_u32(0x100), 0x108, "offset 0 relocated");
         assert_eq!(mem.read_u32(0x104), 0x108, "offset 4 relocated");
+    }
+
+    /// `HUNK_RELRELOC32` (0x3FD) patches a PC-relative *displacement*
+    /// from the patch site to the target, not the target's absolute
+    /// address -- unlike every other reloc type in this file, all of
+    /// which are absolute despite some having "relative"-sounding names
+    /// (see `inter_hunk_drel32_applies_like_reloc32_despite_the_name`).
+    /// Hit loading a real-world `rustc`-for-m68k-Amiga `-fPIC`-style
+    /// binary.
+    #[test]
+    fn inter_hunk_relreloc32_patches_pc_relative_displacement() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 1); // hunk 0 size: 1 longword
+        push_u32(&mut buf, 1); // hunk 1 size: 1 longword
+
+        // Hunk 0: HUNK_CODE containing one longword (addend 0),
+        // RELRELOC32 against hunk 1, then HUNK_END.
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0); // addend placeholder
+        push_u32(&mut buf, HUNK_RELRELOC32);
+        push_u32(&mut buf, 1); // one offset
+        push_u32(&mut buf, 1); // target hunk 1
+        push_u32(&mut buf, 0); // offset 0 within hunk 0
+        push_u32(&mut buf, 0); // terminate reloc groups
+        push_u32(&mut buf, HUNK_END);
+
+        // Hunk 1: HUNK_DATA, one longword, no relocs.
+        push_u32(&mut buf, HUNK_DATA);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0xDEAD_BEEF);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).unwrap();
+        assert_eq!(file.hunks[0].relocs[0].kind, RelocKind::PcRelative);
+
+        let mut mem = FlatMemory::new(0x1000);
+        let result = load(&file, &mut mem, 0x100).unwrap();
+
+        // Hunk 0 at 0x100, hunk 1 at 0x104: displacement from the patch
+        // site (0x100) to hunk 1's base (0x104) is 4, not 0x104.
+        assert_eq!(result.hunk_addrs, vec![0x100, 0x104]);
+        assert_eq!(
+            mem.read_u32(0x100),
+            4,
+            "PC-relative displacement, not absolute address"
+        );
+        assert_eq!(mem.read_u32(0x104), 0xDEAD_BEEF);
     }
 
     #[test]
