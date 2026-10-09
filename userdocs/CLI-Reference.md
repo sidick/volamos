@@ -500,8 +500,9 @@ It also catches two classes of stack bug:
 
   This is stack-smash detection, and it is something valgrind does not
   offer. It stays quiet on the legitimate `move.l #target,-(sp)` + `rts`
-  computed-jump idiom, which has no matching call, and it survives
-  `StackSwap` (a program moving to an entirely different stack).
+  computed-jump idiom, which has no matching call, on `longjmp` returning
+  through a slot a later call reused, and it survives `StackSwap` (a
+  program moving to an entirely different stack).
 
 Violations are reported to stderr after the run, deduplicated by
 (PC, address, kind) with a hit count, and the guest is left to continue
@@ -509,6 +510,12 @@ Violations are reported to stderr after the run, deduplicated by
 rather than dying at the first. A multi-byte access that straddles into
 poisoned memory reports once, at the first offending byte, rather than
 once per byte.
+
+When the run reported any violation, volamos exits with status 99
+instead of the program's own, so a test harness that only checks the
+exit status fails the run. A program started with `System()` or
+`Execute()` from inside the run still returns its own code to its
+caller.
 
 !!! note "Verified against real software"
     `--sanitize` runs the real PhxAss assembler, real pLhA listing a

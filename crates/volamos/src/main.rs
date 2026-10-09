@@ -572,7 +572,8 @@ struct Cli {
         help_heading = "Instrumentation",
         long_help = "Enable shadow-memory checking of guest accesses (heap redzones, freed \
                       blocks, below-stack-pointer reads/writes); reports violations to stderr \
-                      after the run. Off by default; forces --no-jit regardless of \
+                      after the run and then exits with status 99 instead of the program's \
+                      own. Off by default; forces --no-jit regardless of \
                       --jit/--no-jit, since the JIT's fast memory path would otherwise bypass \
                       every check."
     )]
@@ -1309,7 +1310,7 @@ fn format_location(loc: &Location) -> String {
 fn report_sanitizer_violations(
     runtime: &Runtime<M68kCpu>,
     program: Option<(&loader::HunkFile, &loader::LoadResult)>,
-) {
+) -> bool {
     if let Some(shadow) = runtime.memory().shadow()
         && shadow.violation_count() > 0
     {
@@ -1321,8 +1322,17 @@ fn report_sanitizer_violations(
             ),
             None => eprint!("{}", shadow.report()),
         }
+        return true;
     }
+    false
 }
+
+/// The exit status of a `--sanitize` run that reported violations, in
+/// place of the guest's own: the report alone would let a test harness
+/// that only looks at the exit status pass a run that corrupted memory.
+/// Distinct from the small codes AmigaOS programs return (5/10/20) and
+/// from 1, so a harness can tell the two failures apart.
+const SANITIZER_EXIT_CODE: i32 = 99;
 
 /// Checks that `ram_size` is an address space the configured CPU can
 /// actually reach (issue #98).
@@ -1554,7 +1564,9 @@ fn run_nested_program(
     let result = runtime.run(&mut out, None).unwrap_or(-1);
     // Nested runs parse their own executable locally and don't keep the
     // result around; source-location lookup is a top-level nicety, so
-    // these report plain addresses.
+    // these report plain addresses. The return code stays the guest's:
+    // it goes back to the calling program as System()'s result, not to
+    // a host harness.
     report_sanitizer_violations(&runtime, None);
     result
 }
@@ -1740,9 +1752,13 @@ fn run(opts: &Options) -> Result<i32, String> {
     let result = runtime
         .run(&mut out, Some(&mut trace))
         .map_err(|e| format!("{}: {e}", opts.program));
-    report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
+    let violated =
+        report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
     report_emulated_cycles(&runtime);
-    result
+    match result {
+        Ok(_) if violated => Ok(SANITIZER_EXIT_CODE),
+        other => other,
+    }
 }
 
 /// Prints the run's emulated cycle count and the wall time it
