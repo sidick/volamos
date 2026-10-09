@@ -148,8 +148,10 @@
 //! and the bounds always describe the *same* stack (either the old one,
 //! pre-swap, or the new one, post-swap) -- never a torn mix of the two.
 //!
-//! `tc_Node.ln_Type` is set to [`NT_TASK`] and `tc_Node.ln_Name` points to
-//! a heap-allocated, NUL-terminated process name string -- both set once
+//! `tc_Node.ln_Type` is set to [`NT_PROCESS`] -- the current task is a
+//! CLI process, and startup code such as DICE's checks for that before
+//! reading the `pr_*` fields -- and `tc_Node.ln_Name` points to a
+//! heap-allocated, NUL-terminated process name string -- both set once
 //! at creation and never changed. `tc_Node.ln_Succ`/`ln_Pred`/`ln_Pri` stay
 //! `0`: this fake task is never linked onto any exec task list (there is
 //! no such list in this runtime).
@@ -309,6 +311,20 @@ pub const PR_MSGPORT_OFFSET: u32 = TASK_STRUCT_SIZE;
 /// [`crate::dosfile::cli_handler`] (`dos.library`'s `Cli()`, which
 /// just returns this same field) for the guest-visible read path.
 pub const PR_CLI_OFFSET: u32 = 172;
+/// `pr_CIS`: `BPTR`, offset 156 (`pr_CLI` 172 - `pr_FileSystemTask` 4 -
+/// `pr_ConsoleTask` 4 - `pr_COS` 4 - `pr_CIS` 4). The process's current
+/// input handle, the same one `Input()` returns: startup code that reads
+/// it directly (DICE's) instead of calling `Input()` gets no stdin when
+/// it is `0`. Written at creation and by `SelectInput`.
+pub const PR_CIS_OFFSET: u32 = 156;
+/// `pr_COS`: `BPTR`, offset 160. As [`PR_CIS_OFFSET`], for `Output()` and
+/// `SelectOutput`.
+pub const PR_COS_OFFSET: u32 = 160;
+/// `pr_ConsoleTask`: `APTR`, offset 164, the console handler's port, which
+/// `Open("*")` reaches. Set to the port the standard handles' `fh_Type`
+/// already names: startup code that opens its own stderr (DICE's) only
+/// does so when this is non-`NULL`.
+pub const PR_CONSOLE_TASK_OFFSET: u32 = 164;
 /// `pr_HomeDir`: `BPTR`, offset 188 (`pr_CLI` 172 + 4, `pr_ReturnAddr`
 /// 176, `pr_PktWait` 180, `pr_WindowPtr` 184, `pr_HomeDir` 188). A lock
 /// on the directory the running program was loaded from, or `0` if
@@ -388,6 +404,8 @@ const STK_POINTER: u32 = 8;
 
 /// `NT_TASK` (1), per `<exec/nodes.h>`.
 pub const NT_TASK: u8 = 1;
+/// `NT_PROCESS` (13), per `<exec/nodes.h>`: the current task's type.
+pub const NT_PROCESS: u8 = 13;
 
 /// `SIGBREAKF_CTRL_C` (bit 12, `0x00001000`), per `<exec/exec.h>` --
 /// what a real AmigaOS Shell maps a host Ctrl-C onto, and what
@@ -496,6 +514,9 @@ pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, task: u32) {
 /// `StartConfig::stack_size`-derived layout), written into `tc_SPLower`/
 /// `tc_SPUpper` (Phase 3 stage 6) so [`stack_swap_handler`] and
 /// [`check_stack_bounds`] have real bounds to work with from the start.
+///
+/// `input_addr`/`output_addr` are the guest addresses of the handles
+/// `Input()`/`Output()` return, stored in `pr_CIS`/`pr_COS` as BPTRs.
 pub fn create_current_task<M: AddressSpace>(
     mem: &mut M,
     heap: &mut GuestHeap,
@@ -503,6 +524,7 @@ pub fn create_current_task<M: AddressSpace>(
     sp_upper: u32,
     program_name: &str,
     input_addr: u32,
+    output_addr: u32,
 ) -> u32 {
     let task = heap
         .alloc(&mut *mem, PROCESS_STRUCT_SIZE)
@@ -519,11 +541,11 @@ pub fn create_current_task<M: AddressSpace>(
         mem.write_u8(task.wrapping_add(i), 0);
     }
 
-    // tc_Node: ln_Type = NT_TASK, ln_Name -> a heap-allocated process
+    // tc_Node: ln_Type = NT_PROCESS, ln_Name -> a heap-allocated process
     // name string. ln_Succ/ln_Pred/ln_Pri stay 0 -- this fake task is
     // never linked onto any exec task list (there is no such list
     // here).
-    mem.write_u8(task + LN_TYPE, NT_TASK);
+    mem.write_u8(task + LN_TYPE, NT_PROCESS);
     let name_addr = heap
         .alloc(&mut *mem, PROCESS_NAME.len() as u32 + 1)
         .expect("guest heap has room for the process name string");
@@ -542,6 +564,13 @@ pub fn create_current_task<M: AddressSpace>(
     // pr_MsgPort: a real, valid (if perpetually empty) MsgPort owned by
     // this task -- see PR_MSGPORT_OFFSET's doc.
     init_msg_port_fields(mem, task + PR_MSGPORT_OFFSET, task);
+
+    // pr_CIS/pr_COS: the same handles Input()/Output() return;
+    // pr_ConsoleTask: the handler port those handles name.
+    mem.write_u32(task + PR_CIS_OFFSET, bptr_from_addr(input_addr));
+    mem.write_u32(task + PR_COS_OFFSET, bptr_from_addr(output_addr));
+    let console_port = mem.read_u32(output_addr + crate::dosfile::FH_TYPE_OFFSET);
+    mem.write_u32(task + PR_CONSOLE_TASK_OFFSET, console_port);
 
     // pr_CLI: a real, heap-allocated (if otherwise empty) struct
     // CommandLineInterface, written as a BPTR -- see PR_CLI_OFFSET's doc
@@ -1626,7 +1655,7 @@ mod tests {
         assert_ne!(task_addr, 0, "FindTask(NULL) should return a real address");
         assert_eq!(task_addr, rt.current_task());
 
-        assert_eq!(rt.memory().read_u8(task_addr + LN_TYPE), NT_TASK);
+        assert_eq!(rt.memory().read_u8(task_addr + LN_TYPE), NT_PROCESS);
         let name_ptr = rt.memory().read_u32(task_addr + LN_NAME);
         assert_ne!(name_ptr, 0);
         assert_eq!(

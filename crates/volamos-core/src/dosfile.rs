@@ -179,7 +179,7 @@ const FH_ARG1_OFFSET: u32 = 36;
 /// AmigaOS, where the NIL: pseudo-handler has no process (RKRM
 /// `handlers-filesystems.md`: "If the path is relative to `NIL:`, no
 /// handler exists and `NULL` is returned").
-const FH_TYPE_OFFSET: u32 = 8;
+pub(crate) const FH_TYPE_OFFSET: u32 = 8;
 /// Byte offset of `fh_Port` within `struct FileHandle` (`dos/dosextens.h`).
 /// Despite the name/type, real AmigaOS treats it as a plain `LONG`, not a
 /// pointer: "If it is non-zero, the file is interactive" (RKRM
@@ -1466,9 +1466,12 @@ fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let new_addr = addr_from_bptr(bptr);
     match ctx.dos.select_input(ctx.heap, ctx.mem, new_addr) {
-        Ok(old) => ctx
-            .cpu
-            .set_data_register(DataRegister(0), bptr_from_addr(old)),
+        Ok(old) => {
+            ctx.mem
+                .write_u32(ctx.current_task + crate::exectask::PR_CIS_OFFSET, bptr);
+            ctx.cpu
+                .set_data_register(DataRegister(0), bptr_from_addr(old))
+        }
         Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -1483,9 +1486,12 @@ fn select_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let new_addr = addr_from_bptr(bptr);
     match ctx.dos.select_output(ctx.heap, ctx.mem, new_addr) {
-        Ok(old) => ctx
-            .cpu
-            .set_data_register(DataRegister(0), bptr_from_addr(old)),
+        Ok(old) => {
+            ctx.mem
+                .write_u32(ctx.current_task + crate::exectask::PR_COS_OFFSET, bptr);
+            ctx.cpu
+                .set_data_register(DataRegister(0), bptr_from_addr(old))
+        }
         Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
