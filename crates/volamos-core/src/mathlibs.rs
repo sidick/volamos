@@ -202,6 +202,22 @@ fn ieeedp_flt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
+/// Returns a compare or test result the way the ROM math libraries do: in
+/// `D0`, and in the condition codes as a `tst.l d0` would leave them (N for
+/// negative, Z for zero, V and C clear, X untouched), so the caller can
+/// branch on them directly without looking at `D0`. SAS/C's IEEE library
+/// does exactly that, so without the flags every double comparison it
+/// compiles reads as "equal".
+fn return_cmp_result<C: Cpu>(cpu: &mut C, result: i32) {
+    let ccr = match result {
+        r if r < 0 => 0x08,
+        0 => 0x04,
+        _ => 0x00,
+    };
+    cpu.set_data_register(DataRegister(0), result as u32);
+    cpu.set_sr((cpu.sr() & !0x0f) | ccr);
+}
+
 /// `mathieeedoubbas.library`'s `IEEEDPCmp` (LVO -42: `D0/D1` = `y`,
 /// `D2/D3` = `z`). `D0` = `0` if equal, negative if `y < z`, positive if
 /// `y > z`.
@@ -215,7 +231,7 @@ fn ieeedp_cmp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     } else {
         0
     };
-    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    return_cmp_result(ctx.cpu, result);
     Ok(())
 }
 
@@ -230,7 +246,7 @@ fn ieeedp_tst_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     } else {
         0
     };
-    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    return_cmp_result(ctx.cpu, result);
     Ok(())
 }
 
@@ -371,7 +387,7 @@ fn ieeesp_cmp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     } else {
         0
     };
-    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    return_cmp_result(ctx.cpu, result);
     Ok(())
 }
 
@@ -386,7 +402,7 @@ fn ieeesp_tst_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     } else {
         0
     };
-    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    return_cmp_result(ctx.cpu, result);
     Ok(())
 }
 
@@ -929,7 +945,7 @@ fn sp_cmp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     } else {
         0
     };
-    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    return_cmp_result(ctx.cpu, result);
     Ok(())
 }
 
@@ -946,7 +962,7 @@ fn sp_tst_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     } else {
         0
     };
-    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    return_cmp_result(ctx.cpu, result);
     Ok(())
 }
 
