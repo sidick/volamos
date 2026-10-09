@@ -202,6 +202,13 @@ fn ieeedp_flt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
+/// 68k CCR bits within the low byte of the status register, as `tst.l`
+/// leaves them: N for negative, Z for zero. V and C are always clear here;
+/// X is untouched (not part of this mask).
+const CCR_N: u16 = 0x08;
+const CCR_Z: u16 = 0x04;
+const CCR_NZVC_MASK: u16 = 0x0f;
+
 /// Returns a compare or test result the way the ROM math libraries do: in
 /// `D0`, and in the condition codes as a `tst.l d0` would leave them (N for
 /// negative, Z for zero, V and C clear, X untouched), so the caller can
@@ -210,12 +217,12 @@ fn ieeedp_flt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 /// compiles reads as "equal".
 fn return_cmp_result<C: Cpu>(cpu: &mut C, result: i32) {
     let ccr = match result {
-        r if r < 0 => 0x08,
-        0 => 0x04,
+        r if r < 0 => CCR_N,
+        0 => CCR_Z,
         _ => 0x00,
     };
     cpu.set_data_register(DataRegister(0), result as u32);
-    cpu.set_sr((cpu.sr() & !0x0f) | ccr);
+    cpu.set_sr((cpu.sr() & !CCR_NZVC_MASK) | ccr);
 }
 
 /// `mathieeedoubbas.library`'s `IEEEDPCmp` (LVO -42: `D0/D1` = `y`,
@@ -966,14 +973,33 @@ fn sp_tst_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     Ok(())
 }
 
+/// Stores an FFP arithmetic result in `D0`, and sets N/Z in the
+/// condition codes to match its sign (V and C clear, X untouched) --
+/// verified against real Kickstart 3.1 (40.68) via Copperline:
+/// `SPAdd`/`SPSub`/`SPMul`/`SPDiv`/`SPAbs`/`SPNeg`/`SPCeil`/`SPFloor`
+/// all do this on real hardware, not just `SPCmp`/`SPTst` (which
+/// [`return_cmp_result`] already covered). Classifies on the `f32`
+/// result itself, before FFP-encoding it, so `-0.0` (which has no
+/// separate FFP encoding -- see [`f32_to_ffp`]) still reads as zero.
+fn set_ffp_arith_result<C: Cpu>(cpu: &mut C, result: f32) {
+    let ccr = if result == 0.0 {
+        CCR_Z
+    } else if result < 0.0 {
+        CCR_N
+    } else {
+        0x00
+    };
+    cpu.set_data_register(DataRegister(0), f32_to_ffp(result));
+    cpu.set_sr((cpu.sr() & !CCR_NZVC_MASK) | ccr);
+}
+
 /// One-FFP-argument `mathffp.library` function (`D0` in, `D0` out).
 fn sp_unary_ffp<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     f: impl FnOnce(f32) -> f32,
 ) -> Result<(), DispatchError> {
     let parm = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
-    ctx.cpu
-        .set_data_register(DataRegister(0), f32_to_ffp(f(parm)));
+    set_ffp_arith_result(ctx.cpu, f(parm));
     Ok(())
 }
 
@@ -996,8 +1022,7 @@ sp_unary_ffp_handler!(sp_ceil_handler, f32::ceil);
 fn sp_add_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
     let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
-    ctx.cpu
-        .set_data_register(DataRegister(0), f32_to_ffp(left + right));
+    set_ffp_arith_result(ctx.cpu, left + right);
     Ok(())
 }
 
@@ -1016,8 +1041,7 @@ fn sp_add_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 fn sp_sub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
     let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
-    ctx.cpu
-        .set_data_register(DataRegister(0), f32_to_ffp(right - left));
+    set_ffp_arith_result(ctx.cpu, right - left);
     Ok(())
 }
 
@@ -1027,8 +1051,7 @@ fn sp_sub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 fn sp_mul_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
     let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
-    ctx.cpu
-        .set_data_register(DataRegister(0), f32_to_ffp(left * right));
+    set_ffp_arith_result(ctx.cpu, left * right);
     Ok(())
 }
 
@@ -1042,8 +1065,7 @@ fn sp_mul_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 fn sp_div_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let left = ffp_to_f32(ctx.cpu.data_register(DataRegister(1)));
     let right = ffp_to_f32(ctx.cpu.data_register(DataRegister(0)));
-    ctx.cpu
-        .set_data_register(DataRegister(0), f32_to_ffp(right / left));
+    set_ffp_arith_result(ctx.cpu, right / left);
     Ok(())
 }
 
@@ -1230,6 +1252,90 @@ mod tests {
         0x207C | (n << 9)
     }
 
+    /// `moveq.l #imm8,Dn`.
+    fn moveq_to_d(n: u16, imm: i8) -> u16 {
+        0x7000 | (n << 9) | (imm as u8 as u16)
+    }
+
+    /// `Bcc.s <disp8>`, `cond` a 4-bit 68k branch condition.
+    fn bcc_s(cond: u16, disp: i8) -> u16 {
+        0x6000 | (cond << 8) | (disp as u8 as u16)
+    }
+
+    const COND_MI: u16 = 0xB;
+    const COND_EQ: u16 = 0x7;
+    const COND_T: u16 = 0x0; // BRA
+
+    /// Appends a classify-by-condition-codes sequence: `bmi`/`beq`
+    /// against whatever flags the immediately preceding instruction
+    /// (a library call, in every caller here) left, then `rts` with
+    /// `D0` set to `-1`/`0`/`1` for negative/zero/positive. Never reads
+    /// the call's own `D0` result -- this is exactly SAS/C's own
+    /// `scmieee.lib` idiom (branch on CC, ignore the return value) that
+    /// PR #112 fixed `SPCmp`/`SPTst` for, generalized here to verify
+    /// every handler that calls [`return_cmp_result`]/
+    /// [`set_ffp_arith_result`], not just those two.
+    fn append_branch_classify(words: &mut Vec<u16>) {
+        let byte = |idx: usize| (idx * 2) as i32;
+        let disp_to =
+            |from_idx: usize, to_idx: usize| -> i8 { (byte(to_idx) - (byte(from_idx) + 2)) as i8 };
+
+        let bmi_idx = words.len();
+        words.push(0);
+        let beq_idx = words.len();
+        words.push(0);
+        words.push(moveq_to_d(0, 1)); // positive case
+        let bra1_idx = words.len();
+        words.push(0);
+        let neg_label = words.len();
+        words.push(moveq_to_d(0, -1));
+        let bra2_idx = words.len();
+        words.push(0);
+        let zero_label = words.len();
+        words.push(moveq_to_d(0, 0));
+        let done_label = words.len();
+        words.push(RTS);
+
+        words[bmi_idx] = bcc_s(COND_MI, disp_to(bmi_idx, neg_label));
+        words[beq_idx] = bcc_s(COND_EQ, disp_to(beq_idx, zero_label));
+        words[bra1_idx] = bcc_s(COND_T, disp_to(bra1_idx, done_label));
+        words[bra2_idx] = bcc_s(COND_T, disp_to(bra2_idx, done_label));
+    }
+
+    /// Calls the `mathffp.library` LVO at `disp` with `left` in `D1`
+    /// and, if given, `right` in `D0` (both FFP-encoded) -- or just
+    /// `left` in `D0` for a one-argument function when `right` is
+    /// `None`. Returns `-1`/`0`/`1` classified **purely from the
+    /// condition codes** the call left behind, never from the call's
+    /// own `D0` return value -- see [`append_branch_classify`].
+    fn run_ffp_branch_classify(disp: i32, left: f32, right: Option<f32>) -> i32 {
+        let mut words = Vec::new();
+        match right {
+            Some(right) => {
+                words.push(move_imm_to_d(1));
+                let l = f32_to_ffp(left);
+                words.push((l >> 16) as u16);
+                words.push(l as u16);
+                words.push(move_imm_to_d(0));
+                let r = f32_to_ffp(right);
+                words.push((r >> 16) as u16);
+                words.push(r as u16);
+            }
+            None => {
+                words.push(move_imm_to_d(0));
+                let l = f32_to_ffp(left);
+                words.push((l >> 16) as u16);
+                words.push(l as u16);
+            }
+        }
+        words.extend_from_slice(&jsr_disp16_a6(disp));
+        append_branch_classify(&mut words);
+
+        let mut rt = mathffp_program(&words);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed")
+    }
+
     /// Prepends `movea.l #MATHFFP_LIBRARY_BASE,a6` and builds a runtime.
     fn mathffp_program(words: &[u16]) -> Runtime<M68kCpu> {
         let mut full = vec![
@@ -1411,6 +1517,79 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, -1);
+    }
+
+    // The two tests above only check `D0`. A caller that instead branches
+    // on the condition codes directly -- exactly SAS/C's own
+    // `scmieee.lib` idiom, and the whole reason PR #112 exists -- had no
+    // coverage at all: `return_cmp_result`'s CCR bits could silently
+    // regress (e.g. the N/Z bit values swapped) and every test above
+    // would still pass. These do the branching themselves.
+
+    #[test]
+    fn sp_cmp_branch_only_caller_sees_correct_ccr() {
+        assert_eq!(run_ffp_branch_classify(-42, 2.0, Some(5.0)), -1, "2 < 5");
+        assert_eq!(run_ffp_branch_classify(-42, 5.0, Some(5.0)), 0, "5 == 5");
+        assert_eq!(run_ffp_branch_classify(-42, 5.0, Some(2.0)), 1, "5 > 2");
+    }
+
+    #[test]
+    fn sp_tst_branch_only_caller_sees_correct_ccr() {
+        // Unlike SPAbs/SPNeg/SPCeil/SPFloor, SPTst's one argument comes
+        // in D1, not D0 (see sp_tst_handler's doc) -- run_ffp_branch_classify's
+        // one-operand mode wouldn't exercise the right register.
+        fn sp_tst_branch_classify(parm: f32) -> i32 {
+            let mut words = Vec::new();
+            words.push(move_imm_to_d(1));
+            let bits = f32_to_ffp(parm);
+            words.push((bits >> 16) as u16);
+            words.push(bits as u16);
+            words.extend_from_slice(&jsr_disp16_a6(-48)); // SPTst
+            append_branch_classify(&mut words);
+
+            let mut rt = mathffp_program(&words);
+            let mut out = Vec::new();
+            rt.run(&mut out, None).expect("run should succeed")
+        }
+
+        assert_eq!(sp_tst_branch_classify(-2.5), -1);
+        assert_eq!(sp_tst_branch_classify(0.0), 0);
+        assert_eq!(sp_tst_branch_classify(2.5), 1);
+    }
+
+    #[test]
+    fn sp_arith_ops_set_ccr_to_match_their_sign() {
+        // Real Kickstart 3.1 (40.68) behavior, verified via Copperline:
+        // SPAdd/SPSub/SPMul/SPDiv/SPAbs/SPNeg/SPCeil/SPFloor all set N/Z
+        // to match the result's sign, same as SPCmp/SPTst -- not just
+        // the six handlers PR #112 touched.
+        assert_eq!(run_ffp_branch_classify(-66, 2.0, Some(3.0)), 1); // SPAdd: 2+3=5
+        assert_eq!(run_ffp_branch_classify(-66, 2.0, Some(-2.0)), 0);
+        assert_eq!(run_ffp_branch_classify(-66, 2.0, Some(-5.0)), -1);
+
+        // SPSub computes rightParm - leftParm (see sp_sub_handler's doc).
+        assert_eq!(run_ffp_branch_classify(-72, 2.0, Some(5.0)), 1); // 5-2=3
+        assert_eq!(run_ffp_branch_classify(-72, 2.0, Some(2.0)), 0);
+        assert_eq!(run_ffp_branch_classify(-72, 5.0, Some(2.0)), -1); // 2-5=-3
+
+        assert_eq!(run_ffp_branch_classify(-78, 2.0, Some(3.0)), 1); // SPMul: 2*3=6
+        assert_eq!(run_ffp_branch_classify(-78, 2.0, Some(0.0)), 0);
+        assert_eq!(run_ffp_branch_classify(-78, 2.0, Some(-3.0)), -1);
+
+        // SPDiv computes rightParm / leftParm (see sp_div_handler's doc).
+        assert_eq!(run_ffp_branch_classify(-84, 2.0, Some(10.0)), 1); // 10/2=5
+        assert_eq!(run_ffp_branch_classify(-84, 2.0, Some(0.0)), 0);
+        assert_eq!(run_ffp_branch_classify(-84, -2.0, Some(10.0)), -1); // 10/-2=-5
+
+        assert_eq!(run_ffp_branch_classify(-54, -3.0, None), 1); // SPAbs
+        assert_eq!(run_ffp_branch_classify(-54, 0.0, None), 0);
+
+        assert_eq!(run_ffp_branch_classify(-60, 3.0, None), -1); // SPNeg
+        assert_eq!(run_ffp_branch_classify(-60, 0.0, None), 0);
+
+        assert_eq!(run_ffp_branch_classify(-96, 1.5, None), 1); // SPCeil
+        assert_eq!(run_ffp_branch_classify(-90, -1.5, None), -1); // SPFloor
+        assert_eq!(run_ffp_branch_classify(-90, 0.5, None), 0); // SPFloor(0.5)=0.0
     }
 
     #[test]
