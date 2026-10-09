@@ -82,7 +82,9 @@ pub use doslock::{
 };
 pub use dospattern::ERROR_LINE_TOO_LONG;
 pub use dosseg::{SegList, SystemRequest};
-pub use exectask::{NT_TASK, SIGBREAKF_CTRL_C, TASK_STRUCT_SIZE, install_host_break_handler};
+pub use exectask::{
+    NT_PROCESS, NT_TASK, SIGBREAKF_CTRL_C, TASK_STRUCT_SIZE, install_host_break_handler,
+};
 pub use guestmem::{
     DEFAULT_STACK_SIZE, GuestHeap, GuestHeapError, MIN_STACK_SIZE, addr_from_bptr, bptr_from_addr,
     read_bstr, read_c_string, write_bstr, write_c_string,

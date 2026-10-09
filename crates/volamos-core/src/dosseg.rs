@@ -836,9 +836,17 @@ impl DosState {
         let args: Vec<String> = parts.map(str::to_string).collect();
 
         let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
-        let host_path = vfs
-            .resolve(program, ResolveMode::MustExist)
-            .map_err(|e| map_vfs_error(&e))?;
+        // A bare command name is looked up the way the shell does: in the
+        // current directory first, then in C:. (The CLI's Path list sits
+        // between the two on real AmigaOS; this runtime has none.) SAS/C,
+        // for one, runs its linker as "slink WITH ...".
+        let host_path = match vfs.resolve(program, ResolveMode::MustExist) {
+            Ok(path) => path,
+            Err(e) if program.contains(':') => return Err(map_vfs_error(&e)),
+            Err(e) => vfs
+                .resolve(&format!("C:{program}"), ResolveMode::MustExist)
+                .map_err(|_| map_vfs_error(&e))?,
+        };
 
         let runner = self.system_runner.as_mut().ok_or(ERROR_OBJECT_NOT_FOUND)?;
         let request = SystemRequest {

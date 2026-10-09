@@ -2367,6 +2367,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         let input_addr = dos
             .input_addr(&mut heap, &mut mem)
             .expect("guest heap has room for the eagerly allocated Input() handle");
+        // Output() is allocated just as eagerly, so the task's pr_COS can
+        // point at it from the start.
+        let output_addr = dos
+            .output_addr(&mut heap, &mut mem)
+            .expect("guest heap has room for the eagerly allocated Output() handle");
 
         // Fake current task (Phase 3 stage 5; stack bounds since stage
         // 6): a real, guest-visible struct Task allocated on the heap
@@ -2383,6 +2388,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             top,
             &config.program_name,
             input_addr,
+            output_addr,
         );
         mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, task);
 
@@ -4079,10 +4085,11 @@ mod tests {
         // use -- which itself first lazily creates the filesystem
         // handler MsgPort its fh_Type points at (issue #24) -- so the
         // task struct sits after both of those rather than at load_end
-        // itself.
+        // itself. The Output() handle follows, allocated just as eagerly so
+        // the task's pr_COS can point at it.
         // 36 = execlist::MSGPORT_SIZE (34) rounded to the heap's 4-byte
-        // granularity; 44 = dosfile::FILE_HANDLE_SIZE.
-        assert_eq!(rt.task, load_end + 36 + 44);
+        // granularity; 44 = dosfile::FILE_HANDLE_SIZE, once per handle.
+        assert_eq!(rt.task, load_end + 36 + 44 + 44);
         let a0 = rt.cpu.address_register(AddressRegister(0));
         assert!(
             a0 > load_end,
