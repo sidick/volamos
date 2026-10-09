@@ -803,6 +803,17 @@ pub enum DispatchError {
     /// per dispatched trap (the same granularity as host-break polling,
     /// [`crate::exectask::fold_pending_host_break`]) -- see
     /// [`Runtime::run`]'s doc for the granularity caveat.
+    ///
+    /// That granularity has a second-order consequence this error's
+    /// `Display` distinguishes: a guest that overflows and keeps running
+    /// *without making any library call* (e.g. a panic handler that
+    /// re-panics forever while formatting its own message) can push `A7`
+    /// down through the entire guest heap -- task struct included --
+    /// before the next trap gives this check a chance to fire. By then
+    /// `tc_SPLower`/`tc_SPUpper` are whatever stack debris landed on
+    /// them, recognizable when they read back inverted (`lower >
+    /// upper`), a state no code path in this runtime ever writes. The
+    /// overflow itself is still real; only the bounds are garbage.
     StackOverflow { a7: u32, lower: u32, upper: u32 },
     /// The guest reached [`CONTINUATION_STUB_ADDR`] with nothing on
     /// [`ContinuationStack`]'s pending list to run -- see
@@ -849,11 +860,40 @@ impl fmt::Display for DispatchError {
             DispatchError::UnknownLibraryFunction { library, name } => {
                 write!(f, "{library}: no LVO metadata for function {name:?}")
             }
-            DispatchError::StackOverflow { a7, lower, upper } => write!(
-                f,
-                "stack overflow: A7 {a7:#010x} is outside the current task's stack bounds \
-                 [{lower:#010x}, {upper:#010x}] -- try running with a larger --stack"
-            ),
+            DispatchError::StackOverflow { a7, lower, upper } => {
+                if lower > upper {
+                    // Inverted bounds can't have come from this runtime
+                    // (Runtime::new's layout arithmetic always yields
+                    // lower <= upper, and stack_swap_handler copies a
+                    // caller-supplied StackSwapStruct verbatim): they
+                    // mean tc_SPLower/tc_SPUpper themselves were
+                    // overwritten with garbage. Seen in the wild with a
+                    // guest whose panic handler re-panicked forever: the
+                    // recursion ran A7 down through the entire guest
+                    // heap without a single intervening library call
+                    // (the only point this check runs -- see
+                    // check_stack_bounds's granularity caveat), trampled
+                    // the task struct, and the next trap then read stack
+                    // debris back as "bounds". Suggesting --stack for
+                    // that case sends the user chasing a knob that can't
+                    // help, so name the real situation instead.
+                    write!(
+                        f,
+                        "stack overflow: A7 {a7:#010x} is outside the current task's stack \
+                         bounds, and the bounds themselves read back inverted \
+                         (tc_SPLower {lower:#010x} > tc_SPUpper {upper:#010x}) -- the task \
+                         struct has been overwritten, which usually means the stack already \
+                         ran far past its region (e.g. runaway recursion) and corrupted the \
+                         guest heap before this call; a larger --stack will not help"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "stack overflow: A7 {a7:#010x} is outside the current task's stack bounds \
+                         [{lower:#010x}, {upper:#010x}] -- try running with a larger --stack"
+                    )
+                }
+            }
             DispatchError::EmptyContinuationStack { pc } => write!(
                 f,
                 "continuation stub trapped at {pc:#010x} with no pending continuation \
@@ -3163,6 +3203,38 @@ mod tests {
         assert!(
             msg.contains("--stack"),
             "diagnostic should suggest --stack: {msg}"
+        );
+    }
+
+    #[test]
+    fn stack_overflow_with_inverted_bounds_reports_task_corruption_not_stack_size() {
+        // A guest that overflows and keeps running without any library
+        // call (seen in the wild: a panic handler that re-panicked
+        // forever while formatting its own message) pushes A7 down
+        // through the guest heap and overwrites the task struct itself
+        // before the next trap lets check_stack_bounds fire. The bounds
+        // it then reads are stack debris, recognizable when inverted
+        // (lower > upper -- a state no runtime code path ever writes).
+        // Suggesting --stack for that case is actively misleading (the
+        // reported numbers don't even change with --stack), so the
+        // Display must name the task-struct corruption instead.
+        let err = DispatchError::StackOverflow {
+            a7: 0x0001_6D20,
+            lower: 0x2190_0001,
+            upper: 0x2190_0000,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inverted"),
+            "inverted bounds should be called out: {msg}"
+        );
+        assert!(
+            msg.contains("will not help"),
+            "should warn that --stack can't fix this: {msg}"
+        );
+        assert!(
+            !msg.contains("try running"),
+            "must not suggest a larger --stack for corrupted bounds: {msg}"
         );
     }
 
