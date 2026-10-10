@@ -5,6 +5,30 @@ version scheme in `Cargo.toml`.
 
 ## 0.9
 
+- **`exec.library`'s `SetFunction`** — patches a single library
+  jump-table entry with a real `JMP` to guest code and returns a
+  function pointer the caller can chain through to the original
+  behavior, matching real `SetFunction` semantics. Previously
+  deliberately out of scope (see `docs/plan.md`'s 2026-08-19 gap audit)
+  on the assumption it would need a "call back into guest code"
+  primitive this runtime didn't have; it turns out not to need one —
+  the entry just needs to stop being a host trap and become a real
+  `JMP`, which the `m68k` backend already executes as ordinary guest
+  code, the same trick `crate::execlib::make_library`'s `MakeLibrary`
+  already uses for a genuinely `LoadSeg`ed library's own vectors. The
+  "old function" returned for a first-ever patch is a synthesized stub
+  (a verbatim copy of the entry's previous bytes) rather than a bare
+  sentinel, so a guest hook that calls through it to get default
+  behavior — the common real-world `SetFunction` idiom — works, not
+  just a bare patch/restore pair. Doesn't yet support patching an
+  auto-created fake (vamos-escape-hatch) library's jump table, which
+  lacks the real 6-byte-per-vector spacing a `JMP abs.l` needs. A patch
+  only affects the single guest run that installed it — there's no
+  persistence across separate `volamos` invocations or shared
+  system-wide library state, so this is for testing a program's own
+  hooking logic against itself, not emulating a real system-wide patch
+  tool.
+
 - **`--sanitize` exits `99` on a violation, and no longer misreports a
   `longjmp` return as a stack-smash** (issue #118). A `longjmp` returns
   through its `setjmp` slot, which a later call's frame may still

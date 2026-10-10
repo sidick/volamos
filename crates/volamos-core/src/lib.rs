@@ -43,6 +43,7 @@ pub mod execlib;
 pub mod execlist;
 pub mod execmem;
 pub mod execsem;
+pub mod execsetfunc;
 pub mod exectask;
 pub mod graphics;
 pub mod guestmem;
