@@ -82,8 +82,11 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// two `0x200` chunks at once) from `0x2600` for
 /// `mathieeesingbas.library`/`mathieeesingtrans.library`'s real bases
 /// (see `crate::dispatch::MATHIEEESINGBAS_LIBRARY_BASE`/
-/// `MATHIEEESINGTRANS_LIBRARY_BASE`) -- same reasoning each time.
-pub const TRAP_TABLE_SIZE: u32 = 0x2A00;
+/// `MATHIEEESINGTRANS_LIBRARY_BASE`) -- same reasoning each time, then
+/// once more from `0x2A00` for `SetFunction`'s stub pool (see
+/// `crate::execsetfunc::STUB_POOL_BASE`) -- not a library base at all,
+/// just scratch space for synthesized "old function" stubs.
+pub const TRAP_TABLE_SIZE: u32 = 0x2C00;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

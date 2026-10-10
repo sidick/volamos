@@ -53,6 +53,14 @@ gap, not a bug in your program, and worth filing an issue for.
 - I/O requests: `OpenDevice`/`CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/
   `CheckIO`/`AbortIO`, `CreateIORequest`/`DeleteIORequest`.
 - `Alert`, `RawDoFmt`.
+- `SetFunction` — patches a single library jump-table entry with a real
+  `JMP` to guest code and returns a function pointer standing in for
+  whatever was there before (a synthesized stub for a host-handled
+  entry, the real previous target if already patched), so a guest hook
+  can chain through to the original behavior exactly like real
+  `SetFunction` callers do. Doesn't support patching an auto-created
+  fake (vamos-escape-hatch) library's jump table, since those don't
+  have the real 6-byte-per-vector spacing a `JMP abs.l` needs.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
 
@@ -110,8 +118,10 @@ real AmigaOS code uses to call these functions.
 - **Cross-process IPC/message-port bridging** — volamos runs one guest
   process at a time (`System()`/`Execute()`/`RunCommand` run a nested
   program to completion synchronously, not concurrently).
-- **`exec.library`'s `MakeLibrary`/`SetFunction`** — creating a new
-  library at runtime, or patching an existing library's jump table to
-  point at guest code, needs a real architectural extension (a
-  jump-table slot that means "call back into guest code") volamos
-  doesn't have today.
+- **`exec.library`'s `MakeLibrary`** — creating a new library at
+  runtime is not exposed as a guest-callable LVO (the host-side
+  primitive it would use, `crate::execlib::make_library`, exists and
+  is exercised by the real-disk-library-loading path, but nothing
+  wires it up as `MakeLibrary` itself yet). `SetFunction`, which
+  patches an *existing* library's jump table, is implemented — see
+  `exec.library`'s entry above.

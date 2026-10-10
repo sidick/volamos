@@ -2178,6 +2178,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // runtime never needs the real waiter-queue machinery.
         crate::execsem::register_execsem_handlers(&mut table, &mut mem);
 
+        // exec.library SetFunction (jump-table patching) -- see
+        // crate::execsetfunc's module docs.
+        crate::execsetfunc::register_execsetfunc_handlers(&mut table, &mut mem);
+
         // exec.library's raw Allocate/Deallocate (a real, coalescing
         // MemHeader/MemChunk free-list allocator, deliberately separate
         // from execmem.rs's flat AllocMem/FreeMem model) -- see
@@ -4466,5 +4470,121 @@ mod tests {
                 other => panic!("expected EmptyContinuationStack, got {other:?}"),
             }
         }
+    }
+
+    // --- exec.library SetFunction ---
+
+    /// `move.l Dsrc,Ddst` opcode (both data-register-direct).
+    fn move_l_dn_dn(dst: u16, src: u16) -> u16 {
+        0x2000 | (dst << 9) | src
+    }
+
+    /// `or.l Dsrc,Ddst` opcode (both data-register-direct; `<ea> OR
+    /// Dn` form, `<ea>` = `Dsrc` direct).
+    fn or_l_dn_dn(dst: u16, src: u16) -> u16 {
+        0x8080 | (dst << 9) | src
+    }
+
+    /// Appends an `addi.l #imm,Dn` (3 words: opcode + hi + lo) to
+    /// `words`.
+    fn push_addi_l(words: &mut Vec<u16>, dn: u16, imm: u32) {
+        words.push(0x0680 | dn);
+        words.push((imm >> 16) as u16);
+        words.push(imm as u16);
+    }
+
+    /// Appends a `subi.l #imm,Dn` (3 words: opcode + hi + lo) to
+    /// `words`.
+    fn push_subi_l(words: &mut Vec<u16>, dn: u16, imm: u32) {
+        words.push(0x0480 | dn);
+        words.push((imm >> 16) as u16);
+        words.push(imm as u16);
+    }
+
+    #[test]
+    fn set_function_patches_chains_through_and_restores() {
+        // A from-scratch "library" (not one of the real registered
+        // bases -- just some scratch memory far from the test program)
+        // with one fake vector that sets D0 = 111. The program:
+        //
+        //  1. calls it directly -> D0 = 111 (D2), proving the baseline;
+        //  2. SetFunction-patches it to a guest hook, saving the
+        //     returned "old" pointer in D3;
+        //  3. calls it again -> now runs the hook, which chains through
+        //     D3 (jsr (a2)) to get 111 back, then adds 100 -> D0 = 211
+        //     (D4), proving both the patch *and* chain-through work;
+        //  4. SetFunction-restores it with D3;
+        //  5. calls it a third time -> D0 = 111 again (D5), proving
+        //     restore worked.
+        //
+        // Exit code is (D2-111)|(D4-211)|(D5-111): 0 iff every stage
+        // produced exactly the expected value.
+        let entry = TRAP_TABLE_END;
+        let test_lib_base = entry + 0x2000;
+        let test_lvo: i32 = 0;
+
+        let mut words: Vec<u16> = Vec::new();
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE); // A6 = exec base
+        push_movea_imm(&mut words, 1, test_lib_base); // A1 = our fake "library"
+
+        push_jsr(&mut words, 1, test_lvo); // call original -> D0 = 111
+        words.push(move_l_dn_dn(2, 0)); // D2 = D0
+
+        words.push(MOVEQ_D0_0); // D0 = funcOffset (0)
+        let a0_patch_at = words.len();
+        push_movea_imm(&mut words, 0, 0); // A0 = hook (patched below)
+        push_jsr(&mut words, 6, -420); // SetFunction -> D0 = old entry
+        words.push(move_l_dn_dn(3, 0)); // D3 = D0 (old entry)
+
+        push_jsr(&mut words, 1, test_lvo); // call again -> runs the hook
+        words.push(move_l_dn_dn(4, 0)); // D4 = D0 (expect 211)
+
+        words.push(MOVEQ_D0_0); // D0 = funcOffset (0)
+        words.push(movea_dn(0, 3)); // A0 = D3 (old entry) -- restore
+        push_jsr(&mut words, 6, -420); // SetFunction -> restores original
+
+        push_jsr(&mut words, 1, test_lvo); // call a third time -> back to original
+        words.push(move_l_dn_dn(5, 0)); // D5 = D0 (expect 111 again)
+
+        push_subi_l(&mut words, 2, 111);
+        push_subi_l(&mut words, 4, 211);
+        push_subi_l(&mut words, 5, 111);
+        words.push(or_l_dn_dn(2, 4));
+        words.push(or_l_dn_dn(2, 5));
+        words.push(move_l_dn_dn(0, 2));
+        words.push(RTS);
+
+        // The hook itself: chain through the saved "old entry" (still in
+        // D3), then add 100. Placed after the main program's own `rts`,
+        // so it's only ever reached via the JMP SetFunction installs,
+        // never by falling through.
+        let hook_addr = entry + (words.len() as u32) * 2;
+        words.push(movea_dn(2, 3)); // A2 = D3 (old entry)
+        push_jsr(&mut words, 2, 0); // chain through -> D0 = 111
+        push_addi_l(&mut words, 0, 100); // D0 += 100 -> 211
+        words.push(RTS);
+
+        words[a0_patch_at + 1] = (hook_addr >> 16) as u16;
+        words[a0_patch_at + 2] = hook_addr as u16;
+
+        let mut rt = runtime_with_program(&words);
+        rt.table.register(
+            &mut rt.mem,
+            test_lib_base,
+            test_lvo,
+            "test.library",
+            "Fake",
+            |ctx: &mut HandlerContext<'_, M68kCpu>| {
+                ctx.cpu.set_data_register(DataRegister(0), 111);
+                Ok(())
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "expected baseline 111, chained-hook 211, and restored 111"
+        );
     }
 }
