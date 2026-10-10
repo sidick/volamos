@@ -326,7 +326,7 @@ from. `--clock-mhz` implies the plain interpreter path either way
 (equivalent to `--no-jit`, the default) — only an *explicit* `--jit` on
 top of it is refused.
 
-Also cannot be combined with [`--sanitize`](#--sanitize): the
+Also cannot be combined with [`--sanitize`](#-sanitize): the
 cycle-counted execution path `--clock-mhz` uses
 (`M68kCpu::run_via_cycles`) doesn't run the sanitizer's per-instruction
 shadow-map hooks at all, so `--sanitize` would silently check nothing
