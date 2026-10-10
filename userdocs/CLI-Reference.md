@@ -49,6 +49,11 @@ overflow, an invalid instruction). In every one of those cases volamos
 prints a diagnostic to stderr naming exactly what went wrong before
 exiting. `--help` and `--version` exit `0`.
 
+The one case where a normal run's own exit code is overridden: under
+[`--sanitize`](#-sanitize), a run that reported any violation exits
+`99` instead of the guest's own code, so a harness that only checks
+the exit status doesn't pass a run that corrupted memory.
+
 ## `-v`, `--verbose`
 
 Logs every emulated library call to stderr as it happens — library

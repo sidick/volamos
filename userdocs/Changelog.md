@@ -5,6 +5,27 @@ version scheme in `Cargo.toml`.
 
 ## 0.9
 
+- **`--sanitize` exits `99` on a violation, and no longer misreports a
+  `longjmp` return as a stack-smash** (issue #118). A `longjmp` returns
+  through its `setjmp` slot, which a later call's frame may still
+  occupy if nothing unwound it first — the check now recognizes a
+  return landing on a reused slot instead of reporting it. Separately,
+  a run that logged any violation now exits with status `99` instead
+  of the guest's own exit code, so a harness that only checks the exit
+  status doesn't pass a run that corrupted memory; a program started
+  with `System()`/`Execute()` from inside the run still returns its
+  own code to its caller.
+
+- **The current task is now a real CLI process, and a bare `System()`
+  command is looked up in `C:`** (issue #117). The task previously had
+  `pr_CIS`/`pr_COS`/`pr_ConsoleTask` all zero, so startup code reading
+  them directly instead of calling `Input()`/`Output()` — DICE's does —
+  ran with no stdin, stdout or stderr; `SelectInput`/`SelectOutput` now
+  keep those fields in step. Separately, a `System()`/`Execute()`
+  command with no volume was resolved only against the current
+  directory, but the real shell also searches `C:` — SAS/C's `sc`
+  invokes its linker as `slink WITH ...` and failed on exactly this.
+
 - **Dispatch now recognizes task-struct corruption instead of
   misreporting it as stack bounds.** `check_stack_bounds` reads
   `tc_SPLower`/`tc_SPUpper` fresh from guest memory on every dispatched
