@@ -60,7 +60,13 @@ gap, not a bug in your program, and worth filing an issue for.
   can chain through to the original behavior exactly like real
   `SetFunction` callers do. Doesn't support patching an auto-created
   fake (vamos-escape-hatch) library's jump table, since those don't
-  have the real 6-byte-per-vector spacing a `JMP abs.l` needs.
+  have the real 6-byte-per-vector spacing a `JMP abs.l` needs. A patch
+  is purely in-memory for the single guest run that installed it —
+  there's no persistence across separate `volamos` invocations and no
+  shared system-wide library state, so this is only useful for testing
+  a program's own hooking logic against itself, not for anything
+  resembling a real system-wide patch tool (`Enforcer`, `SnoopDos`) —
+  see the "Deliberately out of scope" note below on why.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
 

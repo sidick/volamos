@@ -22,7 +22,12 @@ version scheme in `Cargo.toml`.
   behavior — the common real-world `SetFunction` idiom — works, not
   just a bare patch/restore pair. Doesn't yet support patching an
   auto-created fake (vamos-escape-hatch) library's jump table, which
-  lacks the real 6-byte-per-vector spacing a `JMP abs.l` needs.
+  lacks the real 6-byte-per-vector spacing a `JMP abs.l` needs. A patch
+  only affects the single guest run that installed it — there's no
+  persistence across separate `volamos` invocations or shared
+  system-wide library state, so this is for testing a program's own
+  hooking logic against itself, not emulating a real system-wide patch
+  tool.
 
 - **`--sanitize` exits `99` on a violation, and no longer misreports a
   `longjmp` return as a stack-smash** (issue #118). A `longjmp` returns

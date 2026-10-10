@@ -45,7 +45,24 @@
 //! its target back out), so recognizing "is this a stub" never comes up;
 //! the entry's own content always says what to do next.
 //!
-//! # Known limitation
+//! # Known limitations
+//!
+//! This patches one [`crate::dispatch::Runtime`]'s own in-memory jump
+//! table -- there's no persistence across separate `volamos`
+//! invocations, and no shared system-wide library state for a patch to
+//! affect at all. On real AmigaOS, `SetFunction` matters precisely
+//! because *every* process shares one running `exec.library` instance,
+//! so a patch installed by one program (a debugger, `Enforcer`,
+//! `SnoopDos`) stays in effect for every other program that runs
+//! afterwards, until something undoes it or the machine reboots.
+//! `volamos` runs one guest process per invocation, from a freshly
+//! built jump table each time (see `userdocs/Supported-Libraries.md`'s
+//! "Deliberately out of scope" note on cross-process state) -- so a
+//! patch is only ever visible to the same guest run that installed it,
+//! for exactly as long as that run lasts. Useful for testing a
+//! program's own hooking logic against itself (chain-through, restore,
+//! re-entrant calls), not for anything resembling a real system-wide
+//! patch tool.
 //!
 //! A fake (vamos-escape-hatch) library's whole jump-table block is one
 //! repeated trap opcode with no inter-entry padding (see
