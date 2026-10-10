@@ -142,7 +142,7 @@ Unlike `vamos`'s broader auto-assign machinery (which makes *any* name
 resolve somewhere), only these specific real-AmigaOS names are
 covered: a genuinely unknown or typo'd volume name still fails loudly
 with an `IoErr()`, matching every other case in this page. See
-[CLI Reference](CLI-Reference.md#--defaults---no-defaults) for
+[CLI Reference](CLI-Reference.md#-defaults-no-defaults) for
 `--defaults`/`--no-defaults`/`--volumes-dir`.
 
 ## Case sensitivity
