@@ -3,7 +3,51 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## 0.8
+## 0.9
+
+- **Dispatch now recognizes task-struct corruption instead of
+  misreporting it as stack bounds.** `check_stack_bounds` reads
+  `tc_SPLower`/`tc_SPUpper` fresh from guest memory on every dispatched
+  trap, but a guest that overflows its stack without making a single
+  library call in between can push `A7` all the way down through the
+  task struct before the next trap gets a chance to fire — by then the
+  "bounds" it reads are stack debris, not real bounds, and the old
+  message presented that debris as the task's stack and suggested a
+  larger `--stack`, a knob that can't help. Inverted bounds
+  (`lower > upper`) are unambiguous: no runtime code path ever produces
+  them. The diagnostic now says what actually happened — the task
+  struct was overwritten and the overflow predates this call — instead
+  of printing garbage numbers as if they meant something. Found
+  debugging a Rust/LLVM-m68k guest whose panic handler re-panicked
+  forever (an LLVM M68k backend miscompile), descending ~16 MB of stack
+  with no trap in between.
+
+- **Loader: support `HUNK_RELRELOC32`** (`0x3FD`) (issue #116). Same
+  on-disk shape as `HUNK_RELOC32` (a `uint32` count/hunk-number/offsets
+  list), but the arithmetic is PC-relative rather than absolute:
+  `mem[loc] += target_hunk_addr - (this_hunk_addr + loc)`. Hit loading
+  a real `rustc`-for-m68k-Amiga `-fPIC`-style binary that volamos
+  previously rejected outright as an unrecognized hunk type.
+
+- **Math libraries: condition codes extended to the basic arithmetic
+  functions** (issue #113). Follows up #112's `SPCmp`/`SPTst` fix:
+  verified against real Kickstart 3.1 (40.68) via Copperline that
+  mathffp.library's `SPAdd`/`SPSub`/`SPMul`/`SPDiv`/`SPAbs`/`SPNeg`/
+  `SPCeil`/`SPFloor` also set `N`/`Z` to match the result's actual
+  sign/zero-ness, not just the compare/test functions. Added real
+  regression coverage that branches on the condition codes directly
+  (SAS/C's own idiom), since the existing tests only ever checked `D0`.
+  IEEE single-precision arithmetic's flags were left alone pending
+  follow-up — probing them on real hardware hit an unexplained crash
+  partway through verification.
+
+- **Math libraries: `Cmp`/`Tst` now set the condition codes** (issue
+  #112). `IEEEDPCmp`, `IEEEDPTst`, `IEEESPCmp`, `IEEESPTst`, `SPCmp` and
+  `SPTst` returned their result in `D0` only, but the real ROM also
+  leaves it in the condition codes — and SAS/C's `scmieee.lib` branches
+  on those without looking at `D0`, so every double comparison in a
+  SAS/C program read as equal and `exp()` returned `HUGE_VAL` from its
+  overflow check.
 
 - **`--clock-mhz` reports native-handler call counts at exit**
   (issue #109). Native library handlers (`CopyMem`, `Write`, ...) run in
@@ -53,6 +97,43 @@ version scheme in `Cargo.toml`.
       to stderr.
     - Diagnostic wording for parse errors is clap's, so anything
       matching the old exact stderr text needs updating.
+
+- **`--clock-mhz` reports instruction and bus-access counts alongside
+  emulated cycles** (issue #107). A second stderr line at exit —
+  instructions executed, bus accesses split into read/write, and the
+  derived cycles-per-instruction and accesses-per-instruction ratios —
+  makes a run's memory intensity visible from the run itself. volamos
+  bills no bus wait states, so its emulated time is close to real
+  hardware for arithmetic-bound code and very optimistic for bus-bound
+  code — measured between 1.02x and 25x against cycle-paced hardware on
+  real benchmarks (issue #105), and accesses-per-instruction is the
+  number that says which end of that range a given workload sits at.
+  `read` includes instruction fetch, so its floor sits a little above
+  1.0; `write` carries no fetch component and is the cleaner signal.
+
+- **`--clock-mhz` reports total emulated cycles at exit** (issue #104).
+  Previously the cycle counter was only reachable indirectly — a guest
+  had to call `ReadEClock` and report its own elapsed time, which works
+  for an instrumented benchmark but leaves a plain binary unmeasurable,
+  where `vamos -v` has printed an equivalent "total cycles:" line all
+  along. The new exit line goes to stderr (so a harness parsing the
+  guest's own stdout never sees it) and prints even when the run ends
+  in an error. Cross-checked against vamos on the same binary: within
+  0.3%–1.0% agreement between the `m68k` crate's timing tables and
+  Musashi's, two independently-implemented cycle models.
+
+- **Added `--clock-mhz`: emulated time from `ReadEClock`** (issue
+  #102). Makes `timer.device`'s `ReadEClock` report time derived from
+  the CPU's own emulated m68k cycle count at a configurable rate,
+  instead of host wall-clock time, so compiler A/B benchmarks under
+  volamos are reproducible and independent of host load. Errors
+  cleanly when combined with `--sanitize` (the cycle-counted run path
+  never calls the sanitizer's per-instruction hooks, which would leave
+  its shadow tracking silently stale) or an explicit `--jit` (the trace
+  JIT never tracks a cycle count). `GetSysTime`/`TR_GETSYSTIME`/
+  `DateStamp`/`CurrentTime` are untouched; real hardware derives the
+  E-Clock from chipset timing, not the CPU clock, so `D0` always
+  reports `ECLOCK_PAL_HZ` regardless of the configured rate.
 
 - **`--sanitize` no longer reports a recycled heap block as
   use-after-free** (issue #95, reported by Bernie Innocenti). Once a run
