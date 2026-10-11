@@ -2085,8 +2085,9 @@ impl<C: Cpu + 'static> Runtime<C> {
         // text, and printing it) -- see crate::dosfault's module docs.
         crate::dosfault::register_dosfault_handlers(&mut table, &mut mem);
 
-        // dos.library DateStamp (current date/time as a DateStamp) --
-        // see crate::dosdate's module docs.
+        // dos.library DateStamp/Delay/CompareDates (current date/time
+        // as a DateStamp, process delay, DateStamp comparison) -- see
+        // crate::dosdate's module docs.
         crate::dosdate::register_dosdate_handlers(&mut table, &mut mem);
 
         // dos.library DateToStr (DateStamp -> human-readable strings) --

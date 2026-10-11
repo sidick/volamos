@@ -28,6 +28,11 @@ version scheme in `Cargo.toml`.
   system-wide library state, so this is for testing a program's own
   hooking logic against itself, not emulating a real system-wide patch
   tool.
+- **`dos.library`'s `CompareDates`** — compares two `DateStamp`s
+  field by field (`ds_Days`, then `ds_Minute`, then `ds_Tick`),
+  returning a negative/zero/positive `D0` the same way real
+  `CompareDates` does. Was already in the LVO table but had no
+  handler registered; closes that gap.
 
 - **`--sanitize` exits `99` on a violation, and no longer misreports a
   `longjmp` return as a stack-smash** (issue #118). A `longjmp` returns

@@ -20,7 +20,7 @@ gap, not a bug in your program, and worth filing an issue for.
   template syntax every real `C:` command uses).
 - Environment variables: `GetVar`/`SetVar`/`DeleteVar`, backed by a
   real, directory-mapped `ENV:` volume.
-- Date/time: `StrToDate`/`DateToStr`/`DateStamp`.
+- Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.
 - Process/CLI: `Cli`/`GetProgramName`/`MaxCli`/`AllocDosObject`/
   `FreeDosObject` (`DOS_RDARGS` and `DOS_EXALLCONTROL`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.

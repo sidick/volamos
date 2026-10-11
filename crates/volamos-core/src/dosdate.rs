@@ -1,5 +1,6 @@
-//! `dos.library` `DateStamp`/`Delay`: current date/time, and
-//! suspending the calling process for a tick count.
+//! `dos.library` `DateStamp`/`Delay`/`CompareDates`: current date/time,
+//! suspending the calling process for a tick count, and comparing two
+//! `DateStamp`s.
 //!
 //! `DateStamp` found missing while running the real Workbench 3.1.4
 //! `C:/List` binary: it calls `DateStamp()` (presumably to timestamp
@@ -115,10 +116,40 @@ fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     Ok(())
 }
 
-/// Registers `DateStamp`/`Delay` onto [`DOS_LIBRARY_BASE`], looked up
-/// by name through [`DOS_LVOS`]. Called from
-/// [`crate::dispatch::Runtime::new`] alongside the other `dos.library`
-/// registrations.
+/// Reads a `struct DateStamp` at `addr` as `(ds_Days, ds_Minute, ds_Tick)`.
+fn read_datestamp<C: Cpu>(ctx: &HandlerContext<'_, C>, addr: u32) -> (i32, i32, i32) {
+    let days = ctx.mem.read_u32(addr.wrapping_add(DS_DAYS_OFFSET)) as i32;
+    let minute = ctx.mem.read_u32(addr.wrapping_add(DS_MINUTE_OFFSET)) as i32;
+    let tick = ctx.mem.read_u32(addr.wrapping_add(DS_TICK_OFFSET)) as i32;
+    (days, minute, tick)
+}
+
+/// `CompareDates` (`D1` = `struct DateStamp* date1`, `D2` = `struct
+/// DateStamp* date2`). `D0` = negative if `date1` is earlier than
+/// `date2`, 0 if equal, positive if later -- compared field by field
+/// (`ds_Days`, then `ds_Minute`, then `ds_Tick`), matching the field
+/// order's own significance. Cannot fail.
+fn compare_dates_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let date1_ptr = ctx.cpu.data_register(DataRegister(1));
+    let date2_ptr = ctx.cpu.data_register(DataRegister(2));
+    let date1 = read_datestamp(ctx, date1_ptr);
+    let date2 = read_datestamp(ctx, date2_ptr);
+
+    let diff = match date1.0.cmp(&date2.0) {
+        std::cmp::Ordering::Equal => match date1.1.cmp(&date2.1) {
+            std::cmp::Ordering::Equal => date1.2 - date2.2,
+            other => other as i32,
+        },
+        other => other as i32,
+    };
+    ctx.cpu.set_data_register(DataRegister(0), diff as u32);
+    Ok(())
+}
+
+/// Registers `DateStamp`/`Delay`/`CompareDates` onto
+/// [`DOS_LIBRARY_BASE`], looked up by name through [`DOS_LVOS`]. Called
+/// from [`crate::dispatch::Runtime::new`] alongside the other
+/// `dos.library` registrations.
 pub fn register_dosdate_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -143,6 +174,16 @@ pub fn register_dosdate_handlers<C: Cpu + 'static>(
             delay_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("Delay should be in DOS_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            DOS_LIBRARY_BASE,
+            DOS_LVOS,
+            "dos.library",
+            "CompareDates",
+            compare_dates_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("CompareDates should be in DOS_LVOS: {e}"));
 }
 
 #[cfg(test)]
@@ -246,6 +287,70 @@ mod tests {
         assert!(days > 8_000);
         assert!((0..1440).contains(&minute));
         assert!((0..3000).contains(&tick));
+    }
+
+    fn run_compare_dates(date1: (i32, i32, i32), date2: (i32, i32, i32)) -> i32 {
+        let date1_addr = TRAP_TABLE_END + 0x100;
+        let date2_addr = date1_addr + 12;
+
+        let words = [
+            0x223C, // move.l #imm32,D1
+            (date1_addr >> 16) as u16,
+            date1_addr as u16,
+            0x243C, // move.l #imm32,D2
+            (date2_addr >> 16) as u16,
+            date2_addr as u16,
+            0x4EAE,           // jsr disp16(a6)
+            (-738i16) as u16, // CompareDates
+            0x4E75,           // rts
+        ];
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let mut offset = TRAP_TABLE_END;
+        for &w in &words {
+            mem.write_u16(offset, w);
+            offset += 2;
+        }
+        mem.write_u32(date1_addr + DS_DAYS_OFFSET, date1.0 as u32);
+        mem.write_u32(date1_addr + DS_MINUTE_OFFSET, date1.1 as u32);
+        mem.write_u32(date1_addr + DS_TICK_OFFSET, date1.2 as u32);
+        mem.write_u32(date2_addr + DS_DAYS_OFFSET, date2.0 as u32);
+        mem.write_u32(date2_addr + DS_MINUTE_OFFSET, date2.1 as u32);
+        mem.write_u32(date2_addr + DS_TICK_OFFSET, date2.2 as u32);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: date2_addr + 0x20,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn end_to_end_compare_dates_equal() {
+        assert_eq!(run_compare_dates((100, 200, 300), (100, 200, 300)), 0);
+    }
+
+    #[test]
+    fn end_to_end_compare_dates_date1_earlier_by_days() {
+        assert!(run_compare_dates((100, 200, 300), (101, 0, 0)) < 0);
+    }
+
+    #[test]
+    fn end_to_end_compare_dates_date1_later_by_minute() {
+        assert!(run_compare_dates((100, 201, 0), (100, 200, 999)) > 0);
+    }
+
+    #[test]
+    fn end_to_end_compare_dates_date1_earlier_by_tick_only() {
+        assert!(run_compare_dates((100, 200, 300), (100, 200, 301)) < 0);
     }
 
     #[test]
