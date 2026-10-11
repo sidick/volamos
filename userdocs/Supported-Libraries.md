@@ -8,6 +8,14 @@ listed here, volamos fails loudly with a diagnostic naming the exact
 library and function, rather than silently misbehaving — that's a real
 gap, not a bug in your program, and worth filing an issue for.
 
+`--libs-dir HOSTDIR` is an escape hatch from this: any library whose
+filename (matching the Amiga library name exactly) is found in
+`HOSTDIR` loads and runs as real 68k code instead, for the whole run.
+Useful for benchmarking a real library against this runtime's own
+implementation, or testing a replacement library (e.g. a custom
+`graphics.library`) against real guest programs. Opt-in only; see the
+Changelog.
+
 ## dos.library
 
 - File I/O: `Open`/`Read`/`Write`/`Seek`/`Close`, `Input`/`Output`,

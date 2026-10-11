@@ -182,6 +182,13 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "layers.library",
 ];
 
+/// The `Vfs` volume name a `--libs-dir` override directory is mounted
+/// onto (see [`Runtime::enable_libs_dir_override`]). Internal-only --
+/// never a real Amiga volume name a guest program would reference
+/// itself -- so it's deliberately not a legal-looking one; chosen only
+/// to be distinct from anything a real `-V`/`-a` could plausibly name.
+pub const LIBS_DIR_OVERRIDE_VOLUME: &str = "VOLAMOSLIBSOVERRIDE";
+
 /// Guest address of the exit sentinel: the last word inside the reserved
 /// jump-table region, deliberately kept clear of any library base's
 /// negative-offset range (all real library bases used here sit at or
@@ -1619,6 +1626,43 @@ fn open_library_common<C: Cpu>(
     name: &str,
     requested_version: u32,
 ) -> Result<(), DispatchError> {
+    // `--libs-dir` override (see [`Runtime::enable_libs_dir_override`]):
+    // checked before everything else below, including a `Real`/`Faked`
+    // registry hit -- the whole point of this flag is to let a real
+    // disk-loaded library stand in for this runtime's own native
+    // implementation of the *same* name. A miss here (the override
+    // directory doesn't have this library) falls straight through to
+    // the normal resolution below, unchanged. A hit that fails to load
+    // is a hard error, not a fallback to the fake-stub path below --
+    // unlike the ordinary tier 2 case, this file was explicitly
+    // pointed at by the user, so a structural failure here is much
+    // more likely a real mistake worth surfacing loudly than a
+    // not-yet-real-loadable corpus binary to keep working around.
+    if ctx.dos.libs_dir_override {
+        let override_path = format!("{LIBS_DIR_OVERRIDE_VOLUME}:{name}");
+        let present = ctx
+            .dos
+            .vfs
+            .as_ref()
+            .is_some_and(|vfs| vfs.resolve(&override_path, ResolveMode::MustExist).is_ok());
+        if present {
+            return match crate::execlib::begin_open(ctx, name, &override_path, requested_version)? {
+                crate::execlib::LoadAttempt::Started => Ok(()),
+                crate::execlib::LoadAttempt::StructuralFailure(reason) => {
+                    Err(DispatchError::HandlerFailed {
+                        library: "exec.library".to_string(),
+                        lvo: -552,
+                        handler_name: "OpenLibrary".to_string(),
+                        message: format!(
+                            "--libs-dir override for {name:?} ({override_path}) failed to \
+                             load: {reason}"
+                        ),
+                    })
+                }
+            };
+        }
+    }
+
     if let Some((base, kind)) = ctx.registry.lookup(name) {
         if kind == LibraryKind::Loaded {
             return crate::execlib::reopen(ctx, name, base, requested_version);
@@ -2513,6 +2557,25 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// `IoErr`/`SetIoErr` work either way.
     pub fn set_vfs(&mut self, vfs: Vfs) {
         self.dos.vfs = Some(vfs);
+    }
+
+    /// Enables the `--libs-dir` override: `OpenLibrary` checks the
+    /// [`LIBS_DIR_OVERRIDE_VOLUME`] volume first, before this runtime's
+    /// own native/fake library resolution, for every subsequent
+    /// `OpenLibrary` call -- see [`open_library_common`]'s doc for the
+    /// full tier ordering. Must be called *after* [`Self::set_vfs`]
+    /// with a [`Vfs`] that already has [`LIBS_DIR_OVERRIDE_VOLUME`]
+    /// mounted onto the override's host directory (a CLI's own job --
+    /// `crates/volamos/src/main.rs`'s `vfs_config_from_opts` adds it
+    /// onto `VfsConfig.volumes` whenever `--libs-dir` was given), or
+    /// every `OpenLibrary` call simply finds nothing there and falls
+    /// through to the normal resolution unchanged.
+    ///
+    /// Deliberately opt-in, like [`Self::enable_bsdsocket`]: swapping a
+    /// native implementation for real, unvalidated 68k code is exactly
+    /// the kind of thing that must never happen by default.
+    pub fn enable_libs_dir_override(&mut self) {
+        self.dos.libs_dir_override = true;
     }
 
     /// Registers `bsdsocket.library` as a real, `OpenLibrary`-able

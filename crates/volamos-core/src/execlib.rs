@@ -1695,6 +1695,27 @@ mod loaded_library_e2e {
         (tmp, vfs)
     }
 
+    /// As [`vfs_with_libs_file`], but mounts [`crate::dispatch::
+    /// LIBS_DIR_OVERRIDE_VOLUME`] onto the file's directory instead of
+    /// `LIBS:` -- for `--libs-dir` override tests. No `LIBS:` assign at
+    /// all, so a miss on the override volume falls through to this
+    /// runtime's normal (fake-stub/NULL) resolution, exactly like a
+    /// real invocation with `--libs-dir` but no other `-V`/`-a` flags.
+    fn vfs_with_override_file(tag: &str, file_name: &str, bytes: &[u8]) -> (TempDir, Vfs) {
+        let tmp = TempDir::new(tag);
+        fs::write(tmp.path().join(file_name), bytes).unwrap();
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![(
+                crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME.to_string(),
+                tmp.path().to_path_buf(),
+            )],
+            cwd: format!("{}:", crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME),
+            ..Default::default()
+        })
+        .expect("build vfs");
+        (tmp, vfs)
+    }
+
     pub(super) fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
         let mut offset = addr;
         for &w in words {
@@ -1794,6 +1815,44 @@ mod loaded_library_e2e {
             },
         );
         rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+        (result, rt)
+    }
+
+    /// As [`run_against_library`], but mounts `lib_bytes` onto the
+    /// `--libs-dir` override volume ([`vfs_with_override_file`]) and
+    /// calls [`Runtime::enable_libs_dir_override`] instead of
+    /// configuring an ordinary `LIBS:` assign.
+    fn run_against_override_library(
+        tag: &str,
+        lib_file_name: &str,
+        lib_bytes: &[u8],
+        lib_name: &[u8],
+        mut words: Vec<u16>,
+    ) -> (Result<i32, RuntimeError>, Runtime<M68kCpu>) {
+        let entry = TRAP_TABLE_END;
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, lib_name);
+
+        let (_tmp, vfs) = vfs_with_override_file(tag, lib_file_name, lib_bytes);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + lib_name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        rt.enable_libs_dir_override();
         let mut out = Vec::new();
         let result = rt.run(&mut out, None);
         (result, rt)
@@ -2166,6 +2225,102 @@ mod loaded_library_e2e {
                 assert_eq!(lvo, -6);
             }
             other => panic!("expected a HandlerFailed naming nores.library, got {other:?}"),
+        }
+    }
+
+    /// `--libs-dir` override: a real library present on the override
+    /// volume loads and runs for real, exactly like the ordinary
+    /// `LIBS:`-based tests above -- `OpenLibrary` returns a real base
+    /// whose `initFunc` genuinely ran (`lib_Revision`'s marker).
+    #[test]
+    fn libs_dir_override_present_loads_the_real_library() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary -> D0 = base
+        words.push(RTS);
+
+        let (result, rt) = run_against_override_library(
+            "override-present",
+            "test.library",
+            TESTLIB,
+            b"test.library\0",
+            words,
+        );
+        let base = result.expect("run should succeed") as u32;
+        assert_ne!(
+            base, 0,
+            "OpenLibrary should succeed via the override volume"
+        );
+        assert_eq!(
+            rt.memory().read_u16(base + LIB_REVISION_OFFSET),
+            INIT_MARKER,
+            "the override library's own initFunc should have really run"
+        );
+    }
+
+    /// `--libs-dir` override: a miss (the override volume doesn't have
+    /// this name) falls straight through to this runtime's normal
+    /// resolution, unchanged -- here, no `LIBS:` at all and not a
+    /// standard Workbench library, so `OpenLibrary` returns `NULL`
+    /// exactly like it would with no `--libs-dir` configured at all.
+    #[test]
+    fn libs_dir_override_miss_falls_through_unchanged() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary("other.library", 0) -> D0
+        words.push(RTS);
+
+        // The override volume only has `test.library`; this program asks
+        // for a different name, so nothing on it matches.
+        let (result, _rt) = run_against_override_library(
+            "override-miss",
+            "test.library",
+            TESTLIB,
+            b"other.library\0",
+            words,
+        );
+        assert_eq!(
+            result.expect("run should succeed"),
+            0,
+            "an unmatched name should fall through to NULL, same as with no --libs-dir"
+        );
+    }
+
+    /// `--libs-dir` override: a file present at the override's exact
+    /// name but structurally invalid (no `Resident`/romtag -- the same
+    /// `fixtures/hello` fixture [`library_with_no_resident_falls_back_to_fake_stub`]
+    /// uses) is a **hard error**, not a silent fallback to the
+    /// fake-stub path -- unlike the ordinary `LIBS:` tier, a
+    /// `--libs-dir` hit was explicitly pointed at by the user, so a
+    /// structural failure here is much more likely a real mistake
+    /// worth surfacing loudly.
+    #[test]
+    fn libs_dir_override_present_but_broken_is_a_hard_error() {
+        const HELLO: &[u8] = include_bytes!("../../../fixtures/hello");
+
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary -> should hard-error, never return
+        words.push(RTS);
+
+        let (result, _rt) = run_against_override_library(
+            "override-broken",
+            "nores.library",
+            HELLO,
+            b"nores.library\0",
+            words,
+        );
+        match result.unwrap_err() {
+            RuntimeError::Dispatch(DispatchError::HandlerFailed { handler_name, .. }) => {
+                assert_eq!(handler_name, "OpenLibrary");
+            }
+            other => panic!("expected a hard HandlerFailed error, got {other:?}"),
         }
     }
 

@@ -284,6 +284,15 @@ pub struct DosState {
     /// path-free calls (`Input`/`Output`/`PutStr`/`IoErr`/`SetIoErr`)
     /// still work.
     pub vfs: Option<Vfs>,
+    /// `--libs-dir` (see [`crate::dispatch::Runtime::enable_libs_dir_override`]):
+    /// when `true`, `OpenLibrary` checks the dedicated
+    /// [`crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME`] volume (mounted by
+    /// the caller onto the CLI's `--libs-dir` host directory, via `vfs`
+    /// above) before anything else -- a hit there loads and runs a real
+    /// 68k library in place of this runtime's native implementation, and
+    /// a present-but-broken file there is a hard error rather than a
+    /// silent fallback.
+    pub(crate) libs_dir_override: bool,
     /// Guest `FileHandle` struct address -> host backing.
     handles: HashMap<u32, HostHandle>,
     /// The current `IoErr()` value.
@@ -469,6 +478,7 @@ impl DosState {
     pub fn new(vfs: Option<Vfs>) -> Self {
         Self {
             vfs,
+            libs_dir_override: false,
             handles: HashMap::new(),
             io_err: 0,
             input_handle: None,

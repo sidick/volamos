@@ -204,6 +204,14 @@ struct Options {
     assigns: Vec<(String, Vec<String>)>,
     cwd: Option<String>,
     auto_assign_root: Option<PathBuf>,
+    /// `--libs-dir` (CLI-only, like `sanitize`/`clock_mhz` above --
+    /// kept out of `config::Overrides` deliberately: swapping a native
+    /// library implementation for real, unvalidated 68k code is exactly
+    /// the kind of thing a stale `~/.volamos`/`.volamos` shouldn't be
+    /// able to silently turn on for every future run in that directory).
+    /// `vfs_config_from_opts` mounts it onto
+    /// [`volamos_core::dispatch::LIBS_DIR_OVERRIDE_VOLUME`] when set.
+    libs_dir: Option<PathBuf>,
     stack_size: u32,
     ram_size: u32,
     cpu_type: CpuType,
@@ -273,6 +281,7 @@ impl Options {
             || !self.assigns.is_empty()
             || self.cwd.is_some()
             || self.auto_assign_root.is_some()
+            || self.libs_dir.is_some()
     }
 }
 
@@ -458,6 +467,23 @@ struct Cli {
                       ~/.volamos.d/volumes); ignored with --no-defaults."
     )]
     volumes_dir: Option<PathBuf>,
+
+    /// Load a real 68k library from HOSTDIR instead of this runtime's own implementation
+    #[arg(
+        long = "libs-dir",
+        value_name = "HOSTDIR",
+        help_heading = "Filesystem",
+        long_help = "Load a real 68k library file from HOSTDIR instead of volamos's native \
+                     implementation, for any library whose filename matches an Amiga library \
+                     name exactly (e.g. HOSTDIR/utility.library). A library not found there \
+                     falls back to this runtime's normal resolution, unchanged. A library \
+                     found there but structurally invalid (no Resident/romtag, not \
+                     RTF_AUTOINIT, ...) is a hard error, not a silent fallback -- useful for \
+                     testing a program against a real library implementation, or validating a \
+                     replacement library (e.g. a custom graphics.library) against real guest \
+                     programs."
+    )]
+    libs_dir: Option<PathBuf>,
 
     /// Guest stack size in bytes (default 65536); may be suffixed K (KiB) or M (MiB)
     #[arg(
@@ -817,6 +843,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         overrides,
         sanitize,
         cli.clock_mhz,
+        cli.libs_dir,
         cli.program,
         cli.guest_args,
     )
@@ -1067,6 +1094,7 @@ type RawParsedArgs = (
     config::Overrides,
     InstrumentationOptions,
     Option<f64>,
+    Option<PathBuf>,
     String,
     Vec<String>,
 );
@@ -1130,6 +1158,7 @@ fn resolve(
     overrides: config::Overrides,
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
+    libs_dir: Option<PathBuf>,
     cli_jit: Option<bool>,
     program: String,
     guest_args: Vec<String>,
@@ -1159,6 +1188,7 @@ fn resolve(
         assigns: overrides.assigns,
         cwd: overrides.cwd,
         auto_assign_root: overrides.auto_assign_root,
+        libs_dir,
         stack_size: overrides.stack_size.unwrap_or(DEFAULT_STACK_SIZE),
         ram_size: overrides.ram_size.unwrap_or(DEFAULT_RAM_SIZE),
         cpu_type: overrides.cpu_type.unwrap_or(CpuType::M68000),
@@ -1186,10 +1216,10 @@ fn resolve(
 /// module wants instead.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let (overrides, sanitize, clock_mhz, program, guest_args) = parse_args_raw(args)?;
+    let (overrides, sanitize, clock_mhz, libs_dir, program, guest_args) = parse_args_raw(args)?;
     let cli_jit = overrides.jit;
     Ok(resolve(
-        overrides, sanitize, clock_mhz, cli_jit, program, guest_args,
+        overrides, sanitize, clock_mhz, libs_dir, cli_jit, program, guest_args,
     ))
 }
 
@@ -1226,8 +1256,22 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
     if !opts.wants_vfs() {
         return None;
     }
+    let mut volumes = opts.volumes.clone();
+    if let Some(dir) = &opts.libs_dir {
+        // Mounted under a dedicated, internal-only volume name -- see
+        // `volamos_core::dispatch::LIBS_DIR_OVERRIDE_VOLUME`'s doc --
+        // rather than onto `LIBS:` itself, so a `--libs-dir` override
+        // never shadows an ordinary `-V`/`-a`-configured `LIBS:` for
+        // anything other than the libraries `Runtime::
+        // enable_libs_dir_override`'s own dedicated dispatch tier
+        // explicitly checks it for.
+        volumes.push((
+            volamos_core::dispatch::LIBS_DIR_OVERRIDE_VOLUME.to_string(),
+            dir.clone(),
+        ));
+    }
     Some(VfsConfig {
-        volumes: opts.volumes.clone(),
+        volumes,
         assigns: opts.assigns.clone(),
         auto_assign_root: opts.auto_assign_root.clone(),
         cwd: default_cwd(opts),
@@ -1486,6 +1530,7 @@ fn run_nested_program(
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
     net: bool,
+    libs_dir_override: bool,
 ) -> i32 {
     let Ok(bytes) = std::fs::read(host_path) else {
         return -1;
@@ -1552,6 +1597,9 @@ fn run_nested_program(
             Err(_) => return -1,
         }
     }
+    if libs_dir_override {
+        runtime.enable_libs_dir_override();
+    }
     if let Some(dir) = host_path.parent() {
         runtime.set_program_dir(dir);
     }
@@ -1587,6 +1635,9 @@ fn build_runtime_with_vfs(
         let vfs =
             Vfs::new(vfs_config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
         runtime.set_vfs(vfs);
+    }
+    if opts.libs_dir.is_some() {
+        runtime.enable_libs_dir_override();
     }
     if let Some(dir) = std::path::Path::new(&opts.program).parent() {
         runtime.set_program_dir(dir);
@@ -1719,6 +1770,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_clock_mhz = opts.clock_mhz;
 
     let nested_net = opts.net;
+    let nested_libs_dir_override = opts.libs_dir.is_some();
     runtime.set_system_runner(move |req| {
         run_nested_program(
             &req.resolved_program_host_path,
@@ -1733,6 +1785,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_sanitize.clone(),
             nested_clock_mhz,
             nested_net,
+            nested_libs_dir_override,
         )
     });
 
@@ -1941,7 +1994,7 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     cli.guest_args = guest_args;
-    let (cli_overrides, sanitize, clock_mhz, program, guest_args) = cli_to_raw(cli);
+    let (cli_overrides, sanitize, clock_mhz, libs_dir, program, guest_args) = cli_to_raw(cli);
 
     let file_overrides = match config::load_all(&program) {
         Ok(overrides) => overrides,
@@ -1974,7 +2027,9 @@ fn main() -> ExitCode {
         base
     };
 
-    let opts = resolve(merged, sanitize, clock_mhz, cli_jit, program, guest_args);
+    let opts = resolve(
+        merged, sanitize, clock_mhz, libs_dir, cli_jit, program, guest_args,
+    );
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same
@@ -2594,6 +2649,7 @@ mod tests {
             "--clock-mhz",
             "--sanitize-ignore-pc",
             "--volumes-dir",
+            "--libs-dir",
         ];
         expected.sort_unstable();
         assert_eq!(spellings, expected);
@@ -2988,13 +3044,13 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
 
@@ -3004,13 +3060,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _, _, _) =
+        let (overrides, _, _, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }

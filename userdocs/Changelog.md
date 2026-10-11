@@ -33,6 +33,19 @@ version scheme in `Cargo.toml`.
   returning a negative/zero/positive `D0` the same way real
   `CompareDates` does. Was already in the LVO table but had no
   handler registered; closes that gap.
+- **`--libs-dir HOSTDIR`** — loads a real 68k library file from
+  `HOSTDIR` instead of this runtime's own native implementation, for
+  any library whose filename matches an Amiga library name exactly
+  (e.g. `HOSTDIR/utility.library`), checked before this runtime's own
+  native/fake library resolution. A library not found there falls
+  back to normal resolution, unchanged; one found there but
+  structurally invalid (no `Resident`/romtag, not `RTF_AUTOINIT`, ...)
+  is a hard error, not a silent fallback to the fake-stub path --
+  useful for testing a program against a real library implementation
+  (benchmarking a real `utility.library` against this runtime's own),
+  or validating a replacement library (e.g. a custom `graphics.library`)
+  against real guest programs. Deliberately opt-in and CLI-only, not a
+  `~/.volamos`/`.volamos` config key.
 
 - **`--sanitize` exits `99` on a violation, and no longer misreports a
   `longjmp` return as a stack-smash** (issue #118). A `longjmp` returns
