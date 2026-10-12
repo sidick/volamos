@@ -275,6 +275,35 @@ impl M68kCpu {
         self.clock_hz = mhz.map(|mhz| mhz * 1_000_000.0);
     }
 
+    /// Flips the `m68k` crate's `CpuCore::emulate_unimplemented_060` flag
+    /// -- the CLI's `--fpsp-emulate` (issue #129). `false` (this struct's
+    /// default, via [`Self::new`]/[`Self::with_config`]) matches real
+    /// 68060 hardware: the instructions a real 68060 removed from
+    /// silicon -- most FPU transcendentals (FSIN/FCOS/FATAN/FETOX/FLOGN/
+    /// FMOD/FSCALE/FINT/FGETEXP/FGETMAN/FSINCOS/...) plus a handful of
+    /// integer ops (MOVEP, CHK2/CMP2, misaligned CAS/CAS2, 64-bit
+    /// MUL/DIV) -- take an "unimplemented instruction" exception instead
+    /// of executing, exactly as on real silicon; a real AmigaOS machine
+    /// only keeps 68040-FP-targeted binaries working because
+    /// `68060.library`'s FPSP/ISP kernels install exception-vector
+    /// handlers at boot (via `SetPatch`) to emulate them in software --
+    /// something volamos, with no persistent cross-process boot state,
+    /// has no equivalent of (see issue #129's discussion of why loading
+    /// a real `68060.library` isn't viable here).
+    ///
+    /// `true` instead asks the crate to execute those same instructions
+    /// natively, using its own built-in reference implementation
+    /// (`m68k::fpu::transcendental` backing the FPU subset) rather than
+    /// trapping -- an opt-in convenience for running an unmodified
+    /// 68040-FP binary under `--cpu 68060` without needing any real
+    /// `68060.library`/`fpsp.library` file or persistent boot state.
+    /// Deliberately **not** the default: real-hardware-faithful trapping
+    /// is what every other `--cpu` model already does here, and this
+    /// flag only exists to override that, one run at a time.
+    pub fn set_emulate_unimplemented_060(&mut self, on: bool) {
+        self.core.emulate_unimplemented_060 = on;
+    }
+
     /// Creates a new core for `cpu_type`, with `fpu_present` controlling
     /// whether F-line (coprocessor ID 1) opcodes execute as real FPU
     /// instructions or trap out to [`Cpu::take_hardware_exception`] --
@@ -957,6 +986,103 @@ mod tests {
                 })
             ),
             "a fitted FPU should decode this as a real instruction, not trap: {reason:?}"
+        );
+    }
+
+    // --- --fpsp-emulate (issue #129) ---
+    //
+    // MOVEP is one of the instructions a real 68060 removed from
+    // silicon (see `M68kCpu::set_emulate_unimplemented_060`'s doc);
+    // unlike the F-line/A-line traps this `backend` module routes
+    // through `Cpu::take_hardware_exception` itself, the `m68k` crate
+    // takes this one as a genuine CPU-level hardware exception directly
+    // inside `step` (reading the real vector 61 -- `UNIMPLEMENTED_
+    // INTEGER` -- from guest memory and jumping `PC` there), the same
+    // way real silicon does. volamos never populates that vector table
+    // slot (there is no `68060.library`/`SetPatch` here to do it), so
+    // on a fresh `FlatMemory` it reads back `0` -- a deterministic,
+    // distinctive "the exception was taken" signature these tests use
+    // instead of decoding `m68k`'s own internal step-result variants.
+
+    /// A `MOVEP.L (d16,A0), D0` opcode (mem-to-register, long): one of
+    /// the instructions `trap_unimpl_060` traps for real 68060 fidelity
+    /// -- see `m68k::core::decode`'s dispatch_group_0, which checks this
+    /// *before* consuming the following displacement word, so it's
+    /// enough to test standalone.
+    const MOVEP_L_MEM_TO_D0: u16 = 0x0148;
+
+    #[test]
+    fn movep_traps_on_m68060_by_default() {
+        // Default `emulate_unimplemented_060 = false` -- real-hardware
+        // fidelity -- must make MOVEP take the real vector-61 hardware
+        // exception instead of executing, exactly like real 68060
+        // silicon.
+        let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x3000);
+        cpu.set_address_register(AddressRegister(7), 0x3000);
+        // Displacement word (0) immediately follows the opcode; MOVEP
+        // traps before ever reading it, so its value doesn't matter.
+        load_words(&mut mem, TRAP_TABLE_END, &[MOVEP_L_MEM_TO_D0, 0x0000]);
+        cpu.set_data_register(DataRegister(0), 0xDEAD_BEEF);
+
+        cpu.step(&mut mem);
+
+        // `take_exception` jumps PC to whatever address vector 61 holds
+        // in guest memory; volamos never installs a real handler there
+        // (no SetPatch equivalent -- see issue #129), so a fresh,
+        // zero-filled `FlatMemory` reads back exactly 0. That's the
+        // real-hardware-exception signature this test is checking for
+        // -- the opcode's own fallthrough PC would be
+        // `TRAP_TABLE_END + 4`, never 0.
+        assert_eq!(
+            cpu.pc(),
+            0,
+            "expected the real vector-61 hardware exception to fire (PC jumped to the vector \
+             table's -- empty -- contents), but MOVEP executed instead"
+        );
+        assert_eq!(
+            cpu.data_register(DataRegister(0)),
+            0xDEAD_BEEF,
+            "D0 must be untouched -- the trap fires before MOVEP ever reads memory into it"
+        );
+    }
+
+    #[test]
+    fn movep_executes_natively_on_m68060_with_emulate_unimplemented_060() {
+        // Opt-in `--fpsp-emulate`: the same instruction now executes
+        // for real instead of trapping.
+        let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
+        cpu.set_emulate_unimplemented_060(true);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x3000);
+        cpu.set_address_register(AddressRegister(7), 0x3000);
+        let start = cpu.pc();
+        load_words(&mut mem, start, &[MOVEP_L_MEM_TO_D0, 0x0000]);
+        // A0 points at a scratch area well past the loaded opcode/
+        // displacement words; MOVEP.L reads one byte each at a 2-byte
+        // stride (addr, addr+2, addr+4, addr+6) into D0 -- i.e. just the
+        // high byte of each 16-bit word written below (big-endian, see
+        // FlatMemory::write_u16), not the whole word.
+        let scratch = start + 0x100;
+        cpu.set_address_register(AddressRegister(0), scratch);
+        mem.write_u16(scratch, 0x1200);
+        mem.write_u16(scratch + 2, 0x5600);
+        mem.write_u16(scratch + 4, 0x9A00);
+        mem.write_u16(scratch + 6, 0xDE00);
+
+        cpu.step(&mut mem);
+
+        assert_eq!(
+            cpu.pc(),
+            start + 4,
+            "MOVEP should execute and advance PC past the opcode + displacement word, not trap"
+        );
+        assert_eq!(
+            cpu.data_register(DataRegister(0)),
+            0x1256_9ADE,
+            "MOVEP.L should have assembled D0 from the high byte of each word at the 2-byte \
+             stride"
         );
     }
 

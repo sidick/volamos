@@ -250,6 +250,23 @@ struct Options {
     /// Mutually exclusive with `jit` and with `sanitize.enabled`: see
     /// [`check_clock_mhz_jit`]/[`check_clock_mhz_sanitize`].
     clock_mhz: Option<f64>,
+    /// `--fpsp-emulate` (issue #129): software-emulate the real-68060
+    /// "unimplemented instruction" set (most FPU transcendentals plus
+    /// MOVEP/CHK2/CMP2/misaligned-CAS2/64-bit-MUL-DIV) instead of
+    /// trapping -- see
+    /// [`volamos_core::backend::M68kCpu::set_emulate_unimplemented_060`]'s
+    /// doc for the full mechanism. Only meaningful with `--cpu 68060`;
+    /// a no-op for every other `--cpu` model, since the `m68k` crate's
+    /// `trap_unimpl_060` gate itself only fires for `CpuType::M68060`.
+    ///
+    /// `false` (real-hardware-faithful trapping, matching every other
+    /// `--cpu` model's default behavior) by default; CLI-only, like
+    /// `sanitize`/`net`/`clock_mhz` above -- kept out of
+    /// `config::Overrides` deliberately, since silently swapping real
+    /// hardware behavior (a trap) for software emulation is exactly the
+    /// kind of thing a stale `~/.volamos`/`.volamos` shouldn't be able
+    /// to turn on for every future run in that directory.
+    fpsp_emulate: bool,
     net: bool,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
@@ -541,6 +558,26 @@ struct Cli {
         help_heading = "Machine"
     )]
     no_fpu: bool,
+
+    /// Software-emulate 68060-unimplemented instructions instead of trapping (off by default)
+    #[arg(
+        long = "fpsp-emulate",
+        action = ArgAction::SetTrue,
+        help_heading = "Machine",
+        long_help = "Software-emulate the instructions a real 68060 removed from silicon --\
+                      most FPU transcendentals (FSIN/FCOS/FATAN/FETOX/FLOGN/FMOD/FSCALE/FINT/\
+                      FGETEXP/FGETMAN/FSINCOS/...) plus a handful of integer ops (MOVEP, \
+                      CHK2/CMP2, misaligned CAS/CAS2, 64-bit MUL/DIV) -- instead of taking an \
+                      \"unimplemented instruction\" exception, the way real hardware does \
+                      (that trap is what lets AmigaOS's 68060.library install FPSP/ISP \
+                      software-emulation handlers at boot; volamos has no equivalent of that \
+                      persistent, cross-process boot state, so this flag gets you the same \
+                      effect for a single run instead). Only meaningful with --cpu 68060; a \
+                      no-op for every other --cpu model. Off by default -- matching real \
+                      68060 hardware fidelity -- so a 68040-FP-targeted binary traps under \
+                      --cpu 68060 unless this is given."
+    )]
+    fpsp_emulate: bool,
 
     /// Batch-execute guest code via the trace JIT (default: no JIT)
     #[arg(
@@ -843,6 +880,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         overrides,
         sanitize,
         cli.clock_mhz,
+        cli.fpsp_emulate,
         cli.libs_dir,
         cli.program,
         cli.guest_args,
@@ -1089,11 +1127,14 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// clippy's `type_complexity` lint -- see that function's doc for what
 /// each element means; `Option<f64>` is `--clock-mhz`'s CLI-only value
 /// (issue #102), threaded alongside `InstrumentationOptions` for the
-/// same reason (see `Options::clock_mhz`'s doc).
+/// same reason (see `Options::clock_mhz`'s doc). The trailing `bool` is
+/// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc) --
+/// CLI-only for the same reason.
 type RawParsedArgs = (
     config::Overrides,
     InstrumentationOptions,
     Option<f64>,
+    bool,
     Option<PathBuf>,
     String,
     Vec<String>,
@@ -1154,10 +1195,12 @@ fn parse_args_raw(args: impl Iterator<Item = String>) -> Result<RawParsedArgs, S
 /// producing the final [`Options`] `run` consumes. Used both by
 /// [`parse_args`] (CLI-only, no config files) and by `main` (after
 /// merging CLI overrides with `~/.volamos`/`.volamos`).
+#[allow(clippy::too_many_arguments)] // internal helper; one param per CLI-only setting threaded past config::Overrides
 fn resolve(
     overrides: config::Overrides,
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
+    fpsp_emulate: bool,
     libs_dir: Option<PathBuf>,
     cli_jit: Option<bool>,
     program: String,
@@ -1197,6 +1240,7 @@ fn resolve(
         jit_source,
         sanitize,
         clock_mhz,
+        fpsp_emulate,
         net: overrides.net.unwrap_or(false),
         // Only ever non-empty when `overrides` already includes
         // `config::built_in_defaults`'s own layer -- `main` merges that
@@ -1216,10 +1260,18 @@ fn resolve(
 /// module wants instead.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let (overrides, sanitize, clock_mhz, libs_dir, program, guest_args) = parse_args_raw(args)?;
+    let (overrides, sanitize, clock_mhz, fpsp_emulate, libs_dir, program, guest_args) =
+        parse_args_raw(args)?;
     let cli_jit = overrides.jit;
     Ok(resolve(
-        overrides, sanitize, clock_mhz, libs_dir, cli_jit, program, guest_args,
+        overrides,
+        sanitize,
+        clock_mhz,
+        fpsp_emulate,
+        libs_dir,
+        cli_jit,
+        program,
+        guest_args,
     ))
 }
 
@@ -1529,6 +1581,7 @@ fn run_nested_program(
     jit: bool,
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
+    fpsp_emulate: bool,
     net: bool,
     libs_dir_override: bool,
 ) -> i32 {
@@ -1580,6 +1633,9 @@ fn run_nested_program(
     // Execute() run gets its own fresh cycle counter, starting at `0`
     // again, same as its own fresh CPU.
     cpu.set_clock_mhz(clock_mhz);
+    // --fpsp-emulate (issue #129): a nested System()/Execute() run shares
+    // the parent's --fpsp-emulate setting, same as it shares --cpu/--fpu.
+    cpu.set_emulate_unimplemented_060(fpsp_emulate);
     let mut runtime = Runtime::new(cpu, mem, config);
     if sanitize.dirty_heap {
         runtime.enable_dirty_heap();
@@ -1688,6 +1744,10 @@ fn run(opts: &Options) -> Result<i32, String> {
     // M68kCpu::set_clock_mhz's doc for how the two would conflict if it
     // weren't.
     cpu.set_clock_mhz(opts.clock_mhz);
+    // --fpsp-emulate (issue #129): only meaningful with --cpu 68060 (the
+    // `m68k` crate's own trap gate is keyed on `CpuType::M68060`), but
+    // harmless to set unconditionally for any other model.
+    cpu.set_emulate_unimplemented_060(opts.fpsp_emulate);
     let program_name = program_name_from_path(std::path::Path::new(&opts.program));
     let vfs_config = vfs_config_from_opts(opts);
 
@@ -1768,6 +1828,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_jit = opts.jit;
     let nested_sanitize = opts.sanitize.clone();
     let nested_clock_mhz = opts.clock_mhz;
+    let nested_fpsp_emulate = opts.fpsp_emulate;
 
     let nested_net = opts.net;
     let nested_libs_dir_override = opts.libs_dir.is_some();
@@ -1784,6 +1845,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_jit,
             nested_sanitize.clone(),
             nested_clock_mhz,
+            nested_fpsp_emulate,
             nested_net,
             nested_libs_dir_override,
         )
@@ -1994,7 +2056,8 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     cli.guest_args = guest_args;
-    let (cli_overrides, sanitize, clock_mhz, libs_dir, program, guest_args) = cli_to_raw(cli);
+    let (cli_overrides, sanitize, clock_mhz, fpsp_emulate, libs_dir, program, guest_args) =
+        cli_to_raw(cli);
 
     let file_overrides = match config::load_all(&program) {
         Ok(overrides) => overrides,
@@ -2028,7 +2091,14 @@ fn main() -> ExitCode {
     };
 
     let opts = resolve(
-        merged, sanitize, clock_mhz, libs_dir, cli_jit, program, guest_args,
+        merged,
+        sanitize,
+        clock_mhz,
+        fpsp_emulate,
+        libs_dir,
+        cli_jit,
+        program,
+        guest_args,
     );
 
     // Cleanup happens here, once, after `run` (and every nested
@@ -3034,6 +3104,40 @@ mod tests {
         assert!(check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled).is_ok());
     }
 
+    // --- --fpsp-emulate (issue #129) ---
+
+    #[test]
+    fn default_fpsp_emulate_is_off() {
+        // Real-hardware-faithful trapping is the default -- see
+        // `volamos_core::backend::M68kCpu::set_emulate_unimplemented_060`'s
+        // doc for why this must never silently flip on.
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.fpsp_emulate);
+    }
+
+    #[test]
+    fn fpsp_emulate_flag_turns_it_on() {
+        let opts = parse_args(args(&["--fpsp-emulate", "prog"])).unwrap();
+        assert!(opts.fpsp_emulate);
+    }
+
+    #[test]
+    fn fpsp_emulate_is_cli_only_not_a_config_override() {
+        // Like --sanitize/--net/--clock-mhz, this must never be settable
+        // via ~/.volamos/.volamos -- see `Options::fpsp_emulate`'s doc.
+        // `cli_to_raw`'s `config::Overrides` literal has no field for
+        // it at all, so this is really just documenting the invariant:
+        // the flag's value flows out of `cli_to_raw` as a plain `bool`
+        // alongside (not inside) `overrides`.
+        let (overrides, _, _, fpsp_emulate, _, _, _) =
+            parse_args_raw(args(&["--fpsp-emulate", "prog"])).unwrap();
+        assert!(fpsp_emulate);
+        // `Overrides` has no `fpsp_emulate` field to assert on by name;
+        // the absence of one is exactly the point -- a stray
+        // `FPSP_EMULATE=` key in a config file has no field to land in.
+        let _ = overrides;
+    }
+
     // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---
     //
     // `standard_volumes`/`volumes_dir` are consumed by `main` before
@@ -3044,13 +3148,14 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _, _, _, _) = parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _) =
+            parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
 
@@ -3060,13 +3165,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }

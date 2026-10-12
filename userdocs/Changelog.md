@@ -5,6 +5,24 @@ version scheme in `Cargo.toml`.
 
 ## 0.9
 
+- **`--fpsp-emulate`** (issue #129) — software-emulates the
+  instructions a real 68060 removed from silicon (most FPU
+  transcendentals — FSIN/FCOS/FATAN/FETOX/FLOGN/FMOD/FSCALE/FINT/
+  FGETEXP/FGETMAN/FSINCOS/... — plus a handful of integer ops: MOVEP,
+  CHK2/CMP2, misaligned CAS/CAS2, 64-bit MUL/DIV) instead of taking a
+  real "unimplemented instruction" exception for them, only meaningful
+  together with `--cpu 68060`. Off by default, matching real 68060
+  hardware fidelity — without it, a 68040-FP-targeted binary traps the
+  same way it would on real silicon, since volamos has no equivalent
+  of `68060.library`'s boot-time (`SetPatch`) exception-vector
+  patching to emulate them for every later process the way real
+  AmigaOS does. The `m68k` crate backing this runtime already had both
+  the real-hardware trapping behavior and a reference software
+  implementation to fall back to (`emulate_unimplemented_060`); this
+  just exposes the existing flag on volamos's own CLI. CLI-only, like
+  `--sanitize`/`--net`/`--clock-mhz` — not a `~/.volamos`/`.volamos`
+  config key — and propagates to a nested `System()`/`Execute()`/
+  `RunCommand()` run the same way those do.
 - **`exec.library`'s `SetFunction`** — patches a single library
   jump-table entry with a real `JMP` to guest code and returns a
   function pointer the caller can chain through to the original
