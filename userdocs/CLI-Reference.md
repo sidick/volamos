@@ -4,7 +4,7 @@
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
-        [--fpu|--no-fpu] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
+        [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--net]
         <program> [args...]
 ```
@@ -268,6 +268,39 @@ volamos --cpu 68020 --fpu fixtures/hello
     determined by how the program itself was written/compiled — it
     just decides whether real F-line instructions execute instead of
     trapping.
+
+## `--fpsp-emulate`
+
+Software-emulates the instructions a real 68060 removed from silicon
+— most FPU transcendentals (`FSIN`/`FCOS`/`FATAN`/`FETOX`/`FLOGN`/
+`FMOD`/`FSCALE`/`FINT`/`FGETEXP`/`FGETMAN`/`FSINCOS`/...) plus a
+handful of integer ops (`MOVEP`, `CHK2`/`CMP2`, misaligned `CAS`/
+`CAS2`, 64-bit `MUL`/`DIV`) — instead of taking the real "unimplemented
+instruction" exception a genuine 68060 does for them. Only meaningful
+with `--cpu 68060`; a no-op for every other `--cpu` model. Default:
+off — real 68060 hardware fidelity, matching every other `--cpu`
+model's default behavior.
+
+```sh
+volamos --cpu 68060 --fpu --fpsp-emulate a-68040-fp-binary
+```
+
+On real hardware, that trap is exactly what lets AmigaOS's
+`68060.library` install FPSP/ISP software-emulation handlers at boot
+(via `SetPatch`) — which is how a 68040-FP-targeted binary keeps
+working on a real 68060 machine without ever being recompiled.
+volamos has no equivalent of that persistent, cross-process boot
+state (every invocation is a single, fresh guest process, with no
+"patch once at boot, every later process inherits it" mechanism), so
+loading a real `68060.library` isn't a viable substitute here — this
+flag gets you the same practical effect for a single run instead,
+without needing any real `68060.library`/`fpsp.library` file at all.
+
+CLI-only: unlike most flags on this page, `--fpsp-emulate` can't be
+set in `~/.volamos`/`.volamos` — silently swapping real hardware
+behavior (a trap) for software emulation is exactly the kind of thing
+a stale config file shouldn't be able to turn on for every future run
+in a directory.
 
 ## `--jit`, `--no-jit`
 
