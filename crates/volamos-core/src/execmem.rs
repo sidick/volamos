@@ -755,23 +755,27 @@ fn cache_clear_e_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(),
     Ok(())
 }
 
-/// `TypeOfMem` (LVO -534): `A1` = address, `D0` = attributes. This
-/// runtime's guest RAM is one flat range (`AllocMem` accepts and ignores
-/// `MEMF_CHIP`/`MEMF_FAST`, see their docs), so every address from the
-/// end of the reserved low region (trap table, fake `ExecBase`) up to the
-/// end of guest memory reports `MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST` --
-/// both kinds at once, since anything `AllocMem` hands out satisfies a
-/// request for either, and a guest deciding "is this chip RAM, do I need
-/// to copy it?" then correctly sees it as DMA-able. (Real exec never
-/// reports both bits for one address.) Anything else, including the
-/// reserved region, is not RAM and returns `0`.
+/// End of the address range `TypeOfMem` reports as chip RAM (2 MiB, the
+/// most chip RAM an OCS/ECS machine has).
+const CHIP_RAM_END: u32 = 0x20_0000;
+
+/// `TypeOfMem` (LVO -534): `A1` = address, `D0` = attributes. Classifies
+/// by address like a real machine's memory map: `0..2 MiB` is chip RAM
+/// (`MEMF_PUBLIC | MEMF_CHIP`, including the reserved low region where
+/// real vectors and `ExecBase` live), `2 MiB` up to the end of guest RAM
+/// is fast RAM (`MEMF_PUBLIC | MEMF_FAST`), and anything past the end of
+/// RAM (so also the whole range if `--ram` is under 2 MiB) is `0`.
+/// `AllocMem` itself ignores `MEMF_CHIP`/`MEMF_FAST` (the heap is one
+/// flat range), so an allocation's answer depends only on where the
+/// heap placed it, not on the flags it was requested with.
 fn type_of_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let addr = ctx.cpu.address_register(AddressRegister(1));
-    let is_ram = addr >= crate::backend::TRAP_TABLE_END && (addr as usize) < ctx.mem.len();
-    let attributes = if is_ram {
-        MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST
-    } else {
+    let attributes = if (addr as usize) >= ctx.mem.len() {
         0
+    } else if addr < CHIP_RAM_END {
+        MEMF_PUBLIC | MEMF_CHIP
+    } else {
+        MEMF_PUBLIC | MEMF_FAST
     };
     ctx.cpu.set_data_register(DataRegister(0), attributes);
     Ok(())

@@ -35,10 +35,13 @@ version scheme in `Cargo.toml`.
   a zero result leaves it resident); `AddResource`/`RemResource`/
   `OpenResource` on a real `ExecBase.ResourceList` (no built-in
   resources are modelled, so `OpenResource` of e.g. `misc.resource`
-  returns `NULL`); and `TypeOfMem`, which reports every address in
-  guest RAM as `MEMF_PUBLIC|MEMF_CHIP|MEMF_FAST` (this runtime has one
-  flat RAM range and `AllocMem` ignores the chip/fast distinction) and
-  `0` for anything outside it. Interrupt servers and hardware access
+  returns `NULL`); and `TypeOfMem`, which classifies by address like a real machine: the
+  first 2 MiB (including the reserved low region) is chip RAM
+  (`MEMF_PUBLIC|MEMF_CHIP`), 2 MiB up to the end of guest RAM is fast
+  (`MEMF_PUBLIC|MEMF_FAST`), and anything past the end of RAM is `0`
+  (the chip range is capped when `--ram` is under 2 MiB). `AllocMem`
+  still ignores the chip/fast flags, so which answer an allocation gets
+  depends only on where the heap placed it. Interrupt servers and hardware access
   from a library's init (custom-chip registers) remain out of scope.
 - **`--fpsp-emulate`** (issue #129) — software-emulates the
   instructions a real 68060 removed from silicon (most FPU

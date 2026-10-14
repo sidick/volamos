@@ -89,10 +89,12 @@ Changelog.
   `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
   `cia.resource`, ...) are modelled; `OpenResource` of one returns
   `NULL`.
-- `TypeOfMem`: any address in guest RAM reports
-  `MEMF_PUBLIC|MEMF_CHIP|MEMF_FAST` (one flat range; `AllocMem` ignores
-  the chip/fast distinction); the reserved low region and anything past
-  the end of RAM report `0`.
+- `TypeOfMem`: addresses below 2 MiB (including the reserved low
+  region) report `MEMF_PUBLIC|MEMF_CHIP`; 2 MiB up to the end of guest
+  RAM reports `MEMF_PUBLIC|MEMF_FAST`; past the end of RAM (or the whole
+  range beyond a `--ram` smaller than 2 MiB) reports `0`. `AllocMem`
+  ignores the chip/fast flags, so an allocation's answer depends only
+  on where the heap placed it.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
 

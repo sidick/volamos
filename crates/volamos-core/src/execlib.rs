@@ -3538,8 +3538,16 @@ mod loaded_library_e2e {
         words: Vec<u16>,
         setup: impl FnOnce(&mut FlatMemory),
     ) -> (Result<i32, RuntimeError>, Runtime<M68kCpu>) {
+        run_words_sized(0x6_0000, words, setup)
+    }
+
+    fn run_words_sized(
+        ram: usize,
+        words: Vec<u16>,
+        setup: impl FnOnce(&mut FlatMemory),
+    ) -> (Result<i32, RuntimeError>, Runtime<M68kCpu>) {
         let entry = TRAP_TABLE_END;
-        let mut mem = FlatMemory::new(0x6_0000);
+        let mut mem = FlatMemory::new(ram);
         load_words(&mut mem, entry, &words);
         setup(&mut mem);
         let mut rt = Runtime::new(
@@ -3847,26 +3855,43 @@ mod loaded_library_e2e {
     }
 
     fn type_of_mem(addr: u32) -> u32 {
+        type_of_mem_with_ram(0x30_0000, addr)
+    }
+
+    fn type_of_mem_with_ram(ram: usize, addr: u32) -> u32 {
         let mut words = Vec::new();
         movea_imm(&mut words, 1, addr);
         movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
         jsr(&mut words, 6, -534);
         words.push(RTS);
-        run_words(words, |_| {}).0.expect("run should succeed") as u32
+        run_words_sized(ram, words, |_| {})
+            .0
+            .expect("run should succeed") as u32
     }
 
     #[test]
-    fn type_of_mem_reports_ram_and_rejects_everything_else() {
+    fn type_of_mem_classifies_chip_fast_and_out_of_range() {
         use crate::execmem::{MEMF_CHIP, MEMF_FAST, MEMF_PUBLIC};
-        assert_eq!(type_of_mem(DATA), MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST);
-        assert_eq!(
-            type_of_mem(EXEC_LIBRARY_BASE),
-            0,
-            "the fake ExecBase region"
-        );
-        assert_eq!(type_of_mem(0), 0);
-        assert_eq!(type_of_mem(0x00F8_0000), 0, "ROM space");
+        let chip = MEMF_PUBLIC | MEMF_CHIP;
+        let fast = MEMF_PUBLIC | MEMF_FAST;
+        assert_eq!(type_of_mem(0), chip, "bottom of chip RAM");
+        assert_eq!(type_of_mem(EXEC_LIBRARY_BASE), chip, "reserved region");
+        assert_eq!(type_of_mem(DATA), chip, "64 KiB is below 2 MiB");
+        assert_eq!(type_of_mem(0x1F_FFFF), chip, "last chip byte");
+        assert_eq!(type_of_mem(0x20_0000), fast, "first fast byte");
+        assert_eq!(type_of_mem(0x2F_FFFF), fast, "last byte of 3 MiB RAM");
+        assert_eq!(type_of_mem(0x30_0000), 0, "first byte past RAM");
         assert_eq!(type_of_mem(0xFFFF_FFF0), 0);
+    }
+
+    /// With RAM smaller than 2 MiB the chip range is capped at the end of RAM.
+    #[test]
+    fn type_of_mem_caps_chip_range_at_small_ram() {
+        use crate::execmem::{MEMF_CHIP, MEMF_PUBLIC};
+        let ram = 0x10_0000;
+        assert_eq!(type_of_mem_with_ram(ram, 0xF_FFFF), MEMF_PUBLIC | MEMF_CHIP);
+        assert_eq!(type_of_mem_with_ram(ram, 0x10_0000), 0);
+        assert_eq!(type_of_mem_with_ram(ram, 0x18_0000), 0);
     }
 
     /// Runs a program that `AddResource`s a node named "my.resource" (when
