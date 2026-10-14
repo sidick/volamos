@@ -136,6 +136,19 @@ const LIB_NODE_TYPE_OFFSET: u32 = 8;
 /// `struct Node`'s `ln_Name` (`APTR`) byte offset: `ln_Succ`/`ln_Pred`
 /// (8) + `ln_Type`/`ln_Pri` (1 each, 2) = 10.
 const LIB_NODE_NAME_OFFSET: u32 = 10;
+/// `lib_Flags` byte offset: `Node` (14).
+const LIB_FLAGS_OFFSET: u32 = 14;
+/// `lib_Sum` (`ULONG`) byte offset: `lib_IdString` (24) + 4 = 28.
+const LIB_SUM_OFFSET: u32 = 28;
+/// `LIBF_SUMMING` (`exec/libraries.h`): a checksum is being computed.
+const LIBF_SUMMING: u8 = 1 << 0;
+/// `LIBF_CHANGED`: the library was just modified, so a stale `lib_Sum`
+/// is expected rather than corruption.
+const LIBF_CHANGED: u8 = 1 << 1;
+/// `LIBF_SUMUSED`: the library wants its checksum maintained.
+const LIBF_SUMUSED: u8 = 1 << 2;
+/// `AN_LibChkSum` (`exec/alerts.h`): "Library checksum failure".
+const AN_LIB_CHK_SUM: u32 = 0x0100_0003;
 /// `lib_NegSize` byte offset: `Node` (14) + `lib_Flags`/`lib_pad` (2) =
 /// 16.
 const LIB_NEGSIZE_OFFSET: u32 = 16;
@@ -1199,6 +1212,138 @@ fn begin_direct_init<C: Cpu>(
     Ok(LoadAttempt::Started)
 }
 
+/// The checksum `SumLibrary` stores in `lib_Sum`: the wrapping sum of the
+/// 32-bit target address of every `JMP` in the jump table (the vector
+/// addresses), `lib_NegSize / 6` entries below `base`. The exact real
+/// algorithm isn't documented in the autodocs; only consistency between
+/// `AddLibrary`/`SumLibrary`/`SetFunction` matters to a guest.
+fn lib_checksum(mem: &dyn AddressSpace, base: u32) -> u32 {
+    let negsize = u32::from(mem.read_u16(base.wrapping_add(LIB_NEGSIZE_OFFSET)));
+    (1..=negsize / LIB_VECTSIZE).fold(0u32, |sum, i| {
+        let entry = base.wrapping_sub(i * LIB_VECTSIZE);
+        sum.wrapping_add(mem.read_u32(entry.wrapping_add(2)))
+    })
+}
+
+/// `SumLibrary`'s core: returns `false` on a checksum mismatch that
+/// real exec would raise `Alert(AN_LibChkSum)` for. Skips (returning
+/// `true`) if a sum is already in progress. A stale sum on a
+/// `LIBF_CHANGED` library is expected: it is recomputed and stored, and
+/// `LIBF_CHANGED` cleared.
+fn sum_library_impl(mem: &mut dyn AddressSpace, base: u32) -> bool {
+    let flags_addr = base.wrapping_add(LIB_FLAGS_OFFSET);
+    let flags = mem.read_u8(flags_addr);
+    if flags & LIBF_SUMMING != 0 {
+        return true;
+    }
+    mem.write_u8(flags_addr, flags | LIBF_SUMMING);
+    let sum = lib_checksum(mem, base);
+    let stored = mem.read_u32(base.wrapping_add(LIB_SUM_OFFSET));
+    let ok = if flags & LIBF_CHANGED != 0 {
+        mem.write_u32(base.wrapping_add(LIB_SUM_OFFSET), sum);
+        true
+    } else {
+        stored == sum
+    };
+    mem.write_u8(flags_addr, flags & !(LIBF_SUMMING | LIBF_CHANGED));
+    ok
+}
+
+/// Called after the jump table of `base` was modified (`SetFunction`):
+/// keeps `lib_Sum` current for a library that asked for checksumming
+/// (`LIBF_SUMUSED`), as real `SetFunction` does.
+pub(crate) fn refresh_lib_sum(mem: &mut dyn AddressSpace, base: u32) {
+    let flags_addr = base.wrapping_add(LIB_FLAGS_OFFSET);
+    let flags = mem.read_u8(flags_addr);
+    if flags & LIBF_SUMUSED != 0 {
+        mem.write_u8(flags_addr, flags | LIBF_CHANGED);
+        sum_library_impl(mem, base);
+    }
+}
+
+/// `SumLibrary` (LVO -426): `A1` = library. Recomputes `lib_Sum` and
+/// compares it with the stored value. A mismatch on a library not marked
+/// `LIBF_CHANGED` raises `Alert(AN_LibChkSum)` -- a recovery alert, so,
+/// like [`crate::exectask`]'s `Alert`, it is reported on `stderr` and the
+/// call returns.
+fn sum_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let lib = ctx.cpu.address_register(AddressRegister(1));
+    if !sum_library_impl(ctx.mem, lib) {
+        eprintln!(
+            "volamos: Alert({AN_LIB_CHK_SUM:#010x}): AT_Recovery -- library {lib:#010x} \
+             failed its SumLibrary checksum (GeneralError=0x00 SpecificError=0x0003)"
+        );
+    }
+    Ok(())
+}
+
+/// `RemLibrary` (LVO -402): `A1` = library. Runs the library's own
+/// Expunge vector (`base - 18`, `A6` = base) and, as `CloseLibrary` does
+/// for Close, treats a non-zero result as the segList of a library that
+/// agreed to go: its node is unlinked if still on `LibList`, its registry
+/// entry dropped, the seglist unloaded, and a host-owned base allocation
+/// (AUTOINIT) freed if the library hasn't already freed it itself. A zero
+/// result means it refused (still open) and stays resident. Only
+/// libraries loaded through the disk-library path or `AddLibrary` (the
+/// registry's `Loaded` kind) are expunged; built-in libraries have no
+/// Expunge vector, so `RemLibrary` of one is a no-op. Real exec's own
+/// handling of Expunge's segList isn't documented in the autodocs; this
+/// mirrors the Close path so the two stay consistent.
+fn rem_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let base = ctx.cpu.address_register(AddressRegister(1));
+    let Some(name) = ctx
+        .registry
+        .loaded_library_by_base(base)
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    let alloc_addr = ctx
+        .registry
+        .loaded_library(&name)
+        .and_then(|l| l.alloc_addr);
+    let caller_a6 = ctx.cpu.address_register(AddressRegister(6));
+    ctx.cpu.set_address_register(AddressRegister(6), base);
+    ctx.continuations
+        .trampoline(ctx.cpu, ctx.mem, base.wrapping_sub(18), move |ctx| {
+            ctx.cpu.set_address_register(AddressRegister(6), caller_a6);
+            let seglist = ctx.cpu.data_register(DataRegister(0));
+            if seglist == 0 {
+                *ctx.call_detail = Some(format!("library {name:?} refused to expunge"));
+                return Ok(());
+            }
+            if find_lib_node(ctx.mem, |_, node| node == base).is_some() {
+                crate::execlist::remove_impl(ctx.mem, base);
+            }
+            ctx.registry.unregister_loaded(&name);
+            ctx.dos.unload_seg(ctx.heap, seglist).map_err(|e| {
+                handler_failed(
+                    -402,
+                    "RemLibrary",
+                    format!(
+                        "Expunge of {name:?} returned segList {seglist:#010x}, but UnLoadSeg                          rejected it: {e}"
+                    ),
+                )
+            })?;
+            // A conventional Expunge frees its own base; only free what is
+            // still a live host allocation.
+            if let Some(alloc_addr) = alloc_addr
+                && ctx.heap.size_of_live_alloc(alloc_addr).is_some()
+            {
+                ctx.heap.free(alloc_addr).map_err(|e| {
+                    handler_failed(
+                        -402,
+                        "RemLibrary",
+                        format!("freeing base {alloc_addr:#010x}: {e}"),
+                    )
+                })?;
+            }
+            *ctx.call_detail = Some(format!("library {name:?} expunged"));
+            Ok(())
+        });
+    Ok(())
+}
+
 fn handler_failed(lvo: i32, handler_name: &str, message: String) -> DispatchError {
     DispatchError::HandlerFailed {
         library: "exec.library".to_string(),
@@ -1314,12 +1459,20 @@ fn init_struct_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 /// `OpenLibrary` of that name runs the library's own `Open` vector rather
 /// than going back to disk. If this runs inside a disk load
 /// ([`begin_direct_init`]) [`after_init`] later re-registers the entry
-/// with the real seglist. Real `AddLibrary` also checksums the vector
-/// table (`lib_Sum`); that isn't reproduced.
+/// with the real seglist. Also sets `LIBF_SUMUSED` and computes `lib_Sum`
+/// (see [`sum_library_handler`]).
 fn add_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let lib = ctx.cpu.address_register(AddressRegister(1));
     ctx.mem
         .write_u8(lib.wrapping_add(LIB_NODE_TYPE_OFFSET), NT_LIBRARY);
+    // Real AddLibrary marks the library as checksummed and freshly
+    // changed, then sums it so the first SumLibrary agrees.
+    let flags = ctx.mem.read_u8(lib.wrapping_add(LIB_FLAGS_OFFSET));
+    ctx.mem.write_u8(
+        lib.wrapping_add(LIB_FLAGS_OFFSET),
+        flags | LIBF_SUMUSED | LIBF_CHANGED,
+    );
+    sum_library_impl(ctx.mem, lib);
     crate::execlist::enqueue_impl(ctx.mem, LIBLIST_ADDR, lib);
     let name_ptr = ctx.mem.read_u32(lib.wrapping_add(LIB_NODE_NAME_OFFSET));
     if name_ptr != 0 {
@@ -1329,8 +1482,8 @@ fn add_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
-/// Registers `MakeLibrary`, `MakeFunctions`, `InitStruct` and
-/// `AddLibrary` onto [`EXEC_LIBRARY_BASE`], looked up by name through
+/// Registers `MakeLibrary`, `MakeFunctions`, `InitStruct`, `AddLibrary`,
+/// `SumLibrary` and `RemLibrary` onto [`EXEC_LIBRARY_BASE`], looked up by name through
 /// [`crate::lvos::exec::EXEC_LVOS`]. Called unconditionally from
 /// [`crate::dispatch::Runtime::new`].
 pub fn register_execlib_handlers<C: Cpu + 'static>(
@@ -1355,6 +1508,8 @@ pub fn register_execlib_handlers<C: Cpu + 'static>(
     reg!("MakeFunctions", make_functions_handler::<C>);
     reg!("InitStruct", init_struct_handler::<C>);
     reg!("AddLibrary", add_library_handler::<C>);
+    reg!("SumLibrary", sum_library_handler::<C>);
+    reg!("RemLibrary", rem_library_handler::<C>);
 }
 
 #[cfg(test)]
@@ -3603,6 +3758,272 @@ mod loaded_library_e2e {
             mem.read_u8(opened + 8),
             9,
             "AddLibrary sets ln_Type = NT_LIBRARY"
+        );
+    }
+
+    // --- SumLibrary / RemLibrary / TypeOfMem / resources ---
+
+    const TESTLIB_NOAUTO_KEEP: &[u8] = include_bytes!("../../../fixtures/testlib_noauto_keep");
+    const LIB_FLAGS: u32 = 14;
+    const LIB_SUM: u32 = 28;
+
+    /// Guest-built library at the exit: `MakeLibrary` (2 vectors) +
+    /// `AddLibrary`, leaving `base` in A3 for the caller to continue.
+    fn build_and_add_library(words: &mut Vec<u16>) {
+        make_library_call(words, DATA, 0, 0, 34, 0);
+        words.push(movea_dn(3, 0));
+        words.push(movea_an(1, 3));
+        movea_imm(words, 6, EXEC_LIBRARY_BASE);
+        jsr(words, 6, -396); // AddLibrary
+    }
+
+    #[test]
+    fn add_library_computes_lib_sum_and_sum_library_agrees() {
+        let mut words = Vec::new();
+        build_and_add_library(&mut words);
+        words.push(movea_an(1, 3));
+        jsr(&mut words, 6, -426); // SumLibrary: must be happy
+        words.push(move_an_dn(3, 0));
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            put_u32s(mem, DATA, &[0x1111, 0x2222, 0xFFFF_FFFF]);
+        });
+        let base = result.expect("run should succeed") as u32;
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u32(base + LIB_SUM),
+            0x3333,
+            "sum of vector targets"
+        );
+        let flags = mem.read_u8(base + LIB_FLAGS);
+        assert_eq!(flags & super::LIBF_SUMUSED, super::LIBF_SUMUSED);
+        assert_eq!(flags & (super::LIBF_CHANGED | super::LIBF_SUMMING), 0);
+    }
+
+    #[test]
+    fn sum_library_impl_flags_a_stale_sum_unless_changed() {
+        let mut mem = FlatMemory::new(0x1000);
+        let base = 0x800;
+        mem.write_u16(base + 16, 12); // lib_NegSize: two vectors
+        mem.write_u32(base - 4, 5);
+        mem.write_u32(base - 10, 7);
+        mem.write_u32(base + LIB_SUM, 12);
+        assert!(super::sum_library_impl(&mut mem, base), "matching sum");
+        mem.write_u32(base - 4, 6);
+        assert!(!super::sum_library_impl(&mut mem, base), "stale sum alerts");
+        assert_eq!(mem.read_u32(base + LIB_SUM), 12, "stored sum is left alone");
+        mem.write_u8(base + LIB_FLAGS, super::LIBF_CHANGED);
+        assert!(
+            super::sum_library_impl(&mut mem, base),
+            "CHANGED is excused"
+        );
+        assert_eq!(mem.read_u32(base + LIB_SUM), 13);
+        assert_eq!(mem.read_u8(base + LIB_FLAGS), 0, "CHANGED cleared");
+    }
+
+    /// `SetFunction` on an added library keeps `lib_Sum` current.
+    #[test]
+    fn set_function_refreshes_lib_sum_of_a_summed_library() {
+        let mut words = Vec::new();
+        build_and_add_library(&mut words);
+        words.push(movea_an(1, 3)); // A1 = library
+        movea_imm(&mut words, 0, 0x9999); // A0 = new entry
+        words.push(moveq(0, -6i8 as u8)); // D0 = LVO -6
+        jsr(&mut words, 6, -420); // SetFunction
+        words.push(move_an_dn(3, 0));
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            put_u32s(mem, DATA, &[0x1111, 0x2222, 0xFFFF_FFFF]);
+        });
+        let base = result.expect("run should succeed") as u32;
+        let mem = rt.memory();
+        assert_eq!(mem.read_u32(base - 4), 0x9999, "vector patched");
+        assert_eq!(
+            mem.read_u32(base + LIB_SUM),
+            super::lib_checksum(mem, base),
+            "lib_Sum follows the patched vector"
+        );
+        assert_eq!(mem.read_u8(base + LIB_FLAGS) & super::LIBF_CHANGED, 0);
+    }
+
+    fn type_of_mem(addr: u32) -> u32 {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, addr);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -534);
+        words.push(RTS);
+        run_words(words, |_| {}).0.expect("run should succeed") as u32
+    }
+
+    #[test]
+    fn type_of_mem_reports_ram_and_rejects_everything_else() {
+        use crate::execmem::{MEMF_CHIP, MEMF_FAST, MEMF_PUBLIC};
+        assert_eq!(type_of_mem(DATA), MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST);
+        assert_eq!(
+            type_of_mem(EXEC_LIBRARY_BASE),
+            0,
+            "the fake ExecBase region"
+        );
+        assert_eq!(type_of_mem(0), 0);
+        assert_eq!(type_of_mem(0x00F8_0000), 0, "ROM space");
+        assert_eq!(type_of_mem(0xFFFF_FFF0), 0);
+    }
+
+    /// Runs a program that `AddResource`s a node named "my.resource" (when
+    /// `add`), optionally `RemResource`s it, then `OpenResource(name)`;
+    /// returns (exit code, node address).
+    fn resource_program(add: bool, rem: bool, open_name: &[u8]) -> (u32, u32) {
+        let node = DATA + 0x100;
+        let name = DATA + 0x180;
+        let open_name_addr = DATA + 0x1C0;
+        let mut words = Vec::new();
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        if add {
+            movea_imm(&mut words, 1, node);
+            jsr(&mut words, 6, -486); // AddResource
+        }
+        if rem {
+            movea_imm(&mut words, 1, node);
+            jsr(&mut words, 6, -492); // RemResource
+        }
+        movea_imm(&mut words, 1, open_name_addr);
+        jsr(&mut words, 6, -498); // OpenResource
+        words.push(RTS);
+        let (result, _rt) = run_words(words, |mem| {
+            mem.write_u32(node + 10, name);
+            crate::guestmem::write_c_string(mem, name, b"my.resource\0");
+            crate::guestmem::write_c_string(mem, open_name_addr, open_name);
+        });
+        (result.expect("run should succeed") as u32, node)
+    }
+
+    #[test]
+    fn open_resource_finds_an_added_resource_by_name() {
+        let (found, node) = resource_program(true, false, b"my.resource\0");
+        assert_eq!(found, node);
+    }
+
+    #[test]
+    fn open_resource_of_unknown_or_wrong_name_is_null() {
+        assert_eq!(resource_program(false, false, b"my.resource\0").0, 0);
+        assert_eq!(resource_program(true, false, b"other.resource\0").0, 0);
+        assert_eq!(resource_program(true, false, b"My.Resource\0").0, 0);
+    }
+
+    #[test]
+    fn rem_resource_makes_it_unfindable() {
+        assert_eq!(resource_program(true, true, b"my.resource\0").0, 0);
+    }
+
+    /// `OpenLibrary`, optionally `CloseLibrary`, then `RemLibrary(base)`,
+    /// with the base kept in A3.
+    fn keep_program(close: bool, rem: bool) -> Vec<u16> {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552);
+        words.push(movea_dn(3, 0));
+        if close {
+            words.push(movea_an(1, 3));
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            jsr(&mut words, 6, -414);
+        }
+        if rem {
+            words.push(movea_an(1, 3));
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            jsr(&mut words, 6, -402);
+        }
+        words.push(RTS);
+        words
+    }
+
+    #[test]
+    fn rem_library_of_an_open_library_is_refused() {
+        let (result, rt) = run_against_library(
+            "keep-rem-open",
+            "noauto.library",
+            TESTLIB_NOAUTO_KEEP,
+            NOAUTO_NAME,
+            keep_program(false, true),
+        );
+        result.expect("run should succeed");
+        assert_eq!(
+            liblist_count(rt.memory(), b"noauto.library"),
+            1,
+            "Expunge returned 0 (open), so the library stays"
+        );
+    }
+
+    #[test]
+    fn rem_library_expunges_a_closed_resident_library() {
+        let (result, rt) = run_against_library(
+            "keep-rem-closed",
+            "noauto.library",
+            TESTLIB_NOAUTO_KEEP,
+            NOAUTO_NAME,
+            keep_program(true, true),
+        );
+        result.expect("run should succeed");
+        assert_eq!(
+            liblist_count(rt.memory(), b"noauto.library"),
+            0,
+            "Close left it resident; RemLibrary's Expunge removed it"
+        );
+    }
+
+    #[test]
+    fn close_without_rem_leaves_the_keep_library_resident() {
+        let (result, rt) = run_against_library(
+            "keep-close-only",
+            "noauto.library",
+            TESTLIB_NOAUTO_KEEP,
+            NOAUTO_NAME,
+            keep_program(true, false),
+        );
+        result.expect("run should succeed");
+        assert_eq!(liblist_count(rt.memory(), b"noauto.library"), 1);
+    }
+
+    /// An open/close/RemLibrary cycle returns the heap to baseline, so
+    /// neither the library's own base nor its seglist leaks or is
+    /// double-freed.
+    #[test]
+    fn rem_library_cycle_leaks_nothing() {
+        fn free_bytes(tag: &str, cycle: bool) -> u32 {
+            let entry = TRAP_TABLE_END;
+            let mut words = if cycle {
+                keep_program(true, true)
+            } else {
+                vec![RTS]
+            };
+            let str_addr = entry + (words.len() as u32) * 2;
+            if cycle {
+                words[1] = (str_addr >> 16) as u16;
+                words[2] = str_addr as u16;
+            }
+            let mut mem = FlatMemory::new(0x2_0000);
+            load_words(&mut mem, entry, &words);
+            crate::guestmem::write_c_string(&mut mem, str_addr, NOAUTO_NAME);
+            let (_tmp, vfs) = vfs_with_libs_file(tag, "noauto.library", TESTLIB_NOAUTO_KEEP);
+            let mut rt = Runtime::new(
+                M68kCpu::new(),
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: entry + 0x400,
+                    args: Vec::new(),
+                    ..StartConfig::default()
+                },
+            );
+            rt.set_vfs(vfs);
+            let mut out = Vec::new();
+            rt.run(&mut out, None).expect("run should succeed");
+            rt.heap_mut().free_bytes()
+        }
+        assert_eq!(
+            free_bytes("keep-cycle-0", false),
+            free_bytes("keep-cycle-1", true)
         );
     }
 }

@@ -516,6 +516,12 @@ fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
 /// direct source ([`EXEC_BASE_SOFTVER_OFFSET`]) rather than this list.
 pub(crate) const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 
+/// Byte offset of `ExecBase.ResourceList` from [`EXEC_LIBRARY_BASE`]:
+/// `MemList` (14) sits at `LibList - 56` = 322, so `ResourceList` is
+/// 322 + 14 = 336. `OpenResource`/`AddResource`/`RemResource`
+/// (`crate::execlist`) keep a real, walkable list here.
+pub(crate) const EXEC_BASE_RESOURCELIST_OFFSET: u32 = 336;
+
 /// Byte offset of `ExecBase.SemaphoreList` from [`EXEC_LIBRARY_BASE`] --
 /// same field-by-field derivation as [`EXEC_BASE_LIBLIST_OFFSET`],
 /// continuing past it: `LibList` (14) + `PortList`/`TaskReady`/
@@ -2375,6 +2381,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         );
         mem.write_u32(CACHE_BITS_ADDR, CACHE_BITS_DEFAULT);
         write_library_list_nodes(&mut mem);
+        crate::execlist::init_list_header(
+            &mut mem,
+            EXEC_LIBRARY_BASE + EXEC_BASE_RESOURCELIST_OFFSET,
+        );
         crate::execlist::init_list_header(
             &mut mem,
             EXEC_LIBRARY_BASE + EXEC_BASE_SEMAPHORELIST_OFFSET,

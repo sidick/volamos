@@ -11,3 +11,4 @@ build() {
 build 0 testlib_noauto
 build 1 testlib_noauto_nullret
 build 2 testlib_noauto_refuse
+build 3 testlib_noauto_keep

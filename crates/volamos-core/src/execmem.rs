@@ -755,6 +755,28 @@ fn cache_clear_e_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(),
     Ok(())
 }
 
+/// `TypeOfMem` (LVO -534): `A1` = address, `D0` = attributes. This
+/// runtime's guest RAM is one flat range (`AllocMem` accepts and ignores
+/// `MEMF_CHIP`/`MEMF_FAST`, see their docs), so every address from the
+/// end of the reserved low region (trap table, fake `ExecBase`) up to the
+/// end of guest memory reports `MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST` --
+/// both kinds at once, since anything `AllocMem` hands out satisfies a
+/// request for either, and a guest deciding "is this chip RAM, do I need
+/// to copy it?" then correctly sees it as DMA-able. (Real exec never
+/// reports both bits for one address.) Anything else, including the
+/// reserved region, is not RAM and returns `0`.
+fn type_of_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let addr = ctx.cpu.address_register(AddressRegister(1));
+    let is_ram = addr >= crate::backend::TRAP_TABLE_END && (addr as usize) < ctx.mem.len();
+    let attributes = if is_ram {
+        MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST
+    } else {
+        0
+    };
+    ctx.cpu.set_data_register(DataRegister(0), attributes);
+    Ok(())
+}
+
 /// Registers every T16 `exec.library` memory-allocation handler onto
 /// [`EXEC_LIBRARY_BASE`], looked up by name through [`EXEC_LVOS`] (the T7
 /// table), following [`crate::dosfile::register_dos_handlers`]'s
@@ -779,6 +801,7 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
         };
     }
     reg!("AllocMem", alloc_mem_handler::<C>);
+    reg!("TypeOfMem", type_of_mem_handler::<C>);
     reg!("FreeMem", free_mem_handler::<C>);
     reg!("AvailMem", avail_mem_handler::<C>);
     reg!("AllocVec", alloc_vec_handler::<C>);

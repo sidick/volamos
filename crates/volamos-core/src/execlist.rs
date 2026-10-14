@@ -132,7 +132,9 @@
 //! "cross-process IPC/message-port bridging").
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
-use crate::dispatch::{DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable};
+use crate::dispatch::{
+    DispatchError, EXEC_BASE_RESOURCELIST_OFFSET, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable,
+};
 use crate::guestmem::{GuestHeap, read_c_string};
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
@@ -644,6 +646,39 @@ fn find_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// Guest address of `ExecBase.ResourceList`.
+const RESOURCE_LIST_ADDR: u32 = EXEC_LIBRARY_BASE + EXEC_BASE_RESOURCELIST_OFFSET;
+
+/// `AddResource` (LVO -486): `A1` = resource (any structure starting with
+/// a named `struct Node`). Enqueues it onto `ExecBase.ResourceList` by
+/// priority; like real exec it doesn't touch `ln_Type`. No built-in
+/// resources are pre-installed, so only guest-added ones are findable.
+fn add_resource_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let resource = ctx.cpu.address_register(AddressRegister(1));
+    enqueue_impl(ctx.mem, RESOURCE_LIST_ADDR, resource);
+    Ok(())
+}
+
+/// `RemResource` (LVO -492): `A1` = resource. Unlinks it from whichever
+/// list it is on (real `RemResource` is just `Remove`).
+fn rem_resource_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let resource = ctx.cpu.address_register(AddressRegister(1));
+    remove_impl(ctx.mem, resource);
+    Ok(())
+}
+
+/// `OpenResource` (LVO -498): `A1` = name. Returns the first
+/// `ResourceList` node with that (case-sensitive) name in `D0`, or `0`.
+/// A resource this runtime doesn't model (`misc.resource`, `cia.resource`,
+/// ...) is simply absent, so programs probing for one see `NULL`.
+fn open_resource_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let name = read_c_string(ctx.mem, name_ptr);
+    let node = find_name_impl(ctx.mem, RESOURCE_LIST_ADDR, &name);
+    ctx.cpu.set_data_register(DataRegister(0), node);
+    Ok(())
+}
+
 /// Registers every implemented list/node and message-port
 /// `exec.library` handler onto [`EXEC_LIBRARY_BASE`], looked up by name
 /// through [`EXEC_LVOS`], following [`crate::execmem::
@@ -686,6 +721,9 @@ pub fn register_execlist_handlers<C: Cpu + 'static>(
     reg!("AddPort", add_port_handler::<C>);
     reg!("RemPort", rem_port_handler::<C>);
     reg!("FindPort", find_port_handler::<C>);
+    reg!("AddResource", add_resource_handler::<C>);
+    reg!("RemResource", rem_resource_handler::<C>);
+    reg!("OpenResource", open_resource_handler::<C>);
 }
 
 #[cfg(test)]

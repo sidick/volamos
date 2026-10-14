@@ -76,11 +76,23 @@ Changelog.
   resembling a real system-wide patch tool (`Enforcer`, `SnoopDos`) —
   see the "Deliberately out of scope" note below on why.
 - Building libraries at runtime: `MakeLibrary` (including its `init`
-  routine), `MakeFunctions`, `InitStruct` and `AddLibrary`. A library
-  added this way (or by a disk library's own init code) is openable by
-  name and its jump table holds real `JMP`s. `AddLibrary` doesn't
-  checksum the vectors (`lib_Sum`), and `RemLibrary`, `SumLibrary`,
-  `OpenResource`/`AddResource` and `TypeOfMem` aren't implemented.
+  routine), `MakeFunctions`, `InitStruct`, `AddLibrary`, `SumLibrary`
+  and `RemLibrary`. A library added this way (or by a disk library's
+  own init code) is openable by name and its jump table holds real
+  `JMP`s. `AddLibrary` sets `LIBF_SUMUSED` and computes `lib_Sum`;
+  `SumLibrary` rechecks it (a mismatch is a recovery Alert on
+  `stderr`) and `SetFunction` keeps it current. `RemLibrary` runs the
+  library's Expunge vector and only acts on libraries loaded from disk
+  or added with `AddLibrary` (built-in libraries have no Expunge, so it
+  is a no-op for them).
+- Resources: `AddResource`/`RemResource`/`OpenResource` over a real
+  `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
+  `cia.resource`, ...) are modelled; `OpenResource` of one returns
+  `NULL`.
+- `TypeOfMem`: any address in guest RAM reports
+  `MEMF_PUBLIC|MEMF_CHIP|MEMF_FAST` (one flat range; `AllocMem` ignores
+  the chip/fast distinction); the reserved low region and anything past
+  the end of RAM report `0`.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
 

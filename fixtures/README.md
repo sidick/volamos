@@ -422,7 +422,7 @@ returns `NULL` (refuses the open). Exercises `execlib.rs`'s `after_init`
 NULL-init-result cleanup path (seglist unload + `make_library` allocation
 freed, nothing leaked -- see `loaded_library_e2e`'s heap-free-bytes test).
 
-### `testlib_noauto`, `testlib_noauto_nullret`, `testlib_noauto_refuse`
+### `testlib_noauto`, `testlib_noauto_nullret`, `testlib_noauto_refuse`, `testlib_noauto_keep`
 
 Source: `testlib_noauto.s` (one source, selected by `SET VARIANT=0|1|2`);
 build: `fixtures/build_testlib_noauto.sh`.
@@ -436,7 +436,7 @@ type/name/version/revision/id string) and `AddLibrary`. Variants:
 itself but returns `NULL` (exercises the by-name `LibList` fallback);
 `testlib_noauto_refuse` frees its `MakeLibrary` block and returns `NULL`
 without adding anything. Its Close vector expunges itself on the last
-close (`Remove` + `FreeMem` of its own base) and returns the segList.
+close (`Remove` + `FreeMem` of its own base) and returns the segList. `testlib_noauto_keep` is like `testlib_noauto` except its last Close leaves it resident; only its Expunge vector (reached via `RemLibrary`) removes it, refusing with 0 while open.
 
 Unlike the other fixtures there is no `gen_*.py`: these were assembled
 with the real PhxAss run under volamos itself (no vasm needed), so the

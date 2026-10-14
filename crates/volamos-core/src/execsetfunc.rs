@@ -177,6 +177,7 @@ pub fn register_execsetfunc_handlers<C: Cpu + 'static>(
 
                 ctx.mem.write_u16(target, JMP_ABS_L_OPCODE);
                 ctx.mem.write_u32(target.wrapping_add(2), new_entry);
+                crate::execlib::refresh_lib_sum(ctx.mem, base);
 
                 ctx.cpu.set_data_register(DataRegister(0), old_entry);
                 Ok(())

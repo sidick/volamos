@@ -24,11 +24,22 @@ version scheme in `Cargo.toml`.
   `RTF_AUTOINIT` library's non-`NULL` `InitStruct` table is now
   applied instead of rejected) and `AddLibrary` (links the node into
   `LibList` by priority and makes it openable by name, with no disk
-  file). `AddLibrary` doesn't compute `lib_Sum`; `SumLibrary`,
-  `RemLibrary`, `OpenResource`/`AddResource` and `TypeOfMem` are still
-  unimplemented and will report themselves loudly when a library calls
-  them. Hardware access from a library's init (custom-chip registers)
-  remains out of scope.
+  file). Also added alongside, since a hand-rolled init commonly
+  reaches for them: `SumLibrary` (checksums the jump table's vector
+  addresses into `lib_Sum`; a mismatch on a library not marked
+  `LIBF_CHANGED` raises a recovery `Alert(AN_LibChkSum)`, reported on
+  `stderr`), with `AddLibrary` setting `LIBF_SUMUSED` and computing the
+  initial sum and `SetFunction` keeping it current; `RemLibrary` (calls
+  the library's own Expunge vector and, for a non-zero segList result,
+  unlinks/unloads it like the `CloseLibrary` delayed-expunge path, while
+  a zero result leaves it resident); `AddResource`/`RemResource`/
+  `OpenResource` on a real `ExecBase.ResourceList` (no built-in
+  resources are modelled, so `OpenResource` of e.g. `misc.resource`
+  returns `NULL`); and `TypeOfMem`, which reports every address in
+  guest RAM as `MEMF_PUBLIC|MEMF_CHIP|MEMF_FAST` (this runtime has one
+  flat RAM range and `AllocMem` ignores the chip/fast distinction) and
+  `0` for anything outside it. Interrupt servers and hardware access
+  from a library's init (custom-chip registers) remain out of scope.
 - **`--fpsp-emulate`** (issue #129) — software-emulates the
   instructions a real 68060 removed from silicon (most FPU
   transcendentals — FSIN/FCOS/FATAN/FETOX/FLOGN/FMOD/FSCALE/FINT/

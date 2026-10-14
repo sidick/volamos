@@ -14,11 +14,14 @@
 ;                                       library by its Resident name)
 ;   VARIANT=2  testlib_noauto_refuse    MakeLibrary, then frees it and returns
 ;                                       NULL without AddLibrary (init refusal)
+;   VARIANT=3  testlib_noauto_keep      like 0, but the last Close leaves the
+;                                       library resident (only RemLibrary,
+;                                       via the Expunge vector, removes it)
 ;
-; The library's Close vector implements the real delayed-expunge idiom
-; for a library that owns its base: on the last close it Remove()s its own
-; node, FreeMem()s base-NegSize.. itself, and returns the segList that
-; init stored at SEGLIST_MARKER_OFFSET.
+; The library's Close vector (on the last close) and its Expunge vector (when
+; not open; otherwise it returns 0) implement the real expunge idiom for a
+; library that owns its base: Remove() its own node, FreeMem() base-NegSize..
+; itself, and return the segList that init stored at SEGLIST_MARKER_OFFSET.
 ;
 ; Built with PhxAss run under volamos itself (no vasm needed):
 ;
@@ -26,6 +29,7 @@
 ;       work:testlib_noauto.s SET VARIANT=0 TO work:testlib_noauto
 ;   ... SET VARIANT=1 TO work:testlib_noauto_nullret
 ;   ... SET VARIANT=2 TO work:testlib_noauto_refuse
+;   ... SET VARIANT=3 TO work:testlib_noauto_keep
 
 LIB_NEGSIZE_OFFSET     equ     16
 LIB_POSSIZE_OFFSET     equ     18
@@ -75,10 +79,10 @@ Init:
         ELSE
         move.l  a2,a1
         jsr     _LVOAddLibrary(a6)
-        IFEQ    VARIANT
-        move.l  a2,d0
-        ELSE
+        IFEQ    VARIANT-1
         moveq   #0,d0
+        ELSE
+        move.l  a2,d0
         ENDC
         ENDC
 InitDone:
@@ -105,7 +109,22 @@ OpenFunc:
 CloseFunc:
         subq.w  #1,LIB_OPENCNT_OFFSET(a6)
         bne.s   CloseStillOpen
+        IFEQ    VARIANT-3
+        bra.s   CloseStillOpen          ; keep variant: stay resident, expunge only on RemLibrary
+        ELSE
         ; Last close: expunge ourselves, as a real library's Expunge does.
+        bra.s   DoExpunge
+        ENDC
+CloseStillOpen:
+        moveq   #0,d0
+        rts
+
+; Expunge: refuse (D0=0) while open, otherwise remove ourselves.
+ExpungeFunc:
+        tst.w   LIB_OPENCNT_OFFSET(a6)
+        bne.s   CloseStillOpen
+DoExpunge:
+        ; a6 = our base. Removes the node, frees the base, returns the segList.
         movem.l d2/a2/a6,-(sp)
         move.l  a6,a2                   ; a2 = our base
         move.l  SEGLIST_MARKER_OFFSET(a2),d2
@@ -115,13 +134,6 @@ CloseFunc:
         bsr.s   FreeBase
         move.l  d2,d0                   ; return the segList
         movem.l (sp)+,d2/a2/a6
-        rts
-CloseStillOpen:
-        moveq   #0,d0
-        rts
-
-ExpungeFunc:
-        moveq   #0,d0
         rts
 
 ReservedFunc:
