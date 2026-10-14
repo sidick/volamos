@@ -28,9 +28,6 @@
 //!
 //! # Deviations from UAE
 //!
-//! - UAE's `valid_address(ARG1, 1)` accepts any address backed by memory;
-//!   here address 0 is also rejected (volamos keeps its trap table there,
-//!   so a NULL pointer would print opcode bytes).
 //! - The string is capped at [`MAX_DPATH`]` - 1` bytes, like the sprintf
 //!   port's.
 
@@ -98,7 +95,7 @@ pub fn handler<C: Cpu>(
 }
 
 fn log_string(mem: &dyn AddressSpace, ptr: u32, sink: &mut dyn DebugSink) -> u32 {
-    if ptr == 0 || u64::from(ptr) >= mem.len() as u64 {
+    if u64::from(ptr) >= mem.len() as u64 {
         return 0;
     }
     let mut line = b"DBG: ".to_vec();
@@ -235,12 +232,29 @@ mod tests {
 
     #[test]
     fn bad_pointers_return_0_and_log_nothing() {
-        for ptr in [0, DEFAULT_RAM as u32, 0x7000_0000, 0xFFFF_FFFF] {
+        for ptr in [DEFAULT_RAM as u32, 0x7000_0000, 0xFFFF_FFFF] {
             let (cap, rt) =
                 Guest::new(CpuType::M68020).run(&finish(vec![call(86, ptr, 0)]), |_| {});
             assert_eq!(cap.text(), "", "{ptr:#x}");
             assert_eq!(cell(&rt, 0), 0, "{ptr:#x}");
         }
+    }
+
+    #[test]
+    fn a_null_pointer_is_accepted_like_uae() {
+        // UAE's `valid_address(ARG1, 1)` accepts address 0 (chip RAM
+        // there), so mode 86 logs whatever string sits at 0. Here that is
+        // the start of the trap table: not meaningful text, but the call
+        // succeeds and the output is still one well-formed `DBG: ...\n`
+        // line.
+        let (cap, rt) = Guest::new(CpuType::M68020).run(&finish(vec![call(86, 0, 0)]), |_| {});
+        assert_eq!(cell(&rt, 0), 1);
+        let text = cap.text();
+        assert!(
+            text.starts_with("DBG: ") && text.ends_with('\n'),
+            "{text:?}"
+        );
+        assert_eq!(text.matches('\n').count(), 1, "{text:?}");
     }
 
     #[test]

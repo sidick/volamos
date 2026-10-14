@@ -914,10 +914,11 @@ arguments. In assembly:
 msg:    dc.b    "reached stage 2",0
 ```
 
-- **Bad pointers return `0`** and log nothing: a pointer outside RAM,
-  and address `0` (UAE would read its chip RAM there; volamos keeps its
-  trap table at 0, so a NULL string is treated as invalid). Strings are
-  read through the checked path up to 4095 bytes.
+- **Bad pointers return `0`** and log nothing: a pointer outside RAM.
+  Like UAE, address `0` counts as valid and is read as a string (in
+  volamos that is the start of the trap table, so a NULL pointer logs
+  meaningless bytes rather than failing). Strings are read through the
+  checked path up to 4095 bytes.
 - **Other modes return `0` and warn.** Any mode other than 86 returns 0
   — what "not supported" looks like to a program probing for UAE — and
   prints one `volamos: uae-debug: unsupported uaelib mode N ...` line
