@@ -37,6 +37,7 @@ pub mod dosseg;
 pub mod dossetfiledate;
 pub mod dosstr;
 pub mod dosvar;
+pub mod emu68debug;
 pub mod execchunk;
 pub mod execfmt;
 pub mod execint;

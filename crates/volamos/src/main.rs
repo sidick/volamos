@@ -160,19 +160,24 @@ struct InstrumentationOptions {
     /// `FlatMemory`/`Runtime`, and inherited by nested runs -- though it
     /// observes nothing: see [`Self::forces_interpreter`].
     uae_debug: bool,
+    /// `--emu68-debug` (issue #140): Emu68's debug byte port at
+    /// `0xDEADBEEF`; same CLI-only/JIT/nesting treatment as
+    /// [`Self::uae_debug`], and independent of it (both may be on).
+    emu68_debug: bool,
 }
 
 impl InstrumentationOptions {
     /// Whether the trace JIT must stay off: both the shadow map and the
-    /// debug port hook guest stores, which the JIT's raw-pointer memory
+    /// debug ports hook guest stores, which the JIT's raw-pointer memory
     /// path bypasses. Like `--sanitize` before it, this silently wins
     /// over `--jit` (the interpreter is an exact substitute).
     fn forces_interpreter(&self) -> bool {
-        self.enabled || self.uae_debug
+        self.enabled || self.uae_debug || self.emu68_debug
     }
 
-    /// Installs the `--uae-debug` port on `mem` (a no-op when off).
-    fn install_uae_debug(&self, mem: &mut FlatMemory, cpu_type: CpuType) {
+    /// Installs the `--uae-debug`/`--emu68-debug` ports on `mem` (a
+    /// no-op for whichever is off).
+    fn install_debug_ports(&self, mem: &mut FlatMemory, cpu_type: CpuType) {
         if self.uae_debug {
             volamos_core::uaedebug::install(
                 mem,
@@ -180,15 +185,24 @@ impl InstrumentationOptions {
                 Box::new(volamos_core::uaedebug::StderrSink),
             );
         }
+        if self.emu68_debug {
+            volamos_core::emu68debug::install(mem, Box::new(volamos_core::uaedebug::StderrSink));
+        }
     }
 
-    /// Keeps the `--uae-debug` port out of the guest heap (a no-op when
-    /// off); see [`Runtime::reserve_uae_debug_port`].
-    fn reserve_uae_debug_port(&self, runtime: &mut Runtime<M68kCpu>) -> Result<(), String> {
+    /// Keeps the enabled debug ports out of the guest heap; see
+    /// [`Runtime::reserve_uae_debug_port`] and
+    /// [`Runtime::reserve_emu68_debug_port`].
+    fn reserve_debug_ports(&self, runtime: &mut Runtime<M68kCpu>) -> Result<(), String> {
         if self.uae_debug {
             runtime
                 .reserve_uae_debug_port()
                 .map_err(|e| format!("--uae-debug: {e}"))?;
+        }
+        if self.emu68_debug {
+            runtime
+                .reserve_emu68_debug_port()
+                .map_err(|e| format!("--emu68-debug: {e}"))?;
         }
         Ok(())
     }
@@ -736,6 +750,23 @@ struct Cli {
     )]
     uae_debug: bool,
 
+    /// Enable Emu68's debug byte port at 0xDEADBEEF; bytes go to stderr (off by default)
+    #[arg(
+        long = "emu68-debug",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Enable Emu68's (PiStorm JIT) debug byte port: a byte-sized store to the \
+                      absolute address 0xDEADBEEF writes that character to stderr, raw, with \
+                      no newline or prefix added. Word and long stores there are not special. \
+                      The address is fixed. Only works on 32-bit-addressing CPUs (--cpu 68020 \
+                      or later): on the default 68000 and on 68010 the CPU masks the address \
+                      to 24 bits, so the port never triggers (a warning is printed). Off by \
+                      default and CLI-only (not settable via ~/.volamos/.volamos); forces \
+                      --no-jit regardless of --jit/--no-jit. Combinable with --uae-debug. \
+                      Stores to the port are never --sanitize violations."
+    )]
+    emu68_debug: bool,
+
     /// Enable bsdsocket.library: real host network access for the guest
     #[arg(
         long = "net",
@@ -931,6 +962,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         ignore_pcs: cli.sanitize_ignore_pc,
         dirty_heap: cli.dirty_heap,
         uae_debug: cli.uae_debug,
+        emu68_debug: cli.emu68_debug,
     };
 
     (
@@ -1657,7 +1689,7 @@ fn run_nested_program(
         mem.enable_sanitizer();
         sanitize.apply(&mut mem);
     }
-    sanitize.install_uae_debug(&mut mem, cpu_type);
+    sanitize.install_debug_ports(&mut mem, cpu_type);
     let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
         return -1;
     };
@@ -1695,7 +1727,7 @@ fn run_nested_program(
     // the parent's --fpsp-emulate setting, same as it shares --cpu/--fpu.
     cpu.set_emulate_unimplemented_060(fpsp_emulate);
     let mut runtime = Runtime::new(cpu, mem, config);
-    if sanitize.reserve_uae_debug_port(&mut runtime).is_err() {
+    if sanitize.reserve_debug_ports(&mut runtime).is_err() {
         return -1;
     }
     if sanitize.dirty_heap {
@@ -1748,7 +1780,7 @@ fn build_runtime_with_vfs(
     vfs_config: Option<VfsConfig>,
 ) -> Result<Runtime<M68kCpu>, String> {
     let mut runtime = Runtime::new(cpu, mem, config);
-    opts.sanitize.reserve_uae_debug_port(&mut runtime)?;
+    opts.sanitize.reserve_debug_ports(&mut runtime)?;
     if let Some(vfs_config) = vfs_config {
         let vfs =
             Vfs::new(vfs_config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
@@ -1786,6 +1818,13 @@ fn run(opts: &Options) -> Result<i32, String> {
     // a run that somehow violates both reports the --jit conflict
     // first -- there's no other significance to the order.
     check_ram_addressable(opts.ram_size, opts.cpu_type)?;
+    if opts.sanitize.emu68_debug && addressable_bytes(opts.cpu_type) < (1 << 32) {
+        eprintln!(
+            "volamos: emu68-debug: the port at 0xDEADBEEF is inactive with --cpu {}: that CPU \
+             masks addresses to 24 bits (use --cpu 68020 or later)",
+            cpu_model_name(opts.cpu_type)
+        );
+    }
     check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source)?;
     check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled)?;
 
@@ -1836,7 +1875,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
         }
-        opts.sanitize.install_uae_debug(&mut mem, opts.cpu_type);
+        opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
             load_end: TRAP_TABLE_END,
@@ -1857,7 +1896,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
         }
-        opts.sanitize.install_uae_debug(&mut mem, opts.cpu_type);
+        opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
             .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
         check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
@@ -3244,6 +3283,46 @@ mod tests {
         // parser has no such key (see config.rs's matching test).
         let (_, instrumentation, ..) = parse_args_raw(args(&["--uae-debug", "prog"])).unwrap();
         assert!(instrumentation.uae_debug);
+    }
+
+    // --- --emu68-debug (issue #140) ---
+
+    #[test]
+    fn default_emu68_debug_is_off() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.sanitize.emu68_debug);
+        assert!(!opts.sanitize.forces_interpreter());
+    }
+
+    #[test]
+    fn emu68_debug_flag_is_independent_of_uae_debug_and_sanitize() {
+        let opts = parse_args(args(&["--emu68-debug", "prog"])).unwrap();
+        assert!(opts.sanitize.emu68_debug);
+        assert!(!opts.sanitize.uae_debug);
+        assert!(!opts.sanitize.enabled);
+        assert!(opts.sanitize.forces_interpreter());
+        let both = parse_args(args(&["--uae-debug", "--emu68-debug", "prog"])).unwrap();
+        assert!(both.sanitize.uae_debug && both.sanitize.emu68_debug);
+    }
+
+    #[test]
+    fn emu68_debug_is_not_parsed_after_the_program() {
+        let opts = parse_args(args(&["prog", "--emu68-debug"])).unwrap();
+        assert!(!opts.sanitize.emu68_debug);
+        assert_eq!(opts.guest_args, vec!["--emu68-debug".to_string()]);
+    }
+
+    #[test]
+    fn emu68_debug_overrides_jit() {
+        let opts = parse_args(args(&["--jit", "--emu68-debug", "prog"])).unwrap();
+        assert!(opts.jit);
+        assert!(opts.sanitize.forces_interpreter());
+    }
+
+    #[test]
+    fn emu68_debug_is_cli_only_not_a_config_override() {
+        let (_, instrumentation, ..) = parse_args_raw(args(&["--emu68-debug", "prog"])).unwrap();
+        assert!(instrumentation.emu68_debug);
     }
 
     // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---

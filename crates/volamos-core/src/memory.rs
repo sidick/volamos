@@ -36,7 +36,7 @@ pub enum StoreSize {
 }
 
 /// A device-style, write-only port at a fixed guest address, fed by guest
-/// CPU stores (the UAE debug ports -- see [`crate::uaedebug`]).
+/// CPU stores (the debug ports -- see [`crate::uaedebug`], [`crate::emu68debug`]).
 ///
 /// Installed with [`FlatMemory::add_store_port`]. Stores are offered to
 /// the ports in [`crate::backend`]'s [`m68k::AddressBus`] implementation,
@@ -50,6 +50,14 @@ pub trait StorePort {
     /// address exactly as the CPU core presents it (68000/68010 cores
     /// present the 24-bit-masked address).
     fn claims(&self, addr: u32) -> bool;
+
+    /// Whether a store of `size` at `addr` belongs to this port. Defaults
+    /// to [`Self::claims`]; a port that must let some widths fall through
+    /// to ordinary memory (the Emu68 port is byte-only) overrides it.
+    /// This is what the store path actually asks.
+    fn claims_store(&self, addr: u32, _size: StoreSize) -> bool {
+        self.claims(addr)
+    }
 
     /// Handles a claimed store. `mem` is the guest memory, for ports that
     /// need to read it (e.g. a string the guest points at).
@@ -179,7 +187,7 @@ pub struct FlatMemory {
     /// `FlatMemory`, and so `FlatMemory` stays cheap to move around
     /// (e.g. into a nested [`crate::dispatch::Runtime`]).
     shadow: Option<Box<ShadowMap>>,
-    /// Store-intercepting ports (`--uae-debug`), empty by default; see
+    /// Store-intercepting ports (`--uae-debug`/`--emu68-debug`), empty by default; see
     /// [`StorePort`]. The disabled cost is one `is_empty` check per guest
     /// store.
     ports: Vec<Box<dyn StorePort>>,
@@ -233,7 +241,7 @@ impl FlatMemory {
     }
 
     fn intercept_store_slow(&mut self, addr: u32, value: u32, size: StoreSize) -> bool {
-        let Some(idx) = self.ports.iter().position(|p| p.claims(addr)) else {
+        let Some(idx) = self.ports.iter().position(|p| p.claims_store(addr, size)) else {
             return false;
         };
         // Taken out so the port can read the rest of `self` (it is handed

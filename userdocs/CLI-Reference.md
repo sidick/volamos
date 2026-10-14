@@ -6,7 +6,7 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
-        [--net] <program> [args...]
+        [--emu68-debug] [--net] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself, and
@@ -872,6 +872,71 @@ args:   dc.w    5                   ; %d  (2 bytes)
     previous message — prints nothing and warns, as volamos has no
     cycle counter on this path; on a 68000 the `+8` pair uses the full
     combined pointer (UAE keeps only its low word).
+
+## `--emu68-debug`
+
+Enables **Emu68's debug byte port**. Emu68 (the PiStorm JIT) treats a
+**byte-sized store to the absolute address `0xDEADBEEF`** as "print this
+character" on its debug console; its own `kprintf` is built on it, so
+software written for PiStorm often emits text this way. With the flag,
+that byte is written to **stderr**, raw and exactly as stored — no
+newline, no prefix, nothing buffered.
+
+```console
+$ volamos --emu68-debug --cpu 68020 prog
+Hi
+```
+
+Off by default, and CLI-only — it is not settable from `~/.volamos`/
+`.volamos`, so a stale config file can't start diverting stores. With
+the flag off, a store to `0xDEADBEEF` behaves exactly as it always did
+(a silently dropped out-of-range write). Nested `System()`/`Execute()`/
+`RunCommand()` programs inherit it.
+
+!!! warning "Needs a 32-bit CPU: use `--cpu 68020` or later"
+    The 68000 and 68010 have a 24-bit address bus, and the CPU core
+    presents `0xDEADBEEF` to memory as `0x00ADBEEF`, so the port never
+    triggers there. Emu68 itself only targets 32-bit CPUs. Since
+    `--cpu` defaults to 68000, `--emu68-debug` alone prints nothing —
+    volamos prints a one-line warning to stderr at startup saying so
+    rather than refusing to run.
+
+- **Byte stores only.** Word and long stores to `0xDEADBEEF` are not
+  special in Emu68 and are not here either; they fall through exactly as
+  without the flag. Loads are not intercepted.
+- **The address is fixed.** Emu68 also publishes it in its device tree
+  for future discovery; volamos has no device tree.
+- **The JIT is off.** Like [`--uae-debug`](#-uae-debug) and
+  [`--sanitize`](#-sanitize), the flag forces `--no-jit` (silently
+  overriding `--jit`), since the JIT's raw-pointer stores would bypass
+  the port.
+- **Works at any `--ram`.** The store is intercepted before any memory
+  lookup. A `--ram` large enough to cover `0xDEADBEEF` (about 3.5 GiB)
+  has that one byte kept out of the guest heap.
+- **`--sanitize` is not bothered.** Stores to the port are never
+  reported.
+- **Combinable with [`--uae-debug`](#-uae-debug)**, which is a
+  different mechanism (formatted text through stores to `0xBFFF00`); the
+  two ports are independent.
+
+### Using it from a program
+
+```c
+static void dbg_putc(char c) { *(volatile unsigned char *)0xDEADBEEF = c; }
+
+static void dbg_puts(const char *s) { while (*s) dbg_putc(*s++); }
+```
+
+or in assembly:
+
+```
+        move.b  #'H',$DEADBEEF
+        move.b  #'i',$DEADBEEF
+        move.b  #10,$DEADBEEF
+```
+
+run with `volamos --emu68-debug --cpu 68020 prog`. Use `volatile` so the
+compiler cannot merge or drop the stores.
 
 ## No flags at all
 

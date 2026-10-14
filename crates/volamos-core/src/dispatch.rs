@@ -2815,6 +2815,26 @@ impl<C: Cpu + 'static> Runtime<C> {
         }
     }
 
+    /// Keeps the `--emu68-debug` port's one byte
+    /// ([`crate::emu68debug`]) out of the guest heap. Only reachable
+    /// with a 32-bit CPU and a `--ram` above ~3.5 GiB; otherwise the
+    /// address is beyond RAM and this is a no-op `Ok`. `Err` if the byte
+    /// is already in use (the stack or program image covers it).
+    pub fn reserve_emu68_debug_port(&mut self) -> Result<(), String> {
+        use crate::emu68debug::EMU68_DEBUG_ADDRESS;
+        if u64::from(EMU68_DEBUG_ADDRESS) >= self.mem.len() as u64 {
+            return Ok(());
+        }
+        if self.heap.reserve_range(EMU68_DEBUG_ADDRESS, 1) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the Emu68 debug port at {EMU68_DEBUG_ADDRESS:#x} falls inside the loaded \
+                 program or the guest stack; use a larger --ram or a smaller --stack"
+            ))
+        }
+    }
+
     pub fn enable_heap_sanitizer(&mut self) {
         self.heap
             .set_redzone_size(crate::guestmem::DEFAULT_REDZONE_SIZE);

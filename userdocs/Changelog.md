@@ -21,6 +21,16 @@ version scheme in `Cargo.toml`.
   inherit it. This is the first half of the issue; the `0xF0FF60`
   `uaelib` log call is not implemented yet.
 
+- **`--emu68-debug`: Emu68's debug byte port** (issue #140) — a
+  byte-sized store to the absolute address `0xDEADBEEF` (the debug
+  console of Emu68, the PiStorm JIT) now writes that byte to `stderr`,
+  raw: no newline or prefix added. Word and long stores there stay
+  ordinary memory. Needs a 32-bit CPU (`--cpu 68020` or later): the
+  68000/68010 present `0x00ADBEEF`, so the port never triggers and a
+  startup warning says so. Off by default and CLI-only; forces
+  `--no-jit` like `--uae-debug`, composes with it, and is inherited by
+  nested runs.
+
 ## 0.10
 
 - **`Cause()` software interrupts, and loud interrupt-registration

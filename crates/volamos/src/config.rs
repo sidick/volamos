@@ -547,6 +547,14 @@ mod tests {
     }
 
     #[test]
+    fn emu68_debug_is_not_a_config_key() {
+        for key in ["EMU68_DEBUG", "EMU68-DEBUG"] {
+            let err = parse(&format!("{key}=true\n")).unwrap_err();
+            assert!(err.contains("unknown key"), "unexpected message: {err}");
+        }
+    }
+
+    #[test]
     fn unknown_key_is_an_error() {
         let err = parse("NOPE=1\n").unwrap_err();
         assert!(err.contains("unknown key"), "unexpected message: {err}");
