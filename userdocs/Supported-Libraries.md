@@ -75,6 +75,12 @@ Changelog.
   a program's own hooking logic against itself, not for anything
   resembling a real system-wide patch tool (`Enforcer`, `SnoopDos`) —
   see the "Deliberately out of scope" note below on why.
+- Building libraries at runtime: `MakeLibrary` (including its `init`
+  routine), `MakeFunctions`, `InitStruct` and `AddLibrary`. A library
+  added this way (or by a disk library's own init code) is openable by
+  name and its jump table holds real `JMP`s. `AddLibrary` doesn't
+  checksum the vectors (`lib_Sum`), and `RemLibrary`, `SumLibrary`,
+  `OpenResource`/`AddResource` and `TypeOfMem` aren't implemented.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
 
@@ -132,10 +138,3 @@ real AmigaOS code uses to call these functions.
 - **Cross-process IPC/message-port bridging** — volamos runs one guest
   process at a time (`System()`/`Execute()`/`RunCommand` run a nested
   program to completion synchronously, not concurrently).
-- **`exec.library`'s `MakeLibrary`** — creating a new library at
-  runtime is not exposed as a guest-callable LVO (the host-side
-  primitive it would use, `crate::execlib::make_library`, exists and
-  is exercised by the real-disk-library-loading path, but nothing
-  wires it up as `MakeLibrary` itself yet). `SetFunction`, which
-  patches an *existing* library's jump table, is implemented — see
-  `exec.library`'s entry above.

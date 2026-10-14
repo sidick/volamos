@@ -422,6 +422,26 @@ returns `NULL` (refuses the open). Exercises `execlib.rs`'s `after_init`
 NULL-init-result cleanup path (seglist unload + `make_library` allocation
 freed, nothing leaked -- see `loaded_library_e2e`'s heap-free-bytes test).
 
+### `testlib_noauto`, `testlib_noauto_nullret`, `testlib_noauto_refuse`
+
+Source: `testlib_noauto.s` (one source, selected by `SET VARIANT=0|1|2`);
+build: `fixtures/build_testlib_noauto.sh`.
+
+Non-`RTF_AUTOINIT` `NT_LIBRARY` fixtures (issue #133): `RT_FLAGS` is 0
+and `RT_INIT` points at init code that is called directly (`D0` = 0,
+`A0` = segList, `A6` = ExecBase). The init routine builds the library
+with `MakeLibrary` (plus an `InitStruct` table setting the node
+type/name/version/revision/id string) and `AddLibrary`. Variants:
+`testlib_noauto` returns the base in `D0`; `testlib_noauto_nullret` adds
+itself but returns `NULL` (exercises the by-name `LibList` fallback);
+`testlib_noauto_refuse` frees its `MakeLibrary` block and returns `NULL`
+without adding anything. Its Close vector expunges itself on the last
+close (`Remove` + `FreeMem` of its own base) and returns the segList.
+
+Unlike the other fixtures there is no `gen_*.py`: these were assembled
+with the real PhxAss run under volamos itself (no vasm needed), so the
+`.s` file uses PhxAss syntax.
+
 ### `libcall`
 
 Source: `libcall.s`; generator: `gen_libcall.py`.

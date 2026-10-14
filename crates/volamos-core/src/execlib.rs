@@ -3,7 +3,9 @@
 //! Resident` (romtag), reading the `RTF_AUTOINIT` init table it points
 //! to, decoding both real vector-table encodings, and the host-side
 //! equivalent of `MakeLibrary` itself (jump-table + `struct Library`
-//! header construction on the guest heap).
+//! header construction on the guest heap), plus [`init_struct`] (the
+//! byte-coded `InitStruct` interpreter `MakeLibrary` applies to a
+//! non-`NULL` `structure` argument).
 //!
 //! This is Phase L1 of `library-device-loading-plan.md`: **pure
 //! mechanics, ships inert** -- nothing in this module runs guest code or
@@ -50,11 +52,9 @@
 //! (`$4EF9` + a 32-bit absolute target) per vector walking downward from
 //! the base, zero the positive-offset data area, and fill in the `struct
 //! Library` header's `Node`/version/size fields from the `struct
-//! Resident` that drove the load. `InitStruct` (a non-`NULL` `structure`
-//! argument) is out of scope for L1 -- every on-hand corpus target has
-//! `structure == NULL` (plan §1.5) -- so [`make_library`] fails loudly,
-//! naming the library, rather than silently skipping it; implementing
-//! `InitStruct`'s byte-coded interpreter (`exec/initializers.i`) is L6.
+//! Resident` that drove the load. A non-`NULL` `structure` is applied by
+//! [`init_struct`] after those header defaults are written, so a table
+//! can override them.
 //!
 //! [`GuestHeap::alloc`] already 4-byte-aligns every allocation it hands
 //! back (see that module's doc), and `negsize` is itself rounded up to a
@@ -67,7 +67,7 @@
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, EXEC_BASE_LIBLIST_OFFSET, EXEC_LIBRARY_BASE, HandlerContext};
 use crate::dosseg::{NEXT_SEG_OFFSET, SEG_HEADER_SIZE};
-use crate::guestmem::{GuestHeap, GuestHeapError, addr_from_bptr};
+use crate::guestmem::{GuestHeap, GuestHeapError, addr_from_bptr, read_c_string};
 use crate::memory::AddressSpace;
 
 /// `RTC_MATCHWORD` (`exec/resident.i`): the fixed value every real
@@ -136,8 +136,6 @@ const LIB_NODE_TYPE_OFFSET: u32 = 8;
 /// `struct Node`'s `ln_Name` (`APTR`) byte offset: `ln_Succ`/`ln_Pred`
 /// (8) + `ln_Type`/`ln_Pri` (1 each, 2) = 10.
 const LIB_NODE_NAME_OFFSET: u32 = 10;
-/// `lib_Flags` byte offset: `Node` (14).
-const LIB_FLAGS_OFFSET: u32 = 14;
 /// `lib_NegSize` byte offset: `Node` (14) + `lib_Flags`/`lib_pad` (2) =
 /// 16.
 const LIB_NEGSIZE_OFFSET: u32 = 16;
@@ -146,8 +144,6 @@ const LIB_POSSIZE_OFFSET: u32 = 18;
 /// `lib_Version` byte offset: `lib_NegSize`/`lib_PosSize` (2 each) past
 /// [`LIB_NEGSIZE_OFFSET`] = 20.
 const LIB_VERSION_OFFSET: u32 = 20;
-/// `lib_Revision` byte offset: immediately after `lib_Version` (22).
-const LIB_REVISION_OFFSET: u32 = 22;
 /// `lib_IdString` (`APTR`) byte offset: `lib_Version`/`lib_Revision` (2
 /// each) past [`LIB_VERSION_OFFSET`] = 24.
 const LIB_IDSTRING_OFFSET: u32 = 24;
@@ -238,12 +234,9 @@ pub enum MakeLibraryError {
     /// `dSize` was smaller than [`LIB_STRUCT_SIZE`] -- there'd be no room
     /// for the `struct Library` header `MakeLibrary` is about to write.
     DataSizeTooSmall { d_size: u32 },
-    /// The `structure` (`InitStruct` table) argument was non-`NULL`.
-    /// L1 doesn't implement the `InitStruct` byte-code interpreter (see
-    /// this module's doc) -- every on-hand corpus target has
-    /// `structure == NULL`, so this is a loud, named failure rather than
-    /// a silent skip.
-    InitStructNotImplemented { library_name: String },
+    /// The `structure` (`InitStruct` table) argument held a malformed
+    /// command (see [`init_struct`]).
+    InitStruct(String),
     /// The guest heap couldn't satisfy the `negsize + dSize` allocation.
     Heap(GuestHeapError),
 }
@@ -256,12 +249,7 @@ impl std::fmt::Display for MakeLibraryError {
                 "MakeLibrary: dSize {d_size} is smaller than sizeof(struct Library) \
                  ({LIB_STRUCT_SIZE})"
             ),
-            MakeLibraryError::InitStructNotImplemented { library_name } => write!(
-                f,
-                "MakeLibrary: library {library_name:?} has a non-NULL InitStruct table -- \
-                 InitStruct interpretation isn't implemented yet (deferred to a later phase, \
-                 see library-device-loading-plan.md L6)"
-            ),
+            MakeLibraryError::InitStruct(e) => write!(f, "MakeLibrary: {e}"),
             MakeLibraryError::Heap(e) => write!(f, "MakeLibrary: {e}"),
         }
     }
@@ -436,10 +424,9 @@ fn round_up_longword(value: u32) -> u32 {
 ///
 /// Fails loudly (never silently skips or corrupts memory) if `d_size` is
 /// too small to hold `struct Library`'s own header
-/// ([`MakeLibraryError::DataSizeTooSmall`]), if `structure` is non-`NULL`
-/// ([`MakeLibraryError::InitStructNotImplemented`] -- see the module
-/// doc), or if the heap allocation itself fails
-/// ([`MakeLibraryError::Heap`]).
+/// ([`MakeLibraryError::DataSizeTooSmall`]), if `structure` is malformed
+/// ([`MakeLibraryError::InitStruct`]), or if the heap allocation itself
+/// fails ([`MakeLibraryError::Heap`]).
 pub fn make_library(
     mem: &mut dyn AddressSpace,
     heap: &mut GuestHeap,
@@ -447,13 +434,26 @@ pub fn make_library(
     d_size: u32,
     structure: u32,
     vectors: &[u32],
-    library_name: &str,
 ) -> Result<MadeLibrary, MakeLibraryError> {
-    if structure != 0 {
-        return Err(MakeLibraryError::InitStructNotImplemented {
-            library_name: library_name.to_string(),
-        });
-    }
+    build_library(mem, heap, d_size, structure, vectors, Some(resident))
+}
+
+/// The shared core of [`make_library`] and the guest-callable
+/// `MakeLibrary` handler. `defaults` (the AUTOINIT path's `struct
+/// Resident`) pre-fills the `Node` type/name, `lib_Version` and
+/// `lib_IdString`; the guest-called form passes `None`, since real
+/// `MakeLibrary` takes those only from `structure`'s `InitStruct` table
+/// (or the caller's own later stores). `structure` is applied after the
+/// defaults, so it can override them; `lib_NegSize`/`lib_PosSize` are
+/// written last, as real `MakeLibrary` does.
+fn build_library(
+    mem: &mut dyn AddressSpace,
+    heap: &mut GuestHeap,
+    d_size: u32,
+    structure: u32,
+    vectors: &[u32],
+    defaults: Option<&Resident>,
+) -> Result<MadeLibrary, MakeLibraryError> {
     if d_size < LIB_STRUCT_SIZE {
         return Err(MakeLibraryError::DataSizeTooSmall { d_size });
     }
@@ -469,29 +469,124 @@ pub fn make_library(
         mem.write_u8(base.wrapping_add(i), 0);
     }
 
+    write_jump_table(mem, base, vectors);
+
+    if let Some(resident) = defaults {
+        mem.write_u8(base.wrapping_add(LIB_NODE_TYPE_OFFSET), resident.node_type);
+        mem.write_u32(base.wrapping_add(LIB_NODE_NAME_OFFSET), resident.name_ptr);
+        mem.write_u16(
+            base.wrapping_add(LIB_VERSION_OFFSET),
+            resident.version as u16,
+        );
+        mem.write_u32(
+            base.wrapping_add(LIB_IDSTRING_OFFSET),
+            resident.id_string_ptr,
+        );
+    }
+    if structure != 0 {
+        init_struct(mem, structure, base, 0).map_err(MakeLibraryError::InitStruct)?;
+    }
+    mem.write_u16(base.wrapping_add(LIB_NEGSIZE_OFFSET), negsize as u16);
+    mem.write_u16(base.wrapping_add(LIB_POSSIZE_OFFSET), d_size as u16);
+
+    Ok(MadeLibrary { alloc_addr, base })
+}
+
+/// Writes one `JMP abs.l` per entry of `vectors`, walking downward from
+/// `base` (`vectors[0]` lands at `base - 6`). Shared by `MakeLibrary` and
+/// `MakeFunctions`.
+fn write_jump_table(mem: &mut dyn AddressSpace, base: u32, vectors: &[u32]) {
     let mut vector_addr = base;
     for &target in vectors {
         vector_addr = vector_addr.wrapping_sub(LIB_VECTSIZE);
         mem.write_u16(vector_addr, JMP_ABS_L_OPCODE);
         mem.write_u32(vector_addr.wrapping_add(2), target);
     }
+}
 
-    mem.write_u8(base.wrapping_add(LIB_NODE_TYPE_OFFSET), resident.node_type);
-    mem.write_u32(base.wrapping_add(LIB_NODE_NAME_OFFSET), resident.name_ptr);
-    mem.write_u8(base.wrapping_add(LIB_FLAGS_OFFSET), 0);
-    mem.write_u16(base.wrapping_add(LIB_NEGSIZE_OFFSET), negsize as u16);
-    mem.write_u16(base.wrapping_add(LIB_POSSIZE_OFFSET), d_size as u16);
-    mem.write_u16(
-        base.wrapping_add(LIB_VERSION_OFFSET),
-        resident.version as u16,
-    );
-    mem.write_u16(base.wrapping_add(LIB_REVISION_OFFSET), 0);
-    mem.write_u32(
-        base.wrapping_add(LIB_IDSTRING_OFFSET),
-        resident.id_string_ptr,
-    );
-
-    Ok(MadeLibrary { alloc_addr, base })
+/// `InitStruct` (`exec.doc`; `exec/initializers.i` for the encodings the
+/// assembler macros emit): interprets the byte-command stream at `table`
+/// against the memory at `memory`, first zeroing `size` bytes of it (a
+/// `size` of `0` skips the clear).
+///
+/// Each command byte is `ddssnnnn`, read from the next even address:
+/// `dd` = `00` continue at the running destination (`nnnn`+1 items),
+/// `01` continue and repeat one item `nnnn`+1 times, `10` destination
+/// offset in the next byte, `11` offset in the next 24 bits; `ss` = `00`
+/// longword, `01` word, `10` byte (word/longword sources start on an even
+/// address; `11` is an error -- real exec raises an Alert). A zero
+/// command byte ends the stream. The running destination starts at
+/// `memory` and advances past whatever each command wrote.
+pub fn init_struct(
+    mem: &mut dyn AddressSpace,
+    table: u32,
+    memory: u32,
+    size: u32,
+) -> Result<(), String> {
+    for i in 0..size {
+        mem.write_u8(memory.wrapping_add(i), 0);
+    }
+    let mut it = table;
+    let mut dest = memory;
+    loop {
+        it = it.wrapping_add(1) & !1;
+        let cmd = mem.read_u8(it);
+        it = it.wrapping_add(1);
+        if cmd == 0 {
+            return Ok(());
+        }
+        let dest_type = cmd >> 6;
+        let width: u32 = match (cmd >> 4) & 3 {
+            0 => 4,
+            1 => 2,
+            2 => 1,
+            _ => {
+                return Err(format!(
+                    "InitStruct: command {cmd:#04x} at {:#010x} has the invalid source size \
+                     ss=11",
+                    it.wrapping_sub(1)
+                ));
+            }
+        };
+        let count = u32::from(cmd & 0xF) + 1;
+        match dest_type {
+            2 => {
+                dest = memory.wrapping_add(u32::from(mem.read_u8(it)));
+                it = it.wrapping_add(1);
+            }
+            3 => {
+                let offset = (u32::from(mem.read_u8(it)) << 16)
+                    | (u32::from(mem.read_u8(it.wrapping_add(1))) << 8)
+                    | u32::from(mem.read_u8(it.wrapping_add(2)));
+                dest = memory.wrapping_add(offset);
+                it = it.wrapping_add(3);
+            }
+            _ => {}
+        }
+        if width > 1 {
+            it = it.wrapping_add(1) & !1;
+        }
+        // Repeat mode reads its single source item once; count mode
+        // consumes a fresh item per copy.
+        let items = if dest_type == 1 { 1 } else { count };
+        let mut item = 0;
+        for i in 0..count {
+            if i < items {
+                item = match width {
+                    4 => mem.read_u32(it),
+                    2 => u32::from(mem.read_u16(it)),
+                    _ => u32::from(mem.read_u8(it)),
+                };
+                it = it.wrapping_add(width);
+            }
+            match width {
+                4 => mem.write_u32(dest, item),
+                2 => mem.write_u16(dest, item as u16),
+                _ => mem.write_u8(dest, item as u8),
+            }
+            dest = dest.wrapping_add(width);
+        }
+    }
 }
 
 // --- L3: the OpenLibrary open state machine ---
@@ -518,8 +613,9 @@ struct PendingOpen {
     /// [`crate::dispatch::LibraryRegistry::register_loaded`]).
     name: String,
     /// [`MadeLibrary::alloc_addr`] -- freed via [`GuestHeap::free`] if
-    /// `initFunc` refuses (returns `NULL`).
-    alloc_addr: u32,
+    /// `initFunc` refuses (returns `NULL`). `None` for a non-AUTOINIT
+    /// library, which builds (and frees) its own base.
+    alloc_addr: Option<u32>,
     /// The `BPTR` [`crate::dosfile::DosState::load_seg`] returned --
     /// unloaded via [`crate::dosfile::DosState::unload_seg`] if
     /// `initFunc` refuses, otherwise handed to
@@ -548,8 +644,7 @@ pub enum LoadAttempt {
     /// ([`crate::dispatch::open_library_common`]) must return
     /// immediately without touching them.
     Started,
-    /// The file resolved on the `Vfs` but isn't a loadable `RTF_AUTOINIT`
-    /// library -- no continuation was pushed, nothing was left half-open
+    /// The file resolved on the `Vfs` but isn't a loadable `NT_LIBRARY` -- no continuation was pushed, nothing was left half-open
     /// (any partial seglist/heap allocation was already unwound). The
     /// caller should fall back to the fake-stub path, after logging
     /// `reason` loudly.
@@ -558,7 +653,8 @@ pub enum LoadAttempt {
 
 /// Phase 1 (`library-device-loading-plan.md` §2.1): `LoadSeg`s
 /// `search_path`, scans for a `struct Resident`, validates it's an
-/// `RTF_AUTOINIT` `NT_LIBRARY`, reads its AUTOINIT table and vector
+/// `NT_LIBRARY` (a non-`RTF_AUTOINIT` one is handed to
+/// [`begin_direct_init`]), reads its AUTOINIT table and vector
 /// table, and runs [`make_library`]. On any structural failure, unwinds
 /// whatever was partially built (`unload_seg`, and -- since `make_library`
 /// is the last step -- there's never a `make_library` allocation to free
@@ -598,13 +694,6 @@ pub fn begin_open<C: Cpu>(
     };
     let resident = read_resident(ctx.mem, resident_addr);
 
-    if resident.flags & RTF_AUTOINIT == 0 {
-        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
-        return Ok(LoadAttempt::StructuralFailure(
-            "Resident isn't RTF_AUTOINIT -- non-AUTOINIT libraries aren't implemented yet"
-                .to_string(),
-        ));
-    }
     if resident.node_type != NT_LIBRARY {
         let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
         return Ok(LoadAttempt::StructuralFailure(format!(
@@ -617,6 +706,10 @@ pub fn begin_open<C: Cpu>(
                 "unknown"
             }
         )));
+    }
+
+    if resident.flags & RTF_AUTOINIT == 0 {
+        return begin_direct_init(ctx, name, &resident, seglist_bptr, requested_version);
     }
 
     let autoinit = read_autoinit(ctx.mem, resident.init_ptr);
@@ -635,7 +728,6 @@ pub fn begin_open<C: Cpu>(
         autoinit.d_size,
         autoinit.structure,
         &vectors,
-        name,
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -646,7 +738,7 @@ pub fn begin_open<C: Cpu>(
 
     let pending = PendingOpen {
         name: name.to_string(),
-        alloc_addr: made.alloc_addr,
+        alloc_addr: Some(made.alloc_addr),
         seglist_bptr,
         requested_version,
         caller_a6,
@@ -684,8 +776,8 @@ pub fn begin_open<C: Cpu>(
 ///   base from here on -- a real `initFunc` must return the base, and
 ///   while it's conventionally the same value `make_library` handed it,
 ///   the AUTOINIT contract is "trust `initFunc`'s own `D0`", so that's
-///   what this does. Links the base's `struct Node` onto
-///   `ExecBase.LibList` (the AddLibrary equivalent -- `ln_Name` already
+///   what this does (a non-AUTOINIT init passes the base it built or found on `LibList`, see [`begin_direct_init`]). Links the base's `struct Node` onto
+///   `ExecBase.LibList` unless the library already `AddLibrary`d itself (the AddLibrary equivalent -- `ln_Name` already
 ///   points at the Resident's own name string, written by
 ///   [`make_library`], so no extra name-string bookkeeping is needed
 ///   here, unlike the built-in libraries' `write_library_list_nodes`).
@@ -720,7 +812,9 @@ fn after_init<C: Cpu>(
         // `testlib_initfail` fixture) gets the block reclaimed here
         // instead, so neither style of failing library leaks.
         let _ = ctx.dos.unload_seg(ctx.heap, pending.seglist_bptr);
-        let _ = ctx.heap.free(pending.alloc_addr);
+        if let Some(alloc_addr) = pending.alloc_addr {
+            let _ = ctx.heap.free(alloc_addr);
+        }
         ctx.cpu
             .set_address_register(AddressRegister(6), pending.caller_a6);
         ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -733,8 +827,20 @@ fn after_init<C: Cpu>(
 
     let base = init_result;
 
-    let list_addr = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
-    crate::execlist::add_tail_impl(ctx.mem, list_addr, base);
+    // A non-AUTOINIT init routine normally `AddLibrary`s itself (see
+    // [`add_library_handler`]); only link the node if it hasn't.
+    if find_lib_node(ctx.mem, |_, node| node == base).is_none() {
+        crate::execlist::add_tail_impl(ctx.mem, LIBLIST_ADDR, base);
+    }
+    // `AddLibrary` registered the library under its `ln_Name`; if the
+    // caller opened it by another spelling (e.g. a full path) drop that
+    // entry so the base isn't registered twice.
+    if let Some(prev) = ctx.registry.loaded_library_by_base(base) {
+        let prev = prev.to_string();
+        if prev != pending.name {
+            ctx.registry.unregister_loaded(&prev);
+        }
+    }
     ctx.registry.register_loaded(
         &pending.name,
         base,
@@ -874,7 +980,7 @@ pub fn begin_close<C: Cpu>(
     // so a `loaded_library` miss here would mean the registry changed
     // out from under us within a single handler dispatch -- a bug, not a
     // reachable runtime condition.
-    let alloc_addr = ctx
+    let alloc_addr: Option<u32> = ctx
         .registry
         .loaded_library(name)
         .expect("begin_close is only called for a name just found in the registry")
@@ -952,7 +1058,7 @@ fn finish_close<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     name: &str,
     base: u32,
-    alloc_addr: u32,
+    alloc_addr: Option<u32>,
     caller_a6: u32,
 ) -> Result<(), DispatchError> {
     let close_result = ctx.cpu.data_register(DataRegister(0));
@@ -965,7 +1071,11 @@ fn finish_close<C: Cpu>(
 
     let seglist_bptr = close_result;
 
-    crate::execlist::remove_impl(ctx.mem, base);
+    // A library whose Close vector expunged it itself (RemLibrary-style)
+    // has already unlinked its node; unlinking twice would corrupt the list.
+    if find_lib_node(ctx.mem, |_, node| node == base).is_some() {
+        crate::execlist::remove_impl(ctx.mem, base);
+    }
     ctx.registry.unregister_loaded(name);
 
     ctx.dos
@@ -980,21 +1090,271 @@ fn finish_close<C: Cpu>(
             ),
         })?;
 
-    ctx.heap
-        .free(alloc_addr)
-        .map_err(|e| DispatchError::HandlerFailed {
-            library: name.to_string(),
-            lvo: -12,
-            handler_name: "CloseLibrary".to_string(),
-            message: format!(
-                "freeing library base allocation {alloc_addr:#010x} after expunge: {e}"
-            ),
-        })?;
+    if let Some(alloc_addr) = alloc_addr {
+        ctx.heap
+            .free(alloc_addr)
+            .map_err(|e| DispatchError::HandlerFailed {
+                library: name.to_string(),
+                lvo: -12,
+                handler_name: "CloseLibrary".to_string(),
+                message: format!(
+                    "freeing library base allocation {alloc_addr:#010x} after expunge: {e}"
+                ),
+            })?;
+    }
 
     *ctx.call_detail = Some(format!(
         "library {name:?} closed and expunged (base {base:#010x} freed)"
     ));
     Ok(())
+}
+
+// --- Non-RTF_AUTOINIT libraries and the exec calls a hand-rolled init needs ---
+
+/// Guest address of `ExecBase.LibList` (the `struct List` header).
+const LIBLIST_ADDR: u32 = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
+
+/// Walks `ExecBase.LibList` and returns the first node for which `pred`
+/// holds.
+fn find_lib_node(
+    mem: &dyn AddressSpace,
+    pred: impl Fn(&dyn AddressSpace, u32) -> bool,
+) -> Option<u32> {
+    let mut node = mem.read_u32(LIBLIST_ADDR);
+    loop {
+        let succ = mem.read_u32(node);
+        if succ == 0 {
+            return None;
+        }
+        if pred(mem, node) {
+            return Some(node);
+        }
+        node = succ;
+    }
+}
+
+/// The first `LibList` node whose `ln_Name` is `name` and whose address
+/// isn't `skip` (`0` skips nothing).
+fn find_lib_node_named(mem: &dyn AddressSpace, name: &[u8], skip: u32) -> Option<u32> {
+    find_lib_node(mem, |mem, node| {
+        let name_ptr = mem.read_u32(node.wrapping_add(LIB_NODE_NAME_OFFSET));
+        node != skip && name_ptr != 0 && read_c_string(mem, name_ptr) == name
+    })
+}
+
+/// Phase 1 for a non-`RTF_AUTOINIT` `NT_LIBRARY` Resident: real
+/// `InitResident` jumps straight to `rt_Init` with `D0 = 0`, `A0` =
+/// segList, `A6` = ExecBase (`exec.doc` `InitResident`), and that code
+/// builds the library itself (`MakeLibrary` + `AddLibrary`) and returns
+/// the base. There is no `make_library` here, so [`PendingOpen::alloc_addr`]
+/// is `None` and the library owns its base's memory.
+///
+/// `exec.doc` only says `D0` is "usually the library or device base"; a
+/// routine that added itself but returned `NULL` anyway is therefore
+/// recovered by looking its Resident name up on `LibList` (ignoring a node
+/// of that name that was already there beforehand -- e.g. the built-in
+/// library a `--libs-dir` override is replacing). If neither yields a
+/// base the open is refused like a `NULL` AUTOINIT `initFunc`.
+fn begin_direct_init<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    name: &str,
+    resident: &Resident,
+    seglist_bptr: u32,
+    requested_version: u32,
+) -> Result<LoadAttempt, DispatchError> {
+    if resident.init_ptr == 0 {
+        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        return Ok(LoadAttempt::StructuralFailure(
+            "Resident isn't RTF_AUTOINIT and its RT_INIT is NULL -- nothing to run".to_string(),
+        ));
+    }
+    let caller_a6 = ctx.cpu.address_register(AddressRegister(6));
+    let resident_name = if resident.name_ptr != 0 {
+        read_c_string(ctx.mem, resident.name_ptr)
+    } else {
+        Vec::new()
+    };
+    let preexisting = find_lib_node_named(ctx.mem, &resident_name, 0).unwrap_or(0);
+
+    let pending = PendingOpen {
+        name: name.to_string(),
+        alloc_addr: None,
+        seglist_bptr,
+        requested_version,
+        caller_a6,
+    };
+    ctx.cpu.set_data_register(DataRegister(0), 0);
+    ctx.cpu
+        .set_address_register(AddressRegister(0), seglist_bptr);
+    ctx.cpu
+        .set_address_register(AddressRegister(6), EXEC_LIBRARY_BASE);
+    ctx.continuations
+        .trampoline(ctx.cpu, ctx.mem, resident.init_ptr, move |ctx| {
+            let mut base = ctx.cpu.data_register(DataRegister(0));
+            if base == 0 && !resident_name.is_empty() {
+                base = find_lib_node_named(ctx.mem, &resident_name, preexisting).unwrap_or(0);
+            }
+            after_init(ctx, pending, base)
+        });
+    Ok(LoadAttempt::Started)
+}
+
+fn handler_failed(lvo: i32, handler_name: &str, message: String) -> DispatchError {
+    DispatchError::HandlerFailed {
+        library: "exec.library".to_string(),
+        lvo,
+        handler_name: handler_name.to_string(),
+        message,
+    }
+}
+
+/// `MakeLibrary` (LVO -84): `A0` = vectors, `A1` = InitStruct table (or
+/// `NULL`), `A2` = init routine (or `NULL`), `D0` = dSize, `D1` = segList.
+/// Builds the library with real `JMP` vectors via [`build_library`]; no
+/// node name/type/version is filled in other than what `structure`
+/// provides. If `init` is non-`NULL` it is run (`D0` = base, `A0` =
+/// segList, `A6` = ExecBase) and its `D0` is the result -- on a `NULL`
+/// result the init routine is responsible for freeing the base, as the
+/// autodoc says. Returns `NULL` if the heap is exhausted.
+fn make_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let vectors_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let structure = ctx.cpu.address_register(AddressRegister(1));
+    let init = ctx.cpu.address_register(AddressRegister(2));
+    let d_size = ctx.cpu.data_register(DataRegister(0));
+    let seglist = ctx.cpu.data_register(DataRegister(1));
+
+    if vectors_ptr == 0 {
+        return Err(handler_failed(
+            -84,
+            "MakeLibrary",
+            "called with a NULL vectors pointer".to_string(),
+        ));
+    }
+    let vectors =
+        read_vectors(ctx.mem, vectors_ptr).map_err(|e| handler_failed(-84, "MakeLibrary", e))?;
+    let made = match build_library(ctx.mem, ctx.heap, d_size, structure, &vectors, None) {
+        Ok(made) => made,
+        Err(MakeLibraryError::Heap(_)) => {
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+            return Ok(());
+        }
+        Err(e) => return Err(handler_failed(-84, "MakeLibrary", e.to_string())),
+    };
+
+    ctx.cpu.set_data_register(DataRegister(0), made.base);
+    if init != 0 {
+        ctx.cpu.set_address_register(AddressRegister(0), seglist);
+        ctx.cpu
+            .set_address_register(AddressRegister(6), EXEC_LIBRARY_BASE);
+        ctx.continuations
+            .trampoline(ctx.cpu, ctx.mem, init, |_ctx| Ok(()));
+    }
+    Ok(())
+}
+
+/// `MakeFunctions` (LVO -90): `A0` = target (the high end of the table,
+/// typically the library base), `A1` = function array, `A2` =
+/// displacement base. A zero `A2` means `A1` holds absolute longword
+/// pointers terminated by `-1`; otherwise it holds word displacements
+/// from `A2`, terminated by a `-1` word (no leading format word -- that's
+/// `MakeLibrary`'s `vectors` convention, not this call's). Returns the
+/// table size in bytes in `D0`.
+fn make_functions_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let target = ctx.cpu.address_register(AddressRegister(0));
+    let array = ctx.cpu.address_register(AddressRegister(1));
+    let disp_base = ctx.cpu.address_register(AddressRegister(2));
+
+    let mut vectors = Vec::new();
+    loop {
+        if vectors.len() >= MAX_VECTORS {
+            return Err(handler_failed(
+                -90,
+                "MakeFunctions",
+                format!(
+                    "function array at {array:#010x} exceeded {MAX_VECTORS} entries without a \
+                     -1 terminator"
+                ),
+            ));
+        }
+        let index = vectors.len() as u32;
+        if disp_base == 0 {
+            let entry = ctx.mem.read_u32(array.wrapping_add(index * 4));
+            if entry == 0xFFFF_FFFF {
+                break;
+            }
+            vectors.push(entry);
+        } else {
+            let word = ctx.mem.read_u16(array.wrapping_add(index * 2));
+            if word == 0xFFFF {
+                break;
+            }
+            vectors.push(disp_base.wrapping_add(word as i16 as i32 as u32));
+        }
+    }
+    write_jump_table(ctx.mem, target, &vectors);
+    ctx.cpu
+        .set_data_register(DataRegister(0), vectors.len() as u32 * LIB_VECTSIZE);
+    Ok(())
+}
+
+/// `InitStruct` (LVO -78): `A1` = table, `A2` = memory, `D0` = size. See
+/// [`init_struct`].
+fn init_struct_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let table = ctx.cpu.address_register(AddressRegister(1));
+    let memory = ctx.cpu.address_register(AddressRegister(2));
+    let size = ctx.cpu.data_register(DataRegister(0));
+    init_struct(ctx.mem, table, memory, size).map_err(|e| handler_failed(-78, "InitStruct", e))
+}
+
+/// `AddLibrary` (LVO -396): `A1` = library. Sets `ln_Type` to
+/// `NT_LIBRARY`, `Enqueue`s the node onto `ExecBase.LibList` by priority,
+/// and registers it in [`crate::dispatch::LibraryRegistry`] (under its
+/// `ln_Name`, with no seglist and no host-owned base allocation -- see
+/// [`crate::dispatch::LoadedLibrary::alloc_addr`]) so a later
+/// `OpenLibrary` of that name runs the library's own `Open` vector rather
+/// than going back to disk. If this runs inside a disk load
+/// ([`begin_direct_init`]) [`after_init`] later re-registers the entry
+/// with the real seglist. Real `AddLibrary` also checksums the vector
+/// table (`lib_Sum`); that isn't reproduced.
+fn add_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let lib = ctx.cpu.address_register(AddressRegister(1));
+    ctx.mem
+        .write_u8(lib.wrapping_add(LIB_NODE_TYPE_OFFSET), NT_LIBRARY);
+    crate::execlist::enqueue_impl(ctx.mem, LIBLIST_ADDR, lib);
+    let name_ptr = ctx.mem.read_u32(lib.wrapping_add(LIB_NODE_NAME_OFFSET));
+    if name_ptr != 0 {
+        let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+        ctx.registry.register_loaded(&name, lib, 0, None);
+    }
+    Ok(())
+}
+
+/// Registers `MakeLibrary`, `MakeFunctions`, `InitStruct` and
+/// `AddLibrary` onto [`EXEC_LIBRARY_BASE`], looked up by name through
+/// [`crate::lvos::exec::EXEC_LVOS`]. Called unconditionally from
+/// [`crate::dispatch::Runtime::new`].
+pub fn register_execlib_handlers<C: Cpu + 'static>(
+    table: &mut crate::dispatch::LibraryTable<C>,
+    mem: &mut C::Memory,
+) {
+    macro_rules! reg {
+        ($name:literal, $handler:expr) => {
+            table
+                .register_by_name(
+                    mem,
+                    EXEC_LIBRARY_BASE,
+                    crate::lvos::exec::EXEC_LVOS,
+                    "exec.library",
+                    $name,
+                    $handler,
+                )
+                .unwrap_or_else(|e| panic!("{} should be in EXEC_LVOS: {e}", $name));
+        };
+    }
+    reg!("MakeLibrary", make_library_handler::<C>);
+    reg!("MakeFunctions", make_functions_handler::<C>);
+    reg!("InitStruct", init_struct_handler::<C>);
+    reg!("AddLibrary", add_library_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1279,7 +1639,7 @@ mod tests {
         let resident = dummy_resident(0, 0);
         let vectors = vec![0x1111_1111, 0x2222_2222, 0x3333_3333];
 
-        let made = make_library(&mut mem, &mut heap, &resident, 34, 0, &vectors, "test").unwrap();
+        let made = make_library(&mut mem, &mut heap, &resident, 34, 0, &vectors).unwrap();
 
         assert_eq!(mem.read_u16(made.base - 6), JMP_ABS_L_OPCODE);
         assert_eq!(mem.read_u32(made.base - 4), 0x1111_1111);
@@ -1297,13 +1657,12 @@ mod tests {
 
         // 6 vectors * 6 bytes = 36, already a multiple of 4.
         let six_vectors = vec![0u32; 6];
-        let made6 = make_library(&mut mem, &mut heap, &resident, 34, 0, &six_vectors, "t").unwrap();
+        let made6 = make_library(&mut mem, &mut heap, &resident, 34, 0, &six_vectors).unwrap();
         assert_eq!(made6.base - made6.alloc_addr, 36);
 
         // 5 vectors * 6 bytes = 30, rounds up to 32.
         let five_vectors = vec![0u32; 5];
-        let made5 =
-            make_library(&mut mem, &mut heap, &resident, 34, 0, &five_vectors, "t").unwrap();
+        let made5 = make_library(&mut mem, &mut heap, &resident, 34, 0, &five_vectors).unwrap();
         assert_eq!(made5.base - made5.alloc_addr, 32);
     }
 
@@ -1326,7 +1685,7 @@ mod tests {
         let resident = dummy_resident(0, 0);
         let vectors = vec![0u32; 2];
 
-        let made = make_library(&mut mem, &mut heap, &resident, 40, 0, &vectors, "t").unwrap();
+        let made = make_library(&mut mem, &mut heap, &resident, 40, 0, &vectors).unwrap();
         for i in LIB_STRUCT_SIZE..40 {
             assert_eq!(
                 mem.read_u8(made.base + i),
@@ -1349,7 +1708,7 @@ mod tests {
         resident.version = 6;
         let vectors = vec![0u32; 4];
 
-        let made = make_library(&mut mem, &mut heap, &resident, 34, 0, &vectors, "t").unwrap();
+        let made = make_library(&mut mem, &mut heap, &resident, 34, 0, &vectors).unwrap();
 
         assert_eq!(mem.read_u8(made.base + LIB_NODE_TYPE_OFFSET), NT_LIBRARY);
         assert_eq!(mem.read_u32(made.base + LIB_NODE_NAME_OFFSET), name_ptr);
@@ -1368,34 +1727,88 @@ mod tests {
         let mut mem = FlatMemory::new(0x1000);
         let mut heap = GuestHeap::new(0x100, 0x900);
         let resident = dummy_resident(0, 0);
-        let err = make_library(&mut mem, &mut heap, &resident, 33, 0, &[], "t").unwrap_err();
+        let err = make_library(&mut mem, &mut heap, &resident, 33, 0, &[]).unwrap_err();
         assert!(matches!(
             err,
             MakeLibraryError::DataSizeTooSmall { d_size: 33 }
         ));
     }
 
+    /// Writes `bytes` at `addr` (test helper for InitStruct tables).
+    fn put_bytes(mem: &mut FlatMemory, addr: u32, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            mem.write_u8(addr + i as u32, *b);
+        }
+    }
+
     #[test]
-    fn make_library_rejects_non_null_structure_naming_the_library() {
+    fn init_struct_decodes_the_initializers_i_macro_encodings() {
+        let mut mem = FlatMemory::new(0x1000);
+        // INITBYTE 1,$AA ; INITWORD 2,$BBCC ; INITLONG 4,$11223344 ;
+        // INITBYTE 300,$EE (24-bit offset form) ; terminator.
+        put_bytes(
+            &mut mem,
+            0x100,
+            &[
+                0xA0, 1, 0xAA, 0, // byte at +1
+                0x90, 2, 0xBB, 0xCC, // word at +2
+                0x80, 4, 0x11, 0x22, 0x33, 0x44, // long at +4
+                0xE0, 0, 0x01, 0x2C, 0xEE, 0, // byte at +300
+                0,
+            ],
+        );
+        init_struct(&mut mem, 0x100, 0x400, 0).unwrap();
+        assert_eq!(mem.read_u8(0x401), 0xAA);
+        assert_eq!(mem.read_u16(0x402), 0xBBCC);
+        assert_eq!(mem.read_u32(0x404), 0x1122_3344);
+        assert_eq!(mem.read_u8(0x400 + 300), 0xEE);
+    }
+
+    #[test]
+    fn init_struct_count_repeat_and_running_destination() {
+        let mut mem = FlatMemory::new(0x1000);
+        // dd=10 ss=10 n=2: three bytes at +0x10 (then a pad byte so the
+        // next command starts on an even address); then dd=01 ss=10 n=3:
+        // one source byte repeated four times at the running destination.
+        put_bytes(&mut mem, 0x100, &[0xA2, 0x10, 1, 2, 3, 0, 0x63, 9, 0]);
+        init_struct(&mut mem, 0x100, 0x400, 0).unwrap();
+        assert_eq!(mem.read_u8(0x410), 1);
+        assert_eq!(mem.read_u8(0x411), 2);
+        assert_eq!(mem.read_u8(0x412), 3);
+        for i in 0..4 {
+            assert_eq!(mem.read_u8(0x413 + i), 9, "repeat copy {i}");
+        }
+        assert_eq!(mem.read_u8(0x417), 0, "nothing past the repeat");
+    }
+
+    #[test]
+    fn init_struct_clears_size_first_and_rejects_bad_source_size() {
+        let mut mem = FlatMemory::new(0x1000);
+        for i in 0..16 {
+            mem.write_u8(0x400 + i, 0xFF);
+        }
+        put_bytes(&mut mem, 0x100, &[0xA0, 1, 0x55, 0, 0]);
+        init_struct(&mut mem, 0x100, 0x400, 8).unwrap();
+        assert_eq!(mem.read_u8(0x400), 0);
+        assert_eq!(mem.read_u8(0x401), 0x55);
+        assert_eq!(mem.read_u8(0x407), 0);
+        assert_eq!(mem.read_u8(0x408), 0xFF, "past `size` is untouched");
+
+        put_bytes(&mut mem, 0x100, &[0xB0, 0, 0, 0]);
+        assert!(init_struct(&mut mem, 0x100, 0x400, 0).is_err());
+    }
+
+    #[test]
+    fn make_library_applies_structure_over_the_resident_defaults() {
         let mut mem = FlatMemory::new(0x1000);
         let mut heap = GuestHeap::new(0x100, 0x900);
-        let resident = dummy_resident(0, 0);
-        let err = make_library(
-            &mut mem,
-            &mut heap,
-            &resident,
-            34,
-            0xABCD,
-            &[],
-            "myfancy.library",
-        )
-        .unwrap_err();
-        match err {
-            MakeLibraryError::InitStructNotImplemented { library_name } => {
-                assert_eq!(library_name, "myfancy.library");
-            }
-            other => panic!("expected InitStructNotImplemented, got {other:?}"),
-        }
+        let resident = dummy_resident(0x1234, 0);
+        // INITWORD lib_Version(20), 7.
+        put_bytes(&mut mem, 0xF00, &[0x90, 20, 0, 7, 0]);
+        let made = make_library(&mut mem, &mut heap, &resident, 34, 0xF00, &[]).unwrap();
+        assert_eq!(mem.read_u16(made.base + LIB_VERSION_OFFSET), 7);
+        assert_eq!(mem.read_u32(made.base + LIB_NODE_NAME_OFFSET), 0x1234);
+        assert_eq!(mem.read_u16(made.base + LIB_POSSIZE_OFFSET), 34);
     }
 
     // --- opt-in: real scspill.library, never committed to this repo ---
@@ -1447,7 +1860,6 @@ mod tests {
             autoinit.d_size,
             autoinit.structure,
             &vectors,
-            "scspill.library",
         )
         .expect("make_library should succeed for scspill.library");
         assert_ne!(made.base, 0);
@@ -2689,6 +3101,508 @@ mod loaded_library_e2e {
             1,
             "lib_OpenCnt should be a fresh 1 after the reload's own Open vector ran, not a \
              continuation of the pre-expunge count"
+        );
+    }
+
+    // --- Non-RTF_AUTOINIT libraries (issue #133) ---
+    //
+    // `fixtures/testlib_noauto*` (see testlib_noauto.s): an NT_LIBRARY
+    // Resident with RT_FLAGS = 0 whose rt_Init is code that builds the
+    // library itself via MakeLibrary (+ an InitStruct table) and AddLibrary.
+
+    const TESTLIB_NOAUTO: &[u8] = include_bytes!("../../../fixtures/testlib_noauto");
+    const TESTLIB_NOAUTO_NULLRET: &[u8] =
+        include_bytes!("../../../fixtures/testlib_noauto_nullret");
+    const TESTLIB_NOAUTO_REFUSE: &[u8] = include_bytes!("../../../fixtures/testlib_noauto_refuse");
+    const NOAUTO_NAME: &[u8] = b"noauto.library\0";
+
+    /// Number of `ExecBase.LibList` nodes named `name`.
+    fn liblist_count(mem: &FlatMemory, name: &[u8]) -> usize {
+        use crate::dispatch::EXEC_BASE_LIBLIST_OFFSET;
+        use crate::execlist::{LH_HEAD, LN_NAME, LN_SUCC};
+        let mut node = mem.read_u32(EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET + LH_HEAD);
+        let mut count = 0;
+        while mem.read_u32(node + LN_SUCC) != 0 {
+            let name_ptr = mem.read_u32(node + LN_NAME);
+            if name_ptr != 0 && crate::guestmem::read_c_string(mem, name_ptr) == name {
+                count += 1;
+            }
+            node = mem.read_u32(node + LN_SUCC);
+        }
+        count
+    }
+
+    /// `OpenLibrary("noauto.library", 0)`, call the user vector (LVO -30)
+    /// natively, exit with the library base.
+    fn open_call_return_base_program() -> Vec<u16> {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552);
+        words.push(movea_dn(6, 0));
+        words.push(movea_dn(3, 0));
+        jsr(&mut words, 6, -30);
+        words.push(move_an_dn(3, 0));
+        words.push(RTS);
+        words
+    }
+
+    #[test]
+    fn non_autoinit_library_builds_itself_and_opens() {
+        let (result, rt) = run_against_library(
+            "noauto-open",
+            "noauto.library",
+            TESTLIB_NOAUTO,
+            NOAUTO_NAME,
+            open_call_return_base_program(),
+        );
+        let base = result.expect("run should succeed") as u32;
+        assert_ne!(
+            base, 0,
+            "OpenLibrary of a non-AUTOINIT library should succeed"
+        );
+
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u8(base + 8),
+            9,
+            "ln_Type set by the InitStruct table"
+        );
+        assert_eq!(mem.read_u16(base + 20), 1, "lib_Version from InitStruct");
+        assert_eq!(mem.read_u16(base + 22), 7, "lib_Revision from InitStruct");
+        assert_eq!(mem.read_u16(base + 32), 1, "the Open vector ran once");
+        assert_eq!(
+            mem.read_u16(base - 6),
+            0x4EF9,
+            "vectors are real JMPs built by MakeLibrary, not traps"
+        );
+        assert_ne!(
+            mem.read_u32(base + 34),
+            0,
+            "init stored its segList argument"
+        );
+        assert_eq!(
+            liblist_count(mem, b"noauto.library"),
+            1,
+            "the library's own AddLibrary must not be doubled by the loader"
+        );
+    }
+
+    #[test]
+    fn non_autoinit_library_user_vector_runs_natively() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552);
+        words.push(movea_dn(6, 0));
+        jsr(&mut words, 6, -30);
+        words.push(RTS);
+        let (result, _rt) = run_against_library(
+            "noauto-user-vector",
+            "noauto.library",
+            TESTLIB_NOAUTO,
+            NOAUTO_NAME,
+            words,
+        );
+        assert_eq!(result.expect("run should succeed"), 42);
+    }
+
+    /// The second open finds the library through the registry entry its
+    /// own `AddLibrary` created (re-registered with the seglist by the
+    /// loader) and just runs `Open` again.
+    #[test]
+    fn non_autoinit_library_second_open_reuses_it_and_counts_opens() {
+        let mut words = Vec::new();
+        for _ in 0..2 {
+            movea_imm(&mut words, 1, 0);
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            words.push(moveq(0, 0));
+            jsr(&mut words, 6, -552);
+        }
+        words.push(movea_dn(3, 0));
+        move_w_disp(&mut words, 3, 32, 0); // D0 = lib_OpenCnt
+        words.push(RTS);
+        // Both OpenLibrary calls need the name patched in (the second
+        // movea.l #imm,A1 starts at word 10: 3 + 3 + 1 + 2 words before it).
+        let str_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words[10] = (str_addr >> 16) as u16;
+        words[11] = str_addr as u16;
+        let (result, rt) = run_against_library(
+            "noauto-two-opens",
+            "noauto.library",
+            TESTLIB_NOAUTO,
+            NOAUTO_NAME,
+            words,
+        );
+        assert_eq!(result.expect("run should succeed"), 2);
+        assert_eq!(liblist_count(rt.memory(), b"noauto.library"), 1);
+    }
+
+    /// An init that adds itself but returns `NULL` is recovered by the
+    /// `FindName` fallback on the Resident's name.
+    #[test]
+    fn non_autoinit_init_returning_null_after_addlibrary_is_found_by_name() {
+        let (result, rt) = run_against_library(
+            "noauto-nullret",
+            "noauto.library",
+            TESTLIB_NOAUTO_NULLRET,
+            NOAUTO_NAME,
+            open_call_return_base_program(),
+        );
+        let base = result.expect("run should succeed") as u32;
+        assert_ne!(
+            base, 0,
+            "the added library should be found despite D0 = NULL"
+        );
+        assert_eq!(rt.memory().read_u16(base + 32), 1);
+        assert_eq!(liblist_count(rt.memory(), b"noauto.library"), 1);
+    }
+
+    /// An init that returns `NULL` without adding anything refuses the
+    /// open: `OpenLibrary` returns `NULL` (the program exits with D0).
+    #[test]
+    fn non_autoinit_init_refusing_fails_the_open() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552);
+        words.push(RTS);
+        let (result, rt) = run_against_library(
+            "noauto-refuse",
+            "noauto.library",
+            TESTLIB_NOAUTO_REFUSE,
+            NOAUTO_NAME,
+            words,
+        );
+        assert_eq!(result.expect("run should succeed"), 0);
+        assert_eq!(liblist_count(rt.memory(), b"noauto.library"), 0);
+    }
+
+    /// Runs `OpenLibrary("noauto.library")` (+ `CloseLibrary` of the
+    /// result when `close`), `opens` times, with a fixed `load_end`, and
+    /// returns the guest heap's free bytes afterwards.
+    fn noauto_free_bytes(tag: &str, lib_bytes: &[u8], opens: usize, close: bool) -> u32 {
+        let entry = TRAP_TABLE_END;
+        let fixed_load_end = entry + 0x400;
+        let mut words = Vec::new();
+        let mut placeholders = Vec::new();
+        for _ in 0..opens {
+            placeholders.push(words.len());
+            movea_imm(&mut words, 1, 0);
+            movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+            words.push(moveq(0, 0));
+            jsr(&mut words, 6, -552);
+            if close {
+                words.push(movea_dn(1, 0));
+                movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+                jsr(&mut words, 6, -414);
+            }
+        }
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        for idx in placeholders {
+            words[idx + 1] = (str_addr >> 16) as u16;
+            words[idx + 2] = str_addr as u16;
+        }
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, NOAUTO_NAME);
+        assert!(str_addr + 20 <= fixed_load_end);
+        let (_tmp, vfs) = vfs_with_libs_file(tag, "noauto.library", lib_bytes);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: fixed_load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        rt.heap_mut().free_bytes()
+    }
+
+    #[test]
+    fn non_autoinit_refused_opens_do_not_leak() {
+        assert_eq!(
+            noauto_free_bytes("noauto-refuse-1", TESTLIB_NOAUTO_REFUSE, 1, false),
+            noauto_free_bytes("noauto-refuse-5", TESTLIB_NOAUTO_REFUSE, 5, false),
+            "an init that frees its MakeLibrary base and returns NULL must leave nothing \
+             behind (seglist unloaded, nothing double-freed)"
+        );
+    }
+
+    /// The last close runs the library's own expunge (Remove + FreeMem of
+    /// its own base) and returns the segList: the host must neither unlink
+    /// the node a second time nor free the base, and nothing may leak.
+    #[test]
+    fn non_autoinit_open_close_cycle_leaks_nothing_and_reloads() {
+        let never = noauto_free_bytes("noauto-cycle-0", TESTLIB_NOAUTO, 0, true);
+        let once = noauto_free_bytes("noauto-cycle-1", TESTLIB_NOAUTO, 1, true);
+        let thrice = noauto_free_bytes("noauto-cycle-3", TESTLIB_NOAUTO, 3, true);
+        assert_eq!(never, once, "open+close must return the heap to baseline");
+        assert_eq!(
+            once, thrice,
+            "repeated cycles (fresh reloads) must not leak"
+        );
+    }
+
+    #[test]
+    fn non_autoinit_library_is_gone_from_liblist_after_last_close() {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552);
+        words.push(movea_dn(1, 0));
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -414);
+        words.push(RTS);
+        let (result, rt) = run_against_library(
+            "noauto-close-liblist",
+            "noauto.library",
+            TESTLIB_NOAUTO,
+            NOAUTO_NAME,
+            words,
+        );
+        result.expect("run should succeed");
+        assert_eq!(liblist_count(rt.memory(), b"noauto.library"), 0);
+    }
+
+    // --- Guest-callable MakeLibrary / MakeFunctions / InitStruct / AddLibrary ---
+
+    /// Runs `words` (no `Vfs`) after letting `setup` seed guest data below
+    /// `load_end` (so the guest heap can't overlap it).
+    fn run_words(
+        words: Vec<u16>,
+        setup: impl FnOnce(&mut FlatMemory),
+    ) -> (Result<i32, RuntimeError>, Runtime<M68kCpu>) {
+        let entry = TRAP_TABLE_END;
+        let mut mem = FlatMemory::new(0x6_0000);
+        load_words(&mut mem, entry, &words);
+        setup(&mut mem);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: 0x1_1000,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+        (result, rt)
+    }
+
+    const DATA: u32 = 0x1_0000;
+
+    fn put_u32s(mem: &mut FlatMemory, addr: u32, values: &[u32]) {
+        for (i, v) in values.iter().enumerate() {
+            mem.write_u32(addr + i as u32 * 4, *v);
+        }
+    }
+
+    #[test]
+    fn make_functions_handler_absolute_pointers() {
+        let target = DATA + 0x800;
+        let mut words = Vec::new();
+        movea_imm(&mut words, 0, target);
+        movea_imm(&mut words, 1, DATA);
+        movea_imm(&mut words, 2, 0);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -90);
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            put_u32s(mem, DATA, &[0x1111, 0x2222, 0xFFFF_FFFF]);
+        });
+        assert_eq!(
+            result.expect("run should succeed"),
+            12,
+            "table size in bytes"
+        );
+        let mem = rt.memory();
+        assert_eq!(mem.read_u16(target - 6), 0x4EF9);
+        assert_eq!(mem.read_u32(target - 4), 0x1111);
+        assert_eq!(mem.read_u16(target - 12), 0x4EF9);
+        assert_eq!(mem.read_u32(target - 10), 0x2222);
+    }
+
+    #[test]
+    fn make_functions_handler_word_displacements() {
+        let target = DATA + 0x800;
+        let disp_base = DATA + 0x100;
+        let mut words = Vec::new();
+        movea_imm(&mut words, 0, target);
+        movea_imm(&mut words, 1, DATA);
+        movea_imm(&mut words, 2, disp_base);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -90);
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            // Displacements 0x10, -0x20 (negative), then the -1 terminator.
+            mem.write_u16(DATA, 0x0010);
+            mem.write_u16(DATA + 2, 0xFFE0);
+            mem.write_u16(DATA + 4, 0xFFFF);
+        });
+        assert_eq!(result.expect("run should succeed"), 12);
+        let mem = rt.memory();
+        assert_eq!(mem.read_u32(target - 4), disp_base + 0x10);
+        assert_eq!(mem.read_u32(target - 10), disp_base - 0x20);
+    }
+
+    #[test]
+    fn init_struct_handler_initializes_memory() {
+        let memory = DATA + 0x800;
+        let mut words = Vec::new();
+        movea_imm(&mut words, 1, DATA);
+        movea_imm(&mut words, 2, memory);
+        move_imm_dn(&mut words, 0, 8);
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -78);
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            for i in 0..16 {
+                mem.write_u8(memory + i, 0xFF);
+            }
+            // INITLONG 4,$11223344 ; INITBYTE 1,$AA ; end
+            for (i, b) in [0x80u8, 4, 0x11, 0x22, 0x33, 0x44, 0xA0, 1, 0xAA, 0, 0]
+                .iter()
+                .enumerate()
+            {
+                mem.write_u8(DATA + i as u32, *b);
+            }
+        });
+        result.expect("run should succeed");
+        let mem = rt.memory();
+        assert_eq!(mem.read_u8(memory), 0, "cleared first (size 8)");
+        assert_eq!(mem.read_u8(memory + 1), 0xAA);
+        assert_eq!(mem.read_u32(memory + 4), 0x1122_3344);
+        assert_eq!(mem.read_u8(memory + 8), 0xFF, "past size is untouched");
+    }
+
+    /// Builds the argument registers for a `MakeLibrary` call.
+    fn make_library_call(
+        words: &mut Vec<u16>,
+        vectors: u32,
+        structure: u32,
+        init: u32,
+        d_size: u32,
+        seglist: u32,
+    ) {
+        movea_imm(words, 0, vectors);
+        movea_imm(words, 1, structure);
+        movea_imm(words, 2, init);
+        move_imm_dn(words, 0, d_size);
+        move_imm_dn(words, 1, seglist);
+        movea_imm(words, 6, EXEC_LIBRARY_BASE);
+        jsr(words, 6, -84);
+    }
+
+    /// `MakeLibrary` builds the table and sizes, then runs `init` with
+    /// `D0` = base, `A0` = segList, and its `D0` is the result.
+    #[test]
+    fn make_library_handler_runs_init_and_returns_its_result() {
+        let init_code = DATA + 0x200;
+        let mut words = Vec::new();
+        make_library_call(&mut words, DATA, 0, init_code, 40, 0x77);
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            put_u32s(mem, DATA, &[0x1111, 0x2222, 0xFFFF_FFFF]);
+            // init: movea.l d0,a1 ; move.w #$1234,22(a1) ; move.l a0,34(a1) ; rts
+            let mut code = vec![movea_dn(1, 0), 0x337C, 0x1234, 22];
+            code.push(0x2348); // move.l a0,d16(a1)
+            code.push(34);
+            code.push(RTS);
+            load_words(mem, init_code, &code);
+        });
+        let base = result.expect("run should succeed") as u32;
+        assert_ne!(base, 0);
+        let mem = rt.memory();
+        assert_eq!(mem.read_u16(base + 22), 0x1234, "init ran with D0 = base");
+        assert_eq!(mem.read_u32(base + 34), 0x77, "init got the segList in A0");
+        assert_eq!(mem.read_u16(base + 16), 12, "lib_NegSize");
+        assert_eq!(mem.read_u16(base + 18), 40, "lib_PosSize");
+        assert_eq!(mem.read_u16(base - 6), 0x4EF9);
+        assert_eq!(mem.read_u32(base - 4), 0x1111);
+        assert_eq!(mem.read_u32(base - 10), 0x2222);
+    }
+
+    #[test]
+    fn make_library_handler_without_init_returns_the_base() {
+        let mut words = Vec::new();
+        make_library_call(&mut words, DATA, 0, 0, 34, 0);
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            put_u32s(mem, DATA, &[0x1111, 0xFFFF_FFFF]);
+        });
+        let base = result.expect("run should succeed") as u32;
+        assert_ne!(base, 0);
+        assert_eq!(rt.memory().read_u32(base - 4), 0x1111);
+    }
+
+    /// An `init` returning `NULL` makes `MakeLibrary` return `NULL`.
+    #[test]
+    fn make_library_handler_propagates_init_failure() {
+        let init_code = DATA + 0x200;
+        let mut words = Vec::new();
+        make_library_call(&mut words, DATA, 0, init_code, 34, 0);
+        words.push(RTS);
+        let (result, _rt) = run_words(words, |mem| {
+            put_u32s(mem, DATA, &[0x1111, 0xFFFF_FFFF]);
+            load_words(mem, init_code, &[moveq(0, 0), RTS]);
+        });
+        assert_eq!(result.expect("run should succeed"), 0);
+    }
+
+    /// A guest program that builds a library with `MakeLibrary` (name via
+    /// an InitStruct table), `AddLibrary`s it, then `OpenLibrary`s it by
+    /// name with no disk file at all: `AddLibrary` made it findable, the
+    /// node is typed `NT_LIBRARY`, and `Open` is the library's own code.
+    #[test]
+    fn add_library_makes_a_guest_built_library_openable_by_name() {
+        let structure = DATA + 0x100; // InitStruct: INITLONG LN_NAME
+        let name = DATA + 0x180;
+        let open_code = DATA + 0x200;
+        let mut words = Vec::new();
+        make_library_call(&mut words, DATA, structure, 0, 34, 0);
+        words.push(movea_dn(1, 0)); // A1 = base
+        words.push(movea_dn(3, 0)); // A3 = base (kept)
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -396); // AddLibrary(base)
+        movea_imm(&mut words, 1, name);
+        words.push(moveq(0, 0));
+        jsr(&mut words, 6, -552); // OpenLibrary("mine.library", 0)
+        words.push(RTS);
+        let (result, rt) = run_words(words, |mem| {
+            // Vector 0 (Open): move.l a6,d0 ; rts -- returns the base.
+            put_u32s(mem, DATA, &[open_code, 0xFFFF_FFFF]);
+            for (i, b) in [0x80u8, 10].iter().enumerate() {
+                mem.write_u8(structure + i as u32, *b);
+            }
+            mem.write_u32(structure + 2, name);
+            mem.write_u16(structure + 6, 0);
+            crate::guestmem::write_c_string(mem, name, b"mine.library\0");
+            load_words(mem, open_code, &[move_an_dn(6, 0), RTS]);
+        });
+        let opened = result.expect("run should succeed") as u32;
+        assert_ne!(
+            opened, 0,
+            "OpenLibrary by name should hit the AddLibrary entry"
+        );
+        let mem = rt.memory();
+        assert_eq!(liblist_count(mem, b"mine.library"), 1);
+        assert_eq!(
+            mem.read_u8(opened + 8),
+            9,
+            "AddLibrary sets ln_Type = NT_LIBRARY"
         );
     }
 }

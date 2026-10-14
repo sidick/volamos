@@ -1221,9 +1221,13 @@ pub struct LoadedLibrary {
     /// path would pass to `UnLoadSeg`.
     pub seglist_bptr: u32,
     /// The [`GuestHeap`] allocation-start address
-    /// [`crate::execlib::make_library`] returned -- what a future
-    /// `CloseLibrary`'s expunge path would pass to [`GuestHeap::free`].
-    pub alloc_addr: u32,
+    /// [`crate::execlib::make_library`] returned -- what a
+    /// `CloseLibrary` expunge passes to [`GuestHeap::free`]. `None` for a
+    /// library that built its own base (a non-`RTF_AUTOINIT` init calling
+    /// `MakeLibrary`/`AllocMem` itself, or any `AddLibrary` call): the
+    /// base's memory is then the library's own to free (its Expunge code
+    /// does a `FreeMem`, as on real exec), so the host never frees it.
+    pub alloc_addr: Option<u32>,
 }
 
 /// One auto-created fake library's jump-table block, recorded so
@@ -1300,7 +1304,13 @@ impl LibraryRegistry {
     /// [`LibraryKind::Loaded`] for `name` from here on) and in `loaded`
     /// (so a future `CloseLibrary`/`reopen` can find the seglist/alloc
     /// bookkeeping [`LoadedLibrary`] carries).
-    pub fn register_loaded(&mut self, name: &str, base: u32, seglist_bptr: u32, alloc_addr: u32) {
+    pub fn register_loaded(
+        &mut self,
+        name: &str,
+        base: u32,
+        seglist_bptr: u32,
+        alloc_addr: Option<u32>,
+    ) {
         self.known
             .insert(name.to_string(), (base, LibraryKind::Loaded));
         self.loaded.insert(
@@ -1613,8 +1623,8 @@ fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
 ///    begin_open`] -- on success the open is now running asynchronously
 ///    (via the trampoline primitive) and this handler returns
 ///    immediately, `D0` untouched (a later continuation sets it). On a
-///    *structural* load failure (no `Resident`, non-`AUTOINIT`, a
-///    `.device` opened by mistake, `InitStruct` not yet implemented, ...)
+///    *structural* load failure (no `Resident`, a non-`AUTOINIT` one with
+///    a `NULL` `rt_Init`, a `.device` opened by mistake, ...)
 ///    this prints one loud, named `stderr` line and falls back to the
 ///    fake-stub path below, so every previously-working case (a corpus
 ///    binary that doesn't yet get a real load) keeps working.
@@ -2275,6 +2285,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // DeleteMsgPort/PutMsg/GetMsg/ReplyMsg/AddPort/RemPort/FindPort
         // -- see crate::execlist's module docs.
         crate::execlist::register_execlist_handlers(&mut table, &mut mem);
+
+        // exec.library library-construction primitives a hand-rolled
+        // (non-AUTOINIT) library init routine needs: MakeLibrary/
+        // MakeFunctions/InitStruct/AddLibrary -- see crate::execlib.
+        crate::execlib::register_execlib_handlers(&mut table, &mut mem);
 
         // exec.library task/signal basics + dos.library CheckSignal
         // (Phase 3 stage 5): FindTask/SetSignal/SetExcept/Wait/Signal/

@@ -5,6 +5,30 @@ version scheme in `Cargo.toml`.
 
 ## 0.9
 
+- **Non-`RTF_AUTOINIT` disk libraries, and the `exec.library` calls
+  their init code needs** (issue #133) — `OpenLibrary` can now load an
+  `NT_LIBRARY` whose `struct Resident` has no `RTF_AUTOINIT` flag, the
+  shape real Kickstart modules such as `graphics.library` use:
+  `rt_Init` is code that is called directly (`D0` = 0, `A0` = segList,
+  `A6` = ExecBase, as `InitResident` does) and builds the library
+  itself, returning the base in `D0`. Previously this was rejected
+  with "Resident isn't RTF_AUTOINIT". If the routine adds itself to
+  `LibList` but returns `NULL`, the library is found there by its
+  Resident name; if it does neither the open is refused. The loader
+  no longer double-links a library that already called `AddLibrary`,
+  and since such a library owns its base's memory (its Close/Expunge
+  code frees it, as on real exec) the host never frees or unlinks it a
+  second time on the last close. New guest-callable `MakeLibrary` (runs
+  its `init` routine too), `MakeFunctions`, `InitStruct` (the full
+  `exec/initializers.i` byte-command interpreter, which also means an
+  `RTF_AUTOINIT` library's non-`NULL` `InitStruct` table is now
+  applied instead of rejected) and `AddLibrary` (links the node into
+  `LibList` by priority and makes it openable by name, with no disk
+  file). `AddLibrary` doesn't compute `lib_Sum`; `SumLibrary`,
+  `RemLibrary`, `OpenResource`/`AddResource` and `TypeOfMem` are still
+  unimplemented and will report themselves loudly when a library calls
+  them. Hardware access from a library's init (custom-chip registers)
+  remains out of scope.
 - **`--fpsp-emulate`** (issue #129) — software-emulates the
   instructions a real 68060 removed from silicon (most FPU
   transcendentals — FSIN/FCOS/FATAN/FETOX/FLOGN/FMOD/FSCALE/FINT/
