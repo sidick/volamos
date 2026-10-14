@@ -9,7 +9,9 @@ version scheme in `Cargo.toml`.
   stubs** (issue #136) — `exec.library`'s `Cause` now works for real:
   the node is marked `NT_SOFTINT` (a node already pending is ignored,
   with no nest count), queued on one of exec's five priority levels
-  (-32/-16/0/+16/+32 from `ln_Pri`), and its handler runs before
+  (-32/-16/0/+16/+32 from `ln_Pri`, truncating in-between values; a
+  priority outside -32..=+32, a `NULL` node or a `NULL` `is_Code` stops
+  the run with an error, before the node is touched), and its handler runs before
   `Cause` returns — highest priority first, FIFO within a level — with
   `A1` = `is_Data`, `A5` = `is_Code`, `A6` = ExecBase. A `Cause` made
   from inside a handler is queued and runs once the current handler

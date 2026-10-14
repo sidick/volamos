@@ -87,7 +87,7 @@ Changelog.
   is a no-op for them).
 - Software interrupts: `Cause` runs the node's handler for real
   (priority-ordered across exec's five levels, `NT_SOFTINT` guard
-  against double-queuing, nested `Cause` from a handler queued and run
+  against double-queuing, out-of-range `ln_Pri` rejected, nested `Cause` from a handler queued and run
   afterwards) before returning; `Disable` is not honoured as a
   deferral. `SetIntVector`/`AddIntServer`/`RemIntServer` are
   deliberate loud stubs: the run stops with a message naming the
