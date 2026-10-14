@@ -85,6 +85,14 @@ Changelog.
   library's Expunge vector and only acts on libraries loaded from disk
   or added with `AddLibrary` (built-in libraries have no Expunge, so it
   is a no-op for them).
+- Software interrupts: `Cause` runs the node's handler for real
+  (priority-ordered across exec's five levels, `NT_SOFTINT` guard
+  against double-queuing, nested `Cause` from a handler queued and run
+  afterwards) before returning; `Disable` is not honoured as a
+  deferral. `SetIntVector`/`AddIntServer`/`RemIntServer` are
+  deliberate loud stubs: the run stops with a message naming the
+  `INTB_*` requested, since this runtime never delivers hardware
+  interrupts.
 - Resources: `AddResource`/`RemResource`/`OpenResource` over a real
   `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
   `cia.resource`, ...) are modelled; `OpenResource` of one returns

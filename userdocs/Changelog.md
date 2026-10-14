@@ -5,6 +5,26 @@ version scheme in `Cargo.toml`.
 
 ## 0.9
 
+- **`Cause()` software interrupts, and loud interrupt-registration
+  stubs** (issue #136) — `exec.library`'s `Cause` now works for real:
+  the node is marked `NT_SOFTINT` (a node already pending is ignored,
+  with no nest count), queued on one of exec's five priority levels
+  (-32/-16/0/+16/+32 from `ln_Pri`), and its handler runs before
+  `Cause` returns — highest priority first, FIFO within a level — with
+  `A1` = `is_Data`, `A5` = `is_Code`, `A6` = ExecBase. A `Cause` made
+  from inside a handler is queued and runs once the current handler
+  returns; the node type goes back to `NT_INTERRUPT` just before its
+  handler is entered. The caller's `A5` and `A6` are restored after
+  the queue drains. `Disable`/`Enable` still keep no nest count, so a
+  `Cause` inside a `Disable` section runs its handler immediately
+  instead of at `Enable`. `SetIntVector`, `AddIntServer` and
+  `RemIntServer` now stop the run with a message naming the requested
+  `INTB_*` interrupt and explaining that this runtime never delivers
+  hardware interrupts, rather than the generic unhandled-call text.
+  These are deliberately not "register and ignore": a server that
+  never fires would hang or misbehave far from the cause.
+  Asynchronous interrupt delivery (VBlank, timers, CIA) is not
+  implemented.
 - **Non-`RTF_AUTOINIT` disk libraries, and the `exec.library` calls
   their init code needs** (issue #133) — `OpenLibrary` can now load an
   `NT_LIBRARY` whose `struct Resident` has no `RTF_AUTOINIT` flag, the

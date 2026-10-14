@@ -2239,6 +2239,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // runtime never needs the real waiter-queue machinery.
         crate::execsem::register_execsem_handlers(&mut table, &mut mem);
 
+        // exec.library interrupt calls: loud SetIntVector/AddIntServer/
+        // RemIntServer stubs and a real software-interrupt Cause() -- see
+        // crate::execint's module docs.
+        crate::execint::register_execint_handlers(&mut table, &mut mem);
+
         // exec.library SetFunction (jump-table patching) -- see
         // crate::execsetfunc's module docs.
         crate::execsetfunc::register_execsetfunc_handlers(&mut table, &mut mem);
