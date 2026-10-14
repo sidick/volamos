@@ -278,6 +278,8 @@ version scheme in `Cargo.toml`.
   E-Clock from chipset timing, not the CPU clock, so `D0` always
   reports `ECLOCK_PAL_HZ` regardless of the configured rate.
 
+## 0.8
+
 - **`--sanitize` no longer reports a recycled heap block as
   use-after-free** (issue #95, reported by Bernie Innocenti). Once a run
   freed a block and the heap handed those same addresses back out, every
