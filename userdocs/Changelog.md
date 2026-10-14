@@ -18,8 +18,18 @@ version scheme in `Cargo.toml`.
   its 12 bytes are kept out of the guest heap, `--sanitize` does not
   report stores to it, and it forces `--no-jit` like `--sanitize` does.
   Off by default and CLI-only; nested `System()`/`Execute()` runs
-  inherit it. This is the first half of the issue; the `0xF0FF60`
-  `uaelib` log call is not implemented yet.
+  inherit it. The same flag also enables the `uaelib` log call below.
+
+- **`--uae-debug`: UAE's `uaelib` debug-log trap** (issue #140) — with
+  the flag on, a C-style call to `0xF0FF60` (`calltrap(86, "message")`
+  as declared in amiberry's `uae_pragmas.h`, used by e.g. the
+  vscode-amiga-debug toolchain) writes `DBG: message` to `stderr` and
+  returns 1 in `D0` (0 for a bad pointer). Only mode 86 is implemented;
+  any other mode returns 0 with a one-time-per-mode warning. It is a
+  code address, so it needs `--ram` of 16 MiB or more (a startup
+  warning says otherwise); its two bytes are kept out of the guest
+  heap, it works on every `--cpu`, and with the flag off nothing
+  changes.
 
 - **`--emu68-debug`: Emu68's debug byte port** (issue #140) — a
   byte-sized store to the absolute address `0xDEADBEEF` (the debug

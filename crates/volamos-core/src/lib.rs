@@ -58,6 +58,7 @@ pub mod mathlibs;
 pub mod memory;
 pub mod sanitize;
 pub mod uaedebug;
+pub mod uaelibdebug;
 pub mod utility;
 pub mod vfs;
 

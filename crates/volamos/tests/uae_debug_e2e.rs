@@ -31,6 +31,37 @@ fn program_bytes() -> Vec<u8> {
     let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
     assert_eq!(code.len(), 24);
     code.extend_from_slice(b"n=%d\n\0");
+    hunk(code)
+}
+
+/// The uaelib program (`calltrap(86, "hi")`), whose exit code is the
+/// call's result:
+///
+/// ```text
+/// lea    msg(pc),a0
+/// move.l a0,-(sp)
+/// move.l #86,-(sp)
+/// jsr    $F0FF60
+/// addq.l #8,sp
+/// rts                       ; D0 = calltrap's result = exit code
+/// msg:   dc.b "hi",0
+/// ```
+fn uaelib_program_bytes() -> Vec<u8> {
+    let words: [u16; 11] = [
+        0x41FA, 0x0014, // lea msg(pc),a0
+        0x2F08, // move.l a0,-(sp)
+        0x2F3C, 0x0000, 0x0056, // move.l #86,-(sp)
+        0x4EB9, 0x00F0, 0xFF60, // jsr $F0FF60
+        0x508F, 0x4E75, // addq.l #8,sp ; rts
+    ];
+    let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+    assert_eq!(code.len(), 22);
+    code.extend_from_slice(b"hi\0");
+    hunk(code)
+}
+
+/// Wraps `code` in a one-hunk executable.
+fn hunk(mut code: Vec<u8>) -> Vec<u8> {
     while !code.len().is_multiple_of(4) {
         code.push(0);
     }
@@ -74,6 +105,12 @@ impl Drop for TempDir {
 fn write_program(dir: &TempDir, name: &str) -> PathBuf {
     let path = dir.path().join(name);
     fs::write(&path, program_bytes()).unwrap();
+    path
+}
+
+fn write_uaelib_program(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    fs::write(&path, uaelib_program_bytes()).unwrap();
     path
 }
 
@@ -144,7 +181,8 @@ fn it_works_across_cpu_models_ram_sizes_and_the_jit_flag() {
     ] {
         let out = run(&prog, flags);
         assert_eq!(out.status.code(), Some(0), "{flags:?}: {}", stderr_of(&out));
-        assert_eq!(stderr_of(&out), "n=-2\n", "{flags:?}");
+        // A --ram below 16M also gets the (separate) uaelib warning line.
+        assert!(stderr_of(&out).ends_with("n=-2\n"), "{flags:?}");
     }
     // --clock-mhz adds its own exit report after the guest's text.
     let out = run(&prog, &["--uae-debug", "--clock-mhz", "25"]);
@@ -205,4 +243,85 @@ fn nested_system_runs_inherit_the_port() {
         .unwrap();
     assert_eq!(out.status.code(), Some(42));
     assert_eq!(stderr_of(&out), "");
+}
+
+// --- uaelib debug-log trap at 0xF0FF60 (mode 86) ---
+
+#[test]
+fn the_uaelib_trap_logs_and_returns_1_on_either_cpu_and_with_the_jit_flag() {
+    let dir = TempDir::new("uaelib");
+    let prog = write_uaelib_program(&dir, "prog");
+    for flags in [
+        &["--uae-debug"][..],
+        &["--uae-debug", "--cpu", "68020"],
+        &["--uae-debug", "--cpu", "68010"],
+        &["--uae-debug", "--jit", "--cpu", "68020"],
+        &["--uae-debug", "--sanitize"],
+        &["--uae-debug", "--emu68-debug", "--cpu", "68020"],
+        &["--uae-debug", "--ram", "32M", "--cpu", "68020"],
+    ] {
+        let out = run(&prog, flags);
+        // The exit code is calltrap's return value.
+        assert_eq!(out.status.code(), Some(1), "{flags:?}: {}", stderr_of(&out));
+        assert_eq!(stderr_of(&out), "DBG: hi\n", "{flags:?}");
+    }
+}
+
+#[test]
+fn a_stack_that_covers_the_uaelib_trap_is_a_clear_error() {
+    // 16M - 1M = 0xF00000 < 0xF0FF60, but the sprintf port (0xBFFF00) is
+    // still clear of it, so this isolates the uaelib check.
+    let dir = TempDir::new("uaelib-stack");
+    let prog = write_uaelib_program(&dir, "prog");
+    let out = run(&prog, &["--uae-debug", "--stack", "1M"]);
+    assert!(
+        stderr_of(&out).contains("debug-log trap") && !stderr_of(&out).contains("DBG:"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn the_uaelib_trap_is_absent_without_the_flag() {
+    let dir = TempDir::new("uaelib-off");
+    let prog = write_uaelib_program(&dir, "prog");
+    let out = run(&prog, &["--cpu", "68020"]);
+    // Whatever the zeroed bytes at 0xF0FF60 do, they do not log.
+    assert!(!stderr_of(&out).contains("DBG:"), "{}", stderr_of(&out));
+}
+
+#[test]
+fn a_small_ram_warns_that_the_trap_is_inactive_but_keeps_the_sprintf_port() {
+    let dir = TempDir::new("uaelib-ram");
+    let uaelib = write_uaelib_program(&dir, "uaelib");
+    let out = run(&uaelib, &["--uae-debug", "--ram", "1M"]);
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("debug-log trap") && err.contains("inactive"),
+        "{err}"
+    );
+    assert!(!err.contains("DBG:"), "{err}");
+    // The sprintf port needs no RAM; the warning is printed exactly once.
+    let sprintf = write_program(&dir, "sprintf");
+    let out = run(&sprintf, &["--uae-debug", "--ram", "1M"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("n=-2\n"));
+    assert_eq!(stderr_of(&out).matches("inactive").count(), 1);
+    // Enough RAM: no warning.
+    let out = run(&uaelib, &["--uae-debug"]);
+    assert!(!stderr_of(&out).contains("inactive"));
+}
+
+#[test]
+fn nested_system_runs_inherit_the_uaelib_trap() {
+    let dir = TempDir::new("uaelib-nested");
+    write_uaelib_program(&dir, "echoargs");
+    let out = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg("--uae-debug")
+        .arg("-V")
+        .arg(format!("TEST:{}", dir.path().display()))
+        .arg(SYSTEST_PATH)
+        .output()
+        .unwrap();
+    assert!(stderr_of(&out).contains("DBG: hi\n"), "{}", stderr_of(&out));
 }

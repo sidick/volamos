@@ -742,7 +742,13 @@ plausible. A bug that announces itself beats one that limps on.
 
 ## `--uae-debug`
 
-Enables UAE's **debug sprintf port** at `0xBFFF00` — the memory-mapped
+Enables UAE's debug facilities. One flag turns on both mechanisms:
+the [debug sprintf port](#the-debug-sprintf-port) at `0xBFFF00` and the
+[`uaelib` debug-log trap](#the-uaelib-debug-log-trap) at `0xF0FF60`.
+
+### The debug sprintf port
+
+The **debug sprintf port** at `0xBFFF00` is the memory-mapped
 debug channel WinUAE and amiberry expose when their `debug_mem` option
 is on. A guest formats text using nothing but stores to that address (no
 library call, no `dos.library`, works in code that has none of them
@@ -872,6 +878,65 @@ args:   dc.w    5                   ; %d  (2 bytes)
     previous message — prints nothing and warns, as volamos has no
     cycle counter on this path; on a 68000 the `+8` pair uses the full
     combined pointer (UAE keeps only its low word).
+
+### The `uaelib` debug-log trap
+
+UAE also exposes a *function*: a call to the address `0xF0FF60` enters
+its `uaelib` demultiplexer. volamos implements one mode of it, **mode
+86**, which logs a string — the call the vscode-amiga-debug toolchain
+uses. It is declared in amiberry's `uae_pragmas.h` as a C varargs
+function, so from C:
+
+```c
+static int (*calltrap)(int arg0, ...) = (int (*)(int arg0, ...))0xF0FF60;
+
+calltrap(86, "reached stage 2");
+```
+
+writes this line to **stderr** and returns `1`:
+
+```console
+$ volamos --uae-debug prog
+DBG: reached stage 2
+```
+
+The convention is the plain C stack one, as in UAE: on entry `4(sp)`
+is the mode and `8(sp)` the string pointer (more arguments follow at
+`12(sp)`, ...); the result is returned in `D0` and the caller pops the
+arguments. In assembly:
+
+```
+        pea     msg
+        move.l  #86,-(sp)
+        jsr     $F0FF60
+        addq.l  #8,sp               ; D0 = 1
+        ...
+msg:    dc.b    "reached stage 2",0
+```
+
+- **Bad pointers return `0`** and log nothing: a pointer outside RAM,
+  and address `0` (UAE would read its chip RAM there; volamos keeps its
+  trap table at 0, so a NULL string is treated as invalid). Strings are
+  read through the checked path up to 4095 bytes.
+- **Other modes return `0` and warn.** Any mode other than 86 returns 0
+  — what "not supported" looks like to a program probing for UAE — and
+  prints one `volamos: uae-debug: unsupported uaelib mode N ...` line
+  to stderr, once per distinct mode, so the probe is visible.
+- **Needs `--ram` of at least 16 MiB** (the default). The trap lives at
+  `0xF0FF60`, a code address that has to be inside RAM. With a smaller
+  `--ram` a startup warning says the trap is inactive (the sprintf port
+  still works) and a `jsr` there fails like any jump outside memory.
+  Works on every `--cpu`, including the 24-bit 68000/68010.
+- **Heap and stack.** The two bytes of the trap opcode are kept out of
+  the guest heap; if the program image or the stack covers
+  `0xF0FF60` (e.g. `--stack 1M` or more with the default 16 MiB RAM)
+  the run refuses to start with an error.
+- **JIT and `--sanitize`.** As above, the flag as a whole forces
+  `--no-jit`. The trap's own opcode is never a `--sanitize` violation;
+  the string is read through the checked path, so a pointer into freed
+  memory *is* reported.
+- Nested programs inherit it, and with the flag off nothing is planted:
+  a `jsr` to `0xF0FF60` behaves as it always did.
 
 ## `--emu68-debug`
 

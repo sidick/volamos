@@ -198,6 +198,11 @@ impl InstrumentationOptions {
             runtime
                 .reserve_uae_debug_port()
                 .map_err(|e| format!("--uae-debug: {e}"))?;
+            // Ok(false) (RAM doesn't reach the trap) is warned about once
+            // at startup by `run`, not here, so nested runs stay quiet.
+            runtime
+                .enable_uaelib_debug(Box::new(volamos_core::uaedebug::StderrSink))
+                .map_err(|e| format!("--uae-debug: {e}"))?;
         }
         if self.emu68_debug {
             runtime
@@ -731,7 +736,7 @@ struct Cli {
     )]
     dirty_heap: bool,
 
-    /// Enable UAE's debug sprintf port at 0xBFFF00; text goes to stderr (off by default)
+    /// Enable UAE's debug facilities (sprintf port 0xBFFF00, uaelib log trap 0xF0FF60); output goes to stderr (off by default)
     #[arg(
         long = "uae-debug",
         action = ArgAction::SetTrue,
@@ -743,10 +748,16 @@ struct Cli {
                       switches arguments to memory -- and the text is written to stderr \
                       exactly as formatted. Integers are 16-bit unless the directive has an \
                       `l`. Works whatever --ram is, and the 12 bytes are kept out of the \
-                      guest heap. Off by default and CLI-only (not settable via \
-                      ~/.volamos/.volamos); forces --no-jit regardless of --jit/--no-jit, \
-                      since the JIT's fast memory path would bypass the port. Stores to the \
-                      port are never --sanitize violations."
+                      guest heap. The same flag also enables UAE's uaelib debug-log trap: \
+                      a C-style call to address 0xF0FF60, `calltrap(86, \"message\")` (as \
+                      declared in amiberry's uae_pragmas.h), writes `DBG: message` to stderr \
+                      and returns 1 (0 for a bad pointer). Needs --ram of 16M or more (a \
+                      warning is printed otherwise; the sprintf port still works). Other \
+                      uaelib modes return 0 with a one-time warning each. Off by default \
+                      and CLI-only (not settable via ~/.volamos/.volamos); forces --no-jit \
+                      regardless of --jit/--no-jit, since the JIT's fast memory path would \
+                      bypass the sprintf port. Stores to the port are never --sanitize \
+                      violations."
     )]
     uae_debug: bool,
 
@@ -1823,6 +1834,14 @@ fn run(opts: &Options) -> Result<i32, String> {
             "volamos: emu68-debug: the port at 0xDEADBEEF is inactive with --cpu {}: that CPU \
              masks addresses to 24 bits (use --cpu 68020 or later)",
             cpu_model_name(opts.cpu_type)
+        );
+    }
+    if opts.sanitize.uae_debug && !volamos_core::uaelibdebug::fits_in_ram(opts.ram_size as usize) {
+        eprintln!(
+            "volamos: uae-debug: the debug-log trap at {:#x} is inactive: --ram {} bytes does not \
+             reach it (the sprintf port still works; use --ram 16M or more)",
+            volamos_core::uaelibdebug::UAELIB_ADDRESS,
+            opts.ram_size
         );
     }
     check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source)?;

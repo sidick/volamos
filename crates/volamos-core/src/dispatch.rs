@@ -116,6 +116,12 @@ const FAKE_LIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 2;
 /// Not available to [`LibraryTable::register`].
 const CONTINUATION_SLOT: u16 = MAX_LIBRARY_SLOTS - 3;
 
+/// The slot index reserved for the `--uae-debug` uaelib trap at
+/// [`crate::uaelibdebug::UAELIB_ADDRESS`], bound only when that flag is
+/// on ([`Runtime::enable_uaelib_debug`]). Not available to
+/// [`LibraryTable::register`].
+const UAELIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 4;
+
 /// Size in bytes of the jump-table block [`open_library_handler`] carves
 /// out of the guest heap for each newly auto-created fake library.
 /// Generous (matches [`crate::backend::TRAP_TABLE_SIZE`]) so any
@@ -993,17 +999,16 @@ impl<C: Cpu> LibraryTable<C> {
         handler: impl LibraryHandler<C> + 'static,
     ) -> u16 {
         let slot = self.next_slot;
-        // < CONTINUATION_SLOT, not just < FAKE_LIB_SLOT: CONTINUATION_SLOT
-        // (MAX_LIBRARY_SLOTS - 3) sits below FAKE_LIB_SLOT
-        // (MAX_LIBRARY_SLOTS - 2) and is bound once via
-        // register_fixed_slot, not through this counter -- an unbounded
-        // run of ordinary registrations must stop short of it too, or
-        // next_slot could eventually collide with and silently overwrite
-        // the trampoline stub's own slot entry.
+        // < UAELIB_SLOT, not just < FAKE_LIB_SLOT: UAELIB_SLOT and
+        // CONTINUATION_SLOT sit below FAKE_LIB_SLOT
+        // (MAX_LIBRARY_SLOTS - 2) and are bound via register_fixed_slot,
+        // not through this counter -- an unbounded run of ordinary
+        // registrations must stop short of them too, or next_slot could
+        // eventually collide with and silently overwrite their entries.
         assert!(
-            slot < CONTINUATION_SLOT,
+            slot < UAELIB_SLOT,
             "LibraryTable: too many registered handlers (max {})",
-            CONTINUATION_SLOT - 1
+            UAELIB_SLOT - 1
         );
         self.next_slot += 1;
 
@@ -1068,12 +1073,23 @@ impl<C: Cpu> LibraryTable<C> {
     /// auto-created fake library, keyed at call time by [`HandlerContext::pc`]
     /// rather than by slot.
     fn register_fixed_slot(&mut self, slot: u16, handler: impl LibraryHandler<C> + 'static) {
+        self.register_fixed_slot_named(slot, "<fake>", "<fake-library-vector>", handler);
+    }
+
+    /// [`Self::register_fixed_slot`] with explicit `--verbose`/report names.
+    fn register_fixed_slot_named(
+        &mut self,
+        slot: u16,
+        library: &str,
+        handler_name: &str,
+        handler: impl LibraryHandler<C> + 'static,
+    ) {
         self.slots.insert(
             slot,
             Slot {
-                library: "<fake>".to_string(),
+                library: library.to_string(),
                 lvo: 0,
-                handler_name: "<fake-library-vector>".to_string(),
+                handler_name: handler_name.to_string(),
                 handler: Box::new(handler),
             },
         );
@@ -2813,6 +2829,33 @@ impl<C: Cpu + 'static> Runtime<C> {
                  program or the guest stack; use a larger --ram or a smaller --stack"
             ))
         }
+    }
+
+    /// Plants the `--uae-debug` uaelib trap
+    /// ([`crate::uaelibdebug`]): reserves the stub's two bytes out of
+    /// the guest heap, writes an A-line opcode there and binds it to the
+    /// mode-86 handler writing to `sink`. `Ok(true)` if planted;
+    /// `Ok(false)` if the run's RAM doesn't reach the address (nothing is
+    /// planted; the caller warns); `Err` if the program image or stack
+    /// already covers it.
+    ///
+    /// Call right after [`Runtime::new`], before the guest allocates.
+    pub fn enable_uaelib_debug(
+        &mut self,
+        sink: Box<dyn crate::uaedebug::DebugSink>,
+    ) -> Result<bool, String> {
+        use crate::uaelibdebug::{UAELIB_ADDRESS, handler, reserve};
+        if !reserve(&mut self.heap, self.mem.len())? {
+            return Ok(false);
+        }
+        self.table.register_fixed_slot_named(
+            UAELIB_SLOT,
+            "uaelib",
+            "UaeDbgLog",
+            handler::<C>(sink),
+        );
+        self.mem.write_u16(UAELIB_ADDRESS, 0xA000 | UAELIB_SLOT);
+        Ok(true)
     }
 
     /// Keeps the `--emu68-debug` port's one byte
