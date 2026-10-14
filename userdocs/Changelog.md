@@ -3,7 +3,7 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
-## 0.9
+## 0.10
 
 - **`Cause()` software interrupts, and loud interrupt-registration
   stubs** (issue #136) — `exec.library`'s `Cause` now works for real:
@@ -124,6 +124,8 @@ version scheme in `Cargo.toml`.
   or validating a replacement library (e.g. a custom `graphics.library`)
   against real guest programs. Deliberately opt-in and CLI-only, not a
   `~/.volamos`/`.volamos` config key.
+
+## 0.9
 
 - **`--sanitize` exits `99` on a violation, and no longer misreports a
   `longjmp` return as a stack-smash** (issue #118). A `longjmp` returns
