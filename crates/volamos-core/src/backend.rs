@@ -36,7 +36,7 @@ use m68k::{AddressBus, CpuCore, StepResult};
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason, TrapInfo, TrapKind};
 use crate::m68kops::{self, ControlFlowOp};
-use crate::memory::{AddressSpace, FlatMemory};
+use crate::memory::{AddressSpace, FlatMemory, StoreSize};
 
 /// Re-exported so callers (the CLI's `--cpu` flag) can name a model
 /// without depending on the `m68k` crate directly -- see
@@ -111,16 +111,25 @@ impl AddressBus for FlatMemory {
 
     fn write_byte(&mut self, address: u32, value: u8) {
         self.count_write();
+        if self.intercept_store(address, u32::from(value), StoreSize::Byte) {
+            return;
+        }
         AddressSpace::write_u8(self, address, value);
     }
 
     fn write_word(&mut self, address: u32, value: u16) {
         self.count_write();
+        if self.intercept_store(address, u32::from(value), StoreSize::Word) {
+            return;
+        }
         AddressSpace::write_u16(self, address, value);
     }
 
     fn write_long(&mut self, address: u32, value: u32) {
         self.count_write();
+        if self.intercept_store(address, value, StoreSize::Long) {
+            return;
+        }
         AddressSpace::write_u32(self, address, value);
     }
 
@@ -149,8 +158,11 @@ impl AddressBus for FlatMemory {
     /// the same reason, belt-and-braces; this `None` is what makes that
     /// actually load-bearing rather than merely a hint the JIT could
     /// ignore.
+    // The same reasoning applies to an installed `StorePort` (the
+    // `--uae-debug` port): a raw-pointer store would skip the
+    // interception in `write_byte`/`write_word`/`write_long` above.
     fn fast_mem(&mut self) -> Option<m68k::FastMem> {
-        if self.shadow().is_some() {
+        if self.shadow().is_some() || self.has_store_ports() {
             return None;
         }
         let len = AddressSpace::len(self) as u32;
@@ -370,6 +382,16 @@ pub fn addressable_bytes(cpu_type: CpuType) -> u64 {
     let mut core = CpuCore::new();
     core.set_cpu_type(cpu_type);
     u64::from(core.address_mask) + 1
+}
+
+/// Whether `cpu_type` performs a long store as two word bus cycles
+/// (68000, 68010 and the 68070 -- 16-bit data bus), which is what UAE's
+/// debug sprintf port sees and latches (see [`crate::uaedebug`]).
+pub fn splits_long_stores(cpu_type: CpuType) -> bool {
+    matches!(
+        cpu_type,
+        CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+    )
 }
 
 impl Default for M68kCpu {
@@ -677,7 +699,7 @@ impl Cpu for M68kCpu {
         // too means a caller that installs a shadow map directly
         // (bypassing the CLI) still gets precise attribution rather
         // than depending on remembering to pair the two flags.
-        let max_instructions = if self.jit && mem.shadow().is_none() {
+        let max_instructions = if self.jit && mem.shadow().is_none() && !mem.has_store_ports() {
             u32::MAX
         } else {
             1

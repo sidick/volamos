@@ -601,6 +601,52 @@ impl GuestHeap {
         Ok((user_start, block_start, block_end))
     }
 
+    /// Permanently removes `[start, start + len)` from the free list so
+    /// [`Self::alloc`] can never hand it out -- for fixed guest addresses
+    /// that are not ordinary RAM (the `--uae-debug` port, see
+    /// [`crate::uaedebug`]). The range is not an allocation: nothing is
+    /// recorded as live, it can't be freed, and it simply stops counting
+    /// towards [`Self::total_free`]/[`Self::largest_free`].
+    ///
+    /// Returns `false` (changing nothing) unless the whole range lies
+    /// inside a single free block -- i.e. it is already allocated, or
+    /// overlaps the program image or the stack. `len == 0` is a no-op
+    /// returning `true`.
+    pub fn reserve_range(&mut self, start: u32, len: u32) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let Some(idx) = self
+            .free
+            .iter()
+            .position(|b| b.start <= start && end <= b.start + b.size)
+        else {
+            return false;
+        };
+        let block = self.free[idx];
+        let block_end = block.start + block.size;
+        let head = (block.start < start).then(|| FreeBlock {
+            start: block.start,
+            size: start - block.start,
+        });
+        let tail = (end < block_end).then(|| FreeBlock {
+            start: end,
+            size: block_end - end,
+        });
+        self.free.remove(idx);
+        // Insert tail first so head ends up before it at `idx`.
+        if let Some(tail) = tail {
+            self.free.insert(idx, tail);
+        }
+        if let Some(head) = head {
+            self.free.insert(idx, head);
+        }
+        true
+    }
+
     /// Frees a block previously returned by [`GuestHeap::alloc`].
     ///
     /// Returns [`GuestHeapError::DoubleOrInvalidFree`] if `addr` isn't
@@ -1378,5 +1424,55 @@ mod tests {
         );
 
         redzoned.free(a).unwrap();
+    }
+
+    #[test]
+    fn reserve_range_removes_it_from_the_free_list() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        assert!(heap.reserve_range(0x1800, 12));
+        assert_eq!(heap.total_free(), 0x1000 - 12);
+        assert_eq!(heap.largest_free(), 0x1800 - 0x1000);
+    }
+
+    #[test]
+    fn allocations_never_overlap_a_reserved_range() {
+        let (start, len) = (0x1800, 12);
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        assert!(heap.reserve_range(start, len));
+        let mut seen = 0;
+        while let Ok(a) = heap.alloc_bare(8) {
+            assert!(
+                a + 8 <= start || a >= start + len,
+                "{a:#x} overlaps the reserved range"
+            );
+            seen += 1;
+        }
+        // Everything but the reserved 12 bytes was usable: 12 is not a
+        // multiple of 8, so one 4-byte sliver at most is left over.
+        assert!(seen >= (0x1000 - 12) / 8 - 2, "only {seen} allocations");
+    }
+
+    #[test]
+    fn reserve_range_at_the_edges_and_when_unavailable() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        assert!(heap.reserve_range(0x1000, 8), "start of the block");
+        assert!(heap.reserve_range(0x1FF8, 8), "end of the block");
+        assert_eq!(heap.total_free(), 0x1000 - 16);
+        assert!(!heap.reserve_range(0x1000, 4), "already reserved");
+        assert!(!heap.reserve_range(0x1FFC, 8), "runs past the heap");
+        assert!(!heap.reserve_range(0x0800, 4), "outside the heap");
+        assert!(!heap.reserve_range(u32::MAX - 1, 8), "address overflow");
+        assert!(heap.reserve_range(0x1800, 0), "empty range is a no-op");
+        assert_eq!(heap.total_free(), 0x1000 - 16);
+    }
+
+    #[test]
+    fn reserve_range_fails_over_a_live_allocation() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let a = heap.alloc_bare(16).unwrap();
+        assert!(!heap.reserve_range(a, 4));
+        assert!(!heap.reserve_range(a + 8, 16), "straddling the allocation");
+        heap.free(a).unwrap();
+        assert!(heap.reserve_range(a, 4));
     }
 }

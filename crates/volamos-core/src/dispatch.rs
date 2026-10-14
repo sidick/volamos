@@ -2785,6 +2785,36 @@ impl<C: Cpu + 'static> Runtime<C> {
             .set_dirty_fill(Some(crate::guestmem::DIRTY_HEAP_FILL_BYTE));
     }
 
+    /// Keeps the `--uae-debug` port ([`crate::uaedebug`]) out of the
+    /// guest heap: removes its few bytes from the free list so no
+    /// allocation can cover an address whose stores would be diverted
+    /// to the port. A no-op `Ok` when the port lies wholly outside this
+    /// run's RAM (nothing can be allocated there). `Err` -- with a
+    /// message for the user -- if the range is already in use: it sits
+    /// inside the loaded program or the guest stack (a `--stack`/
+    /// `--ram` combination that puts RAM that high, e.g. `--stack 8M`
+    /// with the default 16 MiB).
+    ///
+    /// Call right after [`Runtime::new`], before the guest allocates
+    /// (and, for overlay programs, before `load_top_level_program`).
+    pub fn reserve_uae_debug_port(&mut self) -> Result<(), String> {
+        use crate::uaedebug::{DEBUG_SPRINTF_ADDRESS, DEBUG_SPRINTF_SIZE};
+        if u64::from(DEBUG_SPRINTF_ADDRESS) >= self.mem.len() as u64 {
+            return Ok(());
+        }
+        if self
+            .heap
+            .reserve_range(DEBUG_SPRINTF_ADDRESS, DEBUG_SPRINTF_SIZE)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "the UAE debug port at {DEBUG_SPRINTF_ADDRESS:#x} falls inside the loaded \
+                 program or the guest stack; use a larger --ram or a smaller --stack"
+            ))
+        }
+    }
+
     pub fn enable_heap_sanitizer(&mut self) {
         self.heap
             .set_redzone_size(crate::guestmem::DEFAULT_REDZONE_SIZE);

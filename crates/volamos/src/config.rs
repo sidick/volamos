@@ -537,6 +537,16 @@ mod tests {
     }
 
     #[test]
+    fn uae_debug_is_not_a_config_key() {
+        // CLI-only (issue #140): a stale config file must not be able to
+        // start diverting guest stores.
+        for key in ["UAE_DEBUG", "UAE-DEBUG"] {
+            let err = parse(&format!("{key}=true\n")).unwrap_err();
+            assert!(err.contains("unknown key"), "unexpected message: {err}");
+        }
+    }
+
+    #[test]
     fn unknown_key_is_an_error() {
         let err = parse("NOPE=1\n").unwrap_err();
         assert!(err.contains("unknown key"), "unexpected message: {err}");

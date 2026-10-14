@@ -153,9 +153,46 @@ struct InstrumentationOptions {
     /// never-perturb-the-program property is worth protecting), and it
     /// is useful on its own with no shadow map and no slowdown.
     dirty_heap: bool,
+    /// `--uae-debug` (issue #140): UAE's debug sprintf port at
+    /// `0xBFFF00`; formatted guest text goes to stderr. Lives here for
+    /// the same reasons as the flags above -- CLI-only (a stale config
+    /// file must not start diverting stores), applied to a freshly built
+    /// `FlatMemory`/`Runtime`, and inherited by nested runs -- though it
+    /// observes nothing: see [`Self::forces_interpreter`].
+    uae_debug: bool,
 }
 
 impl InstrumentationOptions {
+    /// Whether the trace JIT must stay off: both the shadow map and the
+    /// debug port hook guest stores, which the JIT's raw-pointer memory
+    /// path bypasses. Like `--sanitize` before it, this silently wins
+    /// over `--jit` (the interpreter is an exact substitute).
+    fn forces_interpreter(&self) -> bool {
+        self.enabled || self.uae_debug
+    }
+
+    /// Installs the `--uae-debug` port on `mem` (a no-op when off).
+    fn install_uae_debug(&self, mem: &mut FlatMemory, cpu_type: CpuType) {
+        if self.uae_debug {
+            volamos_core::uaedebug::install(
+                mem,
+                cpu_type,
+                Box::new(volamos_core::uaedebug::StderrSink),
+            );
+        }
+    }
+
+    /// Keeps the `--uae-debug` port out of the guest heap (a no-op when
+    /// off); see [`Runtime::reserve_uae_debug_port`].
+    fn reserve_uae_debug_port(&self, runtime: &mut Runtime<M68kCpu>) -> Result<(), String> {
+        if self.uae_debug {
+            runtime
+                .reserve_uae_debug_port()
+                .map_err(|e| format!("--uae-debug: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Applies these options to a freshly-installed shadow map. A no-op
     /// when sanitizing is off (there is no shadow map to configure).
     fn apply(&self, mem: &mut FlatMemory) {
@@ -680,6 +717,25 @@ struct Cli {
     )]
     dirty_heap: bool,
 
+    /// Enable UAE's debug sprintf port at 0xBFFF00; text goes to stderr (off by default)
+    #[arg(
+        long = "uae-debug",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Enable UAE's \"debug sprintf\" port at 0xBFFF00 (WinUAE/amiberry's \
+                      debug_mem feature): the guest formats text with plain stores -- a store \
+                      at +0 pushes an argument, a long store at +4 of a format-string pointer \
+                      prints it, a long store at +8 of a pointer to a va_list-style block \
+                      switches arguments to memory -- and the text is written to stderr \
+                      exactly as formatted. Integers are 16-bit unless the directive has an \
+                      `l`. Works whatever --ram is, and the 12 bytes are kept out of the \
+                      guest heap. Off by default and CLI-only (not settable via \
+                      ~/.volamos/.volamos); forces --no-jit regardless of --jit/--no-jit, \
+                      since the JIT's fast memory path would bypass the port. Stores to the \
+                      port are never --sanitize violations."
+    )]
+    uae_debug: bool,
+
     /// Enable bsdsocket.library: real host network access for the guest
     #[arg(
         long = "net",
@@ -874,6 +930,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         uninit: sanitize_uninit,
         ignore_pcs: cli.sanitize_ignore_pc,
         dirty_heap: cli.dirty_heap,
+        uae_debug: cli.uae_debug,
     };
 
     (
@@ -1600,6 +1657,7 @@ fn run_nested_program(
         mem.enable_sanitizer();
         sanitize.apply(&mut mem);
     }
+    sanitize.install_uae_debug(&mut mem, cpu_type);
     let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
         return -1;
     };
@@ -1625,7 +1683,7 @@ fn run_nested_program(
     // is belt-and-braces (that impl already returns `None` once a
     // shadow map is installed, but making it explicit here means a
     // nested run never even attempts the JIT path in the first place).
-    cpu.set_jit(jit && !sanitize.enabled);
+    cpu.set_jit(jit && !sanitize.forces_interpreter());
     // --clock-mhz (issue #102): the top-level run already validated
     // this against `jit` (see `check_clock_mhz_jit`) before this
     // nested-run closure was ever installed, so `jit`/`clock_mhz` here
@@ -1637,6 +1695,9 @@ fn run_nested_program(
     // the parent's --fpsp-emulate setting, same as it shares --cpu/--fpu.
     cpu.set_emulate_unimplemented_060(fpsp_emulate);
     let mut runtime = Runtime::new(cpu, mem, config);
+    if sanitize.reserve_uae_debug_port(&mut runtime).is_err() {
+        return -1;
+    }
     if sanitize.dirty_heap {
         runtime.enable_dirty_heap();
     }
@@ -1687,6 +1748,7 @@ fn build_runtime_with_vfs(
     vfs_config: Option<VfsConfig>,
 ) -> Result<Runtime<M68kCpu>, String> {
     let mut runtime = Runtime::new(cpu, mem, config);
+    opts.sanitize.reserve_uae_debug_port(&mut runtime)?;
     if let Some(vfs_config) = vfs_config {
         let vfs =
             Vfs::new(vfs_config).map_err(|e| format!("couldn't set up volumes/assigns: {e}"))?;
@@ -1738,7 +1800,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // See run_nested_program's matching comment: --sanitize always wins
     // over --jit, since the JIT's fast_mem path would otherwise bypass
     // every shadow-map check.
-    cpu.set_jit(opts.jit && !opts.sanitize.enabled);
+    cpu.set_jit(opts.jit && !opts.sanitize.forces_interpreter());
     // --clock-mhz (issue #102): already validated against --jit above,
     // so this is never fighting the JIT for control of Cpu::run -- see
     // M68kCpu::set_clock_mhz's doc for how the two would conflict if it
@@ -1774,6 +1836,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
         }
+        opts.sanitize.install_uae_debug(&mut mem, opts.cpu_type);
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
             load_end: TRAP_TABLE_END,
@@ -1794,6 +1857,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
         }
+        opts.sanitize.install_uae_debug(&mut mem, opts.cpu_type);
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
             .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
         check_ram_fits(load_result.end, opts.stack_size, opts.ram_size)?;
@@ -3136,6 +3200,50 @@ mod tests {
         // the absence of one is exactly the point -- a stray
         // `FPSP_EMULATE=` key in a config file has no field to land in.
         let _ = overrides;
+    }
+
+    // --- --uae-debug (issue #140) ---
+
+    #[test]
+    fn default_uae_debug_is_off() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.sanitize.uae_debug);
+        assert!(!opts.sanitize.forces_interpreter());
+    }
+
+    #[test]
+    fn uae_debug_flag_turns_it_on_without_touching_sanitize() {
+        let opts = parse_args(args(&["--uae-debug", "prog"])).unwrap();
+        assert!(opts.sanitize.uae_debug);
+        assert!(!opts.sanitize.enabled, "it observes nothing");
+        assert!(!opts.sanitize.dirty_heap);
+        assert!(opts.sanitize.forces_interpreter());
+    }
+
+    #[test]
+    fn uae_debug_is_not_parsed_after_the_program() {
+        // Everything after <program> belongs to the guest.
+        let opts = parse_args(args(&["prog", "--uae-debug"])).unwrap();
+        assert!(!opts.sanitize.uae_debug);
+        assert_eq!(opts.guest_args, vec!["--uae-debug".to_string()]);
+    }
+
+    #[test]
+    fn uae_debug_does_not_change_the_jit_setting_it_overrides() {
+        // Like --sanitize: Options::jit records what --jit said; the two
+        // are combined where the CPU is configured (`forces_interpreter`).
+        let opts = parse_args(args(&["--jit", "--uae-debug", "prog"])).unwrap();
+        assert!(opts.jit);
+        assert!(opts.sanitize.forces_interpreter());
+    }
+
+    #[test]
+    fn uae_debug_is_cli_only_not_a_config_override() {
+        // The flag flows out of `cli_to_raw` inside `InstrumentationOptions`,
+        // alongside (never inside) `config::Overrides`; and the config
+        // parser has no such key (see config.rs's matching test).
+        let (_, instrumentation, ..) = parse_args_raw(args(&["--uae-debug", "prog"])).unwrap();
+        assert!(instrumentation.uae_debug);
     }
 
     // --- --defaults/--no-defaults/--volumes-dir (issue #43) ---

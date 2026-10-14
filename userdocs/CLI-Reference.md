@@ -5,8 +5,8 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
-        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--net]
-        <program> [args...]
+        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
+        [--net] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself, and
@@ -739,6 +739,139 @@ plausible. A bug that announces itself beats one that limps on.
     `AvailMem` also legitimately reports less free memory under
     `--sanitize`, because redzone and quarantined bytes genuinely aren't
     available.
+
+## `--uae-debug`
+
+Enables UAE's **debug sprintf port** at `0xBFFF00` — the memory-mapped
+debug channel WinUAE and amiberry expose when their `debug_mem` option
+is on. A guest formats text using nothing but stores to that address (no
+library call, no `dos.library`, works in code that has none of them
+open), and the text is written to **stderr**, exactly as formatted: no
+prefix, and no newline unless the format string has one.
+
+```console
+$ volamos --uae-debug prog
+boot: stage=2 flags=$0000beef name=loader
+```
+
+Off by default, and CLI-only — it is not settable from `~/.volamos`/
+`.volamos`, so a stale config file can't start diverting stores. With
+the flag off, a store to `0xBFFF00` behaves exactly as it always did.
+Nested `System()`/`Execute()`/`RunCommand()` programs inherit it.
+
+### Protocol
+
+All offsets are from `0xBFFF00`:
+
+| Store | Effect |
+|---|---|
+| any size at `+0` | Push an argument (its value and width) on a 32-entry stack. Pushes beyond the 32nd are dropped. |
+| **long** at `+4` | The value is a pointer to a NUL-terminated format string: format it with the pushed arguments, print it, and clear the stack. |
+| **long** at `+8` | The value is a pointer to a `va_list`-style argument block in guest memory: from now on every format reads its arguments from there, packed with no padding (until the next push at `+0`). |
+
+Byte and word stores to `+4`/`+8` are ignored. On a 68000/68010 a long
+store is two word bus cycles and UAE sees (and latches) them as such, so
+`+2`/`+6`/`+10` are routed too and a pair of `move.w` works the same as
+one `move.l`; on a 68020 and later only the exact offsets `+0`/`+4`/`+8`
+are routed. volamos picks this from `--cpu`.
+
+### Format codes
+
+`%%`, `%c`, `%s` (C string), `%b` (BSTR), `%p` (printed `$%08x`), and
+`%x %X %d %i %u %o`, with the usual C flags (`-`, `+`, space, `#`, `0`),
+width and precision between the `%` and the code.
+
+!!! warning "Integers are 16 bits unless you say `l`"
+    `%d` consumes a **16-bit** value and sign-extends it; `%x`/`%u`/`%o`
+    zero-extend it. Print a 32-bit value with `%ld`/`%lx`/...; pointers
+    for `%s`, `%b` and `%p` are always 32-bit. Forgetting the `l` prints
+    the low half of the number — and with the `+8` argument block it
+    also *misaligns every later argument*, because the block holds a
+    2-byte slot for each plain integer and a 4-byte slot for each `l`
+    one (and for each pointer).
+
+An unknown or malformed directive (`%z`, `%*d`, ...) is printed
+literally and a `volamos: uae-debug:` warning goes to stderr; a
+directive with no argument left prints `0` (plus a warning). The
+`%[CYCLES]x` form UAE offers is not supported (see below).
+
+### Using it from a program
+
+C, with the stack protocol (`DBG` is a `volatile` pointer so the
+compiler can't merge or reorder the stores):
+
+```c
+#define DBG ((volatile unsigned long *)0xBFFF00)
+
+static void dbg(const char *fmt) { DBG[1] = (unsigned long)fmt; }   /* +4 */
+
+/* arguments are pushed in order, then the format prints them */
+DBG[0] = stage;                      /* %d  (16-bit)  */
+DBG[0] = flags;                      /* %lx (32-bit)  */
+DBG[0] = (unsigned long)name;        /* %s            */
+dbg("boot: stage=%d flags=$%08lx name=%s\n");
+```
+
+(On a 68000 the compiler emits a `move.l` and volamos splits it into
+the word pair, so the same code works on every `--cpu`.) 68000
+assembly:
+
+```
+        move.l  #$FFFE,$BFFF00      ; push a value (prints as -2 with %d)
+        move.l  #msg,$BFFF04        ; print "n=%d\n"
+        ...
+msg:    dc.b    "n=%d",10,0
+```
+
+Or collect the arguments in memory and use the `+8` form — handy for a
+logging helper that already has a `va_list`-style block:
+
+```
+        move.l  #args,$BFFF08       ; switch to memory arguments
+        move.l  #msg,$BFFF04        ; msg = "n=%d name=%s\n"
+        rts
+args:   dc.w    5                   ; %d  (2 bytes)
+        dc.l    name                ; %s  (4 bytes)
+```
+
+### What it does to the run
+
+- **Works at any `--ram`.** The port is intercepted on the CPU's store
+  path *before* any memory lookup, so it is there with `--ram 1M` (where
+  `0xBFFF00` isn't RAM at all) and with the default 16 MiB (where it
+  is). A claimed store never reaches memory.
+- **The JIT is off.** The trace JIT writes guest memory through a raw
+  pointer that would bypass the port, so `--uae-debug` forces
+  `--no-jit` — silently overriding an explicit `--jit`, exactly as
+  [`--sanitize`](#-sanitize) does. It can be combined with
+  `--clock-mhz`.
+- **The 12 bytes are kept out of the guest heap.** When `0xBFFF00` lies
+  inside RAM, `AllocMem` and friends will never hand out an address in
+  `0xBFFF00..0xBFFF0C`, so `AvailMem` reports 12 bytes less (and
+  `MEMF_LARGEST` the larger of the two pieces on either side). If the
+  program image or the stack already covers that range (e.g. `--stack
+  8M` with the default RAM) the run refuses to start with an error
+  rather than corrupt memory — use a bigger `--ram` or a smaller
+  `--stack`.
+- **`--sanitize` is not bothered.** Stores to the port are legitimate
+  device accesses and are never reported. Format strings and `%s`/`%b`
+  arguments are read through the checked path, so passing a pointer to
+  freed or out-of-bounds memory *is* reported.
+- **Reads are not intercepted** (the port is write-only in UAE too): a
+  read of `0xBFFF00..` returns whatever is in memory there.
+- **Bounded.** Strings are read up to 4095 bytes (an unmapped byte
+  ends one), and one message is at most 4095 bytes; nothing the guest
+  stores can hang or crash volamos.
+
+!!! note "Differences from UAE"
+    volamos mirrors UAE's protocol, including its quirks, with these
+    exceptions: missing arguments read as `0` (UAE prints whatever stale
+    values earlier messages left on its stack); malformed directives
+    are printed literally with a warning (UAE passes them to the host
+    `printf`); `%[CYCLES]x` — which prints emulated cycles since the
+    previous message — prints nothing and warns, as volamos has no
+    cycle counter on this path; on a 68000 the `+8` pair uses the full
+    combined pointer (UAE keeps only its low word).
 
 ## No flags at all
 

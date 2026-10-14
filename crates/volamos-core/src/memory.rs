@@ -24,6 +24,38 @@
 
 use crate::sanitize::ShadowMap;
 
+/// The width of one guest CPU store, as seen by a [`StorePort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreSize {
+    /// A byte store.
+    Byte,
+    /// A word store.
+    Word,
+    /// A long store.
+    Long,
+}
+
+/// A device-style, write-only port at a fixed guest address, fed by guest
+/// CPU stores (the UAE debug ports -- see [`crate::uaedebug`]).
+///
+/// Installed with [`FlatMemory::add_store_port`]. Stores are offered to
+/// the ports in [`crate::backend`]'s [`m68k::AddressBus`] implementation,
+/// **before** the bounds check, the sanitizer shadow map and the backing
+/// bytes: the address needn't be backed by RAM (it may be far outside
+/// `--ram`), a claimed store never reaches memory, and it is never a
+/// sanitizer violation. Library-handler writes through [`AddressSpace`]
+/// are not guest stores and are never offered. Reads are not intercepted.
+pub trait StorePort {
+    /// Whether a store at `addr` belongs to this port, judged on the
+    /// address exactly as the CPU core presents it (68000/68010 cores
+    /// present the 24-bit-masked address).
+    fn claims(&self, addr: u32) -> bool;
+
+    /// Handles a claimed store. `mem` is the guest memory, for ports that
+    /// need to read it (e.g. a string the guest points at).
+    fn store(&mut self, mem: &dyn AddressSpace, addr: u32, value: u32, size: StoreSize);
+}
+
 /// A byte-addressable memory space that a [`Cpu`](crate::cpu::Cpu)
 /// implementation can read from and write to.
 ///
@@ -135,7 +167,6 @@ pub trait AddressSpace {
 /// plumbing work. It has no notion of memory-mapped regions, protection,
 /// or sparse allocation; guest address `0` maps to byte `0` of the
 /// backing `Vec`.
-#[derive(Debug, Clone)]
 pub struct FlatMemory {
     bytes: Vec<u8>,
     /// Count of guest-CPU bus reads and writes, for the CLI's
@@ -148,6 +179,20 @@ pub struct FlatMemory {
     /// `FlatMemory`, and so `FlatMemory` stays cheap to move around
     /// (e.g. into a nested [`crate::dispatch::Runtime`]).
     shadow: Option<Box<ShadowMap>>,
+    /// Store-intercepting ports (`--uae-debug`), empty by default; see
+    /// [`StorePort`]. The disabled cost is one `is_empty` check per guest
+    /// store.
+    ports: Vec<Box<dyn StorePort>>,
+}
+
+impl std::fmt::Debug for FlatMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlatMemory")
+            .field("len", &self.bytes.len())
+            .field("sanitizer", &self.shadow.is_some())
+            .field("store_ports", &self.ports.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FlatMemory {
@@ -159,7 +204,44 @@ impl FlatMemory {
             reads: 0,
             writes: 0,
             shadow: None,
+            ports: Vec::new(),
         }
+    }
+
+    /// Installs a [`StorePort`]; from now on guest CPU stores it claims
+    /// are diverted to it, and [`m68k::AddressBus::fast_mem`] returns
+    /// `None` (the JIT's raw-pointer stores would bypass the port --
+    /// the same reason `--sanitize` disables it).
+    pub fn add_store_port(&mut self, port: Box<dyn StorePort>) {
+        self.ports.push(port);
+    }
+
+    /// Whether any [`StorePort`] is installed.
+    pub fn has_store_ports(&self) -> bool {
+        !self.ports.is_empty()
+    }
+
+    /// Offers a guest CPU store to the installed ports; `true` if one
+    /// claimed (and consumed) it. Called only from the
+    /// [`m68k::AddressBus`] impl.
+    #[inline]
+    pub(crate) fn intercept_store(&mut self, addr: u32, value: u32, size: StoreSize) -> bool {
+        if self.ports.is_empty() {
+            return false;
+        }
+        self.intercept_store_slow(addr, value, size)
+    }
+
+    fn intercept_store_slow(&mut self, addr: u32, value: u32, size: StoreSize) -> bool {
+        let Some(idx) = self.ports.iter().position(|p| p.claims(addr)) else {
+            return false;
+        };
+        // Taken out so the port can read the rest of `self` (it is handed
+        // `&FlatMemory`); put back before returning.
+        let mut ports = std::mem::take(&mut self.ports);
+        ports[idx].store(&*self, addr, value, size);
+        self.ports = ports;
+        true
     }
 
     /// Returns a read-only view of the backing bytes.

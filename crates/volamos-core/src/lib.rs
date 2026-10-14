@@ -56,6 +56,7 @@ pub mod m68kops;
 pub mod mathlibs;
 pub mod memory;
 pub mod sanitize;
+pub mod uaedebug;
 pub mod utility;
 pub mod vfs;
 

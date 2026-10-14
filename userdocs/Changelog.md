@@ -3,6 +3,24 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.11
+
+- **`--uae-debug`: UAE's debug sprintf port** (issue #140) — a
+  program that formats debug text with plain stores to `0xBFFF00` (the
+  channel WinUAE/amiberry expose as `debug_mem`) now gets that text on
+  `stderr` instead of nothing: a store at `+0` pushes an argument, a
+  long store at `+4` prints a format string, a long store at `+8`
+  switches to a `va_list`-style argument block in guest memory. Format
+  codes are `%% %c %s %b %p %x %X %d %i %u %o` with C flags, width and
+  precision; integers are 16-bit unless the directive has an `l`. The
+  68000/68010 word-pair stores UAE latches are honoured. The port works
+  whatever `--ram` is (stores are intercepted before the memory lookup),
+  its 12 bytes are kept out of the guest heap, `--sanitize` does not
+  report stores to it, and it forces `--no-jit` like `--sanitize` does.
+  Off by default and CLI-only; nested `System()`/`Execute()` runs
+  inherit it. This is the first half of the issue; the `0xF0FF60`
+  `uaelib` log call is not implemented yet.
+
 ## 0.10
 
 - **`Cause()` software interrupts, and loud interrupt-registration
