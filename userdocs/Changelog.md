@@ -5,6 +5,19 @@ version scheme in `Cargo.toml`.
 
 ## 0.11
 
+- **`FINT`/`FINTRZ` no longer trap under `--cpu 68060`** — the `m68k`
+  CPU core crate's 68060 model wrongly treated both as unimplemented in
+  hardware (true of the 68040, but the 68060 brought them back), so a
+  correctly built 68060 binary that used them — GCC emits `FINTRZ` for
+  `-m68060`, and libm's `exp()` hits it — died with an unimplemented-
+  instruction exception under `--cpu 68060 --fpu`, with or without
+  [`--fpsp-emulate`](CLI-Reference.md#-fpsp-emulate). Fixed upstream and
+  picked up by the crate update to 0.14.5; there is no volamos-side
+  change. The transcendentals, `FMOD`/`FREM`/`FSCALE`, `FGETEXP`/
+  `FGETMAN`, `FSINCOS` and the other genuinely removed instructions
+  still trap as on real hardware. This clears the known issue listed in
+  the v0.10 release notes.
+
 - **`--uae-debug`: UAE's debug sprintf port** (issue #140) — a
   program that formats debug text with plain stores to `0xBFFF00` (the
   channel WinUAE/amiberry expose as `debug_mem`) now gets that text on
