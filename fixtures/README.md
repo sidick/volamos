@@ -1257,3 +1257,33 @@ documented above in sync with the actual file (they're deliberately
 memorable, not incidental), and re-verify the `(line, offset)` table
 by re-dumping the rebuilt binary's `HUNK_DEBUG` blocks rather than
 assuming the old table still applies.
+
+## issue #151 fixture: `looper`
+
+Generator: `gen_looper.py` (no hand-written `.s` source -- the entire
+program is a single two-word `bra spin` back to its own label, not
+worth a `.s` file of its own). Built via `amiga_asm.py`'s
+`build_single_hunk_executable` rather than the usual two-hunk
+CODE+DATA shape: there's no data, and (unlike every other fixture) no
+startup at all -- not even `OpenLibrary` -- since the whole point is a
+guest that never makes a single library call.
+
+Used by `crates/volamos/tests/signal_e2e.rs` to prove real `SIGTERM`/
+`SIGINT` delivery to the actual `volamos` binary (issue #151:
+"`SIGTERM` and `SIGINT` do not stop a guest that ignores breaks"):
+since `looper` never reaches a dispatched-trap boundary,
+`crate::exectask::fold_pending_host_break` never runs, so it is the one
+case where a *cooperative* break genuinely never arrives no matter how
+long the guest runs -- exactly the scenario forced termination
+(`SIGTERM`, or a second `SIGINT`) exists for. See
+`crates/volamos-core/src/exectask.rs`'s module docs ("Host
+`SIGINT`/`SIGTERM`" section) for the handler logic this fixture
+exercises.
+
+### Regenerating
+
+```sh
+python3 fixtures/gen_looper.py
+```
+
+No `vasm` form is given here -- there is no `.s` source to assemble.

@@ -194,36 +194,55 @@
 //!
 //! Real AmigaOS Shells map Ctrl-C at the keyboard to
 //! `SIGBREAKF_CTRL_C` (bit 12, `0x00001000`) delivered to the running
-//! process; `volamos` maps the host equivalent (`SIGINT`/`SIGTERM`,
-//! e.g. an actual Ctrl-C at the host terminal, or `kill`) onto the same
-//! guest signal. [`install_host_break_handler`] installs a minimal
-//! host signal handler -- gated `#[cfg(unix)]`, a no-op on any other
-//! platform -- that does nothing but set an atomic flag
-//! ([`PENDING_HOST_BREAK`]); it is *not* installed automatically by
-//! [`crate::dispatch::Runtime::new`] (that would hijack the test
-//! runner's own `SIGINT` handling for every unit test in this crate),
-//! only by an explicit call, which `crates/volamos/src/main.rs` makes
-//! once at CLI startup.
+//! process; `volamos` maps the host equivalent (an actual Ctrl-C/SIGINT
+//! at the host terminal) onto the same guest signal.
+//! [`install_host_break_handler`] installs minimal host signal handlers
+//! -- gated `#[cfg(unix)]`, a no-op on any other platform -- that are
+//! *not* installed automatically by [`crate::dispatch::Runtime::new`]
+//! (that would hijack the test runner's own `SIGINT` handling for every
+//! unit test in this crate), only by an explicit call, which
+//! `crates/volamos/src/main.rs` makes once at CLI startup.
 //!
-//! [`fold_pending_host_break`] is the only thing that ever consults the
-//! flag: it atomically takes-and-clears it, and if it was set, ORs
-//! [`SIGBREAKF_CTRL_C`] into `tc_SigRecvd`. [`crate::dispatch::Runtime::
-//! run`] calls it once per dispatched library call (right before
-//! building the [`crate::dispatch::HandlerContext`] for the trapped
-//! call), and [`wait_handler`]/[`check_signal_handler`] each also call it
+//! The SIGINT handler does nothing but set an atomic flag
+//! ([`PENDING_HOST_BREAK`]). [`fold_pending_host_break`] is the only
+//! thing that ever consults it: it atomically takes-and-clears it, and
+//! if it was set, ORs [`SIGBREAKF_CTRL_C`] into `tc_SigRecvd`.
+//! [`crate::dispatch::Runtime::run`] calls it once per dispatched
+//! library call (right before building the
+//! [`crate::dispatch::HandlerContext`] for the trapped call), and
+//! [`wait_handler`]/[`check_signal_handler`] each also call it
 //! themselves before consulting `tc_SigRecvd`, so a `Wait`/`CheckSignal`
 //! invoked directly (bypassing the run loop, as this module's own tests
 //! do) still sees a break that was set on the flag directly.
 //!
-//! ## Polling granularity
+//! ## Polling granularity, and forced termination
 //!
 //! Since the flag is only ever folded in at a dispatched library-call
 //! boundary, a guest program running a tight, call-free compute loop
 //! (no library calls at all) will not observe a host break until its
 //! *next* library call, however long that takes -- there is no
-//! instruction-level or timer-driven check. This is a known, accepted
-//! limitation: real hardware interrupts preempt at any instruction, this
-//! runtime only checks at trap-dispatch time.
+//! instruction-level or timer-driven check. Real hardware interrupts
+//! preempt at any instruction; this runtime only checks at
+//! trap-dispatch time.
+//!
+//! That polling gap means a guest that never makes a library call can
+//! never be asked to break cooperatively, so two signals bypass the
+//! flag entirely and terminate the host process immediately via `_exit`
+//! (async-signal-safe, unlike [`std::process::exit`], and consistent
+//! with what an already-hung guest gets from `SIGKILL` today -- no
+//! guest or host cleanup runs either way):
+//!
+//! - `SIGTERM` always does this on receipt. It means "terminate", not
+//!   "ask nicely" -- there is no cooperative delivery for it at all.
+//! - A *second* `SIGINT` does this if it arrives while a first one is
+//!   still pending (i.e. [`PENDING_HOST_BREAK`] is already set, meaning
+//!   it hasn't been folded into any task yet) -- the double-Ctrl-C
+//!   "I mean it" convention most interpreters use. A single `SIGINT`
+//!   still only requests a cooperative break, as before.
+//!
+//! Both exit with the shell's usual `128 + signum` code for a
+//! signal-terminated process (143 for `SIGTERM`, 130 for a forced
+//! `SIGINT`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -444,6 +463,11 @@ unsafe extern "C" {
     /// platform this project targets anyway; this is just the minimal
     /// FFI surface needed to reach it.
     fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    /// The POSIX `_exit(2)` function: terminates the process immediately,
+    /// without running destructors, `atexit` hooks, or anything else --
+    /// unlike [`std::process::exit`], this is async-signal-safe and so
+    /// the only thing this module calls from within a signal handler.
+    fn _exit(status: i32) -> !;
 }
 
 /// `SIGINT`, per POSIX (`<signal.h>`) -- the same numeric value on every
@@ -454,23 +478,42 @@ const SIGINT: i32 = 2;
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 
-/// The actual host signal handler: does nothing except set
-/// [`PENDING_HOST_BREAK`], which is the only async-signal-safe operation
-/// this module needs (a plain atomic store) -- everything else (folding
-/// the flag into guest memory) happens later, synchronously, from
-/// [`fold_pending_host_break`], never from within the signal handler
-/// itself.
+/// The shell's usual exit code for a process terminated by `signum`
+/// (`128 + signum`), used for this module's own forced-`_exit` paths --
+/// see the module docs' "Polling granularity, and forced termination"
+/// section.
 #[cfg(unix)]
-extern "C" fn handle_host_break(_signum: i32) {
-    PENDING_HOST_BREAK.store(true, Ordering::SeqCst);
+const fn signal_exit_code(signum: i32) -> i32 {
+    128 + signum
 }
 
-/// Installs the host `SIGINT`/`SIGTERM` -> [`PENDING_HOST_BREAK`] handler
-/// (see the module docs' "Host `SIGINT`/`SIGTERM`" section). A no-op on
-/// any non-`unix` target.
+/// The `SIGINT` handler: sets [`PENDING_HOST_BREAK`] so the next
+/// dispatched library call delivers `SIGBREAKF_CTRL_C` to the guest --
+/// unless it was *already* set (a prior `SIGINT` the guest hasn't
+/// observed yet), in which case this is a second Ctrl-C and the guest
+/// isn't cooperating, so terminate immediately instead. Both the atomic
+/// swap and `_exit` are async-signal-safe; nothing else runs here.
+#[cfg(unix)]
+extern "C" fn handle_host_break(_signum: i32) {
+    if PENDING_HOST_BREAK.swap(true, Ordering::SeqCst) {
+        unsafe { _exit(signal_exit_code(SIGINT)) };
+    }
+}
+
+/// The `SIGTERM` handler: `SIGTERM` means "terminate", not "ask the
+/// guest nicely" -- there is no cooperative delivery for it, so this
+/// terminates the process immediately on every delivery. See the module
+/// docs' "Polling granularity, and forced termination" section.
+#[cfg(unix)]
+extern "C" fn handle_host_term(_signum: i32) {
+    unsafe { _exit(signal_exit_code(SIGTERM)) };
+}
+
+/// Installs the host `SIGINT`/`SIGTERM` handlers (see the module docs'
+/// "Host `SIGINT`/`SIGTERM`" section). A no-op on any non-`unix` target.
 ///
 /// Deliberately **not** called from [`crate::dispatch::Runtime::new`] --
-/// installing a process-wide signal handler as a side effect of
+/// installing process-wide signal handlers as a side effect of
 /// constructing a `Runtime` would hijack the test runner's own `SIGINT`
 /// handling for every unit test in this crate (including this module's
 /// own). Callers that actually want host-break delivery (i.e.
@@ -479,7 +522,7 @@ pub fn install_host_break_handler() {
     #[cfg(unix)]
     unsafe {
         signal(SIGINT, handle_host_break);
-        signal(SIGTERM, handle_host_break);
+        signal(SIGTERM, handle_host_term);
     }
 }
 

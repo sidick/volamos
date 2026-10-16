@@ -19,22 +19,14 @@
 //!   is known to hit" bug class Phase 3 targets) via `fixtures/recurse`
 //!   (`fixtures/gen_recurse.py`).
 //!
-//! **SIGINT end to end: deliberately not covered here.** The unit tests
-//! in `crates/volamos-core/src/exectask.rs` already cover the host
-//! `SIGINT`/`SIGTERM` -> `SIGBREAKF_CTRL_C` folding logic directly
-//! (`PENDING_HOST_BREAK`/`fold_pending_host_break`). An actual CLI-level
-//! SIGINT e2e test would need a *long-running* guest process that
-//! actively polls/`Wait`s on the signal after receiving it (so there's a
-//! window to deliver the host signal into, and an observable guest-side
-//! reaction to assert on) -- every fixture in this repo runs to
-//! completion near-instantly and none of them call `Wait`/`CheckSignal`
-//! in a loop waiting on `SIGBREAKF_CTRL_C` specifically, so there is no
-//! fixture this test file could drive to make a real signal delivery
-//! observable rather than racy. Building a fixture purely to make this
-//! one test possible (an infinite `Wait`/`CheckSignal` polling loop) was
-//! judged not worth the added maintenance surface given the unit tests
-//! already exercise the exact folding mechanism a real SIGINT would
-//! trigger; revisit if a corpus program with this shape shows up.
+//! **Real SIGINT/SIGTERM delivery: see `signal_e2e.rs` instead.** The
+//! unit tests in `crates/volamos-core/src/exectask.rs` already cover the
+//! cooperative `SIGINT` -> `SIGBREAKF_CTRL_C` folding logic directly
+//! (`PENDING_HOST_BREAK`/`fold_pending_host_break`); `signal_e2e.rs`
+//! covers real signal delivery to the actual `volamos` binary (issue
+//! #151: forced termination on `SIGTERM`/a second `SIGINT`) against
+//! `fixtures/looper`, the long-running, call-free fixture built for that
+//! purpose.
 
 use std::process::Command;
 

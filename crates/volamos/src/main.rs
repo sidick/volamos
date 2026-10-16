@@ -2151,10 +2151,12 @@ fn format_emulated_cycles(cycles: u64, clock_hz: f64) -> Option<String> {
 }
 
 fn main() -> ExitCode {
-    // Host SIGINT/SIGTERM -> guest SIGBREAKF_CTRL_C (Phase 3 stage 5).
-    // Installed here, once, at real CLI startup -- never from
-    // `Runtime::new` itself, which would hijack the test runner's own
-    // SIGINT handling for every unit test in the workspace. See
+    // Host SIGINT -> guest SIGBREAKF_CTRL_C (Phase 3 stage 5), with
+    // SIGTERM/a second SIGINT forcing immediate termination (issue
+    // #151) for guests that never check for a break. Installed here,
+    // once, at real CLI startup -- never from `Runtime::new` itself,
+    // which would hijack the test runner's own SIGINT handling for
+    // every unit test in the workspace. See
     // `volamos_core::exectask`'s module docs.
     install_host_break_handler();
 
