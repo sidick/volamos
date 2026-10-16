@@ -708,8 +708,7 @@ fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 /// therefore a pure query (real, documented behavior -- "if
 /// `cacheMask` is 0, the state is not changed").
 ///
-/// This runtime doesn't model a real CPU cache (nothing here is ever
-/// actually cached or invalidated), so this is bookkeeping only: the
+/// This is bookkeeping only, not a real enable/disable switch: the
 /// bits themselves live in guest memory at [`CACHE_BITS_ADDR`] (single
 /// source of truth, no host-side mirror -- same convention
 /// `crate::exectask`'s module docs establish for task/signal state),
@@ -717,6 +716,14 @@ fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 /// default. Found missing while running the real `CPU` command
 /// (Workbench 3.1.4 `C:`), which queries this to report the current
 /// cache/burst state.
+///
+/// **Known limitation (issue #148):** `--cache`'s modeled instruction
+/// cache (`crate::memory::FlatMemory`'s `IcacheModel`) does not
+/// consult `CACRF_EnableI` here at all -- `--cache` is an
+/// unconditional CLI-level choice for the whole run (see that flag's
+/// doc), so a guest that calls `CacheControl` to disable caching
+/// keeps running with the model active regardless. Only
+/// `CacheClearU`/`CacheClearE` below actually reach the model.
 fn cache_control_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let cache_bits = ctx.cpu.data_register(DataRegister(0));
     let cache_mask = ctx.cpu.data_register(DataRegister(1));
@@ -735,23 +742,47 @@ fn cache_control_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// stale data" -- self-modifying code, building jump tables, relocating
 /// code, loading code from disk (`exec.doc`'s own examples, the last of
 /// which is exactly what [`crate::execlib`]'s disk-library loading does
-/// on every `OpenLibrary`). This runtime has no real CPU cache to flush
-/// (guest code is read fresh from guest memory on every fetch, same
-/// "nothing here is ever actually cached" reasoning as
-/// [`cache_control_handler`]), so this is a genuine no-op, not an
-/// approximation -- there's no stale state for it to have to clear.
-/// Found running the real SAS/C `sc` compiler's `sc1.library`, which
-/// calls this immediately after its own disk-library init code runs.
-fn cache_clear_u_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// on every `OpenLibrary`). Without `--cache` there is no real cache to
+/// flush (guest code is read fresh from guest memory on every fetch,
+/// same "nothing here is ever actually cached" reasoning as
+/// [`cache_control_handler`]'s doc), so this stays a genuine no-op in
+/// that case; with `--cache` (issue #148) it invalidates the modeled
+/// instruction cache (`AddressSpace::invalidate_icache`, a no-op of
+/// its own when no cache is installed) -- a real data cache is not
+/// modeled at all yet, so there is nothing else for this to flush
+/// either way. Found running the real SAS/C `sc` compiler's
+/// `sc1.library`, which calls this immediately after its own
+/// disk-library init code runs.
+fn cache_clear_u_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.mem.invalidate_icache();
     Ok(())
 }
 
+/// `CACRF_ClearI` (`exec/execbase.h`): "Clear instruction cache" --
+/// the only bit of `CacheClearE`'s `caches` parameter this runtime
+/// acts on (see that handler's doc for why `CACRF_ClearD` has nothing
+/// to do without a modeled data cache).
+const CACRF_CLEAR_I: u32 = 1 << 3;
+
 /// `exec.library`'s `CacheClearE` (LVO -642: `A0` = `address`, `D0` =
 /// `length`, `D1` = `caches`, `void`): the range-qualified sibling of
-/// [`cache_clear_u_handler`] -- same "nothing to actually flush"
-/// reasoning applies regardless of which range/cache-type bits are
-/// requested, so this ignores all three arguments and is a no-op too.
-fn cache_clear_e_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// [`cache_clear_u_handler`].
+///
+/// `address`/`length` are ignored even with `--cache` installed: real
+/// `CacheClearE` explicitly documents the latitude to do this ("the
+/// function will determine the most efficient way to implement the
+/// operation... the entire cache may be cleared" -- real 68030
+/// hardware does exactly this for "some cache systems" per that same
+/// note), and [`AddressSpace::invalidate_icache`] always clears
+/// everything for the same reason (see its own doc) -- there is no
+/// cached *data* to lose by over-invalidating, only hit/miss timing to
+/// reset. Only `caches`' [`CACRF_CLEAR_I`] bit matters: this runtime
+/// has no data cache to act on `CACRF_ClearD` for.
+fn cache_clear_e_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let caches = ctx.cpu.data_register(DataRegister(1));
+    if caches & CACRF_CLEAR_I != 0 {
+        ctx.mem.invalidate_icache();
+    }
     Ok(())
 }
 
@@ -1582,7 +1613,7 @@ mod tests {
     // --- CacheClearU / CacheClearE ---
 
     #[test]
-    fn cache_clear_u_is_a_no_op_that_does_not_disturb_cache_control_state() {
+    fn cache_clear_u_takes_no_args_and_does_not_disturb_cache_control_state() {
         let mut words = movea_exec_base_to_a6().to_vec();
         words.extend_from_slice(&jsr_disp16_a6(-636)); // CacheClearU(a6)
         words.push(RTS);
@@ -1598,25 +1629,98 @@ mod tests {
     }
 
     #[test]
-    fn cache_clear_e_is_a_no_op_regardless_of_its_arguments() {
+    fn cache_clear_u_invalidates_an_installed_icache_model() {
+        // Without `--cache` (no `enable_icache` call -- every test
+        // above this one never installs one), `invalidate_icache` has
+        // nothing to do; this is the one that actually exercises issue
+        // #148's wiring through a real dispatched library call.
         let mut words = movea_exec_base_to_a6().to_vec();
-        words.push(move_imm_to_a(0)); // A0 = address (arbitrary, ignored)
+        words.extend_from_slice(&jsr_disp16_a6(-636)); // CacheClearU(a6)
+        words.push(RTS);
+        let mut rt = runtime_with_program(&words);
+        rt.memory_mut().enable_icache(16); // 4 lines of 4 bytes
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(
+            rt.memory().icache_last_fetch_was_cached(),
+            "warmed up before the call"
+        );
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(
+            !rt.memory().icache_last_fetch_was_cached(),
+            "CacheClearU must have evicted it"
+        );
+    }
+
+    #[test]
+    fn cache_clear_e_only_acts_on_cacrf_clear_i_in_its_caches_argument() {
+        // D1 = 3 (CACRF_EnableI | CACRF_FreezeI, neither of them
+        // CACRF_ClearI) must not invalidate anything -- only bit 3
+        // (CACRF_ClearI) does, per cache_clear_e_handler's doc.
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_a(0)); // A0 = address (ignored either way)
         words.push(0x1234);
         words.push(0x5678);
-        words.push(move_imm_to_d(0)); // D0 = length (arbitrary, ignored)
+        words.push(move_imm_to_d(0)); // D0 = length (ignored either way)
         words.push(0);
         words.push(64);
-        words.push(move_imm_to_d(1)); // D1 = caches (arbitrary, ignored)
+        words.push(move_imm_to_d(1)); // D1 = caches: CACRF_EnableI|CACRF_FreezeI, not ClearI
         words.push(0);
         words.push(3);
         words.extend_from_slice(&jsr_disp16_a6(-642)); // CacheClearE(a6)
         words.push(RTS);
         let mut rt = runtime_with_program(&words);
+        rt.memory_mut().enable_icache(16);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(rt.memory().icache_last_fetch_was_cached());
+
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed");
+
         assert_eq!(
             rt.memory().read_u32(CACHE_BITS_ADDR),
-            crate::dispatch::CACHE_BITS_DEFAULT
+            crate::dispatch::CACHE_BITS_DEFAULT,
+            "CacheControl's bits must stay untouched by CacheClearE"
+        );
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(
+            rt.memory().icache_last_fetch_was_cached(),
+            "D1 lacked CACRF_ClearI, so the model must still be warm"
+        );
+    }
+
+    #[test]
+    fn cache_clear_e_with_cacrf_clear_i_invalidates_the_icache_model() {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_a(0)); // A0 = address (CacheClearE always-clears regardless)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = length (likewise ignored)
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // D1 = caches: CACRF_ClearI only
+        words.push(0);
+        words.push(CACRF_CLEAR_I as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-642)); // CacheClearE(a6)
+        words.push(RTS);
+        let mut rt = runtime_with_program(&words);
+        rt.memory_mut().enable_icache(16);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(rt.memory().icache_last_fetch_was_cached());
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(
+            !rt.memory().icache_last_fetch_was_cached(),
+            "CACRF_ClearI must have evicted it"
         );
     }
 

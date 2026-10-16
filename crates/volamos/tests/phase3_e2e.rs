@@ -167,3 +167,48 @@ fn recurse_with_a_small_stack_trips_the_stack_overflow_guard() {
         "expected at least one loop iteration's output before the overflow, got: {stdout:?}"
     );
 }
+
+// --- --cache (issue #148): CLI-level smoke tests. The actual
+// cache-model mechanics (hit/miss tracking, the real `m68k` crate's
+// 68020 timing tables reflecting it) are exercised directly against
+// `Cpu::run` in `volamos_core::backend`'s own tests; these just prove
+// the CLI flag reaches a real run of the binary without blowing up,
+// on a model the flag affects and one it (harmlessly) doesn't.
+
+#[test]
+fn cache_flag_combines_with_clock_mhz_and_cpu_68020_and_still_runs_cleanly() {
+    let output = volamos()
+        .arg("--cpu")
+        .arg("68020")
+        .arg("--clock-mhz")
+        .arg("25")
+        .arg("--cache")
+        .arg(ECHOARGS_PATH)
+        .arg("foo")
+        .output()
+        .expect("failed to run volamos");
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    assert_eq!(stdout_of(&output), "foo \n");
+    assert!(
+        stderr_of(&output).contains("emulated cycles"),
+        "expected --clock-mhz's exit report; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn cache_flag_is_a_harmless_no_op_on_the_default_68000_and_without_clock_mhz() {
+    // icache_size_for_cpu(CpuType::M68000) is None (no on-chip cache on
+    // real 68000/68010 hardware), and --cache has nothing to report
+    // without --clock-mhz either way -- both should just run normally.
+    let output = volamos()
+        .arg("--cache")
+        .arg(ECHOARGS_PATH)
+        .arg("foo")
+        .output()
+        .expect("failed to run volamos");
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    assert_eq!(stdout_of(&output), "foo \n");
+}

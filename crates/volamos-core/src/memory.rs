@@ -167,6 +167,124 @@ pub trait AddressSpace {
     fn shadow_mut(&mut self) -> Option<&mut crate::sanitize::ShadowMap> {
         None
     }
+
+    /// Invalidates the modeled instruction cache (`--cache`, issue
+    /// #148), if one is installed.
+    ///
+    /// This lives on the trait (defaulting to a no-op) for the same
+    /// reason [`AddressSpace::shadow`] does: `crate::execmem`'s
+    /// `CacheClearU`/`CacheClearE` handlers -- the only callers -- are
+    /// generic over `C: Cpu` and so only ever see their memory as
+    /// `C::Memory: AddressSpace`, never as the concrete [`FlatMemory`].
+    ///
+    /// Always invalidates everything rather than modeling a
+    /// partial-range clear, matching real `CacheClearE`'s own
+    /// documented latitude to do exactly that ("regardless of the
+    /// length given, the function will determine the most efficient
+    /// way to implement the operation... the entire cache may be
+    /// cleared" -- real 68030 hardware does this too) -- there is no
+    /// cached *data* to lose by over-invalidating, only hit/miss
+    /// timing to reset, so a full clear is simpler and just as
+    /// correct as a precise one.
+    fn invalidate_icache(&mut self) {}
+}
+
+/// A direct-mapped instruction-cache hit/miss model for `--cache`
+/// (issue #148) -- see [`FlatMemory::enable_icache`].
+///
+/// Tracks only which guest longwords are resident, never their
+/// contents: a guest instruction fetch always reads real, current
+/// memory regardless of cache state (see `crate::backend`'s
+/// `AddressBus::read_immediate_word`/`read_immediate_long`, the only
+/// callers of [`Self::access_span`]) -- this model exists purely to
+/// drive the `m68k` crate's cache-hit/miss *timing* hooks
+/// (`AddressBus::last_fetch_was_cached`/
+/// `instruction_fetches_were_cached`), and has no bearing on
+/// correctness.
+///
+/// Modeled the way Copperline's `src/cache.rs` is (cited as a design
+/// reference in issue #148, GPL-3.0 so not shared code): one tag slot
+/// per [`Self::LINE_SIZE`]-byte line, direct-mapped by `(line base /
+/// LINE_SIZE) % lines.len()`.
+///
+/// Two simplifications, both deliberate (see the CLI's `--cache` flag
+/// doc): a real `CACRF_EnableI` toggle (`crate::execmem`'s
+/// `CacheControl`) is not modeled -- `--cache` is an unconditional
+/// CLI-level choice for the whole run, not something a guest can turn
+/// on or off at runtime -- and the instruction cache never snoops
+/// data writes (matching real 68020/68030/68040/68060 hardware; that
+/// asymmetry is exactly why `CacheClearU`/`CacheClearE` exist at all),
+/// so only [`FlatMemory::invalidate_icache`] ever clears it.
+struct IcacheModel {
+    lines: Vec<Option<u32>>,
+}
+
+impl IcacheModel {
+    /// One cache line per longword -- matches Copperline's model (see
+    /// this type's doc) and is small enough that a 256-byte 68020/030
+    /// cache still gets 64 independent tag slots.
+    const LINE_SIZE: u32 = 4;
+
+    /// `size_bytes` is the CLI's `--cache` sizing by `--cpu` (256 on
+    /// 68020/68030, 4096 on 68040/68060); rounded down to a whole
+    /// number of [`Self::LINE_SIZE`]-byte lines, at least one.
+    fn new(size_bytes: u32) -> Self {
+        let lines = ((size_bytes / Self::LINE_SIZE) as usize).max(1);
+        Self {
+            lines: vec![None; lines],
+        }
+    }
+
+    /// The base address of the line containing `addr`.
+    fn line_base(addr: u32) -> u32 {
+        addr & !(Self::LINE_SIZE - 1)
+    }
+
+    fn index(&self, line_base: u32) -> usize {
+        (line_base / Self::LINE_SIZE) as usize % self.lines.len()
+    }
+
+    /// Looks up the line covering `addr`, filling it in (recording a
+    /// miss) if it wasn't already resident. Returns whether this was
+    /// a hit.
+    fn access(&mut self, addr: u32) -> bool {
+        let base = Self::line_base(addr);
+        let idx = self.index(base);
+        let hit = self.lines[idx] == Some(base);
+        self.lines[idx] = Some(base);
+        hit
+    }
+
+    /// As [`Self::access`], but for a fetch spanning `len` bytes from
+    /// `addr` (a word or long immediate can straddle two lines when
+    /// `addr` isn't [`Self::LINE_SIZE`]-aligned, e.g. a 4-byte fetch
+    /// at a merely 2-byte-aligned PC) -- a hit only if *every* line
+    /// the fetch touches was already resident, matching how a real
+    /// cache miss stalls the whole access regardless of which word
+    /// within it was the one missing. Only ever called with `len` of
+    /// 2 or 4 (a word or long instruction-stream read), so this always
+    /// terminates in at most two [`Self::access`] calls.
+    fn access_span(&mut self, addr: u32, len: u32) -> bool {
+        debug_assert!(
+            len == 2 || len == 4,
+            "instruction fetches are word/long only"
+        );
+        let last = Self::line_base(addr.wrapping_add(len - 1));
+        let mut hit = true;
+        let mut base = Self::line_base(addr);
+        loop {
+            hit &= self.access(base);
+            if base == last {
+                break;
+            }
+            base = base.wrapping_add(Self::LINE_SIZE);
+        }
+        hit
+    }
+
+    fn invalidate_all(&mut self) {
+        self.lines.fill(None);
+    }
 }
 
 /// A simple flat, contiguous [`AddressSpace`] backed by a `Vec<u8>`.
@@ -191,6 +309,25 @@ pub struct FlatMemory {
     /// [`StorePort`]. The disabled cost is one `is_empty` check per guest
     /// store.
     ports: Vec<Box<dyn StorePort>>,
+    /// The modeled instruction cache (`--cache`, issue #148), if
+    /// [`Self::enable_icache`] was called -- see [`IcacheModel`]'s doc.
+    /// `None` (the default) preserves this runtime's pre-issue-#148
+    /// behavior exactly: every instruction fetch reports as cached,
+    /// matching [`m68k::AddressBus::last_fetch_was_cached`]'s own
+    /// "cached by default" contract.
+    icache: Option<IcacheModel>,
+    /// Whether the most recent instruction-stream fetch hit
+    /// [`Self::icache`] -- backs
+    /// [`m68k::AddressBus::last_fetch_was_cached`] (via
+    /// [`Self::icache_last_fetch_was_cached`]). `true` whenever
+    /// `icache` is `None`, matching that method's documented default.
+    icache_last_fetch_cached: bool,
+    /// AND-accumulator over every instruction-stream fetch since the
+    /// last [`Self::icache_begin_instruction_fetches`] call -- backs
+    /// [`m68k::AddressBus::instruction_fetches_were_cached`] (via
+    /// [`Self::icache_fetches_were_cached`]), consulted only by the
+    /// 68020/68030 timing tables; see that method's doc.
+    icache_fetches_cached_since_begin: bool,
 }
 
 impl std::fmt::Debug for FlatMemory {
@@ -199,13 +336,15 @@ impl std::fmt::Debug for FlatMemory {
             .field("len", &self.bytes.len())
             .field("sanitizer", &self.shadow.is_some())
             .field("store_ports", &self.ports.len())
+            .field("icache_lines", &self.icache.as_ref().map(|c| c.lines.len()))
             .finish_non_exhaustive()
     }
 }
 
 impl FlatMemory {
     /// Creates a new zero-initialized [`FlatMemory`] of `size` bytes,
-    /// with the sanitizer disabled (see [`Self::enable_sanitizer`]).
+    /// with the sanitizer disabled (see [`Self::enable_sanitizer`]) and
+    /// no instruction cache modeled (see [`Self::enable_icache`]).
     pub fn new(size: usize) -> Self {
         Self {
             bytes: vec![0u8; size],
@@ -213,6 +352,9 @@ impl FlatMemory {
             writes: 0,
             shadow: None,
             ports: Vec::new(),
+            icache: None,
+            icache_last_fetch_cached: true,
+            icache_fetches_cached_since_begin: true,
         }
     }
 
@@ -364,6 +506,49 @@ impl FlatMemory {
     pub fn shadow_mut(&mut self) -> Option<&mut ShadowMap> {
         self.shadow.as_deref_mut()
     }
+
+    /// Installs a modeled instruction cache (`--cache`, issue #148) of
+    /// `size_bytes` -- see [`IcacheModel`]'s doc for the model itself
+    /// and the CLI's `--cache` flag for how `size_bytes` is chosen per
+    /// `--cpu`. Harmless to call before or after
+    /// [`crate::loader::load`] populates memory, same reasoning as
+    /// [`Self::enable_sanitizer`]'s doc: the model tracks addresses
+    /// only, never cached *contents*, so there's nothing for load
+    /// order to get wrong.
+    pub fn enable_icache(&mut self, size_bytes: u32) {
+        self.icache = Some(IcacheModel::new(size_bytes));
+    }
+
+    /// Records one instruction-stream fetch of `len` bytes at `addr`,
+    /// updating [`Self::icache_last_fetch_was_cached`]'s state and
+    /// ANDing into [`Self::icache_fetches_were_cached`]'s
+    /// accumulator. Called only from `crate::backend`'s `AddressBus::
+    /// read_immediate_word`/`read_immediate_long`. Always a hit when
+    /// [`Self::icache`] is `None`, so `--cache`'s absence costs
+    /// nothing and changes nothing.
+    pub(crate) fn icache_note_instruction_fetch(&mut self, addr: u32, len: u32) {
+        let hit = match &mut self.icache {
+            Some(icache) => icache.access_span(addr, len),
+            None => true,
+        };
+        self.icache_last_fetch_cached = hit;
+        self.icache_fetches_cached_since_begin &= hit;
+    }
+
+    /// See [`m68k::AddressBus::begin_instruction_fetches`].
+    pub(crate) fn icache_begin_instruction_fetches(&mut self) {
+        self.icache_fetches_cached_since_begin = true;
+    }
+
+    /// See [`m68k::AddressBus::last_fetch_was_cached`].
+    pub(crate) fn icache_last_fetch_was_cached(&self) -> bool {
+        self.icache_last_fetch_cached
+    }
+
+    /// See [`m68k::AddressBus::instruction_fetches_were_cached`].
+    pub(crate) fn icache_fetches_were_cached(&self) -> bool {
+        self.icache_fetches_cached_since_begin
+    }
 }
 
 impl AddressSpace for FlatMemory {
@@ -373,6 +558,12 @@ impl AddressSpace for FlatMemory {
 
     fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    fn invalidate_icache(&mut self) {
+        if let Some(icache) = &mut self.icache {
+            icache.invalidate_all();
+        }
     }
 
     fn read_u8(&self, addr: u32) -> u8 {
@@ -650,5 +841,149 @@ mod tests {
         assert_eq!(mem.read_u8(3), 0xBB);
         // Bytes 4 and 5 don't exist; reading them back gives 0.
         assert_eq!(mem.read_u8(4), 0);
+    }
+
+    // --- IcacheModel / --cache (issue #148) ---
+
+    #[test]
+    fn without_enable_icache_every_fetch_is_a_free_hit() {
+        // The pre-issue-#148 default, preserved: no model installed at
+        // all means `icache_note_instruction_fetch` always reports a
+        // hit, matching `m68k::AddressBus::last_fetch_was_cached`'s own
+        // documented "cached by default" contract.
+        let mut mem = FlatMemory::new(64);
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(mem.icache_last_fetch_was_cached());
+        mem.icache_note_instruction_fetch(1000, 2);
+        assert!(mem.icache_last_fetch_was_cached());
+    }
+
+    #[test]
+    fn enable_icache_first_fetch_of_a_line_is_a_miss_second_is_a_hit() {
+        let mut mem = FlatMemory::new(64);
+        mem.enable_icache(16); // 4 lines of 4 bytes each
+
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(!mem.icache_last_fetch_was_cached(), "cold line");
+
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(
+            mem.icache_last_fetch_was_cached(),
+            "same line, now resident"
+        );
+    }
+
+    #[test]
+    fn enable_icache_direct_mapped_aliasing_evicts_the_other_line() {
+        // A 16-byte cache (4 lines) direct-mapped by (line base / 4) %
+        // 4: addresses 0 and 16 both land in index 0, so touching 16
+        // evicts 0's line, and touching 0 again is a fresh miss.
+        let mut mem = FlatMemory::new(64);
+        mem.enable_icache(16);
+
+        mem.icache_note_instruction_fetch(0, 2);
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(mem.icache_last_fetch_was_cached(), "warmed up");
+
+        mem.icache_note_instruction_fetch(16, 2);
+        assert!(!mem.icache_last_fetch_was_cached(), "aliases index 0, cold");
+
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(
+            !mem.icache_last_fetch_was_cached(),
+            "evicted by the access to 16"
+        );
+    }
+
+    #[test]
+    fn enable_icache_a_fetch_spanning_two_lines_hits_only_if_both_are_resident() {
+        // A 4-byte fetch at a merely 2-byte-aligned address straddles
+        // two 4-byte lines (here: lines at 0 and 4). `access` fills a
+        // line as a side effect of even a missed access (real cache
+        // behavior: a miss still ends with the line resident), so this
+        // warms exactly one line by hand before ever touching the
+        // straddling range, to keep the two lines' residency apart.
+        let mut mem = FlatMemory::new(64);
+        mem.enable_icache(4096); // plenty of lines, no aliasing in play
+
+        // Warm only the first line (address 0..4), leaving the second
+        // (4..8) untouched.
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(!mem.icache_last_fetch_was_cached(), "cold start");
+
+        mem.icache_note_instruction_fetch(2, 4);
+        assert!(
+            !mem.icache_last_fetch_was_cached(),
+            "first line resident, second still cold -- a miss overall"
+        );
+        // That access also filled the second line as a side effect of
+        // the miss (same as any real cache), so a repeat is now a hit.
+        mem.icache_note_instruction_fetch(2, 4);
+        assert!(
+            mem.icache_last_fetch_was_cached(),
+            "both lines now resident"
+        );
+    }
+
+    #[test]
+    fn icache_begin_instruction_fetches_resets_the_and_accumulator() {
+        let mut mem = FlatMemory::new(64);
+        mem.enable_icache(16);
+
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(0, 2); // cold -> miss
+        assert!(
+            !mem.icache_fetches_were_cached(),
+            "one miss in the sequence taints the whole instruction"
+        );
+
+        // A later instruction, now that address 0 is resident, should
+        // start a fresh (true) accumulator rather than carrying the
+        // earlier miss forward.
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(0, 2); // now a hit
+        assert!(mem.icache_fetches_were_cached());
+    }
+
+    #[test]
+    fn icache_fetches_were_cached_defaults_to_last_fetch_was_cached_without_a_begin_call() {
+        // Matches `m68k::AddressBus::instruction_fetches_were_cached`'s
+        // own documented default -- callers that never call
+        // `begin_instruction_fetches` still get a sensible answer.
+        let mut mem = FlatMemory::new(64);
+        mem.enable_icache(16);
+        mem.icache_note_instruction_fetch(0, 2);
+        assert_eq!(
+            mem.icache_fetches_were_cached(),
+            mem.icache_last_fetch_was_cached()
+        );
+    }
+
+    #[test]
+    fn invalidate_icache_undoes_every_prior_fetch() {
+        let mut mem = FlatMemory::new(64);
+        mem.enable_icache(16);
+        mem.icache_note_instruction_fetch(0, 2);
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(mem.icache_last_fetch_was_cached(), "warmed up");
+
+        AddressSpace::invalidate_icache(&mut mem);
+
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(
+            !mem.icache_last_fetch_was_cached(),
+            "invalidate_icache must evict everything"
+        );
+    }
+
+    #[test]
+    fn invalidate_icache_without_enable_icache_is_a_harmless_no_op() {
+        let mut mem = FlatMemory::new(64);
+        AddressSpace::invalidate_icache(&mut mem); // must not panic
+        mem.icache_note_instruction_fetch(0, 2);
+        assert!(
+            mem.icache_last_fetch_was_cached(),
+            "still the free-hit default"
+        );
     }
 }

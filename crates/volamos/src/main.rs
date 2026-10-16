@@ -306,6 +306,17 @@ struct Options {
     /// Mutually exclusive with `jit` and with `sanitize.enabled`: see
     /// [`check_clock_mhz_jit`]/[`check_clock_mhz_sanitize`].
     clock_mhz: Option<f64>,
+    /// `--cache` (issue #148): model a direct-mapped instruction cache
+    /// sized by `cpu_type` (see [`icache_size_for_cpu`]) so cache
+    /// hit/miss timing shows up under `--clock-mhz` instead of every
+    /// fetch being treated as a free hit -- see
+    /// [`volamos_core::memory::FlatMemory::enable_icache`] for the
+    /// model itself. `false` (the pre-#148 behavior) by default;
+    /// CLI-only, like `clock_mhz`/`fpsp_emulate`/`net` above -- kept
+    /// out of `config::Overrides` for the same reason: this changes
+    /// what a `--clock-mhz` benchmark number *means*, which a stale
+    /// `~/.volamos`/`.volamos` shouldn't be able to silently flip on.
+    cache: bool,
     /// `--fpsp-emulate` (issue #129): software-emulate the real-68060
     /// "unimplemented instruction" set (most FPU transcendentals plus
     /// MOVEP/CHK2/CMP2/misaligned-CAS2/64-bit-MUL-DIV) instead of
@@ -684,6 +695,31 @@ struct Cli {
     )]
     clock_mhz: Option<f64>,
 
+    /// Model a direct-mapped instruction cache sized by --cpu, for more realistic --clock-mhz timings (off by default)
+    #[arg(
+        long = "cache",
+        action = ArgAction::SetTrue,
+        help_heading = "Execution",
+        long_help = "Model a direct-mapped instruction cache sized by --cpu (256 bytes on \
+                      68020/68030, 4096 bytes on 68040/68060 -- 68000/68010 have no on-chip \
+                      cache on real hardware, so this is a no-op there), so a loop larger than \
+                      the cache -- or extra code size from -Os vs -O2, block duplication, etc. \
+                      -- shows up in --clock-mhz timings instead of every instruction fetch \
+                      being treated as a free cache hit (issue #148). Flushed by \
+                      CacheClearU/CacheClearE, matching real AmigaOS's own cache-coherency \
+                      convention for self-modifying code and freshly loaded code. Off by \
+                      default so existing --clock-mhz numbers stay comparable across runs \
+                      (opt in, as issue #148 asked); meaningless without --clock-mhz, since \
+                      that's the only execution path that reports a cycle count for a modeled \
+                      cache hit/miss to affect. Also currently a no-op on --cpu 68040 for a \
+                      different reason: the m68k crate's 68040 timing model doesn't consult \
+                      cache state at all yet (only 68020/68030/68060 do), so --cache changes \
+                      nothing measurable there besides CacheClearU/CacheClearE bookkeeping. \
+                      Data-cache and memory-wait-state modeling are out of scope here -- the \
+                      m68k crate has no timing hooks for either yet."
+    )]
+    cache: bool,
+
     /// Enable shadow-memory checking of guest accesses (off by default)
     #[arg(
         long = "sanitize",
@@ -980,6 +1016,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         overrides,
         sanitize,
         cli.clock_mhz,
+        cli.cache,
         cli.fpsp_emulate,
         cli.libs_dir,
         cli.program,
@@ -1122,6 +1159,31 @@ fn cpu_model_name(cpu_type: CpuType) -> &'static str {
     }
 }
 
+/// `--cache`'s (issue #148) instruction-cache size in bytes for
+/// `cpu_type`, or `None` on a CPU with no on-chip instruction cache at
+/// all on real hardware (68000/68010, plus the non-Amiga `SCC68070`).
+/// 256 bytes on 68020/68030 (including the `EC`/plain `MMU` variants,
+/// which share the same on-chip cache), 4096 on 68040/68060 -- see the
+/// CLI flag's own doc for why that pairing (and the 68040 size in
+/// particular) is a deliberate simplification matching issue #148's
+/// own proposal and Copperline's `src/cache.rs` design reference,
+/// not a claim about real hardware's actual (set-associative, and for
+/// the 68060 larger) cache geometry.
+fn icache_size_for_cpu(cpu_type: CpuType) -> Option<u32> {
+    match cpu_type {
+        CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030 => Some(256),
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => Some(4096),
+        CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070 => None,
+        // `CpuType` is the `m68k` crate's, so it can grow a variant (or
+        // hand back its `Invalid` sentinel) without this match knowing
+        // -- same convention as `cpu_model_name` above.
+        other => {
+            debug_assert!(false, "unnamed CpuType {other:?}");
+            None
+        }
+    }
+}
+
 /// Computes `ExecBase.AttnFlags` (`exec/execbase.h`'s `AFF_68010`/
 /// `AFF_68020`/`AFF_68030`/`AFF_68040`/`AFF_68060`, plus `AFF_68881`/
 /// `AFF_68882` for a coprocessor FPU or `AFF_FPU40` for the 68040's
@@ -1227,13 +1289,15 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// clippy's `type_complexity` lint -- see that function's doc for what
 /// each element means; `Option<f64>` is `--clock-mhz`'s CLI-only value
 /// (issue #102), threaded alongside `InstrumentationOptions` for the
-/// same reason (see `Options::clock_mhz`'s doc). The trailing `bool` is
+/// same reason (see `Options::clock_mhz`'s doc). The first `bool` is
+/// `--cache` (issue #148, see `Options::cache`'s doc); the second is
 /// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc) --
-/// CLI-only for the same reason.
+/// both CLI-only for the same reason.
 type RawParsedArgs = (
     config::Overrides,
     InstrumentationOptions,
     Option<f64>,
+    bool,
     bool,
     Option<PathBuf>,
     String,
@@ -1300,6 +1364,7 @@ fn resolve(
     overrides: config::Overrides,
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
+    cache: bool,
     fpsp_emulate: bool,
     libs_dir: Option<PathBuf>,
     cli_jit: Option<bool>,
@@ -1340,6 +1405,7 @@ fn resolve(
         jit_source,
         sanitize,
         clock_mhz,
+        cache,
         fpsp_emulate,
         net: overrides.net.unwrap_or(false),
         // Only ever non-empty when `overrides` already includes
@@ -1360,13 +1426,14 @@ fn resolve(
 /// module wants instead.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let (overrides, sanitize, clock_mhz, fpsp_emulate, libs_dir, program, guest_args) =
+    let (overrides, sanitize, clock_mhz, cache, fpsp_emulate, libs_dir, program, guest_args) =
         parse_args_raw(args)?;
     let cli_jit = overrides.jit;
     Ok(resolve(
         overrides,
         sanitize,
         clock_mhz,
+        cache,
         fpsp_emulate,
         libs_dir,
         cli_jit,
@@ -1681,6 +1748,7 @@ fn run_nested_program(
     jit: bool,
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
+    cache: bool,
     fpsp_emulate: bool,
     net: bool,
     libs_dir_override: bool,
@@ -1699,6 +1767,13 @@ fn run_nested_program(
     if sanitize.enabled {
         mem.enable_sanitizer();
         sanitize.apply(&mut mem);
+    }
+    // --cache (issue #148): a nested System()/Execute() run shares the
+    // parent's --cache setting, same as it shares --cpu/--clock-mhz;
+    // `icache_size_for_cpu` returning `None` (68000/68010/scc68070)
+    // makes this a no-op there regardless of `cache`.
+    if cache && let Some(size) = icache_size_for_cpu(cpu_type) {
+        mem.enable_icache(size);
     }
     sanitize.install_debug_ports(&mut mem, cpu_type);
     let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
@@ -1894,6 +1969,14 @@ fn run(opts: &Options) -> Result<i32, String> {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
         }
+        // --cache (issue #148): see `icache_size_for_cpu`'s doc for the
+        // per-`--cpu` sizing; `None` there (68000/68010/scc68070) makes
+        // this a no-op regardless of `opts.cache`.
+        if opts.cache
+            && let Some(size) = icache_size_for_cpu(opts.cpu_type)
+        {
+            mem.enable_icache(size);
+        }
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
@@ -1914,6 +1997,14 @@ fn run(opts: &Options) -> Result<i32, String> {
         if opts.sanitize.enabled {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
+        }
+        // --cache (issue #148): see `icache_size_for_cpu`'s doc for the
+        // per-`--cpu` sizing; `None` there (68000/68010/scc68070) makes
+        // this a no-op regardless of `opts.cache`.
+        if opts.cache
+            && let Some(size) = icache_size_for_cpu(opts.cpu_type)
+        {
+            mem.enable_icache(size);
         }
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
@@ -1950,6 +2041,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_jit = opts.jit;
     let nested_sanitize = opts.sanitize.clone();
     let nested_clock_mhz = opts.clock_mhz;
+    let nested_cache = opts.cache;
     let nested_fpsp_emulate = opts.fpsp_emulate;
 
     let nested_net = opts.net;
@@ -1967,6 +2059,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_jit,
             nested_sanitize.clone(),
             nested_clock_mhz,
+            nested_cache,
             nested_fpsp_emulate,
             nested_net,
             nested_libs_dir_override,
@@ -2180,7 +2273,7 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     cli.guest_args = guest_args;
-    let (cli_overrides, sanitize, clock_mhz, fpsp_emulate, libs_dir, program, guest_args) =
+    let (cli_overrides, sanitize, clock_mhz, cache, fpsp_emulate, libs_dir, program, guest_args) =
         cli_to_raw(cli);
 
     let file_overrides = match config::load_all(&program) {
@@ -2218,6 +2311,7 @@ fn main() -> ExitCode {
         merged,
         sanitize,
         clock_mhz,
+        cache,
         fpsp_emulate,
         libs_dir,
         cli_jit,
@@ -3228,6 +3322,64 @@ mod tests {
         assert!(check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled).is_ok());
     }
 
+    // --- --cache (issue #148) ---
+
+    #[test]
+    fn default_cache_is_off() {
+        // Pre-issue-#148 behavior (every fetch a free hit) is the
+        // default -- opt in, so existing --clock-mhz numbers stay
+        // comparable, matching issue #148's own ask.
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.cache);
+    }
+
+    #[test]
+    fn cache_flag_turns_it_on() {
+        let opts = parse_args(args(&["--cache", "prog"])).unwrap();
+        assert!(opts.cache);
+    }
+
+    #[test]
+    fn cache_is_cli_only_not_a_config_override() {
+        // Like --sanitize/--net/--clock-mhz/--fpsp-emulate, this must
+        // never be settable via ~/.volamos/.volamos -- see
+        // `Options::cache`'s doc. `cli_to_raw`'s `config::Overrides`
+        // literal has no field for it at all, so this documents the
+        // invariant: the flag's value flows out of `cli_to_raw` as a
+        // plain `bool` alongside (not inside) `overrides`.
+        let (overrides, _, _, cache, _, _, _, _) =
+            parse_args_raw(args(&["--cache", "prog"])).unwrap();
+        assert!(cache);
+        let _ = overrides;
+    }
+
+    #[test]
+    fn icache_size_for_cpu_matches_the_flags_documented_sizing() {
+        for cpu in [
+            CpuType::M68EC020,
+            CpuType::M68020,
+            CpuType::M68EC030,
+            CpuType::M68030,
+        ] {
+            assert_eq!(icache_size_for_cpu(cpu), Some(256), "{cpu:?}");
+        }
+        for cpu in [
+            CpuType::M68EC040,
+            CpuType::M68LC040,
+            CpuType::M68040,
+            CpuType::M68060,
+        ] {
+            assert_eq!(icache_size_for_cpu(cpu), Some(4096), "{cpu:?}");
+        }
+        for cpu in [CpuType::M68000, CpuType::M68010, CpuType::SCC68070] {
+            assert_eq!(
+                icache_size_for_cpu(cpu),
+                None,
+                "{cpu:?} has no on-chip instruction cache on real hardware"
+            );
+        }
+    }
+
     // --- --fpsp-emulate (issue #129) ---
 
     #[test]
@@ -3253,7 +3405,7 @@ mod tests {
         // it at all, so this is really just documenting the invariant:
         // the flag's value flows out of `cli_to_raw` as a plain `bool`
         // alongside (not inside) `overrides`.
-        let (overrides, _, _, fpsp_emulate, _, _, _) =
+        let (overrides, _, _, _, fpsp_emulate, _, _, _) =
             parse_args_raw(args(&["--fpsp-emulate", "prog"])).unwrap();
         assert!(fpsp_emulate);
         // `Overrides` has no `fpsp_emulate` field to assert on by name;
@@ -3356,13 +3508,14 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _, _, _, _, _) = parse_args_raw(args(&["--defaults", "prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _, _) =
+            parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
@@ -3373,13 +3526,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }

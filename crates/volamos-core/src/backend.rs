@@ -133,6 +133,46 @@ impl AddressBus for FlatMemory {
         AddressSpace::write_u32(self, address, value);
     }
 
+    /// Instruction-stream word read -- distinct from [`Self::
+    /// read_word`] so `--cache`'s modeled instruction cache (issue
+    /// #148, [`crate::memory::FlatMemory::enable_icache`]) only ever
+    /// sees real opcode/extension-word fetches, never ordinary data
+    /// reads. `count_read` still runs here exactly as it would have
+    /// under the default (which delegates to `read_word`), so
+    /// `--clock-mhz`'s access-count reporting is unaffected by this
+    /// override existing at all.
+    fn read_immediate_word(&mut self, address: u32) -> u16 {
+        self.count_read();
+        self.icache_note_instruction_fetch(address, 2);
+        AddressSpace::read_u16(self, address)
+    }
+
+    /// As [`Self::read_immediate_word`], for a long instruction-stream
+    /// read (a 4-byte immediate operand).
+    fn read_immediate_long(&mut self, address: u32) -> u32 {
+        self.count_read();
+        self.icache_note_instruction_fetch(address, 4);
+        AddressSpace::read_u32(self, address)
+    }
+
+    /// See [`m68k::AddressBus::last_fetch_was_cached`]'s doc; backed by
+    /// [`FlatMemory::icache_last_fetch_was_cached`].
+    fn last_fetch_was_cached(&self) -> bool {
+        self.icache_last_fetch_was_cached()
+    }
+
+    /// See [`m68k::AddressBus::begin_instruction_fetches`]'s doc;
+    /// backed by [`FlatMemory::icache_begin_instruction_fetches`].
+    fn begin_instruction_fetches(&mut self) {
+        self.icache_begin_instruction_fetches();
+    }
+
+    /// See [`m68k::AddressBus::instruction_fetches_were_cached`]'s
+    /// doc; backed by [`FlatMemory::icache_fetches_were_cached`].
+    fn instruction_fetches_were_cached(&self) -> bool {
+        self.icache_fetches_were_cached()
+    }
+
     /// The whole guest address space is one plain, side-effect-free
     /// `Vec<u8>` (see [`FlatMemory`]'s doc comment) -- exactly what the
     /// `jit` feature's [`m68k::CpuCore::run_batch`] fast path needs, and
@@ -1353,5 +1393,119 @@ mod tests {
         let reason = cpu.run(&mut mem);
 
         assert_eq!(reason, StopReason::PcOutOfBounds { pc: 0xFFFF_FFD1 });
+    }
+
+    // --- --cache (issue #148): instruction cache model, end to end ---
+
+    /// Builds a loop (`MOVEQ #iterations,D0`, then `nop_count` NOPs,
+    /// then `DBRA D0,<back to the first NOP>`, then an A-line trap to
+    /// stop) at [`TRAP_TABLE_END`] in a fresh `--cpu 68020` memory --
+    /// `--cache`'s model only feeds the `m68k` crate's 68020/68030/68060
+    /// timing tables (see the CLI's `--cache` doc), so a 68000 loop
+    /// here would prove nothing about whether the model actually
+    /// reaches real cycle counts.
+    fn icache_loop_cpu_and_mem(nop_count: usize, iterations: i16) -> (M68kCpu, FlatMemory) {
+        let mut words = vec![0x7000 | (iterations as u16 & 0xFF)]; // MOVEQ #iterations, D0
+        words.extend(std::iter::repeat_n(0x4E71u16, nop_count)); // NOP * nop_count
+        // DBRA D0, loop -- branch displacement is relative to the
+        // extension word itself (PC+2 at execution time), back to the
+        // first NOP (one word after the MOVEQ).
+        let disp = -(2 * nop_count as i32 + 2);
+        words.push(0x51C8);
+        words.push(disp as u16);
+        words.push(0xA000); // A-line trap: stop here
+
+        let mut mem = FlatMemory::new(0x4000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
+        cpu.set_pc(TRAP_TABLE_END);
+        cpu.set_clock_mhz(Some(25.0));
+        (cpu, mem)
+    }
+
+    #[test]
+    fn enable_icache_makes_a_cache_thrashing_loop_cost_more_cycles_under_clock_mhz() {
+        // 200 NOPs (400 bytes = 100 4-byte lines) is comfortably more
+        // than a 256-byte/64-line --cpu 68020 cache can hold, so every
+        // iteration evicts the lines the *previous* iteration needs --
+        // real thrashing, not a model that happens to never miss.
+        const NOP_COUNT: usize = 200;
+        const ICACHE_SIZE_68020: u32 = 256;
+
+        let (mut cpu, mut mem) = icache_loop_cpu_and_mem(NOP_COUNT, 2);
+        let reason = cpu.run(&mut mem);
+        assert!(matches!(
+            reason,
+            StopReason::Trap(TrapInfo {
+                kind: TrapKind::ALine { opcode: 0xA000 },
+                ..
+            })
+        ));
+        let cycles_without_cache = cpu.emulated_cycles();
+
+        let (mut cpu, mut mem) = icache_loop_cpu_and_mem(NOP_COUNT, 2);
+        mem.enable_icache(ICACHE_SIZE_68020);
+        let reason = cpu.run(&mut mem);
+        assert!(matches!(
+            reason,
+            StopReason::Trap(TrapInfo {
+                kind: TrapKind::ALine { opcode: 0xA000 },
+                ..
+            })
+        ));
+        let cycles_with_cache = cpu.emulated_cycles();
+
+        assert!(
+            cycles_with_cache > cycles_without_cache,
+            "a thrashing loop should cost strictly more cycles once --cache's model can \
+             actually report a miss (without it, every fetch is an unconditional hit, the \
+             68020 timing tables' best case) -- got {cycles_without_cache} without --cache, \
+             {cycles_with_cache} with it"
+        );
+    }
+
+    #[test]
+    fn enable_icache_a_loop_that_fits_entirely_in_the_cache_warms_up_once_then_costs_nothing_more()
+    {
+        // 20 NOPs (40 bytes = 10 lines) comfortably fits in a 256-byte
+        // cache with room to spare, so it costs a one-time miss
+        // penalty filling the cache on the loop's first pass, then
+        // settles into all-hits -- unlike the thrashing case above,
+        // where every single pass re-misses. Proved by comparing the
+        // cost of two *additional* iterations once already warmed up
+        // (iterations 4 vs. 6) against the same delta without --cache
+        // at all: if those match exactly, nothing past the first pass
+        // cost anything extra.
+        const NOP_COUNT: usize = 20;
+        const ICACHE_SIZE_68020: u32 = 256;
+
+        let cycles_without_cache = |iterations| {
+            let (mut cpu, mut mem) = icache_loop_cpu_and_mem(NOP_COUNT, iterations);
+            cpu.run(&mut mem);
+            cpu.emulated_cycles()
+        };
+        let cycles_with_cache = |iterations| {
+            let (mut cpu, mut mem) = icache_loop_cpu_and_mem(NOP_COUNT, iterations);
+            mem.enable_icache(ICACHE_SIZE_68020);
+            cpu.run(&mut mem);
+            cpu.emulated_cycles()
+        };
+
+        let delta_without_cache = cycles_without_cache(6) - cycles_without_cache(4);
+        let delta_with_cache = cycles_with_cache(6) - cycles_with_cache(4);
+        assert_eq!(
+            delta_with_cache, delta_without_cache,
+            "once warmed up, two more iterations of a loop that fits entirely in the cache \
+             must cost exactly what they'd cost with no cache model at all (all hits)"
+        );
+
+        // And the model genuinely did something: the *first* iteration
+        // (a cold cache) really did cost more with --cache than
+        // without, or this test would prove nothing about the model
+        // actually being consulted.
+        assert!(
+            cycles_with_cache(1) > cycles_without_cache(1),
+            "the very first pass through a cold cache should still record real misses"
+        );
     }
 }
