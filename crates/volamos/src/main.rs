@@ -1739,7 +1739,6 @@ fn check_ram_fits(load_end: u32, stack_size: u32, ram_size: u32) -> Result<(), S
 fn run_nested_program(
     host_path: &std::path::Path,
     args: &[String],
-    raw_args: Option<&[u8]>,
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
     ram_size: u32,
@@ -1787,7 +1786,7 @@ fn run_nested_program(
         entry: load_result.entry,
         load_end: load_result.end,
         args: args.to_vec(),
-        raw_command_line: raw_args.map(<[u8]>::to_vec),
+        raw_command_line: None,
         stack_size,
         attn_flags: attn_flags_for(cpu_type, fpu),
         program_name: program_name_from_path(host_path),
@@ -2027,13 +2026,12 @@ fn run(opts: &Options) -> Result<i32, String> {
         build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?
     };
 
-    // System()/Execute/RunCommand (Phase 3 stage 7): a nested program is
-    // loaded and run through run_nested_program, sharing this run's
-    // volumes/assigns and --stack size -- see volamos_core::dosseg's
-    // module docs. RunCommand's own explicit stack argument
-    // (req.stack_size_override) takes priority when present; System()/
-    // Execute() (which have no such argument) fall back to this run's
-    // own --stack/default.
+    // System()/Execute (Phase 3 stage 7): a nested program is loaded and
+    // run through run_nested_program, sharing this run's volumes/assigns
+    // and --stack size -- see volamos_core::dosseg's module docs.
+    // RunCommand does NOT go through this path (issues #8/#156): it
+    // overlays the calling process in place instead, entirely within
+    // volamos_core::dosseg::run_command_handler.
     let nested_stack_size = opts.stack_size;
     let nested_ram_size = opts.ram_size;
     let nested_cpu_type = opts.cpu_type;
@@ -2050,9 +2048,8 @@ fn run(opts: &Options) -> Result<i32, String> {
         run_nested_program(
             &req.resolved_program_host_path,
             &req.args,
-            req.raw_args.as_deref(),
             vfs_config.clone(),
-            req.stack_size_override.unwrap_or(nested_stack_size),
+            nested_stack_size,
             nested_ram_size,
             nested_cpu_type,
             nested_fpu,

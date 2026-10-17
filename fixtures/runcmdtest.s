@@ -49,16 +49,26 @@ start:
         move.l  d0,d1                    ; D1 = seglist BPTR (RunCommand's arg)
 
 ; RunCommand(seg, stack, paramptr, paramlen) -- re-runs the program the
-; seglist above was loaded from as a nested guest program, with "run
-; cmd" as its command-line args (see fixtures/README.md's echoargs
-; section: it PutStrs its own command line verbatim, so "run cmd\n"
-; should appear on stdout before anything below this call prints). D0 on
-; return is the nested program's own exit code (echoargs always exits
-; 0), or -1 if RunCommand couldn't even run it.
+; seglist above was loaded from *on this same CPU*, as a subroutine in
+; this process (issues #8/#156), with "run cmd" as its command-line
+; args (see fixtures/README.md's echoargs section: it PutStrs its own
+; command line verbatim, so "run cmd\n" should appear on stdout before
+; anything below this call prints). D0 on return is the nested
+; program's own exit code (echoargs always exits 0), or -1 if
+; RunCommand couldn't even run it.
+;
+; D1 (seg) is saved on the stack across the call, not kept in a
+; register: the invoked program runs on this same CPU, and its own
+; compiled code (an ordinary standalone executable, with no reason to
+; preserve anything for an invoker it doesn't know exists) is free to
+; clobber D0-D7/A0-A6 exactly as it pleases. No register is actually
+; safe across a real RunCommand call -- only the stack is.
+        movem.l d1,-(a7)
         move.l  #paramlen_val,d4
         move.l  #param,d3
         move.l  #8192,d2                 ; D2 = requested stack size
         jsr     -504(a6)                 ; RunCommand
+        movem.l (a7)+,d1                 ; D1 = seglist BPTR again
 
         tst.l   d0
         beq     ok
@@ -67,8 +77,7 @@ start:
         rts                               ; a nonzero exit code
 
 ok:
-; UnLoadSeg(seg) -- D1 still holds the seglist BPTR from above (no
-; library call in between touches it).
+; UnLoadSeg(seg) -- D1 holds the seglist BPTR, just restored above.
         jsr     -156(a6)                 ; UnLoadSeg
 
         move.l  #okmsg,d1

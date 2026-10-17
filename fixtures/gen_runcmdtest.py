@@ -18,23 +18,32 @@ Program flow (real startup, same convention as systest.s/echoargs.s):
    test sets up), reads and parses it, and builds a seglist. D0 = the
    seglist's own BPTR.
 3. RunCommand(seg, stack=8192, paramptr="run cmd", paramlen=7) via
-   -504(a6): re-runs the program the seglist above was loaded from as a
-   *nested* guest program (crates/volamos/src/main.rs's
-   `run_nested_program`, via `DosState::run_command`), with "run"/"cmd"
-   as its guest command-line args -- fixtures/echoargs PutStrs its
-   command line verbatim (see fixtures/README.md's `echoargs` section),
-   so its nested output ("run cmd\\n") should appear on this process's
-   own stdout, interleaved *before* anything runcmdtest itself prints
-   next.
+   -504(a6): re-runs the program the seglist above was loaded from, as a
+   subroutine *in this same process* (issues #8/#156 --
+   `crates/volamos-core/src/dosseg.rs`'s `run_command_handler`, via the
+   trampoline primitive -- *not* a separate nested `Runtime` the way
+   `System()`/`Execute()` use), with "run"/"cmd" as its guest
+   command-line args -- fixtures/echoargs PutStrs its command line
+   verbatim (see fixtures/README.md's `echoargs` section), so its nested
+   output ("run cmd\\n") should appear on this process's own stdout,
+   interleaved *before* anything runcmdtest itself prints next. `seg`
+   (D1) is saved across this call via `movem.l d1,-(a7)`/`movem.l
+   (a7)+,d1`, **not** just kept in a register: `RunCommand` runs the
+   invoked program on this *same* CPU, and that program's own code
+   (compiled as an ordinary standalone executable, with no reason to
+   preserve anything for an invoker it doesn't know exists) is free to
+   clobber D0-D7/A0-A6 exactly as it pleases, including D1 -- no
+   register is actually safe across a real `RunCommand` call, matching
+   real hardware; only the stack is.
 4. D0 now holds the nested program's own exit code (echoargs always
    exits 0). tst.l d0 / bne fail branches to a distinct failure exit code
    (99) if it's ever nonzero, same convention as systest.
-5. On success: UnLoadSeg(seg) via -156(a6) (D1 still holds the seglist
-   BPTR -- nothing between steps 3 and 5 touches it), PutStr("after
-   runcommand\\n"), and exit 43 -- a distinctive, non-{0,1,42} sentinel
-   so the end-to-end test can tell "really ran the whole flow" apart
-   from any other exit path (42 is systest's own, kept distinct so the
-   two fixtures' exit codes never collide in a shared test file).
+5. On success: pop `seg` back into D1, UnLoadSeg(seg) via -156(a6),
+   PutStr("after runcommand\\n"), and exit 43 -- a distinctive,
+   non-{0,1,42} sentinel so the end-to-end test can tell "really ran the
+   whole flow" apart from any other exit path (42 is systest's own, kept
+   distinct so the two fixtures' exit codes never collide in a shared
+   test file).
 
 Run directly to (re)write fixtures/runcmdtest:
 
@@ -57,7 +66,7 @@ LVO_RUNCOMMAND = -504
 LVO_UNLOADSEG = -156
 LVO_PUTSTR = -948
 
-A6, A1 = 6, 1
+A7, A6, A1 = 7, 6, 1
 D0, D1, D2, D3, D4 = 0, 1, 2, 3, 4
 
 SUCCESS_EXIT_CODE = 43
@@ -87,11 +96,16 @@ def build_program() -> bytes:
     code.jsr_disp16_a(A6, LVO_LOADSEG)  # D0 = seglist BPTR
     code.move_l_d_to_d(D1, D0)  # D1 = seglist BPTR (RunCommand's arg)
 
-    # RunCommand(seg, stack, paramptr, paramlen)
+    # RunCommand(seg, stack, paramptr, paramlen). D1 (seg) is saved on
+    # the stack across the call, not kept in a register -- see this
+    # file's module doc: the invoked program runs on this same CPU and
+    # may clobber any of D0-D7/A0-A6 freely.
+    code.movem_l_to_predec(A7, ["d1"])
     code.move_l_label_to_d(D3, "param")
     code.move_l_imm_to_d(D4, len(PARAM_TEXT))
     code.move_l_imm_to_d(D2, 8192)  # D2 = requested stack size
     code.jsr_disp16_a(A6, LVO_RUNCOMMAND)  # D0 = nested exit code, or -1
+    code.movem_l_from_postinc(A7, ["d1"])  # D1 = seglist BPTR again
 
     code.tst_l_d(D0)
     code.branch(CodeBuilder.BEQ, "ok")
@@ -100,8 +114,6 @@ def build_program() -> bytes:
     code.rts()
 
     code.label("ok")
-    # D1 still holds the seglist BPTR -- no library call in between
-    # touched it.
     code.jsr_disp16_a(A6, LVO_UNLOADSEG)
 
     code.move_l_label_to_d(D1, "okmsg")
