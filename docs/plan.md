@@ -3439,20 +3439,80 @@ strong empirical confirmation of RKRM-conformance without needing to
 change the fixture at all. Its `KNOWN_DIVERGENCES` entry removed;
 issue #7 closed with the root-cause writeup.
 
-**Scope note, filed as issue #8**: real `RunCommand` doesn't create a
-new process at all -- it overlays the *calling* process (same address
-space, stack swapped via `StackSwap`, `pr_Arguments`/`pr_CIS`
-temporarily installed, all reverted on return). volamos still routes
-`RunCommand` through the same brand-new-`Runtime` nested-execution
-path as `System()`/`Execute()` (`run_nested_program`), which is a
-reasonable approximation but not the real overlay semantics --
-researched but deliberately deferred: true overlay needs
-`Runtime::run`'s dispatch loop to support reentrantly invoking guest
-code and getting a return value back, which it can't do today (a
-genuine architectural extension, not a quick change), and nothing in
-the current corpus needs the deeper fidelity yet (shared file-handle
-identity across the overlay, `ReadArgs()` seeing `RunCommand`-supplied
-args specifically via `pr_Arguments`/`pr_CIS`).
+**Scope note, filed as issue #8** (original 2026-08-19 text, superseded
+below): real `RunCommand` doesn't create a new process at all -- it
+overlays the *calling* process (same address space, stack swapped via
+`StackSwap`, `pr_Arguments`/`pr_CIS` temporarily installed, all
+reverted on return). volamos still routes `RunCommand` through the
+same brand-new-`Runtime` nested-execution path as `System()`/
+`Execute()` (`run_nested_program`), which is a reasonable
+approximation but not the real overlay semantics -- researched but
+deliberately deferred: true overlay needs `Runtime::run`'s dispatch
+loop to support reentrantly invoking guest code and getting a return
+value back, which it can't do today (a genuine architectural
+extension, not a quick change), and nothing in the current corpus
+needs the deeper fidelity yet (shared file-handle identity across the
+overlay, `ReadArgs()` seeing `RunCommand`-supplied args specifically
+via `pr_Arguments`/`pr_CIS`).
+
+## RunCommand: real overlay via the trampoline primitive (fixes issues #8, #156) -- 2026-10-17
+
+The "genuine architectural extension" the scope note above said
+`RunCommand` needed turned out to already exist: `ContinuationStack::
+trampoline` (added 2026-08-21 for `OpenLibrary`'s real-library `initFunc`/
+`Open` vectors -- L3, two days after the note above) lets a handler run
+an arbitrary guest subroutine and get control back, host-side, once it
+returns, entirely through `Runtime::run`'s existing dispatch loop -- no
+new CPU-reentrancy machinery needed after all.
+
+`run_command_handler` (`dosseg.rs`) now does exactly what real
+`RunCommand` does: resolves the entry point straight from `DosState::
+seglists` (the already-`LoadSeg`'d, already-relocated bytes sitting in
+*this* guest memory -- no re-read from disk, no separate `Runtime`/
+`FlatMemory` at all), carves a stack region from the caller's own
+`GuestHeap`, repoints `A7`/`tc_SPLower`/`tc_SPUpper`/`pr_Arguments`/
+`DosState::cmdline` (saving the old values), loads `A0`/`D0` with the
+caller's `argptr`/`argsize` verbatim, and `trampoline`s to the entry
+point. The continuation (run once the invoked command's own final `rts`
+returns) reads `D0` as the exit code, restores every saved field, frees
+the stack region, and writes the exit code back for `RunCommand`'s own
+caller.
+
+Concretely motivating issue (#156): the newlib FPCR/FPSR-inheritance
+test (`AmigaPorts/newlib-cygwin#13`) needs the invoked command to
+inherit whatever the caller left in `FPCR`/`FPSR`, and to leave its own
+writes behind for the caller to see afterward. Since `FPCR`/`FPSR` are
+plain `CpuCore` fields nothing else in this codebase ever touches, simply
+running the child on the *same* `cpu`/`mem` (instead of a fresh
+`CpuCore` from a brand-new `Runtime`) gets this for free -- no separate
+save/restore plumbing needed, confirmed by two new real-FPU-opcode unit
+tests (`dosseg.rs`: `run_command_child_inherits_the_callers_fpcr`,
+`run_command_child_writes_to_fpcr_propagate_back_to_the_caller`, both
+driving `FMOVE.L #imm,FPCR`/`FMOVE.L FPCR,Dn` through the actual `m68k`
+crate decoder on a `--cpu 68020 --fpu`-equivalent core).
+
+Found along the way: `fixtures/runcmdtest.s`/`gen_runcmdtest.py` kept
+the seglist `BPTR` in `D1` across the `RunCommand` call, relying on a
+comment ("D1 still holds the seglist BPTR -- no library call in between
+touched it") that was only ever true under the old, unrealistic
+brand-new-`Runtime` implementation. Running the invoked command on the
+*same* CPU means its own compiled code (an ordinary standalone
+executable, with no reason to preserve anything for an invoker it
+doesn't know exists) is free to clobber `D1` -- `fixtures/echoargs`'s own
+`PutStr` call does exactly that. Fixed by saving `seg` on the stack
+(`movem.l d1,-(a7)` / `movem.l (a7)+,d1`) across the call instead of in
+any register -- matching real hardware, where no register at all is
+safe across a real `RunCommand`.
+
+`System()`/`Execute()` are unaffected -- they keep `run_nested_program`'s
+brand-new-`Runtime` path unchanged, which is the real, correct behavior
+for those two (they genuinely spawn independent processes on real
+AmigaOS). `SystemRequest::raw_args`/`stack_size_override` (only ever set
+by the old `RunCommand` path) and `DosState::run_command`/
+`resolve_and_run_command` (superseded by `run_command_handler` doing the
+work itself, since it needs `ctx.cpu`/`ctx.mem`/`ctx.continuations`
+simultaneously, which a `DosState` method can't reach) were removed as
+dead code rather than left behind.
 
 **Verification**: added `raw_command_line_bypasses_args_joining_and_newline_appending`
 (`dispatch.rs`) as a focused unit test; fixed the one existing e2e
