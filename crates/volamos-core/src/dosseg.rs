@@ -247,7 +247,8 @@
 //!    [`crate::guestmem::MIN_STACK_SIZE`], matching
 //!    [`crate::dispatch::Runtime::new`]'s own clamp) from the *caller's*
 //!    [`GuestHeap`], saving the current task's `A7`/`tc_SPLower`/
-//!    `tc_SPUpper`/`pr_Arguments`/[`DosState::cmdline`]/`A6` first --
+//!    `tc_SPUpper`/`pr_Arguments`/[`DosState::cmdline`]/`cmdline_pos`/
+//!    `A6` first --
 //!    same bookkeeping [`crate::exectask`]'s `StackSwap` handler already
 //!    does for the same reason (a stack swap entirely within one
 //!    `FlatMemory`, no new `Task` needed, since `RunCommand` overlays the
@@ -628,7 +629,7 @@ impl DosState {
                 &hunk_file,
                 overlay,
                 file_handle_bptr,
-                host_path.clone(),
+                host_path,
                 heap,
                 mem,
             )
@@ -637,16 +638,12 @@ impl DosState {
             self.overlay_roots.insert(segments_bptr, state);
             self.seglists
                 .insert(seglist.first_bptr, seglist.alloc_addrs);
-            self.seglist_host_paths
-                .insert(seglist.first_bptr, host_path);
             return Ok(seglist.first_bptr);
         }
 
         let seglist = build_seglist(&hunk_file, heap, mem).map_err(|_| ERROR_NO_FREE_STORE)?;
         self.seglists
             .insert(seglist.first_bptr, seglist.alloc_addrs);
-        self.seglist_host_paths
-            .insert(seglist.first_bptr, host_path);
         Ok(seglist.first_bptr)
     }
 
@@ -666,15 +663,14 @@ impl DosState {
     ) -> Result<u32, i32> {
         let bytes = std::fs::read(host_path).map_err(|e| map_io_error(&e))?;
         let hunk_file = loader::parse(&bytes).map_err(|_| ERROR_FILE_NOT_OBJECT)?;
-        let host_path = host_path.to_path_buf();
 
         if let Some(overlay) = &hunk_file.overlay {
-            let file_handle_bptr = self.open_host_file_direct(heap, mem, &host_path)?;
+            let file_handle_bptr = self.open_host_file_direct(heap, mem, host_path)?;
             let (seglist, state) = build_overlay_root_seglist(
                 &hunk_file,
                 overlay,
                 file_handle_bptr,
-                host_path.clone(),
+                host_path.to_path_buf(),
                 heap,
                 mem,
             )
@@ -683,16 +679,12 @@ impl DosState {
             self.overlay_roots.insert(segments_bptr, state);
             self.seglists
                 .insert(seglist.first_bptr, seglist.alloc_addrs);
-            self.seglist_host_paths
-                .insert(seglist.first_bptr, host_path);
             return Ok(seglist.first_bptr);
         }
 
         let seglist = build_seglist(&hunk_file, heap, mem).map_err(|_| ERROR_NO_FREE_STORE)?;
         self.seglists
             .insert(seglist.first_bptr, seglist.alloc_addrs);
-        self.seglist_host_paths
-            .insert(seglist.first_bptr, host_path);
         Ok(seglist.first_bptr)
     }
 
@@ -856,7 +848,6 @@ impl DosState {
                  returned by LoadSeg)"
             ));
         };
-        self.seglist_host_paths.remove(&bptr);
         for addr in addrs {
             heap.free(addr).map_err(|e| {
                 format!(
@@ -1057,6 +1048,7 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let old_sp_upper = ctx.mem.read_u32(task + TC_SPUPPER);
     let old_pr_arguments = ctx.mem.read_u32(task + PR_ARGUMENTS_OFFSET);
     let old_cmdline = ctx.dos.cmdline;
+    let old_cmdline_pos = ctx.dos.cmdline_pos;
 
     let entry_sp = stack_top & !3;
     ctx.cpu.set_address_register(AddressRegister(7), entry_sp);
@@ -1067,6 +1059,14 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // A0/D0, so it has to describe the same buffer.
     ctx.mem.write_u32(task + PR_ARGUMENTS_OFFSET, param_ptr);
     ctx.dos.cmdline = Some((param_ptr, param_len));
+    // ReadArgs's cursor into dos.cmdline -- must restart at the child's
+    // own buffer's beginning, not wherever the caller's own prior
+    // ReadArgs call(s) left it (this field persists across calls, see
+    // crate::dosargs's module doc): without resetting it here, a
+    // RunCommand'd program's own first ReadArgs call would start
+    // partway (often at the very end) of *its* command line instead of
+    // the start, parsing as if no arguments were given at all.
+    ctx.dos.cmdline_pos = 0;
     ctx.cpu
         .set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
     // A0/D0 = argptr/argsize verbatim, exactly as RunCommand's caller
@@ -1096,6 +1096,7 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             ctx.mem
                 .write_u32(task + PR_ARGUMENTS_OFFSET, old_pr_arguments);
             ctx.dos.cmdline = old_cmdline;
+            ctx.dos.cmdline_pos = old_cmdline_pos;
             if let Some(shadow) = ctx.mem.shadow_mut() {
                 shadow.reset_stack_tracking(old_sp_lower, old_sp_upper, old_a7);
             }
@@ -1841,7 +1842,14 @@ mod tests {
         fs::write(tmp.path().join("child"), hunk_file_from_words(&child_words)).unwrap();
         let name = b"SYS:child\0";
 
-        const MARKER: u32 = 0x1234_0000;
+        // Confined to the exception-enable byte (bits 8-15) -- real
+        // 68881/68882/68040/68060 silicon reads FPCR's bits 16-31 back
+        // as 0 regardless of what's written there, so a marker value up
+        // there would only prove this crate's own FPCR storage doesn't
+        // mask it (which it currently doesn't, but isn't architecturally
+        // guaranteed to stay that way), not that this test is checking
+        // real, writable FPCR state.
+        const MARKER: u32 = 0x1000;
         let mut words = Vec::new();
         words.extend_from_slice(&fmove_imm_to_fpcr(MARKER));
         let name_idx = words.len();
@@ -1882,7 +1890,10 @@ mod tests {
         // irrelevant to this test). If RunCommand ran it on a brand-new
         // CpuCore (the pre-#156 behavior) that's discarded on return,
         // the caller's own FPCR would never see this write at all.
-        const CHILD_MARKER: u32 = 0x5678_0000;
+        // See the sibling test above for why this stays confined to the
+        // exception-enable byte (bits 8-15), the part real FPU silicon
+        // actually keeps rather than masking to 0.
+        const CHILD_MARKER: u32 = 0x5000;
         let mut child_words = Vec::new();
         child_words.extend_from_slice(&fmove_imm_to_fpcr(CHILD_MARKER));
         child_words.push(RTS);
@@ -1891,7 +1902,7 @@ mod tests {
         let name = b"SYS:child\0";
 
         let mut words = Vec::new();
-        words.extend_from_slice(&fmove_imm_to_fpcr(0x1234_0000)); // parent's own starting FPCR
+        words.extend_from_slice(&fmove_imm_to_fpcr(0x1000)); // parent's own starting FPCR
         let name_idx = words.len();
         words.push(move_imm_to_d(1));
         words.push(0);
@@ -1922,6 +1933,141 @@ mod tests {
             code, CHILD_MARKER as i32,
             "the invoked command's FPCR write should still be in effect once RunCommand \
              returns to its caller -- same CPU, not a discarded nested one"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::vec_init_then_push)] // one `.push()` per word, each commented
+    fn run_command_resets_readargs_cursor_for_the_child_instead_of_inheriting_the_callers() {
+        // The parent calls ReadArgs on *its own* command line first,
+        // advancing DosState::cmdline_pos partway (here, all the way)
+        // into the parent's buffer. Without resetting that cursor for
+        // the child (DosState::cmdline_pos is a single, shared field --
+        // see crate::dosargs's module doc), the child's own ReadArgs
+        // call would start wherever the parent's left off, typically
+        // past the end of the *child's* entirely different buffer,
+        // silently parsing it as empty. Caught by code review (issue
+        // #156 follow-up), not by any corpus program before this.
+        let tmp = TempDir::new("cmdline-pos");
+
+        // extra's layout, all at a single fixed, known base address
+        // (extra_addr, below) in the *parent's* own loaded region --
+        // the child's own code can reference these addresses directly
+        // as plain immediates (no relocation needed: they don't depend
+        // on wherever LoadSeg ends up placing the child's own seglist).
+        const TEMPLATE: &[u8] = b"ARG\0";
+        const CHILD_CMDLINE: &[u8] = b"CHILD_TOKEN\n";
+        const NAME: &[u8] = b"SYS:child\0";
+        let template_offset = 0u32;
+        let array_offset = 4u32; // must be 4-aligned; TEMPLATE is exactly 4 bytes
+        let child_cmdline_offset = array_offset + 4;
+        let name_offset = child_cmdline_offset + CHILD_CMDLINE.len() as u32;
+        let mut extra = Vec::new();
+        extra.extend_from_slice(TEMPLATE);
+        extra.extend_from_slice(&[0u8; 4]); // array slot, zeroed
+        extra.extend_from_slice(CHILD_CMDLINE);
+        extra.extend_from_slice(NAME);
+
+        // Child: ReadArgs("ARG", array, 0) against *its own* cmdline
+        // (set by RunCommand below), then RTS -- the parent inspects
+        // the array slot's content directly afterward (see below),
+        // so the child's own D0/exit code doesn't matter here.
+        let mut child_words = Vec::new();
+        child_words.push(move_imm_to_d(1)); // D1 = template ptr (patched below)
+        child_words.push(0);
+        child_words.push(0);
+        child_words.push(move_imm_to_d(2)); // D2 = array ptr (patched below)
+        child_words.push(0);
+        child_words.push(0);
+        child_words.push(move_imm_to_d(3)); // D3 = rdargs (0)
+        child_words.push(0);
+        child_words.push(0);
+        child_words.push(jsr_disp16(6));
+        child_words.push((-798i32) as u16); // ReadArgs(a6)
+        child_words.push(RTS);
+
+        let mut words = Vec::new();
+        // Parent's own ReadArgs call first, against its own command
+        // line ("PARENT_TOKEN", below) -- advances cmdline_pos.
+        let parent_template_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        let parent_array_idx = words.len();
+        words.push(move_imm_to_d(2));
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(3));
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -798); // ReadArgs(a6) -- the parent's own
+
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = "SYS:child" (patched below)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -150); // LoadSeg(a6): D0 = BPTR
+        words.push(move_d0_to_d(1)); // D1 = seglist BPTR
+        words.push(move_imm_to_d(2)); // D2 = requested stack size
+        words.push(0);
+        words.push(8192);
+        let child_cmdline_idx = words.len();
+        words.push(move_imm_to_d(3)); // D3 = child's own paramptr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(4)); // D4 = paramlen
+        words.push(0);
+        words.push(CHILD_CMDLINE.len() as u16);
+        push_jsr(&mut words, 6, -504); // RunCommand(a6)
+        words.push(RTS);
+
+        let extra_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let template_addr = extra_addr + template_offset;
+        let array_addr = extra_addr + array_offset;
+        let child_cmdline_addr = extra_addr + child_cmdline_offset;
+        let name_addr = extra_addr + name_offset;
+        patch_imm32(&mut words, parent_template_idx, template_addr);
+        patch_imm32(&mut words, parent_array_idx, array_addr);
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, child_cmdline_idx, child_cmdline_addr);
+        patch_imm32(&mut child_words, 0, template_addr);
+        patch_imm32(&mut child_words, 3, array_addr);
+
+        fs::write(tmp.path().join("child"), hunk_file_from_words(&child_words)).unwrap();
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        for (i, &b) in extra.iter().enumerate() {
+            mem.write_u8(extra_addr + i as u32, b);
+        }
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: extra_addr + extra.len() as u32,
+                args: vec!["PARENT_TOKEN".to_string()],
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs_over(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            code, 0,
+            "RunCommand should have run the child to completion"
+        );
+
+        let matched_ptr = rt.memory().read_u32(array_addr);
+        assert_ne!(
+            matched_ptr, 0,
+            "the child's own ReadArgs call should have matched something"
+        );
+        assert_eq!(
+            read_c_string(rt.memory(), matched_ptr),
+            b"CHILD_TOKEN",
+            "the child's ReadArgs should parse the child's own command line from its start, \
+             not wherever the parent's prior ReadArgs call left DosState::cmdline_pos"
         );
     }
 
