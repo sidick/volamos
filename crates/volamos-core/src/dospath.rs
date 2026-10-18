@@ -1,13 +1,20 @@
 //! `dos.library` pure path-string functions: `AddPart`/`FilePart`/
-//! `PathPart`. Unlike `Open`/`Lock`/`Examine` et al, these never touch a
-//! `Vfs` or a handler -- they operate purely on the bytes of the path
-//! strings passed in, per the RKRM (`paths-and-filenames.md`): "This
-//! function does not interact with file systems and does not check
-//! whether the paths passed in correspond to accessible objects."
+//! `PathPart`/`SplitName`. Unlike `Open`/`Lock`/`Examine` et al, these
+//! never touch a `Vfs` or a handler -- they operate purely on the bytes
+//! of the path strings passed in, per the RKRM
+//! (`paths-and-filenames.md`): "This function does not interact with
+//! file systems and does not check whether the paths passed in
+//! correspond to accessible objects."
 //!
 //! Found missing while running the real Workbench 3.1.4 `C:/List`
 //! binary: it calls `AddPart` to build each listed entry's full path
 //! before it ever prints a directory entry.
+//!
+//! `SplitName` is a separate, iterator-style function ("mainly intended
+//! to support handlers", per its own NDK autodoc) -- it splits a string
+//! on an arbitrary caller-chosen separator byte rather than specifically
+//! on `/`/`:`, one piece per call, so it doesn't share `AddPart`'s
+//! device/parent-step semantics at all.
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
@@ -151,10 +158,59 @@ fn path_part_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
-/// Registers `AddPart`/`FilePart`/`PathPart` onto [`DOS_LIBRARY_BASE`],
-/// looked up by name through [`DOS_LVOS`]. Called from
-/// [`crate::dispatch::Runtime::new`] alongside the other `dos.library`
-/// registrations.
+/// Core of `SplitName`: splits `name[oldpos..]` at the next occurrence
+/// of `separator` (searched for across the *whole* remainder, not just
+/// within `size` bytes of it), copying up to `size - 1` bytes of that
+/// piece into a `NUL`-terminated buffer (truncating if the piece itself
+/// is longer than that -- the real autodoc's "if the separator is not
+/// found within `size` characters" case: the *returned position* is
+/// still based on the separator's real location, only the copied bytes
+/// are capped). Returns the bytes to write (including the trailing
+/// `NUL`) and the position to resume from next call, or `None` for that
+/// position if no further separator exists (this was the last piece,
+/// real `SplitName`'s `-1` case).
+fn split_name(name: &[u8], separator: u8, oldpos: usize, size: usize) -> (Vec<u8>, Option<usize>) {
+    let start = oldpos.min(name.len());
+    let rest = &name[start..];
+    let (piece, newpos) = match rest.iter().position(|&b| b == separator) {
+        Some(rel) => (&rest[..rel], Some(start + rel + 1)),
+        None => (rest, None),
+    };
+    let cap = size.saturating_sub(1);
+    let mut buf = piece[..piece.len().min(cap)].to_vec();
+    buf.push(0);
+    (buf, newpos)
+}
+
+/// `SplitName` (`D1` = name, `D2` = separator byte, `D3` = buffer, `D4`
+/// = `oldpos` (`WORD`), `D5` = buffer size). `D0` = the new position
+/// (`WORD`) for the next call, or `-1` once the last piece has been
+/// returned. Cannot fail.
+fn split_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_addr = ctx.cpu.data_register(DataRegister(1));
+    let separator = ctx.cpu.data_register(DataRegister(2)) as u8;
+    let buf_addr = ctx.cpu.data_register(DataRegister(3));
+    let oldpos = ctx.cpu.data_register(DataRegister(4)) as i32;
+    let size = ctx.cpu.data_register(DataRegister(5)) as usize;
+
+    let name = read_c_string(ctx.mem, name_addr);
+    let (buf, newpos) = split_name(&name, separator, oldpos.max(0) as usize, size);
+
+    let mut a = buf_addr;
+    for &b in &buf {
+        ctx.mem.write_u8(a, b);
+        a = a.wrapping_add(1);
+    }
+
+    let result = newpos.map_or(-1, |p| p as i32);
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
+/// Registers `AddPart`/`FilePart`/`PathPart`/`SplitName` onto
+/// [`DOS_LIBRARY_BASE`], looked up by name through [`DOS_LVOS`]. Called
+/// from [`crate::dispatch::Runtime::new`] alongside the other
+/// `dos.library` registrations.
 pub fn register_dospath_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -176,6 +232,7 @@ pub fn register_dospath_handlers<C: Cpu + 'static>(
     reg!("AddPart", add_part_handler::<C>);
     reg!("FilePart", file_part_handler::<C>);
     reg!("PathPart", path_part_handler::<C>);
+    reg!("SplitName", split_name_handler::<C>);
 }
 
 #[cfg(test)]
@@ -270,6 +327,53 @@ mod tests {
     fn path_part_offset_points_just_before_the_last_components_separator() {
         assert_eq!(path_part_offset(b"SYS:work/foo.txt"), 8); // just after "work"
         assert_eq!(path_part_offset(b"foo.txt"), 7); // single component -> end of string
+    }
+
+    // --- split_name: unit-level ---
+
+    #[test]
+    fn split_name_first_piece_and_resumable_position() {
+        let (buf, newpos) = split_name(b"a/b/c", b'/', 0, 64);
+        assert_eq!(buf, b"a\0");
+        assert_eq!(newpos, Some(2));
+    }
+
+    #[test]
+    fn split_name_resuming_from_a_previous_position() {
+        let (buf, newpos) = split_name(b"a/b/c", b'/', 2, 64);
+        assert_eq!(buf, b"b\0");
+        assert_eq!(newpos, Some(4));
+    }
+
+    #[test]
+    fn split_name_last_piece_reports_no_further_position() {
+        let (buf, newpos) = split_name(b"a/b/c", b'/', 4, 64);
+        assert_eq!(buf, b"c\0");
+        assert_eq!(newpos, None);
+    }
+
+    #[test]
+    fn split_name_no_separator_at_all_is_the_whole_remainder() {
+        let (buf, newpos) = split_name(b"onepiece", b'/', 0, 64);
+        assert_eq!(buf, b"onepiece\0");
+        assert_eq!(newpos, None);
+    }
+
+    #[test]
+    fn split_name_truncates_a_too_long_piece_but_still_reports_the_real_separator_position() {
+        // The piece "abcdef" is longer than size-1 (3) bytes, so the
+        // copy is truncated -- but newpos must still be based on where
+        // the separator *actually* is, not where truncation stopped.
+        let (buf, newpos) = split_name(b"abcdef/g", b'/', 0, 4);
+        assert_eq!(buf, b"abc\0");
+        assert_eq!(newpos, Some(7));
+    }
+
+    #[test]
+    fn split_name_oldpos_past_the_end_is_an_empty_last_piece() {
+        let (buf, newpos) = split_name(b"a/b", b'/', 10, 64);
+        assert_eq!(buf, b"\0");
+        assert_eq!(newpos, None);
     }
 
     // --- End-to-end: real A-line trap dispatch ---
@@ -375,5 +479,42 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, (path_addr + 9) as i32);
         assert_eq!(read_c_string(rt.memory(), code as u32), b"foo.txt");
+    }
+
+    #[test]
+    fn end_to_end_split_name_via_trap_dispatch() {
+        let mut words = Vec::new();
+        let name_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = name (patched)
+        push_move_imm_to_d(&mut words, 2, b'/' as u32); // D2 = separator
+        let buf_idx = push_move_imm_to_d(&mut words, 3, 0); // D3 = buffer (patched)
+        push_move_imm_to_d(&mut words, 4, 0); // D4 = oldpos
+        push_move_imm_to_d(&mut words, 5, 64); // D5 = buffer size
+        push_jsr(&mut words, 6, -414); // SplitName(a6): D0 = newpos
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let buf_addr = name_addr + 16;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        write_c_string(&mut mem, name_addr, b"a/b/c");
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: buf_addr + 0x40,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 2);
+        assert_eq!(read_c_string(rt.memory(), buf_addr), b"a");
     }
 }

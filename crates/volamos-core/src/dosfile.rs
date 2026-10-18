@@ -248,12 +248,23 @@ pub fn map_vfs_error(err: &VfsError) -> i32 {
 }
 
 /// A file handle's host-side backing.
-enum HostHandle {
+///
+/// `pub(crate)` (not just module-private): [`crate::doslock`]'s
+/// `ExamineFH`/`DupLockFromFH`/`ParentOfFH` handlers (V36 calls that
+/// turn a `FileHandle` back into lock/`FileInfoBlock` data -- the same
+/// kind of thing [`crate::doslock::LockEntry`] already carries for a
+/// real `Lock`) need to pattern-match on this from that sibling module,
+/// the same "extensions live in the sibling module" convention this
+/// file's own docs already establish for `locks`/`exnext`.
+pub(crate) enum HostHandle {
     /// A real host file opened via `Open`, plus the normalized Amiga
-    /// path it was resolved from (see [`crate::doslock`]'s `LockEntry`
-    /// for the same "record the path that produced it" convention) --
-    /// [`DosState::name_from_fh`] reads this back for `NameFromFH`.
-    HostFile(File, String),
+    /// path it was resolved from and the host path it actually resolved
+    /// to (see [`crate::doslock`]'s `LockEntry` for the same "record
+    /// both paths" convention) -- [`DosState::name_from_fh`] reads the
+    /// Amiga path back for `NameFromFH`; `ExamineFH`/`DupLockFromFH`/
+    /// `ParentOfFH` (`crate::doslock`) need the host path too, the same
+    /// way `Examine`/`Lock` do from a `LockEntry`.
+    HostFile(File, String, std::path::PathBuf),
     /// The `Input()` default handle: reads come from host stdin.
     Stdin,
     /// The `Output()` default handle. Writes to this handle are
@@ -293,8 +304,10 @@ pub struct DosState {
     /// a present-but-broken file there is a hard error rather than a
     /// silent fallback.
     pub(crate) libs_dir_override: bool,
-    /// Guest `FileHandle` struct address -> host backing.
-    handles: HashMap<u32, HostHandle>,
+    /// Guest `FileHandle` struct address -> host backing. `pub(crate)`
+    /// for the same reason [`HostHandle`] itself is -- see that type's
+    /// doc.
+    pub(crate) handles: HashMap<u32, HostHandle>,
     /// The current `IoErr()` value.
     io_err: i32,
     /// Guest address of the lazily-created `Input()` default handle's
@@ -662,7 +675,7 @@ impl DosState {
 
         let addr = self.alloc_file_handle(heap, mem, false)?;
         self.handles
-            .insert(addr, HostHandle::HostFile(file, resolved.amiga_path));
+            .insert(addr, HostHandle::HostFile(file, resolved.amiga_path, path));
         Ok(bptr_from_addr(addr))
     }
 
@@ -695,7 +708,11 @@ impl DosState {
         let addr = self.alloc_file_handle(heap, mem, false)?;
         self.handles.insert(
             addr,
-            HostHandle::HostFile(file, host_path.to_string_lossy().into_owned()),
+            HostHandle::HostFile(
+                file,
+                host_path.to_string_lossy().into_owned(),
+                host_path.to_path_buf(),
+            ),
         );
         Ok(bptr_from_addr(addr))
     }
@@ -722,7 +739,7 @@ impl DosState {
     /// contract) or an `IoErr()` code.
     pub fn read(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, i32> {
         match self.handles.get_mut(&addr) {
-            Some(HostHandle::HostFile(f, _)) => {
+            Some(HostHandle::HostFile(f, _, _)) => {
                 let mut buf = vec![0u8; len];
                 let n = f.read(&mut buf).map_err(|e| map_io_error(&e))?;
                 buf.truncate(n);
@@ -751,7 +768,7 @@ impl DosState {
     /// bytes actually written, or an `IoErr()` code.
     pub fn write(&mut self, addr: u32, data: &[u8]) -> Result<usize, i32> {
         match self.handles.get_mut(&addr) {
-            Some(HostHandle::HostFile(f, _)) => f.write(data).map_err(|e| map_io_error(&e)),
+            Some(HostHandle::HostFile(f, _, _)) => f.write(data).map_err(|e| map_io_error(&e)),
             Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
             // NIL: discards the data but reports success, as if every
             // byte were written -- real hardware's null device never
@@ -787,7 +804,7 @@ impl DosState {
     /// bug to replicate.)
     pub fn seek(&mut self, addr: u32, position: i32, offset_mode: i32) -> Result<i32, i32> {
         match self.handles.get_mut(&addr) {
-            Some(HostHandle::HostFile(f, _)) => {
+            Some(HostHandle::HostFile(f, _, _)) => {
                 let old = f.stream_position().map_err(|_| ERROR_SEEK_ERROR)? as i64;
                 let len = f.metadata().map_err(|_| ERROR_SEEK_ERROR)?.len() as i64;
                 let target = match offset_mode {
@@ -808,6 +825,47 @@ impl DosState {
         }
     }
 
+    /// `SetFileSize`: truncates or extends the file at `addr` to a new
+    /// length computed exactly the way [`Self::seek`]'s target position
+    /// is (`OFFSET_BEGINNING`/`OFFSET_CURRENT`/`OFFSET_END`), via
+    /// [`File::set_len`]. Per the real documented contract, a target
+    /// past the current length is a legal extension (unlike `Seek`,
+    /// which rejects that) -- only a negative target is an error. If
+    /// the handle's current seek position would now be past the new
+    /// end-of-file, it's moved back to exactly the new EOF; otherwise
+    /// left untouched (matching "the new size will not leave any
+    /// filehandle pointing past the end-of-file", for the one
+    /// filehandle this runtime actually tracks a position for).
+    /// Returns the new length, or an `IoErr()` code
+    /// ([`ERROR_SEEK_ERROR`] for a negative target or an unseekable
+    /// handle, [`ERROR_INVALID_LOCK`] for an unknown one, or a mapped
+    /// [`std::io::Error`] if the host `set_len` call itself fails).
+    pub fn set_file_size(&mut self, addr: u32, offset: i32, offset_mode: i32) -> Result<i32, i32> {
+        match self.handles.get_mut(&addr) {
+            Some(HostHandle::HostFile(f, _, _)) => {
+                let old_pos = f.stream_position().map_err(|_| ERROR_SEEK_ERROR)? as i64;
+                let len = f.metadata().map_err(|_| ERROR_SEEK_ERROR)?.len() as i64;
+                let target = match offset_mode {
+                    OFFSET_BEGINNING => offset as i64,
+                    OFFSET_CURRENT => old_pos + offset as i64,
+                    OFFSET_END => len + offset as i64,
+                    _ => return Err(ERROR_SEEK_ERROR),
+                };
+                if target < 0 {
+                    return Err(ERROR_SEEK_ERROR);
+                }
+                f.set_len(target as u64).map_err(|e| map_io_error(&e))?;
+                if old_pos > target {
+                    f.seek(SeekFrom::Start(target as u64))
+                        .map_err(|_| ERROR_SEEK_ERROR)?;
+                }
+                Ok(target as i32)
+            }
+            Some(_) => Err(ERROR_SEEK_ERROR),
+            None => Err(ERROR_INVALID_LOCK),
+        }
+    }
+
     /// `NameFromFH`: the normalized Amiga path `addr`'s handle was
     /// opened from (recorded on it by [`Self::open`]). Fails with
     /// [`ERROR_INVALID_LOCK`] for an unknown handle, or
@@ -815,7 +873,7 @@ impl DosState {
     /// handles (stdin/stdout aren't Amiga path-backed objects at all).
     pub fn name_from_fh(&self, addr: u32) -> Result<String, i32> {
         match self.handles.get(&addr) {
-            Some(HostHandle::HostFile(_, amiga_path)) => Ok(amiga_path.clone()),
+            Some(HostHandle::HostFile(_, amiga_path, _)) => Ok(amiga_path.clone()),
             Some(HostHandle::Stdin) | Some(HostHandle::Stdout) | Some(HostHandle::Null) => {
                 Err(ERROR_ACTION_NOT_KNOWN)
             }
@@ -1051,6 +1109,23 @@ fn seek_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     Ok(())
 }
 
+/// `SetFileSize` (`D1` = fh, `D2` = offset, `D3` = mode). `D0` = the
+/// new length, or `-1` with `IoErr()` set.
+fn set_file_size_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fh = ctx.cpu.data_register(DataRegister(1));
+    let offset = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let mode = ctx.cpu.data_register(DataRegister(3)) as i32;
+    let addr = addr_from_bptr(fh);
+    match ctx.dos.set_file_size(addr, offset, mode) {
+        Ok(size) => ctx.cpu.set_data_register(DataRegister(0), size as u32),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
+        }
+    }
+    Ok(())
+}
+
 /// `Input()`. `D0` = BPTR of the default input handle (or 0 on the
 /// extremely unlikely guest-heap-exhaustion failure, with `IoErr()`
 /// set).
@@ -1274,6 +1349,53 @@ fn get_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     }
     ctx.cpu
         .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
+/// `SetProgramName` (`D1` = name `CString*`). `D0` = `DOSTRUE`/
+/// `DOSFALSE`. The inverse of [`get_program_name_handler`]: replaces
+/// `cli_CommandName` with a fresh `BSTR` holding `name`, freeing the
+/// old one. Real `SetProgramName` "clips to a fixed (1.3 compatible)
+/// size" on overflow and leaves the old value intact rather than
+/// truncating it -- this runtime has no such fixed-size buffer (the
+/// `BSTR` is allocated to fit exactly, same as
+/// [`crate::exectask::create_current_task`]'s own initial one), so the
+/// only real failure mode left is the guest heap itself being full,
+/// which old-value-preserving `Err` branch below also matches (nothing
+/// is freed or overwritten on that path either). Clips the same way
+/// that initial allocation does (`.min(255)`, a `BSTR`'s length byte
+/// can't address more anyway) rather than rejecting a longer name
+/// outright. `pr_CLI` is always non-`NULL` in this runtime (see
+/// [`get_program_name_handler`]'s doc), so real `SetProgramName`'s
+/// documented "safe to call even if there is no CLI structure" case
+/// never actually applies here.
+fn set_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.data_register(DataRegister(1));
+    let name = read_c_string(ctx.mem, name_ptr);
+    let clipped = &name[..name.len().min(255)];
+
+    let cli_bptr = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_CLI_OFFSET);
+    let cli_addr = addr_from_bptr(cli_bptr);
+    let old_name_bptr = ctx
+        .mem
+        .read_u32(cli_addr + crate::exectask::CLI_COMMAND_NAME_OFFSET);
+
+    match ctx.heap.alloc(ctx.mem, 1 + clipped.len() as u32) {
+        Ok(new_addr) => {
+            crate::guestmem::write_bstr(ctx.mem, new_addr, clipped);
+            ctx.mem.write_u32(
+                cli_addr + crate::exectask::CLI_COMMAND_NAME_OFFSET,
+                bptr_from_addr(new_addr),
+            );
+            let _ = ctx.heap.free(addr_from_bptr(old_name_bptr));
+            ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
+        }
+        Err(_) => {
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
     Ok(())
 }
 
@@ -1560,6 +1682,7 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("Read", read_handler::<C>);
     reg!("Write", write_handler::<C>);
     reg!("Seek", seek_handler::<C>);
+    reg!("SetFileSize", set_file_size_handler::<C>);
     reg!("Input", input_handler::<C>);
     reg!("Output", output_handler::<C>);
     reg!("IsInteractive", is_interactive_handler::<C>);
@@ -1570,6 +1693,7 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("GetProgramDir", get_program_dir_handler::<C>);
     reg!("SetProgramDir", set_program_dir_handler::<C>);
     reg!("GetProgramName", get_program_name_handler::<C>);
+    reg!("SetProgramName", set_program_name_handler::<C>);
     reg!("AllocDosObject", alloc_dos_object_handler::<C>);
     reg!("FreeDosObject", free_dos_object_handler::<C>);
     reg!("GetFileSysTask", get_file_sys_task_handler::<C>);
@@ -1945,6 +2069,99 @@ mod tests {
 
         assert_eq!(dos.seek(addr, 10, OFFSET_BEGINNING), Ok(0));
         assert!(dos.read(addr, 1).unwrap().is_empty(), "at EOF, not past it");
+    }
+
+    // --- SetFileSize (issue #156 follow-up) ---
+
+    #[test]
+    fn set_file_size_extends_a_file() {
+        let tmp = TempDir::new("setfilesize_extend");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        let new_size = dos
+            .set_file_size(addr, 20, OFFSET_BEGINNING)
+            .expect("extending should succeed");
+        assert_eq!(new_size, 20);
+        assert_eq!(
+            fs::metadata(tmp.path().join("f.txt")).unwrap().len(),
+            20,
+            "the host file itself should now be 20 bytes"
+        );
+    }
+
+    #[test]
+    fn set_file_size_truncates_and_moves_a_position_past_the_new_end() {
+        let tmp = TempDir::new("setfilesize_truncate");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+        dos.seek(addr, 8, OFFSET_BEGINNING).unwrap();
+
+        let new_size = dos
+            .set_file_size(addr, 3, OFFSET_BEGINNING)
+            .expect("truncating should succeed");
+        assert_eq!(new_size, 3);
+        // The seek position (8) was past the new end (3) -- must have
+        // been moved back to exactly the new EOF, not left dangling.
+        assert!(dos.read(addr, 1).unwrap().is_empty(), "now sitting at EOF");
+        assert_eq!(dos.seek(addr, 0, OFFSET_BEGINNING), Ok(3));
+    }
+
+    #[test]
+    fn set_file_size_truncating_above_the_current_position_leaves_it_untouched() {
+        let tmp = TempDir::new("setfilesize_truncate_above_pos");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+        dos.seek(addr, 2, OFFSET_BEGINNING).unwrap();
+
+        dos.set_file_size(addr, 5, OFFSET_BEGINNING).unwrap();
+        // Position (2) was already before the new end (5) -- untouched.
+        assert_eq!(dos.seek(addr, 0, OFFSET_CURRENT), Ok(2));
+    }
+
+    #[test]
+    fn set_file_size_rejects_a_negative_target() {
+        let tmp = TempDir::new("setfilesize_negative");
+        fs::write(tmp.path().join("f.txt"), b"0123456789").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        assert_eq!(
+            dos.set_file_size(addr, -100, OFFSET_END),
+            Err(ERROR_SEEK_ERROR)
+        );
+    }
+
+    #[test]
+    fn set_file_size_on_an_unknown_handle_is_invalid_lock() {
+        let mut dos = DosState::new(None);
+        assert_eq!(
+            dos.set_file_size(0x1234, 0, OFFSET_BEGINNING),
+            Err(ERROR_INVALID_LOCK)
+        );
     }
 
     #[test]
@@ -2689,6 +2906,55 @@ mod tests {
             crate::guestmem::read_c_string(rt.memory(), buf_addr),
             b"Ami",
             "truncated to capacity - 1, still NUL-terminated"
+        );
+    }
+
+    // --- SetProgramName (issue #156 follow-up) ---
+
+    #[test]
+    fn end_to_end_set_program_name_then_get_program_name_round_trips() {
+        let name_addr: u32 = 0x1_8000;
+        let buf_addr: u32 = 0x1_8100;
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = name_addr ("replaced")
+            (name_addr >> 16) as u16,
+            name_addr as u16,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-570i16) as u16]); // SetProgramName(a6)
+        words.extend_from_slice(&[
+            move_imm_to_d(1), // D1 = buf_addr
+            (buf_addr >> 16) as u16,
+            buf_addr as u16,
+            move_imm_to_d(2), // D2 = 64 (buffer size)
+            0,
+            64,
+        ]);
+        words.extend_from_slice(&[jsr_disp16(6), (-576i16) as u16]); // GetProgramName(a6)
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_c_string(&mut mem, name_addr, b"replaced");
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                program_name: "original".to_string(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32, "GetProgramName should still succeed");
+        assert_eq!(
+            crate::guestmem::read_c_string(rt.memory(), buf_addr),
+            b"replaced",
+            "GetProgramName should see SetProgramName's new value, not the original"
         );
     }
 

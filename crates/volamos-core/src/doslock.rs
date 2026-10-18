@@ -409,6 +409,129 @@ impl DosState {
         self.new_lock(heap, mem, entry.host_path, entry.amiga_path, SHARED_LOCK)
     }
 
+    /// `DupLockFromFH(fh)`: a [`SHARED_LOCK`] on the object the open
+    /// file at `fh` was opened from -- only works for a
+    /// [`crate::dosfile::HostHandle::HostFile`]-backed handle (real
+    /// `DupLockFromFH` is likewise documented as only working for a
+    /// non-exclusively-opened file); `Input()`/`Output()`/`NIL:` have
+    /// no Amiga path to lock. Returns `0` for an unknown or
+    /// non-file-backed handle (real `DupLockFromFH`'s own "lock or
+    /// `NULL` for failure" contract documents no distinct `IoErr()`
+    /// code for this, so none is set, matching [`Self::parent_of_fh`]
+    /// below).
+    pub fn dup_lock_from_fh(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        fh_addr: u32,
+    ) -> u32 {
+        let Some(crate::dosfile::HostHandle::HostFile(_, amiga_path, host_path)) =
+            self.handles.get(&fh_addr)
+        else {
+            return 0;
+        };
+        let (amiga_path, host_path) = (amiga_path.clone(), host_path.clone());
+        self.new_lock(heap, mem, host_path, amiga_path, SHARED_LOCK)
+            .unwrap_or(0)
+    }
+
+    /// `ParentOfFH(fh)`: a [`SHARED_LOCK`] on the parent directory of
+    /// the open file at `fh` -- the same "pop the last Amiga-path
+    /// component and re-resolve" logic [`Self::parent_dir`] uses for a
+    /// lock, just sourced from a handle's own stored Amiga path instead
+    /// (deliberately not factored into one shared helper: `parent_dir`
+    /// treats a path with no `:` at all as [`crate::dosfile::
+    /// ERROR_INVALID_COMPONENT_NAME`], a real error, while this is
+    /// documented as returning a plain `0`/`NULL` for *any* failure --
+    /// collapsing the two would quietly change `parent_dir`'s existing,
+    /// tested error reporting for a case that can't actually happen on
+    /// this runtime's own well-formed paths anyway). Returns `0` for an
+    /// unknown or non-file-backed handle, or when the handle is already
+    /// at a volume root (no parent -- not an error, matching
+    /// `parent_dir`'s own convention, though with no `IoErr()` set
+    /// either way here since real `ParentOfFH` documents no code for
+    /// this case).
+    pub fn parent_of_fh(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        fh_addr: u32,
+    ) -> u32 {
+        let Some(crate::dosfile::HostHandle::HostFile(_, amiga_path, _)) =
+            self.handles.get(&fh_addr)
+        else {
+            return 0;
+        };
+        let amiga_path = amiga_path.clone();
+        let Some((vol, rest)) = amiga_path.split_once(':') else {
+            return 0;
+        };
+        let mut comps: Vec<&str> = rest.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() {
+            return 0;
+        }
+        comps.pop();
+        let parent_path = format!("{vol}:{}", comps.join("/"));
+
+        let Some(vfs) = self.vfs.as_ref() else {
+            return 0;
+        };
+        let Ok(resolved) = vfs.resolve_with_amiga_path(&parent_path, ResolveMode::MustExist) else {
+            return 0;
+        };
+        self.new_lock(
+            heap,
+            mem,
+            resolved.host_path,
+            resolved.amiga_path,
+            SHARED_LOCK,
+        )
+        .unwrap_or(0)
+    }
+
+    /// `ExamineFH(fh, fib)`: fills `fib` from the open file at `fh`,
+    /// exactly like [`Self::examine`] does for a lock on the same file
+    /// -- see [`crate::dosfile::HostHandle::HostFile`] for the host
+    /// path every open file carries. Fails with [`ERROR_INVALID_LOCK`]
+    /// for an unknown handle or one of the `Input()`/`Output()`/`NIL:`
+    /// handles (none of which are Amiga path-backed objects), or a
+    /// mapped [`std::io::Error`] if the host `metadata` call fails.
+    pub fn examine_fh(
+        &mut self,
+        mem: &mut dyn AddressSpace,
+        fh_addr: u32,
+        fib_addr: u32,
+    ) -> Result<(), i32> {
+        let (amiga_path, host_path) = match self.handles.get(&fh_addr) {
+            Some(crate::dosfile::HostHandle::HostFile(_, amiga_path, host_path)) => {
+                (amiga_path.clone(), host_path.clone())
+            }
+            _ => return Err(ERROR_INVALID_LOCK),
+        };
+        let display_name = own_display_name(&amiga_path);
+        let meta = std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
+        let is_dir = meta.is_dir();
+        let size = if is_dir { 0 } else { meta.len() as u32 };
+        fill_fib(mem, fib_addr, &display_name, is_dir, size, &host_path);
+        Ok(())
+    }
+
+    /// `GetCurrentDirName(buf, len)`'s underlying value: the current
+    /// directory's own normalized Amiga path string
+    /// ([`crate::vfs::Vfs::cwd`]). Fails with [`crate::dosfile::
+    /// ERROR_OBJECT_WRONG_TYPE`] if no [`crate::vfs::Vfs`] is installed
+    /// -- the closest match this runtime has to real
+    /// `GetCurrentDirName`'s documented "no CLI structure" failure
+    /// (every guest process here is conceptually a CLI; the real
+    /// absence this runtime can actually have is no path-resolution
+    /// state at all).
+    pub fn current_dir_name(&self) -> Result<String, i32> {
+        self.vfs
+            .as_ref()
+            .map(|vfs| vfs.cwd().to_string())
+            .ok_or(crate::dosfile::ERROR_OBJECT_WRONG_TYPE)
+    }
+
     /// `NameFromLock(lock)`: the absolute Amiga path that produced
     /// `lock` (`lock == 0` resolves to the literal string `"SYS:"`,
     /// matching the RKRM's own documented quirk for the `ZERO` lock --
@@ -792,6 +915,87 @@ fn dup_lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     Ok(())
 }
 
+/// `DupLockFromFH` (`D1` = `BPTR` filehandle). `D0` = new lock `BPTR`
+/// or `0`; no `IoErr()` code is set on failure, matching real
+/// `DupLockFromFH`'s own undocumented-error-code contract.
+fn dup_lock_from_fh_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fh = ctx.cpu.data_register(DataRegister(1));
+    let addr = addr_from_bptr(fh);
+    let new_bptr = ctx.dos.dup_lock_from_fh(ctx.heap, ctx.mem, addr);
+    ctx.cpu.set_data_register(DataRegister(0), new_bptr);
+    Ok(())
+}
+
+/// `ParentOfFH` (`D1` = `BPTR` filehandle). `D0` = parent lock `BPTR`
+/// or `0`; no `IoErr()` code is set on failure, matching real
+/// `ParentOfFH`'s own undocumented-error-code contract.
+fn parent_of_fh_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fh = ctx.cpu.data_register(DataRegister(1));
+    let addr = addr_from_bptr(fh);
+    let parent_bptr = ctx.dos.parent_of_fh(ctx.heap, ctx.mem, addr);
+    ctx.cpu.set_data_register(DataRegister(0), parent_bptr);
+    Ok(())
+}
+
+/// `ExamineFH` (`D1` = `BPTR` filehandle, `D2` = `struct
+/// FileInfoBlock*`). `D0` = `DOSTRUE`/`DOSFALSE`.
+fn examine_fh_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fh = ctx.cpu.data_register(DataRegister(1));
+    let fib_addr = ctx.cpu.data_register(DataRegister(2));
+    let addr = addr_from_bptr(fh);
+    match ctx.dos.examine_fh(ctx.mem, addr, fib_addr) {
+        Ok(()) => ctx.cpu.set_data_register(DataRegister(0), DOSTRUE),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
+    Ok(())
+}
+
+/// `GetCurrentDirName` (`D1` = buffer, `D2` = buffer size in bytes).
+/// `D0` = `DOSTRUE`/`DOSFALSE`. Same truncation convention
+/// [`crate::dosfile`]'s `GetProgramName` handler uses (copies what
+/// fits, NUL-terminates either way, reports [`crate::dospattern::
+/// ERROR_LINE_TOO_LONG`] on truncation) -- real `GetCurrentDirName`
+/// documents a generic "failure code" on truncation without naming one
+/// specifically, so this reuses the sibling call's own choice rather
+/// than inventing a second convention.
+fn get_current_dir_name_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let buf = ctx.cpu.data_register(DataRegister(1));
+    let len = ctx.cpu.data_register(DataRegister(2)) as i32;
+
+    let name = match ctx.dos.current_dir_name() {
+        Ok(name) => name,
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.mem.write_u8(buf, 0);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+            return Ok(());
+        }
+    };
+    let name_bytes = name.as_bytes();
+    let capacity = (len - 1).max(0) as usize;
+    let (copy_len, ok) = if name_bytes.len() > capacity {
+        (capacity, false)
+    } else {
+        (name_bytes.len(), true)
+    };
+    for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
+        ctx.mem.write_u8(buf.wrapping_add(i as u32), b);
+    }
+    ctx.mem.write_u8(buf.wrapping_add(copy_len as u32), 0);
+
+    if !ok {
+        ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+    }
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
 /// `ParentDir` (`D1` = `BPTR`). `D0` = new `BPTR`, or `0` (with `IoErr()`
 /// left untouched -- "no parent" isn't an error -- unless `D1` itself was
 /// an invalid lock, which does set `IoErr()`).
@@ -913,10 +1117,14 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("Rename", rename_handler::<C>);
     reg!("UnLock", unlock_handler::<C>);
     reg!("DupLock", dup_lock_handler::<C>);
+    reg!("DupLockFromFH", dup_lock_from_fh_handler::<C>);
     reg!("Examine", examine_handler::<C>);
+    reg!("ExamineFH", examine_fh_handler::<C>);
     reg!("ExNext", ex_next_handler::<C>);
     reg!("CurrentDir", current_dir_handler::<C>);
+    reg!("GetCurrentDirName", get_current_dir_name_handler::<C>);
     reg!("ParentDir", parent_dir_handler::<C>);
+    reg!("ParentOfFH", parent_of_fh_handler::<C>);
     reg!("NameFromLock", name_from_lock_handler::<C>);
 }
 
@@ -1475,6 +1683,167 @@ mod tests {
         assert_eq!(err, ERROR_OBJECT_WRONG_TYPE);
     }
 
+    // --- ExamineFH / DupLockFromFH / ParentOfFH (issue #156 follow-up) ---
+
+    #[test]
+    fn examine_fh_matches_examine_on_the_same_file() {
+        let tmp = TempDir::new("examinefh");
+        fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let fh_bptr = dos
+            .open(
+                &mut heap,
+                &mut mem,
+                "SYS:f.txt",
+                crate::dosfile::MODE_OLDFILE,
+            )
+            .expect("open should succeed");
+        let fh_addr = addr_from_bptr(fh_bptr);
+
+        let fib_addr = 0x2000;
+        dos.examine_fh(&mut mem, fh_addr, fib_addr)
+            .expect("examine_fh should succeed");
+        assert_eq!(
+            mem.read_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET) as i32,
+            ENTRY_TYPE_FILE
+        );
+        assert_eq!(mem.read_u32(fib_addr + FIB_SIZE_OFFSET), 5);
+        assert_eq!(
+            read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+            b"f.txt"
+        );
+    }
+
+    #[test]
+    fn examine_fh_on_an_unknown_handle_is_an_invalid_lock() {
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(None);
+        let err = dos.examine_fh(&mut mem, 0x1234, 0x2000).unwrap_err();
+        assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    fn examine_fh_on_the_output_default_handle_is_an_invalid_lock() {
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(None);
+        let addr = dos.output_addr(&mut heap, &mut mem).unwrap();
+        let err = dos.examine_fh(&mut mem, addr, 0x2000).unwrap_err();
+        assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    fn dup_lock_from_fh_gets_a_shared_lock_on_the_same_path() {
+        let tmp = TempDir::new("duplockfromfh");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let fh_bptr = dos
+            .open(
+                &mut heap,
+                &mut mem,
+                "SYS:f.txt",
+                crate::dosfile::MODE_OLDFILE,
+            )
+            .unwrap();
+        let fh_addr = addr_from_bptr(fh_bptr);
+
+        let lock_bptr = dos.dup_lock_from_fh(&mut heap, &mut mem, fh_addr);
+        assert_ne!(lock_bptr, 0);
+        let lock_addr = addr_from_bptr(lock_bptr);
+        let entry = dos.locks.get(&lock_addr).expect("lock should be recorded");
+        assert_eq!(entry.amiga_path, "SYS:f.txt");
+        assert_eq!(entry.access, SHARED_LOCK);
+    }
+
+    #[test]
+    fn dup_lock_from_fh_on_an_unknown_handle_is_zero() {
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(None);
+        assert_eq!(dos.dup_lock_from_fh(&mut heap, &mut mem, 0x1234), 0);
+    }
+
+    #[test]
+    fn parent_of_fh_matches_parent_dir_on_the_same_file() {
+        let tmp = TempDir::new("parentoffh");
+        fs::create_dir_all(tmp.path().join("a")).unwrap();
+        fs::write(tmp.path().join("a/f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let fh_bptr = dos
+            .open(
+                &mut heap,
+                &mut mem,
+                "SYS:a/f.txt",
+                crate::dosfile::MODE_OLDFILE,
+            )
+            .unwrap();
+        let fh_addr = addr_from_bptr(fh_bptr);
+
+        let parent_bptr = dos.parent_of_fh(&mut heap, &mut mem, fh_addr);
+        assert_ne!(parent_bptr, 0);
+        let parent_addr = addr_from_bptr(parent_bptr);
+        assert_eq!(dos.locks.get(&parent_addr).unwrap().amiga_path, "SYS:a");
+    }
+
+    #[test]
+    fn parent_of_fh_on_a_file_directly_in_the_volume_root_is_the_root_itself() {
+        // "SYS:f.txt"'s parent is the volume root "SYS:" -- not "no
+        // parent" (that case is locking "SYS:" itself, same as
+        // parent_dir_walks_up_and_stops_at_root covers for a plain
+        // lock).
+        let tmp = TempDir::new("parentoffh-root");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let fh_bptr = dos
+            .open(
+                &mut heap,
+                &mut mem,
+                "SYS:f.txt",
+                crate::dosfile::MODE_OLDFILE,
+            )
+            .unwrap();
+        let fh_addr = addr_from_bptr(fh_bptr);
+
+        let parent_bptr = dos.parent_of_fh(&mut heap, &mut mem, fh_addr);
+        assert_ne!(parent_bptr, 0);
+        let parent_addr = addr_from_bptr(parent_bptr);
+        assert_eq!(dos.locks.get(&parent_addr).unwrap().amiga_path, "SYS:");
+    }
+
+    #[test]
+    fn parent_of_fh_on_an_unknown_handle_is_zero() {
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(None);
+        assert_eq!(dos.parent_of_fh(&mut heap, &mut mem, 0x1234), 0);
+    }
+
+    // --- GetCurrentDirName ---
+
+    #[test]
+    fn current_dir_name_reports_the_vfs_cwd() {
+        let tmp = TempDir::new("getcurrentdirname");
+        let dos = DosState::new(Some(vfs_over(tmp.path())));
+        assert_eq!(dos.current_dir_name().unwrap(), "SYS:");
+    }
+
+    #[test]
+    fn current_dir_name_without_a_vfs_is_object_wrong_type() {
+        let dos = DosState::new(None);
+        assert_eq!(
+            dos.current_dir_name().unwrap_err(),
+            crate::dosfile::ERROR_OBJECT_WRONG_TYPE
+        );
+    }
+
     #[test]
     fn parent_dir_walks_up_and_stops_at_root() {
         let tmp = TempDir::new("parentdir");
@@ -1860,6 +2229,127 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, DOSTRUE as i32);
         assert_eq!(read_c_string(rt.memory(), buf_addr), b"SYS:work");
+    }
+
+    #[test]
+    fn end_to_end_examine_fh_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-examinefh");
+        fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, crate::dosfile::MODE_OLDFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = fh BPTR
+        words.push(0x2200); // move.l d0,d1 (fh for ExamineFH)
+        let fib_idx = push_move_imm_to_d(&mut words, 2, 0); // D2 = fib (patched)
+        push_jsr(&mut words, 6, -390); // ExamineFH(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let fib_addr = name_addr + name.len() as u32;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, fib_idx, fib_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(
+            read_c_string(rt.memory(), fib_addr + FIB_FILENAME_OFFSET),
+            b"f.txt"
+        );
+        assert_eq!(rt.memory().read_u32(fib_addr + FIB_SIZE_OFFSET), 5);
+    }
+
+    #[test]
+    fn end_to_end_dup_lock_from_fh_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-duplockfromfh");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, crate::dosfile::MODE_OLDFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = fh BPTR
+        words.push(0x2200); // move.l d0,d1 (fh for DupLockFromFH)
+        push_jsr(&mut words, 6, -372); // DupLockFromFH(a6): D0 = lock BPTR
+        words.push(0x2200); // move.l d0,d1 (lock for NameFromLock)
+        let buf_idx = push_move_imm_to_d(&mut words, 2, 0); // D2 = buffer (patched)
+        push_move_imm_to_d(&mut words, 3, 64); // D3 = capacity
+        push_jsr(&mut words, 6, -402); // NameFromLock(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let buf_addr = name_addr + name.len() as u32;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(read_c_string(rt.memory(), buf_addr), b"SYS:f.txt");
+    }
+
+    #[test]
+    fn end_to_end_parent_of_fh_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-parentoffh");
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        fs::write(tmp.path().join("a/f.txt"), b"hi").unwrap();
+        let name = b"SYS:a/f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, crate::dosfile::MODE_OLDFILE as u32);
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = fh BPTR
+        words.push(0x2200); // move.l d0,d1 (fh for ParentOfFH)
+        push_jsr(&mut words, 6, -384); // ParentOfFH(a6): D0 = lock BPTR
+        words.push(0x2200); // move.l d0,d1 (lock for NameFromLock)
+        let buf_idx = push_move_imm_to_d(&mut words, 2, 0); // D2 = buffer (patched)
+        push_move_imm_to_d(&mut words, 3, 64); // D3 = capacity
+        push_jsr(&mut words, 6, -402); // NameFromLock(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let buf_addr = name_addr + name.len() as u32;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(read_c_string(rt.memory(), buf_addr), b"SYS:a");
+    }
+
+    #[test]
+    fn end_to_end_get_current_dir_name_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-getcurrentdirname");
+
+        let mut words = Vec::new();
+        let buf_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = buffer (patched)
+        push_move_imm_to_d(&mut words, 2, 64); // D2 = capacity
+        push_jsr(&mut words, 6, -564); // GetCurrentDirName(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let buf_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, 0, &[], Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(read_c_string(rt.memory(), buf_addr), b"SYS:");
     }
 
     #[test]
