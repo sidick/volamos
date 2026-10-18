@@ -112,6 +112,12 @@ pub const ACCESS_WRITE: i32 = EXCLUSIVE_LOCK;
 /// `ExNext`'s "no more entries" `IoErr()` code.
 pub const ERROR_NO_MORE_ENTRIES: i32 = 232;
 
+/// `ChangeMode`'s `type` argument: `object` is a lock (`<dos/dos.h>`).
+pub const CHANGE_LOCK: i32 = 0;
+/// `ChangeMode`'s `type` argument: `object` is a filehandle
+/// (`<dos/dos.h>`).
+pub const CHANGE_FH: i32 = 1;
+
 /// `Close`/boolean-success convention: AmigaOS `BOOL` true is `-1`.
 const DOSTRUE: u32 = 0xFFFF_FFFF;
 /// `Close`/boolean-failure convention.
@@ -530,6 +536,56 @@ impl DosState {
             .as_ref()
             .map(|vfs| vfs.cwd().to_string())
             .ok_or(crate::dosfile::ERROR_OBJECT_WRONG_TYPE)
+    }
+
+    /// `ChangeMode(type, object, newmode)`: attempts to change the
+    /// access mode of a lock or filehandle (e.g. shared -> exclusive).
+    /// This runtime models no real concurrency (single process, same
+    /// posture as [`crate::execsem`]'s `InitSemaphore`/`ObtainSemaphore`
+    /// family and [`crate::exectask`]'s unscheduled-task `AddTask`
+    /// stub) -- there's no real shared/exclusive enforcement for a
+    /// `ChangeMode` to actually *do* here, same as there's none for
+    /// `Lock` to begin with (see the module docs' "Lock model"
+    /// section). So this just validates that `object` refers to a
+    /// currently-open lock or filehandle (per `type`) and reports
+    /// success, which the real autodoc's own "the handler may well
+    /// reject this request" already tells callers not to rely on
+    /// unconditionally anyway -- even a real filesystem doesn't
+    /// guarantee this succeeds.
+    ///
+    /// For `CHANGE_LOCK`, `newmode` is also written into the
+    /// [`LockEntry::access`] field, mirroring that field's own existing
+    /// "recorded for debuggability only" convention (see
+    /// [`LockEntry::access`]'s doc) -- not because anything in this
+    /// runtime reads it back to change behavior, but because a lock
+    /// whose `ChangeMode` silently no-oped would show stale, misleading
+    /// data to a debugger inspecting it, which `access`'s whole purpose
+    /// is to avoid. For `CHANGE_FH`, there's no equivalent field on
+    /// [`crate::dosfile::HostHandle::HostFile`] to update -- adding one
+    /// purely to record a value nothing else in this runtime ever reads
+    /// would be exactly the kind of defensive bookkeeping this
+    /// runtime's semaphore/task stubs already decline to do for the
+    /// same reason, so reporting success without persisting anything is
+    /// the honest-enough answer here too.
+    ///
+    /// Returns `false` for an unknown lock/filehandle (per `type`) or an
+    /// invalid `type` value -- real `ChangeMode`'s own warning is that
+    /// passing the *wrong* type for `object` "may crash the system", a
+    /// risk that doesn't apply here since this is a plain lookup rather
+    /// than a real handler dereferencing the object by its assumed
+    /// type.
+    pub fn change_mode(&mut self, change_type: i32, object_addr: u32, newmode: i32) -> bool {
+        match change_type {
+            CHANGE_LOCK => match self.locks.get_mut(&object_addr) {
+                Some(entry) => {
+                    entry.access = newmode;
+                    true
+                }
+                None => false,
+            },
+            CHANGE_FH => self.handles.contains_key(&object_addr),
+            _ => false,
+        }
     }
 
     /// `NameFromLock(lock)`: the absolute Amiga path that produced
@@ -996,6 +1052,22 @@ fn get_current_dir_name_handler<C: Cpu>(
     Ok(())
 }
 
+/// `ChangeMode` (`D1` = `type` [`CHANGE_LOCK`]/[`CHANGE_FH`], `D2` =
+/// `BPTR` lock or filehandle, `D3` = new mode). `D0` =
+/// `DOSTRUE`/`DOSFALSE`. No `IoErr()` code is set on failure -- the real
+/// autodoc documents only a boolean `BOOL success` result, no error
+/// code to go with it.
+fn change_mode_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let change_type = ctx.cpu.data_register(DataRegister(1)) as i32;
+    let object_bptr = ctx.cpu.data_register(DataRegister(2));
+    let newmode = ctx.cpu.data_register(DataRegister(3)) as i32;
+    let object_addr = addr_from_bptr(object_bptr);
+    let ok = ctx.dos.change_mode(change_type, object_addr, newmode);
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
 /// `ParentDir` (`D1` = `BPTR`). `D0` = new `BPTR`, or `0` (with `IoErr()`
 /// left untouched -- "no parent" isn't an error -- unless `D1` itself was
 /// an invalid lock, which does set `IoErr()`).
@@ -1126,6 +1198,7 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("ParentDir", parent_dir_handler::<C>);
     reg!("ParentOfFH", parent_of_fh_handler::<C>);
     reg!("NameFromLock", name_from_lock_handler::<C>);
+    reg!("ChangeMode", change_mode_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1844,6 +1917,71 @@ mod tests {
         );
     }
 
+    // --- ChangeMode (issue #159) ---
+
+    #[test]
+    fn change_mode_on_a_lock_reports_success_and_records_the_new_access() {
+        let tmp = TempDir::new("changemode-lock");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        assert!(dos.change_mode(CHANGE_LOCK, addr, EXCLUSIVE_LOCK));
+        assert_eq!(dos.locks.get(&addr).unwrap().access, EXCLUSIVE_LOCK);
+    }
+
+    #[test]
+    fn change_mode_on_an_unknown_lock_is_false() {
+        let mut dos = DosState::new(None);
+        assert!(!dos.change_mode(CHANGE_LOCK, 0x1234, EXCLUSIVE_LOCK));
+    }
+
+    #[test]
+    fn change_mode_on_an_open_filehandle_reports_success() {
+        let tmp = TempDir::new("changemode-fh");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let fh_bptr = dos
+            .open(
+                &mut heap,
+                &mut mem,
+                "SYS:f.txt",
+                crate::dosfile::MODE_OLDFILE,
+            )
+            .unwrap();
+        let fh_addr = addr_from_bptr(fh_bptr);
+
+        assert!(dos.change_mode(CHANGE_FH, fh_addr, 0));
+    }
+
+    #[test]
+    fn change_mode_on_an_unknown_filehandle_is_false() {
+        let mut dos = DosState::new(None);
+        assert!(!dos.change_mode(CHANGE_FH, 0x1234, 0));
+    }
+
+    #[test]
+    fn change_mode_with_an_invalid_type_is_false() {
+        let tmp = TempDir::new("changemode-badtype");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        let addr = addr_from_bptr(bptr);
+
+        assert!(!dos.change_mode(2, addr, EXCLUSIVE_LOCK));
+    }
+
     #[test]
     fn parent_dir_walks_up_and_stops_at_root() {
         let tmp = TempDir::new("parentdir");
@@ -2446,5 +2584,56 @@ mod tests {
         assert_eq!(code, DOSTRUE as i32);
         assert!(!tmp.path().join("old.txt").exists());
         assert_eq!(fs::read(tmp.path().join("new.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn end_to_end_change_mode_on_a_lock_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-changemode-lock");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = name (patched)
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32); // D2 = SHARED_LOCK
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = lock BPTR
+        words.push(0x2200); // move.l d0,d1 (type CHANGE_LOCK below overwrites d1, so save first)
+        words.push(0x2401); // move.l d1,d2 (lock -> D2, ChangeMode's object register)
+        push_move_imm_to_d(&mut words, 1, CHANGE_LOCK as u32); // D1 = CHANGE_LOCK
+        push_move_imm_to_d(&mut words, 3, EXCLUSIVE_LOCK as u32); // D3 = newmode
+        push_jsr(&mut words, 6, -450); // ChangeMode(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+    }
+
+    #[test]
+    fn end_to_end_change_mode_on_an_unknown_lock_returns_dosfalse() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = CHANGE_LOCK
+            0,
+            CHANGE_LOCK as u16,
+            move_imm_to_d(2), // D2 = a bogus lock BPTR, never allocated
+            0,
+            0x7FFF,
+            move_imm_to_d(3), // D3 = newmode (irrelevant)
+            0,
+            EXCLUSIVE_LOCK as u16,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-450i16) as u16]); // ChangeMode(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSFALSE as i32);
     }
 }

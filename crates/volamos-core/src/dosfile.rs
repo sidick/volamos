@@ -636,24 +636,45 @@ impl DosState {
 
         let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
 
-        let (resolve_mode, is_new) = match access_mode {
-            MODE_OLDFILE => (ResolveMode::MustExist, false),
-            MODE_NEWFILE => (ResolveMode::ParentMustExist, true),
-            MODE_READWRITE => (ResolveMode::ParentMustExist, false),
+        let resolve_mode = match access_mode {
+            MODE_OLDFILE => ResolveMode::MustExist,
+            MODE_NEWFILE | MODE_READWRITE => ResolveMode::ParentMustExist,
             _ => return Err(ERROR_ACTION_NOT_KNOWN),
         };
         let resolved = vfs
             .resolve_with_amiga_path(name, resolve_mode)
             .map_err(|e| map_vfs_error(&e))?;
-        let path = resolved.host_path;
+        self.open_resolved(
+            heap,
+            mem,
+            resolved.host_path,
+            resolved.amiga_path,
+            access_mode,
+        )
+    }
 
-        let file = if is_new {
+    /// The actual "open a host file per `access_mode` and register a
+    /// guest `FileHandle` for it" half of [`Self::open`], split out so
+    /// [`Self::open_from_lock`] (`OpenFromLock`) can skip straight to it
+    /// with a lock's already-resolved `(host_path, amiga_path)` instead
+    /// of re-resolving a name through the `Vfs` -- issue #159's reason
+    /// for existing. `open` itself still does its own path resolution
+    /// first, then calls this.
+    fn open_resolved(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        host_path: std::path::PathBuf,
+        amiga_path: String,
+        access_mode: i32,
+    ) -> Result<u32, i32> {
+        let file = if access_mode == MODE_NEWFILE {
             OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&path)
+                .open(&host_path)
                 .map_err(|e| map_io_error(&e))?
         } else if access_mode == MODE_READWRITE {
             OpenOptions::new()
@@ -661,22 +682,80 @@ impl DosState {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&path)
+                .open(&host_path)
                 .map_err(|e| map_io_error(&e))?
         } else {
-            // MODE_OLDFILE: read+write, falling back to read-only.
+            // MODE_OLDFILE (and OpenFromLock's own always-existing-file
+            // case, which calls this with MODE_OLDFILE regardless of the
+            // lock's access mode -- see that method's doc): read+write,
+            // falling back to read-only.
             OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&path)
-                .or_else(|_| OpenOptions::new().read(true).open(&path))
+                .open(&host_path)
+                .or_else(|_| OpenOptions::new().read(true).open(&host_path))
                 .map_err(|e| map_io_error(&e))?
         };
 
         let addr = self.alloc_file_handle(heap, mem, false)?;
         self.handles
-            .insert(addr, HostHandle::HostFile(file, resolved.amiga_path, path));
+            .insert(addr, HostHandle::HostFile(file, amiga_path, host_path));
         Ok(bptr_from_addr(addr))
+    }
+
+    /// `OpenFromLock(lock)`: opens the object `lock` refers to, reusing
+    /// its already-resolved `(host_path, amiga_path)` from
+    /// [`crate::doslock::LockEntry`] instead of resolving a name through
+    /// the `Vfs` (see [`Self::open_resolved`]'s doc). Fails with
+    /// [`ERROR_INVALID_LOCK`] for an unknown lock, or whatever
+    /// [`Self::open_resolved`]'s underlying host open fails with.
+    ///
+    /// Per the real autodoc, "If the open succeeds, the lock is
+    /// (effectively) relinquished, and should not be `UnLock()`ed or
+    /// used [again]. If the open fails, the lock is still usable." This
+    /// implementation takes that literally: on success it calls
+    /// [`crate::doslock::DosState::unlock`] on `lock` itself, freeing
+    /// the registry entry and the guest `FileLock` struct exactly as a
+    /// real `UnLock()` would -- not a defensive guard against a guest
+    /// that ignores the "don't touch it again" contract (real AmigaOS
+    /// doesn't guard against that either; using the dangling lock
+    /// afterwards is undefined there too, and here it would now just
+    /// hit the ordinary "unknown lock" error paths every other lock call
+    /// already has), simply this runtime's own honest way to free
+    /// resources the caller has promised not to need again. On failure
+    /// the lock is left completely untouched, matching the autodoc.
+    ///
+    /// The autodoc also says the resulting handle's access mode "is of
+    /// the same access mode as the lock you gave up -- shared is
+    /// similar to `MODE_OLDFILE`, exclusive is similar to
+    /// `MODE_NEWFILE`." Taken literally for the *open* step that would
+    /// mean creating-and-truncating the file for an exclusive lock --
+    /// but the file necessarily already exists (that's how the lock
+    /// came to exist at all), so `MODE_NEWFILE`'s create/truncate
+    /// semantics would destroy data for no reason a real filesystem
+    /// would ever have. This always opens the existing file read+write
+    /// (falling back to read-only) via [`Self::open_resolved`]'s
+    /// `MODE_OLDFILE` branch, for both access modes -- reading the
+    /// autodoc's "NEWFILE-like" wording as describing the resulting
+    /// handle's nominal access-mode *label* (which this runtime doesn't
+    /// track per-[`HostHandle`] at all -- there's no field to set either
+    /// way), not a license to re-create an already-locked file.
+    pub fn open_from_lock(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        lock_addr: u32,
+    ) -> Result<u32, i32> {
+        let entry = self
+            .locks
+            .get(&lock_addr)
+            .ok_or(ERROR_INVALID_LOCK)?
+            .clone();
+        let result = self.open_resolved(heap, mem, entry.host_path, entry.amiga_path, MODE_OLDFILE);
+        if result.is_ok() {
+            self.unlock(heap, lock_addr);
+        }
+        result
     }
 
     /// Opens `host_path` directly (no `Vfs` resolution at all) and
@@ -983,6 +1062,22 @@ fn open_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
             *ctx.call_detail = Some(format!(
                 "file {name:?} ({mode_label}) -> FAILED (IoErr {code})"
             ));
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+    }
+    Ok(())
+}
+
+/// `OpenFromLock` (`D1` = `BPTR` lock). `D0` = new file handle `BPTR`,
+/// or `0` with `IoErr()` set on failure (the lock remains valid and
+/// usable in that case -- see [`DosState::open_from_lock`]'s doc).
+fn open_from_lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let lock_bptr = ctx.cpu.data_register(DataRegister(1));
+    let lock_addr = addr_from_bptr(lock_bptr);
+    match ctx.dos.open_from_lock(ctx.heap, ctx.mem, lock_addr) {
+        Ok(bptr) => ctx.cpu.set_data_register(DataRegister(0), bptr),
+        Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
         }
@@ -1677,6 +1772,7 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
         };
     }
     reg!("Open", open_handler::<C>);
+    reg!("OpenFromLock", open_from_lock_handler::<C>);
     reg!("Close", close_handler::<C>);
     reg!("NameFromFH", name_from_fh_handler::<C>);
     reg!("Read", read_handler::<C>);
@@ -2161,6 +2257,78 @@ mod tests {
         assert_eq!(
             dos.set_file_size(0x1234, 0, OFFSET_BEGINNING),
             Err(ERROR_INVALID_LOCK)
+        );
+    }
+
+    // --- OpenFromLock (issue #159) ---
+
+    #[test]
+    fn open_from_lock_opens_the_file_and_relinquishes_a_shared_lock() {
+        let tmp = TempDir::new("openfromlock_ok");
+        fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let lock_bptr = dos
+            .lock(
+                &mut heap,
+                &mut mem,
+                "SYS:f.txt",
+                crate::doslock::SHARED_LOCK,
+            )
+            .expect("lock should succeed");
+        let lock_addr = addr_from_bptr(lock_bptr);
+
+        let fh_bptr = dos
+            .open_from_lock(&mut heap, &mut mem, lock_addr)
+            .expect("open_from_lock should succeed");
+        let fh_addr = addr_from_bptr(fh_bptr);
+        assert_eq!(dos.read(fh_addr, 5).unwrap(), b"hello");
+        assert!(
+            !dos.locks.contains_key(&lock_addr),
+            "a successful OpenFromLock must relinquish the lock"
+        );
+    }
+
+    #[test]
+    fn open_from_lock_on_an_unknown_lock_is_invalid_lock() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        assert_eq!(
+            dos.open_from_lock(&mut heap, &mut mem, 0x1234),
+            Err(ERROR_INVALID_LOCK)
+        );
+    }
+
+    #[test]
+    fn open_from_lock_leaves_the_lock_usable_on_a_failed_open() {
+        let tmp = TempDir::new("openfromlock_fail");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        // Fabricate a lock entry pointing at a host path that doesn't
+        // exist, forcing the underlying host open to fail cleanly (a
+        // mapped `std::io::Error`) without needing `Lock` itself to
+        // ever have accepted a bad path -- the point here is purely
+        // "did a failed open leave the lock alone".
+        let lock_addr = 0x3000;
+        dos.locks.insert(
+            lock_addr,
+            crate::doslock::LockEntry {
+                host_path: tmp.path().join("missing.txt"),
+                amiga_path: "SYS:missing.txt".to_string(),
+                access: crate::doslock::SHARED_LOCK,
+            },
+        );
+
+        let err = dos
+            .open_from_lock(&mut heap, &mut mem, lock_addr)
+            .expect_err("opening a nonexistent host path should fail");
+        assert_eq!(err, ERROR_OBJECT_NOT_FOUND);
+        assert!(
+            dos.locks.contains_key(&lock_addr),
+            "a failed OpenFromLock must leave the lock usable"
         );
     }
 
@@ -3109,6 +3277,65 @@ mod tests {
         assert_eq!(
             code, 0,
             "SetIoErr should return the previous IoErr() value (0)"
+        );
+    }
+
+    // --- OpenFromLock (issue #159) ---
+
+    #[test]
+    fn end_to_end_lock_then_open_from_lock_then_read_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-openfromlock");
+        fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = name (patched below)
+        push_move_imm_to_d(&mut words, 2, crate::doslock::SHARED_LOCK as u32); // D2 = SHARED_LOCK
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = lock BPTR
+        words.push(move_d0_to_d(1)); // D1 = lock (for OpenFromLock)
+        push_jsr(&mut words, 6, -378); // OpenFromLock(a6): D0 = fh BPTR
+        words.push(move_d0_to_d(1)); // D1 = fh (for Read)
+        let buf_idx = push_move_imm_to_d(&mut words, 2, 0); // D2 = buffer (patched)
+        push_move_imm_to_d(&mut words, 3, 5); // D3 = length
+        push_jsr(&mut words, 6, -42); // Read(a6): D0 = bytes read or -1
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let buf_addr = name_addr + name.len() as u32;
+        patch_imm32(&mut words, name_idx, name_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 5,
+            "Read should see all 5 bytes through the lock-opened handle"
+        );
+        let mut buf = [0u8; 5];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = rt.memory().read_u8(buf_addr + i as u32);
+        }
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn end_to_end_open_from_lock_on_an_invalid_lock_returns_zero_in_d0() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = a bogus lock BPTR, never allocated
+            0,
+            0x7FFF,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-378i16) as u16]); // OpenFromLock(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "OpenFromLock on an unknown lock should return 0 in D0"
         );
     }
 }
