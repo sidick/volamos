@@ -552,6 +552,21 @@ What it catches:
   write guest memory through the same checked path, so passing a
   too-small buffer to a `dos.library` call is caught without any
   per-function instrumentation.
+- **Use-after-free and uninitialized reads through `exec.library`'s
+  `Allocate`/`Deallocate`** too (issue #83) — which matters because a C
+  program's `malloc` (under both libnix and newlib) takes a few big
+  blocks via `AllocVec` and then sub-allocates from its own pool with
+  `Allocate`, so most of a real C program's heap traffic goes through
+  `Allocate`, not `AllocMem` directly. Unlike the `AllocMem` family,
+  there are **no redzones here** — `Allocate` hands out memory from a
+  pool the *guest* owns and walks with its own pointers, so volamos
+  cannot grow a block without changing what the guest's own free-list
+  walk sees. This means a single-byte overrun past the end of a
+  `malloc`'d block (as opposed to a use-after-free, or a read of memory
+  `malloc` never initialized) is not yet caught; see issue #83's "Tier
+  2" for why that's a separate, bigger decision.
+
+
 
 It also catches two classes of stack bug:
 

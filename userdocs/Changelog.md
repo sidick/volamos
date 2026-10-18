@@ -5,6 +5,19 @@ version scheme in `Cargo.toml`.
 
 ## 0.11
 
+- **`--sanitize` now reaches `exec.library`'s `Allocate`/`Deallocate`**
+  (issue #83, Tier 1) — a successful `Allocate` marks its returned
+  block uninitialized and `Deallocate` poisons the freed block as
+  used-after-free, the same shadow-map states the `AllocMem`/`AllocVec`
+  family already got. This matters because a C program's `malloc`
+  (under both libnix and newlib) takes a few big blocks via `AllocVec`
+  and then sub-allocates from its own pool with `Allocate`, so most of
+  a real C program's heap traffic was previously invisible to the
+  detector entirely. No redzones yet (that's Tier 2, a separate,
+  bigger decision noted in the issue) — so a `malloc` overrun one byte
+  past the end of a block still isn't caught, only use-after-free and
+  uninitialized reads. See [`--sanitize`](CLI-Reference.md#-sanitize).
+
 - **`FINT`/`FINTRZ` no longer trap under `--cpu 68060`** — the `m68k`
   CPU core crate's 68060 model wrongly treated both as unimplemented in
   hardware (true of the 68040, but the 68060 brought them back), so a
