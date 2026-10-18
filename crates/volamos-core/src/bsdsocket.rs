@@ -282,7 +282,10 @@ const FIONBIO: u32 = 0x8004_667E;
 /// `FIONREAD` -- `_IOR('f', 127, LONG)` (`IOC_OUT (0x40000000) |
 /// (sizeof(LONG)=4 << 16) | ('f'=0x66 << 8) | 127`), the other real
 /// `IoctlSocket` command this backend implements -- "how many bytes are
-/// available to read right now" -- see [`ioctl_socket_handler`].
+/// available to read right now" -- see [`ioctl_socket_handler`]. Only
+/// read from [`ioctl_socket_handler`]'s `#[cfg(unix)]` half (issue
+/// #61), hence the `allow` on non-Unix targets.
+#[cfg_attr(not(unix), allow(dead_code))]
 const FIONREAD: u32 = 0x4004_667F;
 
 /// `MSG_PEEK` -- a real `<sys/socket.h>` (Roadshow) value, not
@@ -313,7 +316,13 @@ const SBTC_RELEASESTRPTR: u32 = 29;
 // <libraries/bsdsocket.h> (Roadshow) value set, not invented. See
 // [`wait_select_poll`]'s event-synthesis pass and
 // [`get_socket_events_handler`].
+// Only read from `wait_select_poll`'s `#[cfg(unix)]` half (issue #61
+// again: these are real `<libraries/bsdsocket.h>` values, used for
+// real event synthesis, but only on the platform that actually
+// implements it), hence the `allow` on non-Unix targets.
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_ACCEPT: u32 = 0x01;
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_CONNECT: u32 = 0x02;
 #[allow(dead_code)] // listed for completeness against the real header; no
 // portable way to detect true OOB-data-pending short of a peek this
@@ -321,9 +330,13 @@ const FD_CONNECT: u32 = 0x02;
 // docs -- FD_OOB/MSG_OOB share the same unimplemented-OOB gap as
 // WaitSelect's own exceptfds).
 const FD_OOB: u32 = 0x04;
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_READ: u32 = 0x08;
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_WRITE: u32 = 0x10;
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_ERROR: u32 = 0x20;
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_CLOSE: u32 = 0x40;
 
 /// `SO_EVENTMASK` -- a real `<sys/socket.h>` (Roadshow) value, not
@@ -503,11 +516,17 @@ pub struct BsdSocketState {
     /// [`getservbyname_handler`]/[`getservbyport_handler`]'s `struct
     /// servent*` result -- a separate static buffer from `hostent`,
     /// matching real `bsdsocket.library`'s own per-function-family
-    /// static results.
+    /// static results. Only read from [`build_servent`]'s
+    /// `#[cfg(unix)]` body (issue #61), hence the `allow` on non-Unix
+    /// targets.
+    #[cfg_attr(not(unix), allow(dead_code))]
     servent_allocs: Vec<u32>,
     /// Same lifetime pattern as [`Self::hostent_allocs`], but for
     /// [`getprotobyname_handler`]/[`getprotobynumber_handler`]'s
-    /// `struct protoent*` result.
+    /// `struct protoent*` result. Only read from [`build_protoent`]'s
+    /// `#[cfg(unix)]` body (issue #61), hence the `allow` on non-Unix
+    /// targets.
+    #[cfg_attr(not(unix), allow(dead_code))]
     protoent_allocs: Vec<u32>,
     /// Guest heap address of a small, lazily-allocated buffer holding
     /// this library's version/release identifier string, returned by
@@ -1586,11 +1605,16 @@ fn getdtablesize_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 
 /// `sizeof(fd_set)`: `FD_SETSIZE` (256) bits, packed into 32-bit words
 /// (`fd_mask`) -- a real `<sys/socket.h>` layout (confirmed against a
-/// real Roadshow NDK), 8 longwords = 32 bytes.
+/// real Roadshow NDK), 8 longwords = 32 bytes. Only used from
+/// `wait_select_poll`'s `#[cfg(unix)]` half (issue #61), hence the
+/// `allow` on non-Unix targets, same as this section's three
+/// functions below.
+#[cfg_attr(not(unix), allow(dead_code))]
 const FD_SET_BYTES: u32 = 32;
 
 /// Whether `fd` is a member of the `fd_set` at `addr` (`FD_ISSET`'s own
 /// semantics, translated to guest memory).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn fd_set_test(mem: &dyn AddressSpace, addr: u32, fd: i32) -> bool {
     if !(0..256).contains(&fd) {
         return false;
@@ -1600,6 +1624,7 @@ fn fd_set_test(mem: &dyn AddressSpace, addr: u32, fd: i32) -> bool {
 }
 
 /// Zeroes an `fd_set` at `addr` (`FD_ZERO`).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn fd_set_zero(mem: &mut dyn AddressSpace, addr: u32) {
     for i in 0..FD_SET_BYTES {
         mem.write_u8(addr.wrapping_add(i), 0);
@@ -1607,6 +1632,7 @@ fn fd_set_zero(mem: &mut dyn AddressSpace, addr: u32) {
 }
 
 /// Adds `fd` to the `fd_set` at `addr` (`FD_SET`).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn fd_set_add(mem: &mut dyn AddressSpace, addr: u32, fd: i32) {
     let word_addr = addr.wrapping_add((fd as u32 / 32) * 4);
     let word = mem.read_u32(word_addr);
