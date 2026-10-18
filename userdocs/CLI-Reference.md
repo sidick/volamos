@@ -483,6 +483,41 @@ models.)
       it means a benchmark that shells out mid-measurement will
       under-report.
 
+## `--cache`
+
+Models a direct-mapped instruction cache, sized by `--cpu` (256 bytes on
+68020/68030, 4096 bytes on 68040/68060 — 68000/68010 have no on-chip
+cache on real hardware, so this is a no-op there), so a loop larger than
+the cache — or extra code size from `-Os` vs `-O2`, block duplication,
+etc. — shows up in [`--clock-mhz`](#-clock-mhz-n) timings instead of
+every instruction fetch being treated as a free cache hit
+([issue #148](https://github.com/sidick/volamos/issues/148)).
+
+```sh
+volamos --clock-mhz 25 --cache fixtures/hello
+```
+
+Meaningless without `--clock-mhz`: that's the only execution path that
+reports a cycle count for a modeled cache hit/miss to affect. Off by
+default so existing `--clock-mhz` numbers stay comparable across runs
+(opt in, as issue #148 asked).
+
+`CacheClearU`/`CacheClearE` flush the model, matching real AmigaOS's own
+cache-coherency convention for self-modifying code and freshly loaded
+code.
+
+Two known gaps, both out of scope for issue #148 and left as follow-up:
+
+- **No effect on `--cpu 68040`.** The `m68k` crate's 68040 timing model
+  doesn't consult cache state at all yet (only 68020/68030/68060 do), so
+  `--cache` changes nothing measurable there besides
+  `CacheClearU`/`CacheClearE` bookkeeping.
+- **No data cache or memory-wait-state modeling.** The `m68k` crate has
+  no timing hooks for either yet, and `CacheControl`'s `CACRF_EnableI`
+  toggle isn't wired to the model — `--cache` is an unconditional
+  CLI-level choice for the whole run, not something a guest can turn
+  on/off at runtime.
+
 ## `--sanitize`
 
 Turns on shadow-memory checking of every guest memory access, to catch

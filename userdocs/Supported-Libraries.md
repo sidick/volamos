@@ -18,10 +18,17 @@ Changelog.
 
 ## dos.library
 
-- File I/O: `Open`/`Read`/`Write`/`Seek`/`Close`, `Input`/`Output`,
-  `IoErr`/`SetIoErr`.
-- Locks and directory traversal: `Lock`/`UnLock`/`DupLock`/`Examine`/
-  `ExNext`/`ExAll`/`ExAllEnd`/`CurrentDir`/`ParentDir`/`SameLock`.
+- File I/O: `Open`/`Read`/`Write`/`Seek`/`Close`/`SetFileSize`,
+  `Input`/`Output`, `IoErr`/`SetIoErr`.
+- Locks and directory traversal: `Lock`/`UnLock`/`DupLock`/
+  `DupLockFromFH`/`OpenFromLock`/`Examine`/`ExamineFH`/`ExNext`/`ExAll`/
+  `ExAllEnd`/`CurrentDir`/`ParentDir`/`ParentOfFH`/`SameLock`/
+  `ChangeMode`/`NameFromLock`/`GetCurrentDirName`.
+- Filesystem links and record locking: `MakeLink`/`ReadLink` (real host
+  symlinks/hard links — see the Changelog's 0.11 entry for the scope
+  this covers), `LockRecord`/`LockRecords`/`UnLockRecord`/
+  `UnLockRecords` (always-succeeds stubs — this runtime models no real
+  concurrency).
 - Pattern matching: `MatchFirst`/`MatchNext`/`MatchEnd`/`ParsePattern`/
   `MatchPattern`(`NoCase`).
 - Argument parsing: `ReadArgs`/`FreeArgs` (the standard `ReadArgs`
@@ -29,8 +36,9 @@ Changelog.
 - Environment variables: `GetVar`/`SetVar`/`DeleteVar`, backed by a
   real, directory-mapped `ENV:` volume.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.
-- Process/CLI: `Cli`/`GetProgramName`/`MaxCli`/`AllocDosObject`/
-  `FreeDosObject` (`DOS_RDARGS` and `DOS_EXALLCONTROL`).
+- Process/CLI: `Cli`/`GetProgramName`/`SetProgramName`/`MaxCli`/
+  `AllocDosObject`/`FreeDosObject` (`DOS_RDARGS` and `DOS_EXALLCONTROL`).
+- Path strings: `SplitName` (alongside `AddPart`/`FilePart`/`PathPart`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
   `SystemTagList`/`System`/`Execute` for tools that shell out to
