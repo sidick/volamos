@@ -945,6 +945,60 @@ impl DosState {
         }
     }
 
+    /// `LockRecord(fh, offset, length, mode, timeout)` / `UnLockRecord(fh,
+    /// offset, length)`: byte-range record locking within an open file.
+    /// This runtime models no real concurrency (single process, same
+    /// posture as [`crate::execsem`]'s `InitSemaphore`/`ObtainSemaphore`
+    /// family and [`crate::exectask`]'s unscheduled-task `AddTask` stub
+    /// -- see [`crate::doslock::DosState::change_mode`]'s doc for the
+    /// same reasoning spelled out in more detail), so there's nothing a
+    /// record lock could actually enforce even if this runtime tracked
+    /// one. `offset`/`length`/`mode`/`timeout` are accepted by the
+    /// handler (so the real register convention is honored) but never
+    /// reach here at all -- there's no equivalent of [`crate::doslock::
+    /// LockEntry::access`]'s "recorded for debuggability only" field a
+    /// record lock could usefully populate, since nothing else in this
+    /// runtime ever inspects per-handle record-lock state either way.
+    /// This just validates that `fh` refers to a currently-open
+    /// filehandle and reports success; the real autodoc's own "may fail
+    /// for implementation specific reasons" already tells callers not
+    /// to rely on this unconditionally anyway.
+    pub fn lock_record(&self, fh_addr: u32) -> bool {
+        self.handles.contains_key(&fh_addr)
+    }
+
+    /// See [`Self::lock_record`]'s doc -- the same validate-only posture
+    /// for `UnLockRecord`.
+    pub fn unlock_record(&self, fh_addr: u32) -> bool {
+        self.handles.contains_key(&fh_addr)
+    }
+
+    /// `LockRecords(recArray, timeout)` / `UnLockRecords(recArray)`:
+    /// like [`Self::lock_record`]/[`Self::unlock_record`] above, no real
+    /// concurrency to enforce -- but unlike those, there's also nothing
+    /// meaningful to validate here. `recArray` is a caller-allocated
+    /// array of individual lock-request records (each naming its own
+    /// filehandle, offset, and length), and there's no single
+    /// `struct RecordLock`-equivalent layout documented across real
+    /// AmigaOS filesystems to walk it by -- the autodoc describes the
+    /// array only loosely, by convention rather than by a fixed struct.
+    /// Rather than guess at a layout purely to perform a validation this
+    /// runtime can't act on anyway (no real concurrency, as above),
+    /// this always reports success unconditionally -- real `LockRecords`/
+    /// `UnLockRecords` are themselves documented as all-or-nothing calls
+    /// (`LockRecords` either locks every record in the array or none of
+    /// them), so "always succeeds" is a faithful enough stand-in for a
+    /// single-process runtime with no actual contention to fail on.
+    pub fn lock_records(&self) -> bool {
+        true
+    }
+
+    /// See [`Self::lock_records`]'s doc -- the same unconditional-success
+    /// posture for `UnLockRecords`.
+    pub fn unlock_records(&self) -> bool {
+        true
+    }
+
     /// `NameFromFH`: the normalized Amiga path `addr`'s handle was
     /// opened from (recorded on it by [`Self::open`]). Fails with
     /// [`ERROR_INVALID_LOCK`] for an unknown handle, or
@@ -1218,6 +1272,57 @@ fn set_file_size_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
     }
+    Ok(())
+}
+
+/// `LockRecord` (`D1` = fh, `D2` = offset, `D3` = length, `D4` = mode,
+/// `D5` = timeout). `D0` = `DOSTRUE`/`DOSFALSE`. See
+/// [`DosState::lock_record`]'s doc for why `offset`/`length`/`mode`/
+/// `timeout` are read but otherwise unused.
+fn lock_record_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fh = ctx.cpu.data_register(DataRegister(1));
+    let _offset = ctx.cpu.data_register(DataRegister(2));
+    let _length = ctx.cpu.data_register(DataRegister(3));
+    let _mode = ctx.cpu.data_register(DataRegister(4));
+    let _timeout = ctx.cpu.data_register(DataRegister(5));
+    let addr = addr_from_bptr(fh);
+    let ok = ctx.dos.lock_record(addr);
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
+/// `LockRecords` (`D1` = recArray, `D2` = timeout). `D0` =
+/// `DOSTRUE`/`DOSFALSE` -- see [`DosState::lock_records`]'s doc for why
+/// this never actually inspects `recArray`/`timeout`.
+fn lock_records_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let _rec_array = ctx.cpu.data_register(DataRegister(1));
+    let _timeout = ctx.cpu.data_register(DataRegister(2));
+    let ok = ctx.dos.lock_records();
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
+/// `UnLockRecord` (`D1` = fh, `D2` = offset, `D3` = length). `D0` =
+/// `DOSTRUE`/`DOSFALSE`.
+fn unlock_record_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let fh = ctx.cpu.data_register(DataRegister(1));
+    let _offset = ctx.cpu.data_register(DataRegister(2));
+    let _length = ctx.cpu.data_register(DataRegister(3));
+    let addr = addr_from_bptr(fh);
+    let ok = ctx.dos.unlock_record(addr);
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
+/// `UnLockRecords` (`D1` = recArray). `D0` = `DOSTRUE`/`DOSFALSE`.
+fn unlock_records_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let _rec_array = ctx.cpu.data_register(DataRegister(1));
+    let ok = ctx.dos.unlock_records();
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
     Ok(())
 }
 
@@ -1779,6 +1884,10 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("Write", write_handler::<C>);
     reg!("Seek", seek_handler::<C>);
     reg!("SetFileSize", set_file_size_handler::<C>);
+    reg!("LockRecord", lock_record_handler::<C>);
+    reg!("LockRecords", lock_records_handler::<C>);
+    reg!("UnLockRecord", unlock_record_handler::<C>);
+    reg!("UnLockRecords", unlock_records_handler::<C>);
     reg!("Input", input_handler::<C>);
     reg!("Output", output_handler::<C>);
     reg!("IsInteractive", is_interactive_handler::<C>);
@@ -2258,6 +2367,45 @@ mod tests {
             dos.set_file_size(0x1234, 0, OFFSET_BEGINNING),
             Err(ERROR_INVALID_LOCK)
         );
+    }
+
+    // --- LockRecord / UnLockRecord (issue #160) ---
+
+    #[test]
+    fn lock_record_on_an_open_handle_succeeds() {
+        let tmp = TempDir::new("lockrecord-ok");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let fh_bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .unwrap();
+        let fh_addr = addr_from_bptr(fh_bptr);
+
+        assert!(dos.lock_record(fh_addr));
+        assert!(dos.unlock_record(fh_addr));
+    }
+
+    #[test]
+    fn lock_record_on_an_unknown_handle_is_false() {
+        let dos = DosState::new(None);
+        assert!(!dos.lock_record(0x1234));
+    }
+
+    #[test]
+    fn unlock_record_on_an_unknown_handle_is_false() {
+        let dos = DosState::new(None);
+        assert!(!dos.unlock_record(0x1234));
+    }
+
+    // --- LockRecords / UnLockRecords (issue #160) ---
+
+    #[test]
+    fn lock_records_and_unlock_records_always_succeed() {
+        let dos = DosState::new(None);
+        assert!(dos.lock_records());
+        assert!(dos.unlock_records());
     }
 
     // --- OpenFromLock (issue #159) ---
@@ -3336,6 +3484,114 @@ mod tests {
         assert_eq!(
             code, 0,
             "OpenFromLock on an unknown lock should return 0 in D0"
+        );
+    }
+
+    // --- LockRecord / UnLockRecord / LockRecords / UnLockRecords (issue #160) ---
+
+    #[test]
+    fn end_to_end_lock_record_then_unlock_record_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-lockrecord");
+        fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let name = b"SYS:f.txt\0";
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = name (patched)
+        push_move_imm_to_d(&mut words, 2, MODE_OLDFILE as u32); // D2 = MODE_OLDFILE
+        push_jsr(&mut words, 6, -30); // Open(a6): D0 = fh BPTR
+        words.push(0x2200); // move.l d0,d1 (fh -> D1 for LockRecord)
+        push_move_imm_to_d(&mut words, 2, 0); // D2 = offset
+        push_move_imm_to_d(&mut words, 3, 0); // D3 = length
+        push_move_imm_to_d(&mut words, 4, 0); // D4 = mode
+        push_move_imm_to_d(&mut words, 5, 0); // D5 = timeout
+        push_jsr(&mut words, 6, -270); // LockRecord(a6): D0 = DOSTRUE/DOSFALSE
+        // LockRecord doesn't touch D1, so it's still the fh here.
+        push_move_imm_to_d(&mut words, 2, 0); // D2 = offset
+        push_move_imm_to_d(&mut words, 3, 0); // D3 = length
+        push_jsr(&mut words, 6, -282); // UnLockRecord(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, name_addr, name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, DOSTRUE as i32,
+            "LockRecord then UnLockRecord on an open handle should both succeed"
+        );
+    }
+
+    #[test]
+    fn end_to_end_lock_record_on_an_unknown_handle_returns_dosfalse() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = a bogus fh BPTR, never allocated
+            0,
+            0x7FFF,
+        ];
+        words.extend_from_slice(&[
+            move_imm_to_d(2),
+            0,
+            0,
+            move_imm_to_d(3),
+            0,
+            0,
+            move_imm_to_d(4),
+            0,
+            0,
+            move_imm_to_d(5),
+            0,
+            0,
+        ]);
+        words.extend_from_slice(&[jsr_disp16(6), (-270i16) as u16]); // LockRecord(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSFALSE as i32);
+    }
+
+    #[test]
+    fn end_to_end_unlock_record_on_an_unknown_handle_returns_dosfalse() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = a bogus fh BPTR, never allocated
+            0,
+            0x7FFF,
+        ];
+        words.extend_from_slice(&[move_imm_to_d(2), 0, 0, move_imm_to_d(3), 0, 0]);
+        words.extend_from_slice(&[jsr_disp16(6), (-282i16) as u16]); // UnLockRecord(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSFALSE as i32);
+    }
+
+    #[test]
+    fn end_to_end_lock_records_and_unlock_records_via_trap_dispatch() {
+        let mut words = vec![
+            move_imm_to_d(1), // D1 = recArray (arbitrary, never inspected)
+            0,
+            0x1234,
+            move_imm_to_d(2), // D2 = timeout (arbitrary, never inspected)
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), (-276i16) as u16]); // LockRecords(a6)
+        words.push(0x2200); // move.l d0,d1 (save LockRecords' result for UnLockRecords' D1)
+        words.extend_from_slice(&[jsr_disp16(6), (-288i16) as u16]); // UnLockRecords(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, DOSTRUE as i32,
+            "LockRecords and UnLockRecords should both always succeed"
         );
     }
 }

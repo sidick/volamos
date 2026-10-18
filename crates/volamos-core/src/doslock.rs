@@ -78,6 +78,32 @@
 //! source of non-determinism between runs and runners this side of that
 //! harness; a fixed epoch (or a sidecar's own explicit, checked-in date)
 //! is parity-ready either way.
+//!
+//! # `MakeLink`/`ReadLink` (issue #160)
+//!
+//! Real AmigaOS "soft link" semantics map naturally onto a host
+//! symlink, and "hard link" onto a host hard link -- see
+//! [`DosState::make_link_hard`]/[`DosState::make_link_soft`]'s docs for
+//! the details and the Windows-specific judgment call. This runtime
+//! does **not** implement the real "filesystem returns
+//! `ERROR_IS_SOFT_LINK`, DOS calls `ReadLink`, retries" protocol inside
+//! `Lock`/`Open`/`Examine` -- deliberately out of scope: a host symlink
+//! already transparently resolves via ordinary host filesystem calls
+//! (`std::fs::metadata` et al follow it), so those calls "just work" on
+//! a soft link without any extra code here. `MakeLink`/`ReadLink`
+//! themselves are implemented for a guest that calls them directly.
+//!
+//! A further judgment call, deliberately **not** implemented: whether
+//! `Examine`/`ExNext`/`ExAll` should report `ST_SOFTLINK` (3) for a
+//! host symlink entry instead of the type it resolves to. [`fill_fib`]
+//! (and [`crate::dosexall`]'s equivalent scan) use `std::fs::metadata`,
+//! which follows symlinks, so a soft link currently lists as whatever
+//! it points at (or fails to list at all if it's dangling). Detecting
+//! this would need `std::fs::symlink_metadata` plus a
+//! `file_type().is_symlink()` check at every `fill_fib` call site; cut
+//! for scope here rather than touching that shared, already-tested
+//! machinery -- see issue #160's closing PR for the explicit "deferred"
+//! callout.
 
 use std::path::{Path, PathBuf};
 
@@ -588,6 +614,108 @@ impl DosState {
         }
     }
 
+    /// `MakeLink(name, dest, FALSE)`'s hard-link half: `dest` is a
+    /// `BPTR` lock on an already-existing target, and this creates a
+    /// real host hard link from `name` to that target via
+    /// [`std::fs::hard_link`]. `name` is resolved
+    /// [`ResolveMode::ParentMustExist`] (the link itself obviously
+    /// doesn't exist yet -- same resolve mode [`Self::create_dir`]/
+    /// [`Self::rename`]'s `new_name` use). Fails with
+    /// [`crate::dosfile::ERROR_OBJECT_EXISTS`] if something's already
+    /// there (matching [`Self::create_dir`]'s own existing convention
+    /// for that), [`ERROR_INVALID_LOCK`] if `dest` isn't a currently-
+    /// open lock, or a mapped [`std::io::Error`] if the host
+    /// `hard_link` call itself fails.
+    pub fn make_link_hard(&mut self, name: &str, dest_lock_addr: u32) -> Result<(), i32> {
+        let vfs = self
+            .vfs
+            .as_ref()
+            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+        let resolved = vfs
+            .resolve_with_amiga_path(name, ResolveMode::ParentMustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        if resolved.host_path.exists() {
+            return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
+        }
+        let dest_host_path = self
+            .locks
+            .get(&dest_lock_addr)
+            .ok_or(ERROR_INVALID_LOCK)?
+            .host_path
+            .clone();
+        std::fs::hard_link(&dest_host_path, &resolved.host_path).map_err(|e| map_io_error(&e))
+    }
+
+    /// `MakeLink(name, dest, soft != FALSE)`'s soft-link half: `dest` is
+    /// a `CPTR` to a `NUL`-terminated Amiga path string naming the
+    /// link's target. `name` is resolved [`ResolveMode::ParentMustExist`]
+    /// for the same reason [`Self::make_link_hard`] does.
+    ///
+    /// Judgment call: real soft-link targets are "resolved lazily" (the
+    /// NDK autodoc's own wording for `MakeLink`) -- a filesystem only
+    /// has to notice a soft link's target when something later tries to
+    /// traverse it, not at `MakeLink` time itself. So `dest_amiga_path`
+    /// is also resolved via [`ResolveMode::ParentMustExist`] -- the
+    /// closest existing primitive that turns an Amiga path into a host
+    /// path *without* requiring the target to already exist -- purely
+    /// to get a host path string to embed in the symlink, not to
+    /// validate the target. This means `MakeLink` can create a soft
+    /// link to a target that doesn't exist yet, exactly as real
+    /// AmigaOS permits.
+    ///
+    /// Fails with [`crate::dosfile::ERROR_OBJECT_EXISTS`] if something
+    /// already exists at `name`, or whatever the host symlink call
+    /// fails with -- see [`make_symlink`]'s doc for the Unix-vs-other-
+    /// platforms story.
+    pub fn make_link_soft(&mut self, name: &str, dest_amiga_path: &str) -> Result<(), i32> {
+        let vfs = self
+            .vfs
+            .as_ref()
+            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+        let resolved = vfs
+            .resolve_with_amiga_path(name, ResolveMode::ParentMustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        if resolved.host_path.exists() {
+            return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
+        }
+        let target_host_path = vfs
+            .resolve(dest_amiga_path, ResolveMode::ParentMustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        make_symlink(&target_host_path, &resolved.host_path)
+    }
+
+    /// `ReadLink(port, lock, path, buffer, size)`'s underlying value:
+    /// the raw target string a real host symlink at `lock`'s directory
+    /// joined with the relative `path` component stores. `port` is
+    /// accepted by the handler but never reaches here at all -- see
+    /// [`read_link_handler`]'s doc for why ignoring it is safe.
+    ///
+    /// The returned bytes are exactly what [`std::fs::read_link`]
+    /// reports for the host symlink -- i.e. whatever string
+    /// [`Self::make_link_soft`] originally embedded in it (a *host*
+    /// path, not necessarily a well-formed Amiga path), not a
+    /// re-derived Amiga path string. Real `ReadLink` is documented as
+    /// handing back "the modified path string" for the caller (DOS
+    /// itself, normally) to retry with; this runtime hands back
+    /// whatever the underlying host symlink actually contains, which is
+    /// the most faithful thing to report given `make_link_soft` is the
+    /// only thing in this runtime that ever creates one.
+    ///
+    /// Fails with [`ERROR_INVALID_LOCK`] for an unknown `lock`,
+    /// [`ERROR_OBJECT_WRONG_TYPE`] if the resolved host object exists
+    /// but isn't a symlink, or a mapped [`std::io::Error`] for anything
+    /// else (including the object simply not existing).
+    pub fn read_link(&self, lock_addr: u32, rel_path: &str) -> Result<Vec<u8>, i32> {
+        let entry = self.locks.get(&lock_addr).ok_or(ERROR_INVALID_LOCK)?;
+        let target_path = entry.host_path.join(rel_path);
+        let meta = std::fs::symlink_metadata(&target_path).map_err(|e| map_io_error(&e))?;
+        if !meta.file_type().is_symlink() {
+            return Err(ERROR_OBJECT_WRONG_TYPE);
+        }
+        let target = std::fs::read_link(&target_path).map_err(|e| map_io_error(&e))?;
+        Ok(target.to_string_lossy().into_owned().into_bytes())
+    }
+
     /// `NameFromLock(lock)`: the absolute Amiga path that produced
     /// `lock` (`lock == 0` resolves to the literal string `"SYS:"`,
     /// matching the RKRM's own documented quirk for the `ZERO` lock --
@@ -762,6 +890,37 @@ impl DosState {
         fill_fib(mem, fib_addr, &name, is_dir, size, &entry_path);
         Ok(())
     }
+}
+
+/// Creates a real host symlink at `link` pointing at `target`, for
+/// [`DosState::make_link_soft`].
+///
+/// Judgment call (issue #160): this project also cross-compiles to
+/// Windows (`userdocs/Building-from-Source.md`), where creating a
+/// symlink needs either elevated privileges or Developer Mode enabled
+/// -- there's no way to know in advance whether the current process can
+/// do it. Rather than attempting a Windows symlink and surfacing
+/// whatever OS-specific permission error results (which `map_io_error`
+/// has no principled way to distinguish from an ordinary permissions
+/// failure), this build simply never attempts it on a non-Unix target:
+/// it always reports [`crate::dosfile::ERROR_ACTION_NOT_KNOWN`], the
+/// same code [`map_io_error`] itself already falls back to for any
+/// unmapped host I/O error. There's no dedicated real-AmigaOS error
+/// code for "this filesystem doesn't support soft links" in `dos.h`, so
+/// this is a deliberate, documented choice rather than an attempt at a
+/// faithful mapping -- the important property (per the issue) is just
+/// that it's a clean `IoErr()`/`DOSFALSE` return, never a panic or
+/// hang.
+#[cfg(unix)]
+fn make_symlink(target: &Path, link: &Path) -> Result<(), i32> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| map_io_error(&e))
+}
+
+/// See the `#[cfg(unix)]` twin above for the reasoning -- this build
+/// target never attempts a host symlink at all.
+#[cfg(not(unix))]
+fn make_symlink(_target: &Path, _link: &Path) -> Result<(), i32> {
+    Err(crate::dosfile::ERROR_ACTION_NOT_KNOWN)
 }
 
 /// The directory entry names at `host_path`, sorted byte-wise for
@@ -1068,6 +1227,94 @@ fn change_mode_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
+/// `MakeLink` (`D1` = name `CString*`, `D2` = `dest` -- a `BPTR` lock
+/// for a hard link, or a `CString*` Amiga path for a soft link, per
+/// `D3` -- `D3` = `soft`, `FALSE` (`0`) for a hard link). `D0` =
+/// `DOSTRUE`/`DOSFALSE` (+`IoErr()` set on failure). See
+/// [`DosState::make_link_hard`]/[`DosState::make_link_soft`]'s docs.
+fn make_link_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.data_register(DataRegister(1));
+    let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
+    let dest = ctx.cpu.data_register(DataRegister(2));
+    let soft = ctx.cpu.data_register(DataRegister(3)) != 0;
+
+    let result = if soft {
+        let dest_path = String::from_utf8_lossy(&read_c_string(ctx.mem, dest)).into_owned();
+        ctx.dos.make_link_soft(&name, &dest_path)
+    } else {
+        ctx.dos.make_link_hard(&name, addr_from_bptr(dest))
+    };
+    match result {
+        Ok(()) => ctx.cpu.set_data_register(DataRegister(0), DOSTRUE),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        }
+    }
+    Ok(())
+}
+
+/// `ReadLink` (`D1` = `port` [`struct MsgPort*`], `D2` = `lock` `BPTR`,
+/// `D3` = path `CString*`, `D4` = buffer, `D5` = buffer size). `D0` =
+/// `DOSTRUE`/`DOSFALSE` (+`IoErr()` set on failure).
+///
+/// `port` is read (so the real register convention is honored) but
+/// never used: real `ReadLink` is normally called by DOS itself, not a
+/// guest program directly, after a filesystem handler process's own
+/// packet reply comes back `ERROR_IS_SOFT_LINK` -- `port` identifies
+/// *that handler process* so a real, multi-process AmigaOS can route
+/// the follow-up request back to it. This runtime has no real
+/// per-filesystem handler process for ordinary volumes (same posture as
+/// [`crate::dosdevproc`]/[`crate::dospkt`]'s own "no real handler
+/// process" scope -- see those modules' docs), and
+/// [`DosState::read_link`] resolves everything directly from
+/// `self.locks` plus the host filesystem instead of going through a
+/// packet at all -- so there's no handler for `port` to identify in the
+/// first place, and accepting-and-ignoring it changes nothing
+/// observable for any guest program.
+fn read_link_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let _port = ctx.cpu.data_register(DataRegister(1));
+    let lock_bptr = ctx.cpu.data_register(DataRegister(2));
+    let path_ptr = ctx.cpu.data_register(DataRegister(3));
+    let buf = ctx.cpu.data_register(DataRegister(4));
+    let size = ctx.cpu.data_register(DataRegister(5)) as i32;
+
+    let lock_addr = addr_from_bptr(lock_bptr);
+    let path = String::from_utf8_lossy(&read_c_string(ctx.mem, path_ptr)).into_owned();
+
+    let target = match ctx.dos.read_link(lock_addr, &path) {
+        Ok(t) => t,
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+            return Ok(());
+        }
+    };
+
+    // Same truncation convention as `get_current_dir_name_handler`:
+    // copy what fits, NUL-terminate either way, report
+    // `ERROR_LINE_TOO_LONG` on truncation (real `ReadLink` documents no
+    // specific code for this, so this reuses the sibling call's own
+    // choice rather than inventing a second convention).
+    let capacity = (size - 1).max(0) as usize;
+    let (copy_len, ok) = if target.len() > capacity {
+        (capacity, false)
+    } else {
+        (target.len(), true)
+    };
+    for (i, &b) in target[..copy_len].iter().enumerate() {
+        ctx.mem.write_u8(buf.wrapping_add(i as u32), b);
+    }
+    ctx.mem.write_u8(buf.wrapping_add(copy_len as u32), 0);
+
+    if !ok {
+        ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+    }
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ok { DOSTRUE } else { DOSFALSE });
+    Ok(())
+}
+
 /// `ParentDir` (`D1` = `BPTR`). `D0` = new `BPTR`, or `0` (with `IoErr()`
 /// left untouched -- "no parent" isn't an error -- unless `D1` itself was
 /// an invalid lock, which does set `IoErr()`).
@@ -1199,6 +1446,8 @@ pub fn register_lock_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("ParentOfFH", parent_of_fh_handler::<C>);
     reg!("NameFromLock", name_from_lock_handler::<C>);
     reg!("ChangeMode", change_mode_handler::<C>);
+    reg!("MakeLink", make_link_handler::<C>);
+    reg!("ReadLink", read_link_handler::<C>);
 }
 
 #[cfg(test)]
@@ -1982,6 +2231,185 @@ mod tests {
         assert!(!dos.change_mode(2, addr, EXCLUSIVE_LOCK));
     }
 
+    // --- MakeLink / ReadLink (issue #160) ---
+
+    #[test]
+    fn make_link_hard_creates_a_real_hard_link() {
+        let tmp = TempDir::new("makelink-hard");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let lock_bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:orig.txt", SHARED_LOCK)
+            .unwrap();
+        let lock_addr = addr_from_bptr(lock_bptr);
+
+        dos.make_link_hard("SYS:link.txt", lock_addr)
+            .expect("hard link should succeed");
+        assert_eq!(fs::read(tmp.path().join("link.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn make_link_hard_on_an_existing_name_is_object_exists() {
+        let tmp = TempDir::new("makelink-hard-exists");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        fs::write(tmp.path().join("link.txt"), b"already here").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let lock_bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:orig.txt", SHARED_LOCK)
+            .unwrap();
+        let lock_addr = addr_from_bptr(lock_bptr);
+
+        let err = dos
+            .make_link_hard("SYS:link.txt", lock_addr)
+            .expect_err("should fail: link.txt already exists");
+        assert_eq!(err, crate::dosfile::ERROR_OBJECT_EXISTS);
+    }
+
+    #[test]
+    fn make_link_hard_on_an_unknown_lock_is_invalid_lock() {
+        let tmp = TempDir::new("makelink-hard-badlock");
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos
+            .make_link_hard("SYS:link.txt", 0x1234)
+            .expect_err("should fail: unknown dest lock");
+        assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn make_link_soft_creates_a_real_symlink_to_an_existing_target() {
+        let tmp = TempDir::new("makelink-soft");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        dos.make_link_soft("SYS:link.txt", "SYS:orig.txt")
+            .expect("soft link should succeed");
+        let link_path = tmp.path().join("link.txt");
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link.txt should be a real host symlink"
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"hello");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn make_link_soft_to_a_not_yet_existing_target_succeeds() {
+        // Real soft-link targets are resolved lazily -- MakeLink itself
+        // must not require the target to exist yet.
+        let tmp = TempDir::new("makelink-soft-lazy");
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        dos.make_link_soft("SYS:link.txt", "SYS:not_there_yet.txt")
+            .expect("soft link to a not-yet-existing target should succeed");
+        let link_path = tmp.path().join("link.txt");
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !link_path.exists(),
+            "following the dangling symlink should fail (target doesn't exist)"
+        );
+    }
+
+    #[test]
+    fn make_link_soft_on_an_existing_name_is_object_exists() {
+        let tmp = TempDir::new("makelink-soft-exists");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        fs::write(tmp.path().join("link.txt"), b"already here").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let err = dos
+            .make_link_soft("SYS:link.txt", "SYS:orig.txt")
+            .expect_err("should fail: link.txt already exists");
+        assert_eq!(err, crate::dosfile::ERROR_OBJECT_EXISTS);
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn make_link_soft_on_a_non_unix_build_is_a_clean_io_error() {
+        let tmp = TempDir::new("makelink-soft-nonunix");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let err = dos
+            .make_link_soft("SYS:link.txt", "SYS:orig.txt")
+            .expect_err("soft links are unsupported on this build");
+        assert_eq!(err, crate::dosfile::ERROR_ACTION_NOT_KNOWN);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_link_reports_a_real_symlinks_raw_target() {
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = TempDir::new("readlink-ok");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.make_link_soft("SYS:link.txt", "SYS:orig.txt").unwrap();
+        let dir_bptr = dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap();
+        let dir_addr = addr_from_bptr(dir_bptr);
+
+        let target = dos
+            .read_link(dir_addr, "link.txt")
+            .expect("read_link should succeed on a real symlink");
+        assert_eq!(
+            target,
+            tmp.path().join("orig.txt").into_os_string().into_vec()
+        );
+    }
+
+    #[test]
+    fn read_link_on_a_plain_file_is_object_wrong_type() {
+        let tmp = TempDir::new("readlink-notlink");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let dir_bptr = dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap();
+        let dir_addr = addr_from_bptr(dir_bptr);
+
+        let err = dos
+            .read_link(dir_addr, "f.txt")
+            .expect_err("a plain file is not a symlink");
+        assert_eq!(err, ERROR_OBJECT_WRONG_TYPE);
+    }
+
+    #[test]
+    fn read_link_on_an_unknown_lock_is_invalid_lock() {
+        let dos = DosState::new(None);
+        let err = dos
+            .read_link(0x1234, "foo")
+            .expect_err("should fail: unknown lock");
+        assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    fn read_link_on_a_missing_object_is_a_mapped_io_error() {
+        let tmp = TempDir::new("readlink-missing");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let dir_bptr = dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap();
+        let dir_addr = addr_from_bptr(dir_bptr);
+
+        let err = dos
+            .read_link(dir_addr, "nope.txt")
+            .expect_err("should fail: nope.txt doesn't exist");
+        assert_eq!(err, crate::dosfile::ERROR_OBJECT_NOT_FOUND);
+    }
+
     #[test]
     fn parent_dir_walks_up_and_stops_at_root() {
         let tmp = TempDir::new("parentdir");
@@ -2635,5 +3063,142 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, DOSFALSE as i32);
+    }
+
+    #[test]
+    fn end_to_end_make_link_hard_via_trap_dispatch() {
+        let tmp = TempDir::new("e2e-makelink-hard");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        let orig_name = b"SYS:orig.txt\0";
+        let link_name = b"SYS:link.txt\0";
+
+        let mut words = Vec::new();
+        let orig_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = orig name (patched)
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32); // D2 = SHARED_LOCK
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = lock BPTR
+        words.push(0x2400); // move.l d0,d2 (lock -> D2, MakeLink's dest)
+        let link_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = link name (patched)
+        push_move_imm_to_d(&mut words, 3, 0); // D3 = soft (FALSE: hard link)
+        push_jsr(&mut words, 6, -444); // MakeLink(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let orig_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let link_addr = orig_addr + orig_name.len() as u32;
+        patch_imm32(&mut words, orig_idx, orig_addr);
+        patch_imm32(&mut words, link_idx, link_addr);
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(orig_name);
+        extra.extend_from_slice(link_name);
+        let mut rt = runtime_with_program_and_extra(&words, orig_addr, &extra, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(fs::read(tmp.path().join("link.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn end_to_end_make_link_hard_on_an_unknown_lock_returns_dosfalse_and_ioerr() {
+        let link_name = b"SYS:link.txt\0";
+        let tmp = TempDir::new("e2e-makelink-hard-badlock");
+
+        let mut words = Vec::new();
+        let link_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = link name (patched)
+        push_move_imm_to_d(&mut words, 2, 0x7FFF); // D2 = a bogus lock BPTR, never allocated
+        push_move_imm_to_d(&mut words, 3, 0); // D3 = soft (FALSE)
+        push_jsr(&mut words, 6, -444); // MakeLink(a6): D0 = DOSTRUE/DOSFALSE
+        push_jsr(&mut words, 6, -132); // IoErr(a6)
+        words.push(RTS);
+
+        let link_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, link_idx, link_addr);
+
+        let mut rt = runtime_with_program_and_extra(&words, link_addr, link_name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn end_to_end_read_link_via_trap_dispatch() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = TempDir::new("e2e-readlink");
+        fs::write(tmp.path().join("orig.txt"), b"hello").unwrap();
+        // The symlink itself is created directly through the host fs
+        // (not via a volamos call) -- this test only needs to exercise
+        // ReadLink's own real LVO offset/register assignments, not
+        // MakeLink's (covered separately above).
+        std::os::unix::fs::symlink(tmp.path().join("orig.txt"), tmp.path().join("link.txt"))
+            .unwrap();
+        let dir_name = b"SYS:\0";
+        let path_name = b"link.txt\0";
+
+        let mut words = Vec::new();
+        let dir_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = dir name (patched)
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32); // D2 = SHARED_LOCK
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = lock BPTR
+        words.push(0x2400); // move.l d0,d2 (lock -> D2, ReadLink's lock arg)
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = port (ignored)
+        let path_idx = push_move_imm_to_d(&mut words, 3, 0); // D3 = path (patched)
+        let buf_idx = push_move_imm_to_d(&mut words, 4, 0); // D4 = buffer (patched)
+        push_move_imm_to_d(&mut words, 5, 256); // D5 = buffer size
+        push_jsr(&mut words, 6, -438); // ReadLink(a6): D0 = DOSTRUE/DOSFALSE
+        words.push(RTS);
+
+        let dir_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let path_addr = dir_addr + dir_name.len() as u32;
+        let buf_addr = path_addr + path_name.len() as u32;
+        patch_imm32(&mut words, dir_idx, dir_addr);
+        patch_imm32(&mut words, path_idx, path_addr);
+        patch_imm32(&mut words, buf_idx, buf_addr);
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(dir_name);
+        extra.extend_from_slice(path_name);
+        let mut rt = runtime_with_program_and_extra(&words, dir_addr, &extra, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, DOSTRUE as i32);
+        let target = crate::guestmem::read_c_string(rt.memory(), buf_addr);
+        assert_eq!(
+            target,
+            tmp.path().join("orig.txt").into_os_string().into_vec()
+        );
+    }
+
+    #[test]
+    fn end_to_end_read_link_on_a_plain_file_returns_dosfalse_and_ioerr() {
+        let tmp = TempDir::new("e2e-readlink-notlink");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let dir_name = b"SYS:\0\0\0";
+        let path_name = b"f.txt\0";
+
+        let mut words = Vec::new();
+        let dir_idx = push_move_imm_to_d(&mut words, 1, 0); // D1 = dir name (patched)
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32); // D2 = SHARED_LOCK
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = lock BPTR
+        words.push(0x2400); // move.l d0,d2 (lock -> D2, ReadLink's lock arg)
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = port (ignored)
+        let path_idx = push_move_imm_to_d(&mut words, 3, 0); // D3 = path (patched)
+        push_move_imm_to_d(&mut words, 4, 0x10000); // D4 = buffer
+        push_move_imm_to_d(&mut words, 5, 256); // D5 = buffer size
+        push_jsr(&mut words, 6, -438); // ReadLink(a6): D0 = DOSTRUE/DOSFALSE
+        push_jsr(&mut words, 6, -132); // IoErr(a6)
+        words.push(RTS);
+
+        let dir_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let path_addr = dir_addr + dir_name.len() as u32;
+        patch_imm32(&mut words, dir_idx, dir_addr);
+        patch_imm32(&mut words, path_idx, path_addr);
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(dir_name);
+        extra.extend_from_slice(path_name);
+        let mut rt = runtime_with_program_and_extra(&words, dir_addr, &extra, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, ERROR_OBJECT_WRONG_TYPE);
     }
 }
