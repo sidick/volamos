@@ -54,6 +54,97 @@ version scheme in `Cargo.toml`.
   `--no-jit` like `--uae-debug`, composes with it, and is inherited by
   nested runs.
 
+- **`SIGTERM` and a second `SIGINT` now force-exit immediately**
+  (issue #151) — `volamos` could keep running after `SIGTERM`/`SIGINT`
+  if the guest never made a library call: host signals are only folded
+  into the guest as a cooperative `SIGBREAKF_CTRL_C` at a dispatched
+  library-call boundary, so a tight, call-free guest loop could never
+  observe either. `SIGTERM` now terminates the process on receipt --
+  it means "terminate", not "ask the guest nicely" -- exiting with the
+  shell's usual `128 + SIGTERM` (143). A *second* `SIGINT` (arriving
+  before the first was folded into the guest) also force-exits,
+  matching the double-Ctrl-C "I mean it" convention most interpreters
+  use, exiting `128 + SIGINT` (130). A single `SIGINT` keeps the
+  existing cooperative-delivery behavior, unchanged. Both forced paths
+  use `_exit` directly from the signal handler.
+
+- **`--cache`: an opt-in direct-mapped instruction-cache model**
+  (issue #148) -- `--clock-mhz` timings treated every instruction fetch
+  as a free cache hit, so cache-thrashing effects never showed up: a
+  loop bigger than the 68020/030/060's on-chip cache, `-Os` vs `-O2`
+  code-size trade-offs, block duplication, etc. all cost nothing.
+  `--cache` adds a real direct-mapped model, sized by `--cpu` (256
+  bytes on 68020/68030, 4096 on 68040/68060), wired into the `m68k`
+  crate's own cache-aware cycle tables. `CacheClearU`/`CacheClearE`
+  now actually invalidate the model instead of being pure no-ops. Off
+  by default, so existing `--clock-mhz` numbers stay comparable. Known
+  limitations: no effect on `--cpu 68040` (the crate's 68040 timing
+  model doesn't consult cache state at all yet), `CacheControl`'s
+  `CACRF_EnableI` toggle isn't wired to the model, and data-cache/
+  memory-wait-state modeling (also proposed in #148) is explicitly not
+  included -- left as a follow-up.
+
+- **`RunCommand()` now really overlays the calling process** (issues
+  #8 and #156) -- it used to run the invoked seglist through a
+  brand-new `Runtime`/`CpuCore`/`FlatMemory`, the same path `System()`/
+  `Execute()` use (correct for those two, which really do spawn
+  independent processes on real hardware, but wrong for `RunCommand`:
+  real AmigaOS runs it as a subroutine *in the caller's own process*,
+  inheriting whatever the caller left in its registers -- `FPCR`/
+  `FPSR` included -- and leaving its own writes behind for the caller
+  to see afterward). `RunCommand` now resolves the entry point directly
+  from the already-`LoadSeg`'d bytes in guest memory, carves a stack
+  region from the caller's own heap, and runs the invoked program
+  through the ordinary dispatch loop via the `trampoline` primitive,
+  resuming the caller once it returns with `D0` as the exit code.
+  `System()`/`Execute()` are unaffected -- they keep the nested-
+  `Runtime` path. A real consequence of running on the same CPU: no
+  register is actually safe across a `RunCommand` call, matching real
+  hardware (a program invoked this way is free to clobber `D0`-`D7`/
+  `A0`-`A6` exactly as it pleases).
+
+- **dos.library: `ExamineFH`, `DupLockFromFH`, `ParentOfFH`,
+  `GetCurrentDirName`, `SetFileSize`, `SplitName`, `SetProgramName`**
+  (issue #159, "Tier 1") -- codewiz's newlib-porting feedback flagged
+  that volamos 0.10 aborted the program on several dos.library calls a
+  real libc port needs: `fstat()` had to fall back to `Seek`, `getcwd()`
+  to `Lock("")`+`NameFromLock`, and `link()`/`symlink()`/`fchdir()` were
+  implemented but excluded from CI pending a real-AmigaOS run. These
+  seven are the calls that were genuinely cheap to add because they
+  reuse infrastructure that already existed (`Examine`/`Lock`'s own
+  `fill_fib`/`new_lock` helpers, `Vfs::cwd()`, `Seek`'s offset-mode
+  resolution, `GetProgramName`'s own BSTR handling) rather than needing
+  new capability.
+
+- **dos.library: `OpenFromLock`, `ChangeMode`** (issue #159, "Tier 2")
+  -- cheap in the same sense as Tier 1 above, but needed a small
+  refactor first: `DosState::open` was split into its VFS-resolution
+  step and a reusable `open_resolved` that `OpenFromLock` could call
+  directly on an existing lock's already-resolved path, relinquishing
+  the lock on success.
+
+- **dos.library: `MakeLink`, `ReadLink`, `LockRecord`/`LockRecords`/
+  `UnLockRecord`/`UnLockRecords`** (issue #160, "Tier 3") -- the
+  remaining, genuinely new-capability half of codewiz's feedback above.
+  `MakeLink` maps real AmigaOS "soft link"/"hard link" semantics onto a
+  real host symlink/hard link (`soft != FALSE` creates a symlink via
+  `std::os::unix::fs::symlink`, pointing at a target that need not
+  exist yet, matching real soft links' documented "resolved lazily"
+  semantics; `soft == FALSE` creates a `std::fs::hard_link` from an
+  existing lock). `ReadLink` reports a real host symlink's raw target
+  string back to the caller. This runtime deliberately does **not**
+  implement the real AmigaOS-level "filesystem returns
+  `ERROR_IS_SOFT_LINK`, DOS calls `ReadLink`, retries" protocol inside
+  `Lock`/`Open`/`Examine` -- a host symlink already resolves
+  transparently through ordinary host filesystem calls, so those calls
+  "just work" on a soft link without it. Symlink creation is Unix-only;
+  on other targets `MakeLink`'s soft-link half reports a clean `IoErr()`
+  rather than attempting a host call that would need elevated
+  privileges/Developer Mode. `LockRecord`/`LockRecords`/`UnLockRecord`/
+  `UnLockRecords` (byte-range record locking) are cheap, always-
+  succeeds stubs -- this runtime models no real concurrency, so there's
+  nothing a record lock could actually enforce.
+
 ## 0.10
 
 - **`Cause()` software interrupts, and loud interrupt-registration
