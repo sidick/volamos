@@ -566,8 +566,6 @@ What it catches:
   `malloc` never initialized) is not yet caught; see issue #83's "Tier
   2" for why that's a separate, bigger decision.
 
-
-
 It also catches two classes of stack bug:
 
 - **Accesses below the stack pointer** — reading or writing memory a
