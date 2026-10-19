@@ -8,16 +8,16 @@ version scheme in `Cargo.toml`.
 - **`--cpu 68040 --no-fpu` now behaves correctly instead of silently
   doing nothing** (issue #167) — the full 68040 always has its on-die
   FPU on real hardware (there's no plug-in-68881 option to leave out,
-  unlike 68020/68030), so `--no-fpu` combined with `--cpu 68040` is now
-  refused with a pointer to `--cpu 68ec040`/`68lc040` (the models that
-  really do have no FPU at all), rather than silently having no effect
-  — before this fix, the CPU core kept executing every FPU instruction
-  regardless of the flag while `AttnFlags` told the guest there was no
-  FPU, a combination no real chip has. `AttnFlags`' `AFF_FPU40` bit is
-  now also unconditional for `--cpu 68040`/`68060` (previously gated on
-  `--fpu`, which was itself the source of the lie). `--cpu 68060
-  --no-fpu` is a separate, still-open crash (tracked under the same
-  issue) — not fixed here.
+  unlike 68020/68030), so before this fix the CPU core kept executing
+  every FPU instruction regardless of `--no-fpu` while `AttnFlags`
+  told the guest there was no FPU, a combination no real chip has.
+  `--cpu 68040` combined with an explicit `--no-fpu` now runs as
+  `--cpu 68ec040` instead — the model that really has no FPU at all —
+  printing a one-line note; pass `--cpu 68ec040`/`68lc040` directly to
+  skip it. `AttnFlags`' `AFF_FPU40` bit is now also unconditional for
+  `--cpu 68040`/`68060` (previously gated on `--fpu`, which was itself
+  the source of the lie). `--cpu 68060 --no-fpu` is a separate,
+  still-open crash (tracked under the same issue) — not fixed here.
 
 - **`--sanitize` now reaches `exec.library`'s `Allocate`/`Deallocate`**
   (issue #83, Tier 1) — a successful `Allocate` marks its returned
