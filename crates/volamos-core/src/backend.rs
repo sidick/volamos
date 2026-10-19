@@ -85,8 +85,20 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// `MATHIEEESINGTRANS_LIBRARY_BASE`) -- same reasoning each time, then
 /// once more from `0x2A00` for `SetFunction`'s stub pool (see
 /// `crate::execsetfunc::STUB_POOL_BASE`) -- not a library base at all,
-/// just scratch space for synthesized "old function" stubs.
-pub const TRAP_TABLE_SIZE: u32 = 0x2C00;
+/// just scratch space for synthesized "old function" stubs -- then once
+/// more (this time just 4 bytes -- one `ILLEGAL` opcode word plus one
+/// padding word, rounded up to keep [`TRAP_TABLE_END`] 4-byte aligned,
+/// which the heap-start rounding in `crate::dispatch::Runtime::new`'s
+/// own doc relies on -- no library involved at all) from `0x2C00` for
+/// [`crate::dispatch::FPU_DISABLED_060_DECLINE_STUB_ADDR`] (issue #167's
+/// second half): the fixed-address stub `--cpu 68060 --no-fpu` pre-seeds
+/// into vector 11's slot, so the `m68k` crate's internal 68060
+/// FPU-disabled exception delivery (which bypasses
+/// [`Cpu::take_hardware_exception`] entirely -- see that constant's doc
+/// for the full mechanism) lands on a clean trap instead of falling
+/// through the deliberately-zeroed exception-vector-table span into
+/// [`crate::dispatch::CONTINUATION_STUB_ADDR`] by accident.
+pub const TRAP_TABLE_SIZE: u32 = 0x2C04;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

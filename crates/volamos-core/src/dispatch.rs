@@ -614,6 +614,129 @@ pub(crate) const CACHE_BITS_DEFAULT: u32 = 0xC000_3111;
 /// LVOs starting at `0x02CC`.
 pub const CONTINUATION_STUB_ADDR: u32 = 0x00C4;
 
+/// Guest address of a single `ILLEGAL` (`0x4AFC`) opcode word, pre-seeded
+/// into vector 11's slot (`m68k::core::exceptions::vector::LINE_1111 * 4`
+/// = guest address `0x2C`) only when the resolved CPU is
+/// `CpuType::M68060` with `fpu_present == false` -- see
+/// [`install_fpu_disabled_060_decline_stub`].
+///
+/// # Why this exists (issue #167, second half)
+///
+/// For every CPU/FPU combination this runtime models *except* this one,
+/// an FPU-absence trap (an F-line opcode under `fpu_present == false`)
+/// surfaces through the `m68k` crate's host-interceptable
+/// `StepResult::FlineTrap`/`CycleBatchExit::FlineTrap` escape hatch --
+/// `Cpu::take_hardware_exception` (`crate::backend`) catches it there,
+/// and declines cleanly (a reported `UnexpectedStop`, not a jump) if the
+/// guest never installed a real handler at the relevant vector slot.
+///
+/// The 68060's on-die-FPU-disabled exception doesn't go through that
+/// hatch at all: the `m68k` crate's own `decode.rs`/`fpu/operations.rs`
+/// call `cpu.take_fp_disabled_060(bus)` directly, entirely inside
+/// `step`/`run_batch`, bypassing `take_hardware_exception` completely.
+/// That crate-internal routine pushes a real exception frame and jumps
+/// straight to whatever 32-bit value sits at vector 11's slot (guest
+/// address `0x2C`) -- which this runtime deliberately leaves genuinely
+/// zero (see [`EXEC_LIBRARY_BASE`]'s "Reserved-region memory map" doc)
+/// so a guest that installs its *own* real handler there (a common
+/// idiom: probing for an FPU by executing a real F-line instruction and
+/// catching the resulting exception) gets genuine semantics. A
+/// `-m68020-60 -m68881`-compiled binary that never does this probe (the
+/// ordinary case -- it was told by its own compile flags to assume an
+/// FPU exists) never writes anything to `0x2C`. Its first real FPU
+/// instruction under `fpu_present = false` then sets `PC = 0` and falls
+/// through the deliberately-zeroed exception-vector-table span (reading
+/// back as a long run of harmless-looking zero words, plus
+/// `ABS_EXEC_BASE_ADDR`'s own raw bytes) until `PC` happens to reach
+/// [`CONTINUATION_STUB_ADDR`] by sheer bad luck of where the fall-through
+/// lands, and executes it directly -- not through
+/// [`ContinuationStack::trampoline`] -- producing the exact confusing
+/// "continuation stub trapped ... with no pending continuation" report
+/// issue #167 describes, rather than anything that names the real cause.
+///
+/// This stub mitigates that: [`Runtime::new`]'s caller (via
+/// [`install_fpu_disabled_060_decline_stub`], called from the CLI, which
+/// -- like [`crate::backend`]'s own doc on why `attn_flags_for` lives in
+/// `main.rs` rather than here -- is where `CpuType`/`fpu_present` are
+/// already in scope, since `Runtime`/`StartConfig` otherwise don't know
+/// or care which concrete CPU model is in use) pre-seeds vector 11's slot
+/// with this address *before* the guest's own code ever runs. If the
+/// guest never installs its own handler (the expected case), the 68060's
+/// internal exception delivery lands here instead of falling through to
+/// `CONTINUATION_STUB_ADDR`, and executes a real `ILLEGAL` opcode --
+/// surfacing through the ordinary `StepResult::IllegalInstruction`/
+/// `CycleBatchExit::IllegalInstruction` path with no new plumbing, as a
+/// clean, attributable `RuntimeError::UnexpectedStop` (the vector-4
+/// `ILLEGAL_INSTRUCTION` slot `take_hardware_exception` then consults is
+/// itself inside the deliberately-zero span, so this never jumps
+/// anywhere either -- it just reports the stop). If the guest *does*
+/// install its own real handler at `0x2C` first (the FPU-probe idiom
+/// above), that ordinary guest write simply overwrites this pre-seeded
+/// value like any other guest memory write -- no special-casing needed,
+/// since the pre-seed happens once at setup time, strictly before the
+/// guest's own code executes.
+///
+/// This is a volamos-side mitigation only -- it does not fix the
+/// underlying `m68k` crate design gap (68060 FPU-disabled/unimplemented
+/// exception delivery bypassing the host's interception hook, unlike
+/// every other modeled FPU-absence path), which may be worth reporting
+/// upstream separately.
+///
+/// Placed in the space [`crate::backend::TRAP_TABLE_SIZE`] was grown to
+/// fit (4 bytes -- this opcode word plus one padding word, so
+/// [`crate::backend::TRAP_TABLE_END`] stays 4-byte aligned -- at the very
+/// end of the reserved region, immediately after [`EXIT_STUB_ADDR`]'s
+/// own 4-byte slot) -- see `TRAP_TABLE_SIZE`'s doc for the full growth
+/// history.
+pub const FPU_DISABLED_060_DECLINE_STUB_ADDR: u32 = TRAP_TABLE_END - 2;
+
+/// Pre-seeds [`FPU_DISABLED_060_DECLINE_STUB_ADDR`]'s opcode and installs
+/// its address into vector 11's slot (guest address `0x2C`), but only
+/// when `cpu_type == CpuType::M68060 && !fpu_present` -- see that
+/// constant's doc for the full "why" and the mechanism it mitigates
+/// (issue #167's second half). A no-op for every other `cpu_type`/`fpu`
+/// combination: vector 11's slot stays genuinely zero, matching
+/// [`EXEC_LIBRARY_BASE`]'s documented "guest can install its own real
+/// FPU-probe handler there" behavior, completely unaffected.
+///
+/// Called from the CLI (`main.rs`) at every point a guest `Cpu`/memory
+/// pair is constructed -- the top-level run and a nested `System()`/
+/// `Execute()` run alike, since each builds its own independent
+/// `CpuCore`/`FlatMemory` -- right after [`Runtime::new`] rather than
+/// from inside it: `Runtime::new`'s own "unknown call" sentinel prefill
+/// sweep (see its doc) covers this whole region, including this stub's
+/// 2 bytes, and would clobber a write made *before* construction, so
+/// this has to run after. `Runtime`/`StartConfig` still don't know or
+/// care which concrete `CpuType`/FPU configuration is in use -- matching
+/// the same reasoning [`crate::backend`]'s `attn_flags_for` doc gives
+/// for why the CLI computes `AttnFlags` itself -- this just has to be
+/// sequenced after construction instead of threaded through it.
+pub fn install_fpu_disabled_060_decline_stub<C: Cpu>(
+    runtime: &mut Runtime<C>,
+    cpu_type: crate::backend::CpuType,
+    fpu_present: bool,
+) {
+    use m68k::core::exceptions::vector;
+
+    if cpu_type != crate::backend::CpuType::M68060 || fpu_present {
+        return;
+    }
+
+    /// `ILLEGAL` (`exec/`-documented m68k opcode `0x4AFC`) -- the
+    /// simplest opcode that surfaces cleanly through the existing
+    /// `StepResult::IllegalInstruction`/`CycleBatchExit::
+    /// IllegalInstruction` path with no new plumbing. See
+    /// [`FPU_DISABLED_060_DECLINE_STUB_ADDR`]'s doc.
+    const ILLEGAL_OPCODE: u16 = 0x4AFC;
+
+    runtime
+        .mem
+        .write_u16(FPU_DISABLED_060_DECLINE_STUB_ADDR, ILLEGAL_OPCODE);
+    runtime
+        .mem
+        .write_u32(vector::LINE_1111 * 4, FPU_DISABLED_060_DECLINE_STUB_ADDR);
+}
+
 /// Byte length of each library's `ln_Name` string, including its `NUL`
 /// terminator, as laid out by [`write_library_list_nodes`] in the
 /// headroom above `ExecBase.LibList` -- see the "Reserved-region memory
@@ -3099,7 +3222,7 @@ impl<C: Cpu + 'static> Runtime<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::M68kCpu;
+    use crate::backend::{CpuType, M68kCpu};
     use crate::cpu::DataRegister;
     use crate::memory::FlatMemory;
     use crate::vfs::VfsConfig;
@@ -3229,6 +3352,165 @@ mod tests {
                 ..StartConfig::default()
             },
         )
+    }
+
+    #[test]
+    fn m68060_no_fpu_fpu_instruction_repro_167() {
+        // issue #167, second half: `--cpu 68060 --no-fpu` running a
+        // program whose very first instruction is a real FPU opcode.
+        // Empirical repro, run once *before* this issue's fix landed to
+        // confirm the hand-derived mechanism in the PR description: the
+        // run ended in `RuntimeError::Dispatch(DispatchError::
+        // EmptyContinuationStack { pc: 0x000000c4 })` -- exactly the
+        // reported "continuation stub trapped at 0x000000c4 with no
+        // pending continuation" -- confirming that the `m68k` crate's
+        // internal `take_fp_disabled_060` jumps through vector 11's
+        // slot (guest address 0x2C) directly (bypassing
+        // `Cpu::take_hardware_exception` entirely), finds it genuinely
+        // zero, sets PC to 0, and falls through the deliberately-zeroed
+        // low-memory region until PC happens to land on
+        // CONTINUATION_STUB_ADDR (0xC4) and executes it directly.
+        //
+        // After the fix, this asserts the intended clean outcome
+        // instead: an attributable `RuntimeError::UnexpectedStop` for an
+        // illegal instruction, from FPU_DISABLED_060_DECLINE_STUB_ADDR.
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        // A generic coprocessor-ID-1 F-line opcode -- same encoding
+        // `crate::backend`'s own unit tests use to drive an FPU trap.
+        load_words(&mut mem, entry, &[0xF200, 0x0000]);
+        let load_end = entry + 0x100;
+        let cpu = M68kCpu::with_config(CpuType::M68060, false);
+        let mut rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                ..StartConfig::default()
+            },
+        );
+        // The fix under test: pre-seed vector 11's slot, exactly as
+        // main.rs now does at every real Runtime construction site.
+        install_fpu_disabled_060_decline_stub(&mut rt, CpuType::M68060, false);
+
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+
+        match result {
+            Err(RuntimeError::UnexpectedStop { reason, pc }) => {
+                assert_eq!(pc, FPU_DISABLED_060_DECLINE_STUB_ADDR);
+                assert!(
+                    reason.contains("Illegal"),
+                    "expected an Illegal-instruction trap, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected a clean UnexpectedStop (Illegal) trap at \
+                 FPU_DISABLED_060_DECLINE_STUB_ADDR, got {other:?}"
+            ),
+        }
+    }
+
+    /// Guest address of vector 11's slot -- `m68k::core::exceptions::
+    /// vector::LINE_1111 * 4`, computed the same way
+    /// [`install_fpu_disabled_060_decline_stub`]/`Cpu::
+    /// take_hardware_exception` do, rather than hardcoded independently.
+    fn vector_11_slot_addr() -> u32 {
+        use m68k::core::exceptions::vector;
+        vector::LINE_1111 * 4
+    }
+
+    #[test]
+    fn install_fpu_disabled_060_decline_stub_is_a_no_op_for_every_other_combination() {
+        // issue #167 (second half): vector 11's slot must stay genuinely
+        // zero for every cpu_type/fpu combination except
+        // M68060/fpu=false -- otherwise a guest program that installs
+        // its own real handler there (a real, common idiom -- e.g.
+        // probing for an FPU) would stop seeing genuine 68000 exception
+        // semantics. See EXEC_LIBRARY_BASE's "Reserved-region memory
+        // map" doc.
+        for (cpu_type, fpu) in [
+            (CpuType::M68020, false),
+            (CpuType::M68030, false),
+            (CpuType::M68040, false),
+            (CpuType::M68060, true),
+        ] {
+            let mut rt = runtime_with_program(&[0x4E71]); // NOP, never run
+            install_fpu_disabled_060_decline_stub(&mut rt, cpu_type, fpu);
+            assert_eq!(
+                rt.mem.read_u32(vector_11_slot_addr()),
+                0,
+                "vector 11's slot should stay zero for cpu_type={cpu_type:?}, fpu={fpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_installed_fpu_handler_runs_instead_of_the_decline_stub() {
+        // issue #167 (second half): a guest program that installs its
+        // own real handler at vector 11's slot *before* triggering the
+        // 68060 FPU-disabled exception (the real "probe for an FPU"
+        // idiom) must have that handler run, not this runtime's own
+        // pre-seeded decline stub -- the pre-seed happens once at setup
+        // time, strictly before the guest's own code runs, so an
+        // ordinary later guest write simply overwrites it like any
+        // other guest memory write.
+        let entry = TRAP_TABLE_END;
+        // Entry: a single real F-line FPU opcode (the same encoding used
+        // throughout this module's and crate::backend's FPU-trap tests).
+        let words = [0xF200, 0x0000];
+        // A tiny "handler", placed well clear of the entry program: a
+        // distinctive moveq #0x42,d0 then an ILLEGAL opcode of its own
+        // (at an address distinct from FPU_DISABLED_060_DECLINE_STUB_ADDR),
+        // so a successful run is observable both by D0's value and by
+        // the trap's own pc differing from the decline stub's address.
+        let handler_addr = entry + 0x20;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        load_words(&mut mem, handler_addr, &[0x7042, 0x4AFC]);
+        let load_end = entry + 0x100;
+        let cpu = M68kCpu::with_config(CpuType::M68060, false);
+        let mut rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                ..StartConfig::default()
+            },
+        );
+        // First, the pre-seed this issue's fix installs (what every real
+        // Runtime construction site does)...
+        install_fpu_disabled_060_decline_stub(&mut rt, CpuType::M68060, false);
+        // ...then the guest's own real handler overwrites it, exactly as
+        // an ordinary guest write would during startup/FPU-probing.
+        rt.mem.write_u32(vector_11_slot_addr(), handler_addr);
+
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+
+        match result {
+            Err(RuntimeError::UnexpectedStop { reason, pc }) => {
+                assert_eq!(
+                    pc,
+                    handler_addr + 2,
+                    "expected the trap to come from the guest's own handler, not the decline stub"
+                );
+                assert_ne!(pc, FPU_DISABLED_060_DECLINE_STUB_ADDR);
+                assert!(
+                    reason.contains("Illegal"),
+                    "expected an Illegal-instruction trap, got {reason:?}"
+                );
+            }
+            other => panic!("expected the guest handler's own Illegal trap, got {other:?}"),
+        }
+        assert_eq!(
+            rt.cpu.data_register(DataRegister(0)),
+            0x42,
+            "the guest's own handler should have run (and set D0) before trapping"
+        );
     }
 
     #[test]

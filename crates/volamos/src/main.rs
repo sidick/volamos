@@ -85,7 +85,9 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser};
 
 use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END, addressable_bytes};
-use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent};
+use volamos_core::dispatch::{
+    Runtime, StartConfig, TraceEvent, install_fpu_disabled_060_decline_stub,
+};
 use volamos_core::exectask::install_host_break_handler;
 use volamos_core::loader::Location;
 use volamos_core::memory::FlatMemory;
@@ -1828,8 +1830,20 @@ fn check_ram_fits(load_end: u32, stack_size: u32, ram_size: u32) -> Result<(), S
     }
 }
 
+/// Builds the independent `Runtime`/`CpuCore`/`FlatMemory` a nested
+/// `System()`/`Execute()` run executes in -- everything
+/// [`run_nested_program`] does before calling [`Runtime::run`], factored
+/// out so a test can construct one and inspect/run it directly (the
+/// `i32` exit code `run_nested_program` returns collapses every
+/// construction failure *and* every runtime error to `-1`, which makes
+/// issue #167's fix unobservable at that boundary -- this returns the
+/// `Runtime` itself instead). `None` on any of the same early-exit
+/// conditions `run_nested_program` used to inline (unreadable file, bad
+/// hunk file, load failure, oversized load vs. `--ram`/`--stack`, a
+/// `--uae-debug`/`--emu68-debug` port reservation failure, or a bad
+/// `Vfs` config).
 #[allow(clippy::too_many_arguments)] // internal helper; one param per thing a nested run inherits from its parent
-fn run_nested_program(
+fn build_nested_runtime(
     host_path: &std::path::Path,
     args: &[String],
     vfs_config: Option<VfsConfig>,
@@ -1838,19 +1852,15 @@ fn run_nested_program(
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
-    sanitize: InstrumentationOptions,
+    sanitize: &InstrumentationOptions,
     clock_mhz: Option<f64>,
     cache: bool,
     fpsp_emulate: bool,
     net: bool,
     libs_dir_override: bool,
-) -> i32 {
-    let Ok(bytes) = std::fs::read(host_path) else {
-        return -1;
-    };
-    let Ok(hunk_file) = loader::parse(&bytes) else {
-        return -1;
-    };
+) -> Option<Runtime<M68kCpu>> {
+    let bytes = std::fs::read(host_path).ok()?;
+    let hunk_file = loader::parse(&bytes).ok()?;
     let mut mem = FlatMemory::new(ram_size as usize);
     // Right after construction, before `loader::load` populates it --
     // harmless either way (see `FlatMemory::enable_sanitizer`'s doc for
@@ -1868,12 +1878,8 @@ fn run_nested_program(
         mem.enable_icache(size);
     }
     sanitize.install_debug_ports(&mut mem, cpu_type);
-    let Ok(load_result) = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END) else {
-        return -1;
-    };
-    if check_ram_fits(load_result.end, stack_size, ram_size).is_err() {
-        return -1;
-    }
+    let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END).ok()?;
+    check_ram_fits(load_result.end, stack_size, ram_size).ok()?;
 
     let config = StartConfig {
         entry: load_result.entry,
@@ -1905,9 +1911,14 @@ fn run_nested_program(
     // the parent's --fpsp-emulate setting, same as it shares --cpu/--fpu.
     cpu.set_emulate_unimplemented_060(fpsp_emulate);
     let mut runtime = Runtime::new(cpu, mem, config);
-    if sanitize.reserve_debug_ports(&mut runtime).is_err() {
-        return -1;
-    }
+    // issue #167 (second half): a nested System()/Execute() run builds
+    // its own independent CpuCore/FlatMemory, so it needs this pre-seed
+    // exactly as much as the top-level run does -- see
+    // install_fpu_disabled_060_decline_stub's doc for why this has to
+    // run after Runtime::new (its own sentinel prefill would otherwise
+    // clobber a write made beforehand).
+    install_fpu_disabled_060_decline_stub(&mut runtime, cpu_type, fpu);
+    sanitize.reserve_debug_ports(&mut runtime).ok()?;
     if sanitize.dirty_heap {
         runtime.enable_dirty_heap();
     }
@@ -1919,10 +1930,8 @@ fn run_nested_program(
     }
 
     if let Some(vfs_config) = vfs_config {
-        match Vfs::new(vfs_config) {
-            Ok(vfs) => runtime.set_vfs(vfs),
-            Err(_) => return -1,
-        }
+        let vfs = Vfs::new(vfs_config).ok()?;
+        runtime.set_vfs(vfs);
     }
     if libs_dir_override {
         runtime.enable_libs_dir_override();
@@ -1933,6 +1942,45 @@ fn run_nested_program(
     if net {
         runtime.enable_bsdsocket();
     }
+
+    Some(runtime)
+}
+
+#[allow(clippy::too_many_arguments)] // internal helper; one param per thing a nested run inherits from its parent
+fn run_nested_program(
+    host_path: &std::path::Path,
+    args: &[String],
+    vfs_config: Option<VfsConfig>,
+    stack_size: u32,
+    ram_size: u32,
+    cpu_type: CpuType,
+    fpu: bool,
+    jit: bool,
+    sanitize: InstrumentationOptions,
+    clock_mhz: Option<f64>,
+    cache: bool,
+    fpsp_emulate: bool,
+    net: bool,
+    libs_dir_override: bool,
+) -> i32 {
+    let Some(mut runtime) = build_nested_runtime(
+        host_path,
+        args,
+        vfs_config,
+        stack_size,
+        ram_size,
+        cpu_type,
+        fpu,
+        jit,
+        &sanitize,
+        clock_mhz,
+        cache,
+        fpsp_emulate,
+        net,
+        libs_dir_override,
+    ) else {
+        return -1;
+    };
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -1958,6 +2006,12 @@ fn build_runtime_with_vfs(
     vfs_config: Option<VfsConfig>,
 ) -> Result<Runtime<M68kCpu>, String> {
     let mut runtime = Runtime::new(cpu, mem, config);
+    // issue #167 (second half): both of run()'s loading strategies reach
+    // Runtime::new through here, so one call covers them both -- see
+    // install_fpu_disabled_060_decline_stub's doc for why this has to
+    // run after Runtime::new (its own sentinel prefill would otherwise
+    // clobber a write made beforehand).
+    install_fpu_disabled_060_decline_stub(&mut runtime, opts.cpu_type, opts.fpu);
     opts.sanitize.reserve_debug_ports(&mut runtime)?;
     if let Some(vfs_config) = vfs_config {
         let vfs =
@@ -3820,5 +3874,123 @@ mod tests {
         // No documented AFF_* bit exists for this model.
         assert_eq!(attn_flags_for(CpuType::SCC68070, false), 0);
         assert_eq!(attn_flags_for(CpuType::SCC68070, true), 0);
+    }
+
+    /// Appends a big-endian `u32` to `buf`.
+    fn push_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// Builds a minimal single-hunk `HUNK_HEADER` + `HUNK_CODE` +
+    /// `HUNK_END` executable file whose code is exactly `code`
+    /// (must be a multiple of 4 bytes) -- enough for
+    /// [`volamos_core::loader::parse`]/`load` to accept, with no
+    /// relocations. Mirrors `volamos_core::loader`'s own
+    /// `build_single_hunk_code_file` test helper (not reusable here --
+    /// private to that crate's `#[cfg(test)]` module), kept minimal
+    /// since this is only ever used to drive [`build_nested_runtime`]'s
+    /// own tests below with a single hand-picked opcode.
+    fn build_single_hunk_code_file(code: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            code.len() % 4,
+            0,
+            "test helper requires longword-aligned code"
+        );
+        const HUNK_HEADER: u32 = 0x3F3;
+        const HUNK_CODE: u32 = 0x3E9;
+        const HUNK_END: u32 = 0x3F2;
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0); // no resident library names
+        push_u32(&mut buf, 1); // table_size: 1 hunk
+        push_u32(&mut buf, 0); // first_hunk
+        push_u32(&mut buf, 0); // last_hunk
+        push_u32(&mut buf, (code.len() / 4) as u32); // hunk 0 size (longwords)
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, (code.len() / 4) as u32);
+        buf.extend_from_slice(code);
+        push_u32(&mut buf, HUNK_END);
+        buf
+    }
+
+    struct NestedTempFile {
+        path: PathBuf,
+    }
+
+    impl NestedTempFile {
+        /// Writes `code` as a minimal hunk executable to a fresh,
+        /// uniquely-named temp file -- see [`build_single_hunk_code_file`].
+        fn new(tag: &str, code: &[u8]) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pid = std::process::id();
+            let path =
+                std::env::temp_dir().join(format!("volamos-nested-runtime-test-{tag}-{pid}-{n}"));
+            std::fs::write(&path, build_single_hunk_code_file(code)).expect("write temp hunk file");
+            NestedTempFile { path }
+        }
+    }
+
+    impl Drop for NestedTempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// issue #167 (second half): a nested `System()`/`Execute()` run
+    /// builds its own independent `CpuCore`/`FlatMemory` via
+    /// [`build_nested_runtime`] -- exercised directly here (rather than
+    /// through [`run_nested_program`] itself) because that function's
+    /// `i32` return collapses every construction failure *and* every
+    /// runtime error to `-1`, which would make this fix unobservable at
+    /// that boundary. [`build_nested_runtime`] factors out exactly the
+    /// steps `run_nested_program` performs (including the
+    /// `install_fpu_disabled_060_decline_stub` call this test is about),
+    /// so this exercises the real nested-run construction path, not a
+    /// re-implementation of it.
+    #[test]
+    fn nested_runtime_68060_no_fpu_gets_a_clean_trap_not_the_continuation_stub() {
+        // A generic coprocessor-ID-1 F-line opcode, as its own first (and
+        // only) instruction -- same encoding `volamos_core::backend`'s
+        // and `volamos_core::dispatch`'s own tests use to drive an FPU
+        // trap.
+        let file = NestedTempFile::new("167", &[0xF2, 0x00, 0x00, 0x00]);
+        let runtime = build_nested_runtime(
+            &file.path,
+            &[],
+            None,
+            DEFAULT_STACK_SIZE,
+            1 << 20, // 1 MiB -- comfortably more than this tiny program needs
+            CpuType::M68060,
+            false,
+            false,
+            &InstrumentationOptions::default(),
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+        let mut runtime = runtime.expect("build_nested_runtime should succeed");
+
+        let mut out = Vec::new();
+        let result = runtime.run(&mut out, None);
+
+        match result {
+            Err(volamos_core::dispatch::RuntimeError::UnexpectedStop { reason, pc }) => {
+                assert_eq!(
+                    pc,
+                    volamos_core::dispatch::FPU_DISABLED_060_DECLINE_STUB_ADDR
+                );
+                assert!(
+                    reason.contains("Illegal"),
+                    "expected an Illegal-instruction trap, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected a clean UnexpectedStop (Illegal) trap at \
+                 FPU_DISABLED_060_DECLINE_STUB_ADDR, got {other:?}"
+            ),
+        }
     }
 }
