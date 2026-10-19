@@ -270,10 +270,27 @@ Hello from volamos
 
 Pass `--cpu 68ec040`/`--cpu 68lc040` directly to skip the note.
 
-`--cpu 68060 --no-fpu` is a separate, still-open issue (also tracked
-under #167) — the `m68k` crate *can* model an FPU-less 68060 internally,
-but doing so currently crashes volamos's own guest-exception routing,
-so this combination isn't refused yet, it just doesn't work.
+`--cpu 68060 --no-fpu` is a different case: the `m68k` crate *can*
+model an FPU-less 68060 internally (unlike the 68040, there's no
+separate `CpuType` to substitute to), but its internal FPU-disabled
+exception delivery bypasses this runtime's usual guest-exception
+interception entirely — if the guest never installed its own FPU
+handler (the ordinary case for `-m68020-60 -m68881`-compiled code,
+which assumes the FPU just exists), it used to land on whatever
+garbage happened to be at the real vector-11 slot, surfacing as a
+baffling "continuation stub trapped ... with no pending continuation."
+That slot is now pre-seeded with a dedicated stub, so this reports a
+clean, attributable stop instead:
+
+```console
+$ volamos --cpu 68060 --no-fpu a-68060-fpu-binary
+volamos: a-68060-fpu-binary: unexpected CPU stop at 0x00002c02: Illegal { opcode: ... }
+```
+
+A guest that installs its own real FPU-probe handler before executing
+any FPU instruction (the common "catch the exception, fall back to
+software float" idiom) is unaffected — that write simply overwrites
+the pre-seeded stub like any other guest memory write.
 
 !!! note "Performance: software math libraries are faster than a real FPU"
     Programs that do floating-point math through `mathffp.library`/

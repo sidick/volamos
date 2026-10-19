@@ -6,7 +6,8 @@ version scheme in `Cargo.toml`.
 ## 0.11
 
 - **`--cpu 68040 --no-fpu` now behaves correctly instead of silently
-  doing nothing** (issue #167) — the full 68040 always has its on-die
+  doing nothing, and `--cpu 68060 --no-fpu` no longer crashes** (issue
+  #167, both halves) — the full 68040/68060 always have their on-die
   FPU on real hardware (there's no plug-in-68881 option to leave out,
   unlike 68020/68030), so before this fix the CPU core kept executing
   every FPU instruction regardless of `--no-fpu` while `AttnFlags`
@@ -16,8 +17,16 @@ version scheme in `Cargo.toml`.
   printing a one-line note; pass `--cpu 68ec040`/`68lc040` directly to
   skip it. `AttnFlags`' `AFF_FPU40` bit is now also unconditional for
   `--cpu 68040`/`68060` (previously gated on `--fpu`, which was itself
-  the source of the lie). `--cpu 68060 --no-fpu` is a separate,
-  still-open crash (tracked under the same issue) — not fixed here.
+  the source of the lie). `--cpu 68060 --no-fpu` had a separate, deeper
+  bug: the `m68k` crate's own internal 68060 FPU-disabled exception
+  delivery bypasses this runtime's usual guest-exception interception
+  entirely, landing on whatever garbage happened to sit at vector 11's
+  slot and manifesting as a baffling "continuation stub trapped ...
+  with no pending continuation" — now mitigated by pre-seeding that
+  vector with a dedicated stub that reports a clean, attributable stop
+  instead, without affecting any other `--cpu`/`--fpu` combination's
+  existing (correct) behavior, including a guest that installs its own
+  real FPU-probe handler there.
 
 - **`--sanitize` now reaches `exec.library`'s `Allocate`/`Deallocate`**
   (issue #83, Tier 1) — a successful `Allocate` marks its returned
