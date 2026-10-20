@@ -118,9 +118,13 @@ const MAX_SEGLIST_SEGMENTS: u32 = 4096;
 /// A cap on how many entries [`read_vectors`] will decode before giving
 /// up loudly, so a vector table missing its terminator (`$FFFF`/`-1` for
 /// the word-displacement form, `$FFFFFFFF` for the absolute-pointer
-/// form) can't be read forever. Real libraries have at most a few dozen
-/// vectors; this is generous headroom above that.
-const MAX_VECTORS: usize = 256;
+/// form) can't be read forever. Most libraries have at most a few dozen
+/// vectors (`dos.library` has about 170); a shared C library like
+/// `ixemul.library` is the known outlier, exporting around 720
+/// (issue #171) -- `256` was comfortable headroom for ordinary AmigaOS
+/// libraries but rejected `ixemul.library` outright as "corrupt". `1024`
+/// is generous headroom above that real outlier instead.
+const MAX_VECTORS: usize = 1024;
 
 /// `sizeof(struct Library)` (`exec/libraries.h`): `Node` (14) +
 /// `lib_Flags`/`lib_pad` (1 each, 2) + `lib_NegSize`/`lib_PosSize` (2

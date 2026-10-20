@@ -5,6 +5,18 @@ version scheme in `Cargo.toml`.
 
 ## 0.11
 
+- **`--libs-dir` can load libraries with large vector tables, like
+  `ixemul.library`** (issue #171) — the loader's "treat an unterminated
+  vector table as corrupt rather than scanning forever" safety cap was
+  256 entries, comfortable headroom for an ordinary AmigaOS library
+  (`dos.library` has about 170) but too small for a shared C library:
+  `ixemul.library` exports around 720 functions, so loading it via
+  `--libs-dir` was refused outright as "corrupt" even though the file
+  is fine. Raised to 1024. Whether `ixemul`-linked binaries actually
+  run under volamos afterward is a separate, unexamined question (it
+  wants a real process environment this runtime doesn't fully provide)
+  -- this only fixes the loader's own refusal to read the file.
+
 - **`--cpu 68040 --no-fpu` now behaves correctly instead of silently
   doing nothing, and `--cpu 68060 --no-fpu` no longer crashes** (issue
   #167, both halves) — the full 68040/68060 always have their on-die
