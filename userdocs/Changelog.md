@@ -5,6 +5,23 @@ version scheme in `Cargo.toml`.
 
 ## 0.11
 
+- **`--cpu 68040`/`68060` now default to the full chip with its on-die
+  FPU present** (issues #174/#175) — after #167's fixes, a plain
+  `--cpu 68060` (no `--fpu`) inherited the global no-FPU default and
+  ran as an FPU-less 68060, so an ordinary `-m68020-60 -m68881` binary
+  died on its first FPU instruction unless `--fpu` was spelled out,
+  while the equivalent plain `--cpu 68040` ran it fine — the two full
+  chips disagreeing about the same default. Both now resolve the FPU
+  as present unless `--no-fpu` is given explicitly (`--cpu 68040
+  --no-fpu` still substitutes to `68ec040`; `--cpu 68060 --no-fpu`
+  still selects the genuinely FPU-less 68LC060/68EC060 with the clean
+  vector-11 stop). With the FPU present, `AttnFlags` now also reports
+  `AFF_68881|AFF_68882` alongside `AFF_FPU40`, matching a real
+  68040/68060 system booted with SetPatch — programs commonly test
+  `AFF_68881` alone to mean "an FPU is present" (`ixemul.library`'s
+  init is one); the FPU-less 68060 case advertises no FPU bits at all,
+  as a real LC/EC060 machine does.
+
 - **`--libs-dir` can load libraries with large vector tables, like
   `ixemul.library`** (issue #171) — the loader's "treat an unterminated
   vector table as corrupt rather than scanning forever" safety cap was

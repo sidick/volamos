@@ -241,10 +241,11 @@ was actually compiled for.
 
 ## `--fpu`, `--no-fpu`
 
-Whether a coprocessor FPU is fitted. Default: no FPU. Only meaningful
-for `--cpu 68020`/`68030` — earlier models have no coprocessor
-interface at all, so F-line (FPU) instructions always trap on them
-regardless of this flag.
+Whether a coprocessor FPU is fitted. Only meaningful for
+`--cpu 68020`/`68030`, where the default is no FPU (a plug-in
+68881/68882 is genuinely optional on real hardware) — earlier models
+have no coprocessor interface at all, so F-line (FPU) instructions
+always trap on them regardless of this flag.
 
 ```sh
 volamos --cpu 68020 --fpu fixtures/hello
@@ -252,8 +253,15 @@ volamos --cpu 68020 --fpu fixtures/hello
 
 The full `68040` and `68060` always have their on-die FPU on real
 hardware — unlike `68020`/`68030`, there's no plug-in 68881/68882 to
-leave out. `--fpu` is therefore a harmless no-op on `--cpu 68040`/
-`68060` ([issue #167](https://github.com/sidick/volamos/issues/167)).
+leave out — so for those two the FPU **defaults present**: a plain
+`--cpu 68040` or `--cpu 68060` means the full chip, FPU included, and
+`--fpu` is a harmless no-op ([issues
+#167](https://github.com/sidick/volamos/issues/167)/[#174](https://github.com/sidick/volamos/issues/174)).
+With the FPU present, `AttnFlags` reports `AFF_68881|AFF_68882` as
+well as `AFF_FPU40`, matching a real 68040/68060 system booted with
+SetPatch (`68040.library`/`68060.library` loaded) — programs commonly
+test `AFF_68881` alone to mean "an FPU is present"
+([issue #175](https://github.com/sidick/volamos/issues/175)).
 `--no-fpu` combined with `--cpu 68040` is substituted to
 `--cpu 68ec040` instead of silently having no effect, which is what it
 did before this was fixed — `AttnFlags` told the guest there was no
@@ -270,17 +278,18 @@ Hello from volamos
 
 Pass `--cpu 68ec040`/`--cpu 68lc040` directly to skip the note.
 
-`--cpu 68060 --no-fpu` is a different case: the `m68k` crate *can*
-model an FPU-less 68060 internally (unlike the 68040, there's no
-separate `CpuType` to substitute to), but its internal FPU-disabled
-exception delivery bypasses this runtime's usual guest-exception
-interception entirely — if the guest never installed its own FPU
-handler (the ordinary case for `-m68020-60 -m68881`-compiled code,
-which assumes the FPU just exists), it used to land on whatever
-garbage happened to be at the real vector-11 slot, surfacing as a
-baffling "continuation stub trapped ... with no pending continuation."
-That slot is now pre-seeded with a dedicated stub, so this reports a
-clean, attributable stop instead:
+An **explicit** `--cpu 68060 --no-fpu` is a different case: it selects
+the genuinely FPU-less `68LC060`/`68EC060`, which the `m68k` crate
+models directly (unlike the 68040, there's no separate `CpuType` to
+substitute to). The crate's internal FPU-disabled exception delivery
+bypasses this runtime's usual guest-exception interception entirely —
+if the guest never installed its own FPU handler (the ordinary case
+for `-m68020-60 -m68881`-compiled code, which assumes the FPU just
+exists), it used to land on whatever garbage happened to be at the
+real vector-11 slot, surfacing as a baffling "continuation stub
+trapped ... with no pending continuation." That slot is now pre-seeded
+with a dedicated stub, so this reports a clean, attributable stop
+instead:
 
 ```console
 $ volamos --cpu 68060 --no-fpu a-68060-fpu-binary
