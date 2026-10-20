@@ -515,6 +515,269 @@ fn free_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
         })
 }
 
+// --- AllocEntry/FreeEntry: `struct MemList` layout (`<exec/memory.h>`) ---
+//
+//     struct MemList {
+//         struct Node ml_Node;        /* offset  0, 14 bytes */
+//         UWORD  ml_NumEntries;       /* offset 14 */
+//         struct MemEntry ml_ME[1];   /* offset 16, 8 bytes each:  */
+//     };                              /*   me_Reqs/me_Addr (ULONG union) */
+//                                     /*   + me_Length (ULONG)           */
+/// Byte offset of `ml_NumEntries` (`UWORD`) within a `struct MemList` --
+/// right after the 14-byte `struct Node` header.
+const ML_NUMENTRIES_OFFSET: u32 = 14;
+/// Byte offset of `ml_ME[0]`, the first `struct MemEntry`, within a
+/// `struct MemList`.
+const ML_FIRST_ENTRY_OFFSET: u32 = 16;
+/// `sizeof(struct MemEntry)`: the `me_Reqs`/`me_Addr` union (`ULONG`)
+/// plus `me_Length` (`ULONG`).
+const MEMENTRY_SIZE: u32 = 8;
+/// `AllocEntry`'s documented failure marker: "If enough memory cannot
+/// be obtained, then the requirements of the allocation that failed is
+/// returned and bit 31 is set" (`exec.doc`, which adds: "WARNING: The
+/// result is unusual!  Bit 31 indicates failure.").
+const ALLOCENTRY_FAILURE_BIT: u32 = 1 << 31;
+
+/// `exec.library`'s `AllocEntry` (LVO -222: `A0` = a caller-built
+/// `struct MemList`). `D0` = a freshly allocated `MemList` of the same
+/// shape whose every `me_Addr` holds a newly allocated block of the
+/// corresponding `me_Length` bytes (each allocated exactly as
+/// [`alloc_mem_handler`] would with that entry's own `me_Reqs` --
+/// including honoring `MEMF_CLEAR` per entry, as `exec.doc`'s own
+/// example mixes per-entry `MEMF_CLEAR`/`MEMF_PUBLIC` requirements). On
+/// failure, `D0` = the *requirements* of the entry that failed with
+/// [`ALLOCENTRY_FAILURE_BIT`] (bit 31) set -- the documented, unusual
+/// error convention callers test with `BCLR #31,D0`.
+///
+/// # Partial failure backs out fully (the post-V1.3-SetPatch behavior)
+///
+/// `exec.doc`'s BUGS section: "If any one of the allocations fails,
+/// this function fails to back out fully.  This is fixed by the
+/// 'SetPatch' program on V1.3 Workbench disks." This runtime targets
+/// KS 3.1 (V40), where that fix has long been ROM behavior, so the
+/// fixed semantics are implemented: every block allocated for an
+/// earlier entry -- and the new `MemList` itself -- is freed before the
+/// failure return, leaking nothing.
+///
+/// # Node header
+///
+/// The new `MemList`'s `ln_Type`/`ln_Pri`/`ln_Name` are copied from the
+/// caller's template (real `AllocEntry` preserves them -- the caller
+/// may rely on the name/priority when the list is later enqueued, e.g.
+/// on `TC_MEMENTRY`); `ln_Succ`/`ln_Pred` are written as zero, since
+/// the new list isn't on any list yet and the template's own link
+/// fields are meaningless to it.
+///
+/// # Zero-length entries
+///
+/// An entry with `me_Length == 0` is treated as the failing entry
+/// (returning its requirements with bit 31 set): real `AllocEntry` just
+/// calls `AllocMem` per entry and treats a `NULL` result as the
+/// failure, and `AllocMem(0, ...)` yields `NULL` in this module (see
+/// the module docs' NULL-handling section), so this falls out of the
+/// same rule rather than being a special case.
+fn alloc_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let template = ctx.cpu.address_register(AddressRegister(0));
+    let num_entries = u32::from(
+        ctx.mem
+            .read_u16(template.wrapping_add(ML_NUMENTRIES_OFFSET)),
+    );
+
+    // The new MemList, sized for `num_entries` entries. Note
+    // `sizeof(struct MemList)` already includes ml_ME[1] (memory.h's
+    // own comment), i.e. the header before the entries is 16 bytes.
+    let list_size = ML_FIRST_ENTRY_OFFSET + num_entries * MEMENTRY_SIZE;
+    let list_rounded = round_up_8(list_size);
+    let Ok(list) = ctx
+        .heap
+        .alloc_with_requested(&mut *ctx.mem, list_rounded, list_size)
+    else {
+        // The MemList struct itself couldn't be allocated. The autodoc
+        // only describes the failure return in terms of a failed
+        // *entry*; for this case the struct's own (implicit) MEMF_PUBLIC
+        // requirement is reported, bit 31 set as always.
+        ctx.cpu
+            .set_data_register(DataRegister(0), ALLOCENTRY_FAILURE_BIT | MEMF_PUBLIC);
+        return Ok(());
+    };
+
+    // Node header: ln_Succ/ln_Pred zeroed, ln_Type/ln_Pri/ln_Name
+    // copied from the template (bytes 8..14 of the Node) -- see the
+    // handler doc.
+    ctx.mem.write_u32(list, 0);
+    ctx.mem.write_u32(list.wrapping_add(4), 0);
+    for off in 8..ML_NUMENTRIES_OFFSET {
+        let b = ctx.mem.read_u8(template.wrapping_add(off));
+        ctx.mem.write_u8(list.wrapping_add(off), b);
+    }
+    ctx.mem
+        .write_u16(list.wrapping_add(ML_NUMENTRIES_OFFSET), num_entries as u16);
+
+    let mut allocated: Vec<(u32, u32)> = Vec::with_capacity(num_entries as usize);
+    for i in 0..num_entries {
+        let entry = ML_FIRST_ENTRY_OFFSET + i * MEMENTRY_SIZE;
+        let reqs = ctx.mem.read_u32(template.wrapping_add(entry));
+        let length = ctx
+            .mem
+            .read_u32(template.wrapping_add(entry).wrapping_add(4));
+
+        let rounded = round_up_8(length);
+        let result = if length == 0 {
+            // AllocMem(0) is NULL in this module -- see the handler doc.
+            Err(())
+        } else {
+            ctx.heap
+                .alloc_with_requested(&mut *ctx.mem, rounded, length)
+                .map_err(|_| ())
+        };
+        let Ok(addr) = result else {
+            // Back out fully -- the V36+/SetPatch-fixed behavior (see
+            // the handler doc): free every earlier entry's block and
+            // the new MemList itself, then return the failed entry's
+            // requirements with bit 31 set. Poison-before-free ordering
+            // per `poison_freed_block`'s doc, as `free_mem_handler`.
+            for &(block, _) in &allocated {
+                poison_freed_block(ctx, block);
+                ctx.heap
+                    .free(block)
+                    .map_err(|e| DispatchError::HandlerFailed {
+                        library: "exec.library".to_string(),
+                        lvo: -222,
+                        handler_name: "AllocEntry".to_string(),
+                        message: format!(
+                            "GuestHeap::free unexpectedly failed backing out a block \
+                             this call just allocated at {block:#010x}: {e}"
+                        ),
+                    })?;
+            }
+            poison_freed_block(ctx, list);
+            ctx.heap
+                .free(list)
+                .map_err(|e| DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo: -222,
+                    handler_name: "AllocEntry".to_string(),
+                    message: format!(
+                        "GuestHeap::free unexpectedly failed backing out the MemList \
+                         this call just allocated at {list:#010x}: {e}"
+                    ),
+                })?;
+            ctx.cpu
+                .set_data_register(DataRegister(0), ALLOCENTRY_FAILURE_BIT | reqs);
+            return Ok(());
+        };
+
+        // Same per-block treatment as alloc_mem_handler: MEMF_CLEAR
+        // zeroing or the --dirty-heap fill first, the sanitizer poison
+        // step after (see poison_allocation_edges' doc for the
+        // ordering).
+        let cleared = reqs & MEMF_CLEAR != 0;
+        if cleared {
+            for off in 0..rounded {
+                ctx.mem.write_u8(addr.wrapping_add(off), 0);
+            }
+        } else {
+            apply_dirty_fill(ctx, addr, rounded);
+        }
+        poison_allocation_edges(ctx, addr, !cleared);
+
+        ctx.mem.write_u32(list.wrapping_add(entry), addr);
+        ctx.mem
+            .write_u32(list.wrapping_add(entry).wrapping_add(4), length);
+        allocated.push((addr, length));
+    }
+
+    // Poison the MemList block's own edges last, after every header and
+    // entry write above -- per poison_allocation_edges' doc. `false`
+    // because this handler itself initialized every byte the guest will
+    // read back.
+    poison_allocation_edges(ctx, list, false);
+    ctx.cpu.set_data_register(DataRegister(0), list);
+    Ok(())
+}
+
+/// `exec.library`'s `FreeEntry` (LVO -228: `A0` = a `MemList` as
+/// returned by [`alloc_entry_handler`]). No return value. Frees each
+/// entry's block (same loud size-mismatch/unknown-address contract as
+/// [`free_mem_handler`], trusting each entry's own `me_Length` exactly
+/// as real `FreeEntry`'s per-entry `FreeMem` trusts it), then the
+/// `MemList` structure itself.
+///
+/// Entries whose `me_Addr` is `NULL` or whose `me_Length` is 0 are
+/// skipped: real `FreeEntry` just calls `FreeMem` per entry, and
+/// `FreeMem(NULL, ...)` / a zero `byteSize` are both no-ops there
+/// (nothing was allocated to free).
+///
+/// `FreeEntry(NULL)` is treated as a defensive no-op, matching every
+/// other `Free*`/`Delete*` call's NULL tolerance in this module.
+fn free_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let list = ctx.cpu.address_register(AddressRegister(0));
+    if list == 0 {
+        return Ok(());
+    }
+
+    let free_block = |ctx: &mut HandlerContext<'_, C>,
+                      addr: u32,
+                      length: u32,
+                      what: &str|
+     -> Result<(), DispatchError> {
+        let rounded = round_up_8(length);
+        match ctx.heap.size_of_live_alloc(addr) {
+            Some(actual) if actual == rounded => {
+                poison_freed_block(ctx, addr);
+                ctx.heap
+                    .free(addr)
+                    .map_err(|e| DispatchError::HandlerFailed {
+                        library: "exec.library".to_string(),
+                        lvo: -228,
+                        handler_name: "FreeEntry".to_string(),
+                        message: format!(
+                            "GuestHeap::free unexpectedly failed for a block it just \
+                             confirmed as live at {addr:#010x}: {e}"
+                        ),
+                    })
+            }
+            Some(actual) => Err(DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -228,
+                handler_name: "FreeEntry".to_string(),
+                message: format!(
+                    "FreeEntry size mismatch freeing {what} at {addr:#010x}: its \
+                     recorded length {length} (rounds to {rounded}) doesn't match \
+                     the live allocation's size {actual} -- this looks like a \
+                     corrupted or hand-altered MemList, which would silently \
+                     corrupt the free list on real AmigaOS"
+                ),
+            }),
+            None => Err(DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -228,
+                handler_name: "FreeEntry".to_string(),
+                message: format!(
+                    "FreeEntry called on {what} at {addr:#010x}, which isn't a \
+                     currently-live allocation (never allocated, already freed, \
+                     or not an AllocEntry result at all)"
+                ),
+            }),
+        }
+    };
+
+    let num_entries = u32::from(ctx.mem.read_u16(list.wrapping_add(ML_NUMENTRIES_OFFSET)));
+    for i in 0..num_entries {
+        let entry = list.wrapping_add(ML_FIRST_ENTRY_OFFSET + i * MEMENTRY_SIZE);
+        let addr = ctx.mem.read_u32(entry);
+        let length = ctx.mem.read_u32(entry.wrapping_add(4));
+        if addr == 0 || length == 0 {
+            // Nothing was allocated here -- see the handler doc.
+            continue;
+        }
+        free_block(ctx, addr, length, "a MemEntry block")?;
+    }
+
+    let list_size = ML_FIRST_ENTRY_OFFSET + num_entries * MEMENTRY_SIZE;
+    free_block(ctx, list, list_size, "the MemList structure")
+}
+
 /// `CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`'s pool-header
 /// size: one `u32` holding the pool's `requirements` (`MEMF_*`, applied
 /// to every subsequent `AllocPooled` from it, since that call takes no
@@ -841,6 +1104,8 @@ pub fn register_execmem_handlers<C: Cpu + 'static>(
     reg!("AvailMem", avail_mem_handler::<C>);
     reg!("AllocVec", alloc_vec_handler::<C>);
     reg!("FreeVec", free_vec_handler::<C>);
+    reg!("AllocEntry", alloc_entry_handler::<C>);
+    reg!("FreeEntry", free_entry_handler::<C>);
     reg!("CopyMem", copy_mem_handler::<C>);
     reg!("CopyMemQuick", copy_mem_handler::<C>);
     reg!("CacheControl", cache_control_handler::<C>);
@@ -1845,5 +2110,291 @@ mod tests {
             message.contains("size mismatch"),
             "unexpected message: {message}"
         );
+    }
+
+    // --- AllocEntry / FreeEntry ---
+
+    /// Writes a caller-style `struct MemList` template at `addr`: a
+    /// zeroed `Node`, `ml_NumEntries`, then one `(me_Reqs, me_Length)`
+    /// pair per entry -- exactly the shape `exec.doc`'s own `AllocEntry`
+    /// example builds with `DC.W`/`DC.L`.
+    fn write_memlist_template(mem: &mut FlatMemory, addr: u32, entries: &[(u32, u32)]) {
+        for off in 0..ML_FIRST_ENTRY_OFFSET {
+            mem.write_u8(addr + off, 0);
+        }
+        mem.write_u16(addr + ML_NUMENTRIES_OFFSET, entries.len() as u16);
+        for (i, &(reqs, length)) in entries.iter().enumerate() {
+            let e = addr + ML_FIRST_ENTRY_OFFSET + (i as u32) * MEMENTRY_SIZE;
+            mem.write_u32(e, reqs);
+            mem.write_u32(e + 4, length);
+        }
+    }
+
+    /// Builds a runtime around `words` (a full program, A6 fixup
+    /// included) with a `MemList` template written just past it,
+    /// patching the `move_imm_to_a(0)` placeholder at `a0_idx` (the
+    /// index of the opcode word itself) to point at the template.
+    /// Returns the runtime and the template's address.
+    fn alloc_entry_program(
+        mut words: Vec<u16>,
+        a0_idx: usize,
+        entries: &[(u32, u32)],
+    ) -> (Runtime<M68kCpu>, u32) {
+        let ml_addr = (TRAP_TABLE_END + (words.len() as u32) * 2 + 3) & !3;
+        words[a0_idx + 1] = (ml_addr >> 16) as u16;
+        words[a0_idx + 2] = ml_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        write_memlist_template(&mut mem, ml_addr, entries);
+        let load_end =
+            ml_addr + ML_FIRST_ENTRY_OFFSET + (entries.len() as u32) * MEMENTRY_SIZE + 16;
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        (rt, ml_addr)
+    }
+
+    #[test]
+    fn alloc_entry_allocates_every_entry_and_preserves_lengths() {
+        // Three entries of different sizes and requirements, as
+        // exec.doc's own example mixes them -- the middle one asks for
+        // MEMF_CLEAR and must come back zeroed.
+        let entries = [(0u32, 10u32), (MEMF_CLEAR, 32), (MEMF_PUBLIC, 4)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = template, patched by the helper
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6)
+        words.push(RTS);
+
+        let (mut rt, ml_addr) = alloc_entry_program(words, a0_idx, &entries);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let list = code as u32;
+        assert_eq!(
+            list & ALLOCENTRY_FAILURE_BIT,
+            0,
+            "bit 31 clear means success, got {list:#010x}"
+        );
+        assert_ne!(list, 0, "AllocEntry should return a new MemList");
+        assert_ne!(
+            list, ml_addr,
+            "the result is a NEW MemList, not the template"
+        );
+
+        let mem = rt.memory();
+        assert_eq!(mem.read_u16(list + ML_NUMENTRIES_OFFSET), 3);
+        let mut addrs = Vec::new();
+        for (i, &(_, length)) in entries.iter().enumerate() {
+            let e = list + ML_FIRST_ENTRY_OFFSET + (i as u32) * MEMENTRY_SIZE;
+            let addr = mem.read_u32(e);
+            assert_ne!(addr, 0, "entry {i}'s me_Addr should hold a real block");
+            assert_eq!(
+                mem.read_u32(e + 4),
+                length,
+                "entry {i}'s me_Length must be preserved"
+            );
+            assert!(
+                !addrs.contains(&addr),
+                "entry {i}'s block must be distinct from the others"
+            );
+            addrs.push(addr);
+        }
+        // The MEMF_CLEAR entry's block reads as zeros.
+        for off in 0..32u32 {
+            assert_eq!(
+                mem.read_u8(addrs[1] + off),
+                0,
+                "MEMF_CLEAR applies per entry"
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_entry_failure_returns_the_failed_entrys_requirements_with_bit_31() {
+        // The second entry is far bigger than the whole 128 KiB test
+        // address space, so its allocation fails -- exec.doc: "the
+        // requirements of the allocation that failed is returned and
+        // bit 31 is set".
+        let entries = [(0u32, 16u32), (MEMF_PUBLIC, 0x0100_0000)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6)
+        words.push(RTS);
+
+        let (mut rt, _) = alloc_entry_program(words, a0_idx, &entries);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code as u32,
+            ALLOCENTRY_FAILURE_BIT | MEMF_PUBLIC,
+            "D0 must be the failed entry's requirements with bit 31 set"
+        );
+    }
+
+    #[test]
+    fn alloc_entry_failure_backs_out_the_blocks_already_allocated() {
+        // The documented V1.x behavior ("fails to back out fully") was
+        // fixed by SetPatch and is ROM behavior on this runtime's KS
+        // 3.1 target -- so the first entry's block, allocated before
+        // the second entry fails, must be freed, and AvailMem must
+        // report the same total free space after the call as before it.
+        let entries = [(0u32, 64u32), (MEMF_PUBLIC, 0x0100_0000)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(1)); // D1 = 0 (plain total query)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-216)); // AvailMem(a6)
+        words.push(move_d0_to_d(2)); // D2 = total free before
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6) -- fails
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-216)); // AvailMem(a6)
+        words.push(0x9480); // sub.l D0,D2
+        words.push(0x2002); // move.l D2,D0 -- exit code = before - after
+        words.push(RTS);
+
+        let (mut rt, _) = alloc_entry_program(words, a0_idx, &entries);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "a failed AllocEntry must leak nothing -- free space delta {code}"
+        );
+    }
+
+    #[test]
+    fn alloc_entry_then_free_entry_round_trips_the_heap() {
+        let entries = [(0u32, 24u32), (MEMF_CLEAR, 100)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_d(1)); // D1 = 0
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-216)); // AvailMem(a6)
+        words.push(move_d0_to_d(2)); // D2 = total free before
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6)
+        // A failed AllocEntry here would hand FreeEntry a bit-31 error
+        // code as its MemList, which fails the run loudly -- so this
+        // test can't silently "pass" on an allocation failure.
+        words.push(move_d0_to_a(0)); // A0 = the new MemList
+        words.extend_from_slice(&jsr_disp16_a6(-228)); // FreeEntry(a6)
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-216)); // AvailMem(a6)
+        words.push(0x9480); // sub.l D0,D2
+        words.push(0x2002); // move.l D2,D0 -- exit code = before - after
+        words.push(RTS);
+
+        let (mut rt, _) = alloc_entry_program(words, a0_idx, &entries);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "FreeEntry must return every block AND the MemList itself -- \
+             free space delta {code}"
+        );
+    }
+
+    #[test]
+    fn alloc_entry_blocks_get_redzones_and_uninit_marking_under_sanitize() {
+        // Each block AllocEntry hands out is a guest-visible allocation
+        // exactly like an AllocMem result, so --sanitize must treat it
+        // the same: data uninitialised (no MEMF_CLEAR here), alignment
+        // slack past the requested 10 bytes unaddressable -- and none
+        // of the handler's own writes reported as violations.
+        let entries = [(0u32, 10u32)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6)
+        words.push(RTS);
+
+        let (mut rt, _) = alloc_entry_program(words, a0_idx, &entries);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let list = code as u32;
+        assert_eq!(list & ALLOCENTRY_FAILURE_BIT, 0);
+
+        let addr = rt.memory().read_u32(list + ML_FIRST_ENTRY_OFFSET);
+        let shadow = rt.memory().shadow().expect("sanitizer was enabled above");
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "the handler's own writes are clean"
+        );
+        assert_eq!(
+            shadow.state(addr),
+            crate::sanitize::ShadowState::Uninit,
+            "a non-MEMF_CLEAR entry's bytes start uninitialised"
+        );
+        assert_eq!(
+            shadow.state(addr + 10),
+            crate::sanitize::ShadowState::Unaddressable,
+            "the alignment slack past the requested 10 bytes is poisoned"
+        );
+    }
+
+    #[test]
+    fn a_freed_entry_block_reports_use_after_free() {
+        let entries = [(0u32, 16u32)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6) -> D0 = list
+        words.push(move_d0_to_d(3)); // D3 = list (kept safe)
+        words.push(move_d0_to_a(0)); // A0 = list
+        words.push(0x2428); // move.l 16(a0),d2 -- D2 = entry 0's me_Addr
+        words.push(ML_FIRST_ENTRY_OFFSET as u16);
+        words.push(0x2043); // movea.l d3,a0 -- A0 = list, fresh (A0 is scratch)
+        words.extend_from_slice(&jsr_disp16_a6(-228)); // FreeEntry(a6)
+        words.push(0x2242); // movea.l d2,a1 -- the now-dangling block
+        words.push(0x12bc); // move.b #1,(a1) -- use after free
+        words.push(0x0001);
+        words.push(0x7000); // moveq #0,d0
+        words.push(RTS);
+
+        let (mut rt, _) = alloc_entry_program(words, a0_idx, &entries);
+        rt.memory_mut().enable_sanitizer();
+        rt.enable_heap_sanitizer();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        let shadow = rt.memory().shadow().expect("sanitizer was enabled above");
+        assert_eq!(
+            shadow.violation_count(),
+            1,
+            "writing into a block FreeEntry freed must be reported"
+        );
+        let violation = &shadow.violations()[0];
+        assert_eq!(violation.kind, crate::sanitize::ViolationKind::InvalidWrite);
+        assert_eq!(violation.reason, Some(crate::sanitize::PoisonReason::Freed));
     }
 }

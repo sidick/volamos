@@ -53,8 +53,11 @@ Changelog.
   (`mathtrans`, `mathieee*`, `locale`, `intuition`) are always present,
   matching real ROM-resident behavior.
 - Memory: `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem`, memory
-  pools (`CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`), and the
-  raw `Allocate`/`Deallocate` primitive over a real, coalescing
+  pools (`CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`),
+  `AllocEntry`/`FreeEntry` (per-entry `MEMF_CLEAR` honoured; a partial
+  failure backs out fully, the post-SetPatch/V36+ behavior, and returns
+  the failed entry's requirements with bit 31 set), and the raw
+  `Allocate`/`Deallocate` primitive over a real, coalescing
   `MemHeader`/`MemChunk` free list.
 - Lists and nodes: `AddHead`/`AddTail`/`Remove`/`RemHead`/`RemTail`/
   `Insert`/`Enqueue`/`FindName`, plus minimal single-threaded message

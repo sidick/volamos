@@ -5,6 +5,20 @@ version scheme in `Cargo.toml`.
 
 ## 0.11
 
+- **`AllocEntry`/`FreeEntry` implemented** (the other half of issue
+  #175) — `ixemul.library`'s init calls `AllocEntry()` right after
+  reading its environment variables, which was the first unhandled
+  library call on the way to running `-mcrt=ixemul` binaries. Each
+  entry is allocated exactly as `AllocMem` would with that entry's own
+  `MEMF_*` requirements (`MEMF_CLEAR` honoured per entry), failure
+  returns the failed entry's requirements with bit 31 set (the
+  documented, unusual convention), and a partial failure backs out
+  fully — the post-SetPatch behavior that's been ROM since V36, not
+  the leaky V1.x one the autodoc's BUGS section describes. Blocks
+  handed out get the full `--sanitize` treatment (redzones,
+  uninitialised marking, use-after-free on `FreeEntry`), same as
+  `AllocMem`'s.
+
 - **`--cpu 68040`/`68060` now default to the full chip with its on-die
   FPU present** (issues #174/#175) — after #167's fixes, a plain
   `--cpu 68060` (no `--fpu`) inherited the global no-FPU default and
