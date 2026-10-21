@@ -652,10 +652,12 @@ pub const MAX_CALL_STACK_DEPTH: usize = 4096;
 /// in bytes -- see
 /// [`ShadowMap::below_sp_violation_is_within_grace_band`] for the full
 /// reasoning. Sized to cover the largest single-instruction stack push
-/// on this CPU family (`movem.l` with all sixteen registers, 64 bytes);
-/// anything deeper than one instruction's worth of push is a genuine
-/// use of released or never-reserved stack.
-pub const BELOW_SP_GRACE_BYTES: u32 = 64;
+/// on this CPU family: not `movem.l` with all sixteen registers (64
+/// bytes), but `fmovem.x` with all eight FPU registers, each 96-bit
+/// extended precision (12 bytes), for 96 bytes; anything deeper than one
+/// instruction's worth of push is a genuine use of released or
+/// never-reserved stack.
+pub const BELOW_SP_GRACE_BYTES: u32 = 96;
 
 /// One outstanding call recorded by [`ShadowMap::record_call`] -- the
 /// stack slot a return address was pushed to, and the value that was
@@ -1142,7 +1144,7 @@ impl ShadowMap {
     ///
     /// The band is [`BELOW_SP_GRACE_BYTES`] wide, which comfortably
     /// covers the largest push any one instruction can perform
-    /// (`movem.l d0-d7/a0-a7,-(sp)` moves 64 bytes). Accesses further
+    /// (`fmovem.x fp0-fp7,-(sp)` moves 96 bytes). Accesses further
     /// below SP than that are still reported, which is the bug class
     /// worth catching: a released stack frame being read after the fact,
     /// or a wild pointer well past the live stack. valgrind takes the
@@ -2117,6 +2119,27 @@ mod tests {
         // either -- it's a real, valid value now.
         shadow.check_read(0x17fc, 4);
         assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn grace_band_covers_fmovem_x_of_six_fpu_registers() {
+        // Issue #180: `fmovem.x fp2-fp7,-(sp)` (gcc's FP-register-save
+        // prologue) pushes 6 registers * 12 bytes (96-bit extended
+        // precision) = 72 bytes before the run loop republishes the new
+        // SP -- deeper than movem.l's 64-byte widest push, so the old
+        // grace band flagged the deepest 8 bytes of the store as
+        // below-SP violations even though the whole write is one
+        // instruction's predecrement push.
+        let mut shadow = ShadowMap::new(0x2000);
+        shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
+
+        shadow.check_write(0x1800 - 72, 72);
+
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "a 72-byte fmovem.x push must be forgiven, not flagged below-SP"
+        );
     }
 
     #[test]
