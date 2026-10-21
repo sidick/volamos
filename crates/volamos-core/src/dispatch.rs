@@ -2330,6 +2330,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         // only -- see crate::dosvar's module docs for scope).
         crate::dosvar::register_dosvar_handlers(&mut table, &mut mem);
 
+        // dos.library StartNotify/EndNotify (accept-and-forget stubs) --
+        // see crate::dosnotify's module docs.
+        crate::dosnotify::register_dosnotify_handlers(&mut table, &mut mem);
+
         // exec.library: only the three LVOs T12 needs (OpenLibrary /
         // OldOpenLibrary / CloseLibrary) -- see EXEC_LIBRARY_BASE's doc
         // for the full reserved-region memory map. Looked up by name
@@ -2569,6 +2573,16 @@ impl<C: Cpu + 'static> Runtime<C> {
         let stack_base = top.saturating_sub(stack_size) & !3;
         let mut heap = GuestHeap::new(config.load_end, stack_base);
 
+        // pr_ReturnAddr footer (RunCommand convention, issue #178): one
+        // longword holding this run's actual reserved-stack size in
+        // bytes, written immediately below the exit-stub return address
+        // already at `sp` -- together they're the `[stack size, return
+        // address]` pair `pr_ReturnAddr` points at. See
+        // exectask::PR_RETURNADDR_OFFSET's doc for the full convention
+        // and why ixemul.library needs it.
+        let return_addr_footer = sp.wrapping_sub(4);
+        mem.write_u32(return_addr_footer, top - stack_base);
+
         // dos.library state, created here (rather than at this
         // function's end, where it used to live) so its Input() handle
         // can be eagerly allocated below and threaded into the fake
@@ -2607,6 +2621,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             &config.program_name,
             input_addr,
             output_addr,
+            return_addr_footer,
         );
         mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, task);
 
@@ -2678,6 +2693,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         // the region entirely or poison live bytes.
         if let Some(shadow) = mem.shadow_mut() {
             shadow.begin_stack_tracking(stack_base, top, sp);
+            // The pr_ReturnAddr footer longword written above sits
+            // just below this initial `sp`, inside the range
+            // begin_stack_tracking just poisoned as dead below-SP
+            // space -- but it's real, permanent setup data a guest
+            // may legitimately read via pr_ReturnAddr, not a stale
+            // stack frame, so heal it back to Valid (same reasoning
+            // as a grace-band-forgiven push, just not a push).
+            shadow.mark_valid(return_addr_footer, 4);
         }
 
         cpu.set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
@@ -3352,6 +3375,43 @@ mod tests {
                 ..StartConfig::default()
             },
         )
+    }
+
+    #[test]
+    fn pr_return_addr_footer_survives_sanitizer_below_sp_poisoning() {
+        // Issue #178: the pr_ReturnAddr footer this runtime writes just
+        // below the initial sp (one longword: the reserved stack size)
+        // sits inside begin_stack_tracking's below-SP poisoned range.
+        // Reading it (as a real ixemul.library startup would, via
+        // pr_ReturnAddr) must not be flagged -- it's real, permanent
+        // setup data, not a stale stack frame.
+        let mut mem = FlatMemory::new(0x2_0000);
+        mem.enable_sanitizer();
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[RTS]);
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let task = rt.current_task();
+        // Reading pr_ReturnAddr itself, then the footer longword it
+        // points at (what a real ixemul.library startup does) --
+        // FlatMemory::read_u32 runs the sanitizer check as a side
+        // effect, same as a guest instruction's read would.
+        let pr_return_addr = rt.memory().read_u32(task + exectask::PR_RETURNADDR_OFFSET);
+        let _ = rt.memory().read_u32(pr_return_addr);
+        assert_eq!(
+            rt.memory().shadow().unwrap().violation_count(),
+            0,
+            "reading the pr_ReturnAddr footer must not be a below-SP violation"
+        );
     }
 
     #[test]

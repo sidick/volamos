@@ -344,6 +344,26 @@ pub const PR_COS_OFFSET: u32 = 160;
 /// already names: startup code that opens its own stderr (DICE's) only
 /// does so when this is non-`NULL`.
 pub const PR_CONSOLE_TASK_OFFSET: u32 = 164;
+/// `pr_ReturnAddr`: `APTR`, offset 176 (`pr_CLI` 172 + 4). Per the
+/// `RunCommand`/`CreateNewProc` convention real AmigaOS uses (and
+/// `ixemul.library`'s startup code, `ix_init.c`, relies on): it points
+/// at a longword holding the process's reserved stack size in bytes,
+/// immediately followed (at `pr_ReturnAddr + 4`) by the return address
+/// the process's outermost `rts` lands on -- the layout this runtime
+/// already builds at the top of the guest stack region (the exit-stub
+/// return address `Runtime::new` writes at its initial `sp`, see
+/// [`crate::dispatch::EXIT_STUB_ADDR`]), one longword earlier. A reader
+/// derives the process's stack bounds as `upper = pr_ReturnAddr + 8`,
+/// `lower = pr_ReturnAddr + 8 - size`. Left at `0`, ixemul's
+/// `get_stack_size()`/stack-extension code computed both bounds from
+/// address `0` instead and its `CopyMem` of the live frame onto the
+/// "extended" stack overwrote the real one. Written once, at creation,
+/// by [`crate::dispatch::Runtime::new`] (not this function -- it's
+/// part of the stack region's own layout, not the fake task struct's
+/// static fields, so it's naturally set alongside the exit-stub
+/// write). Found needed running a real `ixemul.library` 80.1-linked
+/// program (issue #178).
+pub const PR_RETURNADDR_OFFSET: u32 = 176;
 /// `pr_HomeDir`: `BPTR`, offset 188 (`pr_CLI` 172 + 4, `pr_ReturnAddr`
 /// 176, `pr_PktWait` 180, `pr_WindowPtr` 184, `pr_HomeDir` 188). A lock
 /// on the directory the running program was loaded from, or `0` if
@@ -408,6 +428,22 @@ pub(crate) const CLI_COMMAND_NAME_OFFSET: u32 = 16;
 /// input was redirected from a non-interactive, non-`Input()` source
 /// even on a plain unredirected CLI invocation.
 pub(crate) const CLI_STANDARD_INPUT_OFFSET: u32 = 28;
+/// `cli_DefaultStack`: `LONG`, offset 52 within `struct
+/// CommandLineInterface` (`cli_StandardInput` 28, `cli_CurrentInput` 4,
+/// `cli_CommandFile` 4, `cli_Interactive` 4, `cli_Background` 4,
+/// `cli_CurrentOutput` 4, summing to 48; `cli_DefaultStack` is the 14th
+/// field). Per `<dos/dosextens.h>`: "stack size to use, in longwords";
+/// real `NewCLI`/`RunCommand` fill it from the `Stack` shell command,
+/// dividing bytes by 4. `ixemul.library`'s startup code
+/// (`get_stack_size()` in `library/stackextend.c`) compares a
+/// program's own `__stack` against `cli_DefaultStack * 4` to decide
+/// whether to extend the stack -- left at 0 (unset), every program
+/// looks stack-starved and ixemul always extends, using
+/// [`PR_RETURNADDR_OFFSET`]'s (also-then-unset) bounds to decide where
+/// the "current" frame is, with disastrous results (see that offset's
+/// doc). Found needed running a real `ixemul.library` 80.1-linked
+/// program (issue #178).
+pub(crate) const CLI_DEFAULT_STACK_OFFSET: u32 = 52;
 
 // --- struct StackSwapStruct field offsets (bytes from the struct's own
 // address) -- per <exec/execbase.h>: `struct StackSwapStruct { APTR
@@ -560,6 +596,16 @@ pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, task: u32) {
 ///
 /// `input_addr`/`output_addr` are the guest addresses of the handles
 /// `Input()`/`Output()` return, stored in `pr_CIS`/`pr_COS` as BPTRs.
+///
+/// `return_addr_footer` is the guest address of the `[stack size,
+/// return address]` longword pair [`crate::dispatch::Runtime::new`]
+/// already wrote just below the stack's initial `sp` (per
+/// [`PR_RETURNADDR_OFFSET`]'s doc), written here into `pr_ReturnAddr`
+/// unchanged; `cli_DefaultStack` (see
+/// [`CLI_DEFAULT_STACK_OFFSET`]) is derived from the same `[sp_lower,
+/// sp_upper)` region as `tc_SPLower`/`tc_SPUpper` below, so both
+/// fields describe one consistent reserved-stack size.
+#[allow(clippy::too_many_arguments)] // internal setup helper; one param per real struct field it fills
 pub fn create_current_task<M: AddressSpace>(
     mem: &mut M,
     heap: &mut GuestHeap,
@@ -568,6 +614,7 @@ pub fn create_current_task<M: AddressSpace>(
     program_name: &str,
     input_addr: u32,
     output_addr: u32,
+    return_addr_footer: u32,
 ) -> u32 {
     let task = heap
         .alloc(&mut *mem, PROCESS_STRUCT_SIZE)
@@ -603,6 +650,10 @@ pub fn create_current_task<M: AddressSpace>(
     // this function's doc).
     mem.write_u32(task + TC_SPLOWER, sp_lower);
     mem.write_u32(task + TC_SPUPPER, sp_upper);
+
+    // pr_ReturnAddr: see PR_RETURNADDR_OFFSET's doc and this
+    // function's own doc for `return_addr_footer`.
+    mem.write_u32(task + PR_RETURNADDR_OFFSET, return_addr_footer);
 
     // pr_MsgPort: a real, valid (if perpetually empty) MsgPort owned by
     // this task -- see PR_MSGPORT_OFFSET's doc.
@@ -645,6 +696,13 @@ pub fn create_current_task<M: AddressSpace>(
     mem.write_u32(
         cli_addr + CLI_STANDARD_INPUT_OFFSET,
         bptr_from_addr(input_addr),
+    );
+
+    // cli_DefaultStack: this run's reserved stack size, in longwords
+    // -- see CLI_DEFAULT_STACK_OFFSET's doc.
+    mem.write_u32(
+        cli_addr + CLI_DEFAULT_STACK_OFFSET,
+        (sp_upper - sp_lower) / 4,
     );
 
     task
@@ -1704,6 +1762,47 @@ mod tests {
         assert_eq!(
             crate::guestmem::read_c_string(rt.memory(), name_ptr),
             PROCESS_NAME
+        );
+    }
+
+    #[test]
+    fn pr_return_addr_and_cli_default_stack_match_the_runcommand_convention() {
+        // Issue #178: ixemul.library's startup code computes its stack
+        // bounds from pr_ReturnAddr and decides whether to extend from
+        // cli_DefaultStack. FlatMemory::new(0x2_0000) with the default
+        // 64 KiB stack (DEFAULT_STACK_SIZE) gives top = 0x20000,
+        // stack_base = 0x10000, sp = 0x1FFFC.
+        let rt = runtime_with_program(&[RTS]);
+        let mem = rt.memory();
+        let task = rt.current_task();
+
+        let pr_return_addr = mem.read_u32(task + PR_RETURNADDR_OFFSET);
+        assert_eq!(
+            pr_return_addr, 0x1FFF8,
+            "pr_ReturnAddr should point 4 bytes below the initial sp (0x1FFFC)"
+        );
+        // [pr_ReturnAddr]: the reserved stack size, in bytes.
+        assert_eq!(mem.read_u32(pr_return_addr), 0x10000);
+        // [pr_ReturnAddr + 4]: the return address, the same exit-stub
+        // longword already at the initial sp.
+        assert_eq!(
+            mem.read_u32(pr_return_addr + 4),
+            mem.read_u32(0x1FFFC),
+            "pr_ReturnAddr + 4 should be the same return-address slot as the initial sp"
+        );
+        // upper = pr_ReturnAddr + 8, lower = upper - size: should
+        // reproduce this run's real [stack_base, top) bounds.
+        let size = mem.read_u32(pr_return_addr);
+        let upper = pr_return_addr + 8;
+        let lower = upper - size;
+        assert_eq!((lower, upper), (0x10000, 0x20000));
+
+        let cli_bptr = mem.read_u32(task + PR_CLI_OFFSET);
+        let cli_addr = crate::guestmem::addr_from_bptr(cli_bptr);
+        assert_eq!(
+            mem.read_u32(cli_addr + CLI_DEFAULT_STACK_OFFSET),
+            0x10000 / 4,
+            "cli_DefaultStack is the reserved stack size in longwords"
         );
     }
 

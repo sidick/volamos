@@ -5,15 +5,28 @@
 //! # Why the stubs fail instead of registering
 //!
 //! This runtime has no interrupt sources: no custom-chip model, no timer
-//! tick, no VBlank. A server added with `AddIntServer(INTB_VERTB, ...)`
+//! tick, no VBlank. A server added with `AddIntServer(INTB_PORTS, ...)`
 //! would never run, and a program that depends on it (a game loop paced
 //! by a VBlank server, a library whose init hooks `INTB_PORTS`) would
 //! hang or misbehave far from the real cause. None of the three calls has
 //! an API-level failure return (`SetIntVector` returns the old vector, the
 //! others return nothing), so the only honest answer is to stop the run
 //! with a [`DispatchError::HandlerFailed`] that says what was asked for.
-//! Accepting the registration and never firing it is a possible later
-//! upgrade, to be decided per real program (see issue #136).
+//!
+//! # The one exception: `INTB_VERTB`
+//!
+//! `AddIntServer`/`RemIntServer` accept `INTB_VERTB` instead of refusing
+//! it (issue #136's "possible later upgrade", decided for this real
+//! program: issue #178's `ixemul.library` 80.1, whose `OpenLibrary`
+//! unconditionally adds a VERTB server -- `ix_timer`, driving
+//! `setitimer()`/`alarm()` -- so refusing it would make every ixemul
+//! program fail at library-open time, long before anything it actually
+//! does cares about interval timers). The server is linked onto
+//! [`VertbServers`] (and unlinked by `RemIntServer`) but never run: this
+//! runtime still has no VBlank tick to drive it, so a program whose
+//! *correctness*, not just its timers, depends on this server firing
+//! will still misbehave -- just not at `OpenLibrary` time. Every other
+//! `INTB_*` still gets the loud stub above.
 //!
 //! # `Cause()`
 //!
@@ -91,6 +104,19 @@ const IS_CODE: u32 = 18;
 const NT_INTERRUPT: u8 = 2;
 /// `NT_SOFTINT` (`<exec/nodes.h>`): "internal flag used by SoftInts".
 const NT_SOFTINT: u8 = 11;
+/// `INTB_VERTB` (`<hardware/intbits.h>`): the one interrupt number
+/// `AddIntServer`/`RemIntServer` accept instead of refusing -- see this
+/// module's doc.
+const INTB_VERTB: u32 = 5;
+
+/// Interrupt-server nodes registered on [`INTB_VERTB`] via
+/// `AddIntServer`, in registration order -- see this module's doc for
+/// why they're tracked but never run. A `Vec` rather than a real linked
+/// list through the nodes' own `ln_Succ`/`ln_Pred` (as real exec would
+/// use) since nothing reads this list as guest memory; only
+/// `RemIntServer`'s own removal needs it.
+#[derive(Default)]
+struct VertbServers(Vec<u32>);
 
 /// Number of software-interrupt priority levels (-32, -16, 0, +16, +32).
 const LEVELS: usize = 5;
@@ -236,16 +262,28 @@ pub fn register_execint_handlers<C: Cpu + 'static>(
             "replacing an interrupt vector",
         ))
     });
-    reg_exec!("AddIntServer", |ctx: &mut HandlerContext<'_, C>| {
-        Err(stub_error(ctx, -168, "AddIntServer", "an interrupt server"))
+    let vertb = Rc::new(RefCell::new(VertbServers::default()));
+    let vertb_add = Rc::clone(&vertb);
+    reg_exec!("AddIntServer", move |ctx: &mut HandlerContext<'_, C>| {
+        if ctx.cpu.data_register(DataRegister(0)) & 0x1F != INTB_VERTB {
+            return Err(stub_error(ctx, -168, "AddIntServer", "an interrupt server"));
+        }
+        let node = ctx.cpu.address_register(AddressRegister(1));
+        vertb_add.borrow_mut().0.push(node);
+        Ok(())
     });
-    reg_exec!("RemIntServer", |ctx: &mut HandlerContext<'_, C>| {
-        Err(stub_error(
-            ctx,
-            -174,
-            "RemIntServer",
-            "removing an interrupt server",
-        ))
+    reg_exec!("RemIntServer", move |ctx: &mut HandlerContext<'_, C>| {
+        if ctx.cpu.data_register(DataRegister(0)) & 0x1F != INTB_VERTB {
+            return Err(stub_error(
+                ctx,
+                -174,
+                "RemIntServer",
+                "removing an interrupt server",
+            ));
+        }
+        let node = ctx.cpu.address_register(AddressRegister(1));
+        vertb.borrow_mut().0.retain(|&n| n != node);
+        Ok(())
     });
 
     let state = Rc::new(RefCell::new(SoftInts::default()));
@@ -662,8 +700,8 @@ mod tests {
 
     #[test]
     fn add_int_server_stub_names_the_interrupt() {
-        let msg = stub_message(-168, 5);
-        assert!(msg.contains("AddIntServer(INTB_VERTB (5)"), "{msg}");
+        let msg = stub_message(-168, 3);
+        assert!(msg.contains("AddIntServer(INTB_PORTS (3)"), "{msg}");
         assert!(msg.contains("never delivers hardware interrupts"), "{msg}");
     }
 
@@ -671,6 +709,26 @@ mod tests {
     fn rem_int_server_stub_names_the_interrupt() {
         let msg = stub_message(-174, 3);
         assert!(msg.contains("RemIntServer(INTB_PORTS (3)"), "{msg}");
+    }
+
+    #[test]
+    fn add_and_rem_int_server_accept_vertb_instead_of_refusing() {
+        // Issue #178: ixemul.library's OpenLibrary unconditionally adds
+        // a VERTB server, so VERTB must not be refused the way every
+        // other INTB_* still is (see the previous two tests).
+        let program = [
+            0x2C7C,
+            hi(EXEC_LIBRARY_BASE),
+            lo(EXEC_LIBRARY_BASE),
+            0x7005, // moveq #INTB_VERTB,d0
+            0x4EAE,
+            -168i16 as u16, // jsr AddIntServer(a6)
+            0x7005, // moveq #INTB_VERTB,d0
+            0x4EAE,
+            -174i16 as u16, // jsr RemIntServer(a6)
+            RTS,
+        ];
+        run(&program, |_| {}).0.expect("VERTB must be accepted");
     }
 
     #[test]
