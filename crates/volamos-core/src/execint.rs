@@ -723,7 +723,7 @@ mod tests {
             0x7005, // moveq #INTB_VERTB,d0
             0x4EAE,
             -168i16 as u16, // jsr AddIntServer(a6)
-            0x7005, // moveq #INTB_VERTB,d0
+            0x7005,         // moveq #INTB_VERTB,d0
             0x4EAE,
             -174i16 as u16, // jsr RemIntServer(a6)
             RTS,
