@@ -3,6 +3,76 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.12
+
+- **`ixemul.library`-linked programs run file I/O** (issue #186) —
+  `ixemul`'s `__open()` does `AllocDosObject(DOS_FILEHANDLE)` for a
+  `FileHandle` of its own, then drives the rest of the I/O with raw
+  `DosPacket`s sent straight to a handler's message port instead of
+  further library calls (the same packet-level idiom issue #24's
+  `sc1.library` fix already covers for `ACTION_READ`/`WRITE`/`SEEK`/
+  `END`). `AllocDosObject(DOS_FILEHANDLE)`/`FreeDosObject` are now
+  real (reusing the same `FileHandle` allocation `Open` itself uses,
+  with bookkeeping so a later explicit `FreeDosObject` doesn't race a
+  packet-driven `Close`), and `handle_fs_packet` now also answers
+  `ACTION_LOCATE_OBJECT` (the packet-level `Lock`), `ACTION_FINDINPUT`/
+  `ACTION_FINDOUTPUT`/`ACTION_FINDUPDATE` (the packet-level `Open`),
+  `ACTION_EXAMINE_FH`, and `ACTION_READ_LINK` (reusing the real
+  host-symlink support issue #160 added). Every lock's `fl_Task` now
+  points at the same synthetic handler port a `FileHandle`'s `fh_Type`
+  does, since `ixemul`'s `__plock()` sends `ACTION_LOCATE_OBJECT`
+  straight to a lock's own task to resolve path components — the real,
+  documented AmigaOS idiom. Verified against the real `ixemul.library`
+  80.1 SDK (Aminet `dev/lib/ixemul-80.1-m68k.lha`): a program linked
+  against it now runs to completion of its own logic (see issue #192
+  for a separate, still-open gap in its *exit* cleanup path).
+
+- **`m68k` crate bumped to 0.14.7** — fixes three real FPU correctness
+  bugs, all traced to the crate's old lossy extended-to-double/single
+  conversion and extended-format exponent handling:
+    - Issue #150: values below 2^-16382 were off by a factor of two
+      (the crate read a biased exponent of 0 the x87 way, "treat it as
+      if biased 1"; the MC68881 reads it as 2^-16383 with the integer
+      bit still stored — M68000 PRM Table 1-6), and `FDIV`/`FSQRT`
+      truncated instead of rounding to nearest.
+    - Issue #155: `FMOVE` from an FP register to `.d`/`.s`/an integer
+      format truncated instead of rounding — every hard-float `double`
+      a program stores was up to 1 ulp off, rounded toward zero.
+    - Issue #181: a denormal `double` round-tripped through an FP
+      register (`fmove.d <mem>,fp0` then back out) came back as zero.
+
+  Verified directly against each issue's own repro values (hand-built
+  m68k instruction sequences) rather than just trusting the upstream
+  changelog — all three now match the expected bit patterns exactly,
+  including `FDIV`'s correctly-rounded last digit. Found and fixed via
+  the gcc toolchain's test suite running under `--cpu 68020 --fpu`.
+
+- **Three `ixemul.library` 80.1 startup gaps fixed** (issue #178) —
+  with issue #175's `AllocEntry` and the `--libs-dir` vector-table cap
+  raise already in place, an `ixemul`-linked program's library-init
+  path still stopped on three more calls: `dos.library`'s
+  `StartNotify`/`EndNotify` (unhandled — `ix_init.c`'s `ENV:` watch now
+  fails cleanly with `ERROR_ACTION_NOT_KNOWN`, which it already
+  tolerates, instead of crashing the run); `AddIntServer(INTB_VERTB)`
+  (refused on principle before — `ix_open.c` adds one unconditionally
+  on every `OpenLibrary`, so `VERTB` is now accepted and tracked,
+  though still never fired, since there's still no VBlank tick model);
+  and `pr_ReturnAddr`/`cli_DefaultStack` (never populated — `ixemul`'s
+  stack-extension logic follows the real `RunCommand` convention for
+  both, and with them left at zero it always "extended" the stack
+  using bounds computed from address zero, corrupting the live stack
+  mid-copy; both are now laid out for real, right below the exit-stub
+  return address already at the initial `sp`).
+
+- **`--sanitize` no longer false-positives on `fmovem.x <list>,-(sp)`**
+  (issue #180) — the below-stack-pointer "grace band" that forgives a
+  push's own store landing below the stack pointer before the run loop
+  republishes it was sized for `movem.l`'s widest push (16 integer
+  registers, 64 bytes), but `fmovem.x` can push up to 8 FPU registers
+  at 12 bytes each (96-bit extended precision) for 96 bytes — wider
+  than the band, so a 6-register FP-register-save prologue (gcc's own)
+  flagged its deepest bytes as invalid. The band is now 96 bytes.
+
 ## 0.11
 
 - **`AllocEntry`/`FreeEntry` implemented** (the other half of issue

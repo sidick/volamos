@@ -37,7 +37,26 @@ Changelog.
   real, directory-mapped `ENV:` volume.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.
 - Process/CLI: `Cli`/`GetProgramName`/`SetProgramName`/`MaxCli`/
-  `AllocDosObject`/`FreeDosObject` (`DOS_RDARGS` and `DOS_EXALLCONTROL`).
+  `AllocDosObject`/`FreeDosObject` (`DOS_RDARGS`, `DOS_EXALLCONTROL`,
+  `DOS_FIB`, and `DOS_FILEHANDLE` — a real `FileHandle`, the same
+  allocation `Open` itself uses).
+- `StartNotify`/`EndNotify`: `StartNotify` always fails cleanly with
+  `ERROR_ACTION_NOT_KNOWN` (no filesystem-change notification
+  machinery exists in this runtime at all) rather than crashing the
+  run as an unhandled call; real callers that treat a failed
+  `StartNotify` as "no notifications, poll instead" (e.g.
+  `ixemul.library`'s `ENV:` watch) work unaffected. `EndNotify` always
+  succeeds.
+- Packet-level file I/O: a program that bypasses the library calls
+  above and sends raw `DosPacket`s straight to a handler's message
+  port (the real AmigaOS idiom some runtime libraries use, e.g.
+  `ixemul.library`) is answered the same as the library calls:
+  `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK`/`ACTION_END`,
+  `ACTION_LOCATE_OBJECT` (`Lock`), `ACTION_FINDINPUT`/
+  `ACTION_FINDOUTPUT`/`ACTION_FINDUPDATE` (`Open`), `ACTION_EXAMINE_FH`,
+  `ACTION_READ_LINK`, and `ACTION_DISK_INFO`/`ACTION_INFO`/
+  `ACTION_IS_FILESYSTEM` sent to a volume's own task. Any other packet
+  type fails cleanly with `ERROR_ACTION_NOT_KNOWN`.
 - Path strings: `SplitName` (alongside `AddPart`/`FilePart`/`PathPart`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
@@ -101,9 +120,13 @@ Changelog.
   against double-queuing, out-of-range `ln_Pri` rejected, nested `Cause` from a handler queued and run
   afterwards) before returning; `Disable` is not honoured as a
   deferral. `SetIntVector`/`AddIntServer`/`RemIntServer` are
-  deliberate loud stubs: the run stops with a message naming the
-  `INTB_*` requested, since this runtime never delivers hardware
-  interrupts.
+  deliberate loud stubs for every `INTB_*` except `INTB_VERTB`: the
+  run stops with a message naming the one requested, since this
+  runtime never delivers hardware interrupts. `INTB_VERTB` is the one
+  exception — `AddIntServer`/`RemIntServer` accept it (tracked, but
+  still never fired; there's no VBlank tick model), since some
+  runtime libraries (`ixemul.library`) add one unconditionally on
+  every `OpenLibrary` and would otherwise fail to open at all.
 - Resources: `AddResource`/`RemResource`/`OpenResource` over a real
   `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
   `cia.resource`, ...) are modelled; `OpenResource` of one returns
