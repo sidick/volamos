@@ -1756,11 +1756,7 @@ fn set_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
 /// `ixemul.library`'s `__open()` does this as the first step of opening
 /// any filesystem-backed file, then drives the rest of the I/O with raw
 /// packets (see `dospkt.rs`'s `handle_fs_packet`) instead of further
-/// library calls. `DOS_STDPKT` (3) and `DOS_CLI` (4) remain
-/// unimplemented -- no corpus binary has needed either yet, and `DOS_CLI`
-/// in particular would need real integration with this runtime's own
-/// `pr_CLI` bookkeeping to be genuinely usable, not just a same-shaped
-/// zeroed block.
+/// library calls.
 const DOS_FILEHANDLE: u32 = 0;
 /// `DOS_RDARGS` (5), per `<dos/dos.h>` -- one of the `AllocDosObject`
 /// `type`s this runtime implements as a plain zeroed block (see
@@ -1785,6 +1781,63 @@ const DOS_EXALLCONTROL: u32 = 1;
 /// which allocates its own `FileInfoBlock` this way instead of using
 /// `ExAll`.
 const DOS_FIB: u32 = 2;
+/// `DOS_STDPKT` (3): a `struct StandardPacket` (an exec `Message`
+/// followed by a `DosPacket`, [`STANDARD_PACKET_SIZE`]), linked both
+/// ways the way packet clients expect: `sp_Msg.mn_Node.ln_Name` points
+/// at `sp_Pkt` and `sp_Pkt.dp_Link` at `sp_Msg`. The object handed back,
+/// and the one `FreeDosObject` takes, is the `DosPacket` part
+/// ([`SP_PKT_OFFSET`] bytes in), not the start of the allocation --
+/// per the autodoc and AROS's `allocdospacket()`. The documented way to
+/// get a packet for `SendPkt`/`WaitPkt`; nothing in it depends on this
+/// runtime's own bookkeeping.
+const DOS_STDPKT: u32 = 3;
+/// `DOS_CLI` (4): a `struct CommandLineInterface` plus its four `BSTR`
+/// buffers: `cli_SetName`, `cli_CommandName`, `cli_CommandFile` and
+/// `cli_Prompt`, sized by the `ADO_DirLen`/`ADO_CommNameLen`/
+/// `ADO_CommFileLen`/`ADO_PromptLen` tags (each [`CLI_BUFFER_DEFAULT`]
+/// bytes when absent, as in AROS) plus the `BSTR` length byte, each an
+/// empty string. Per `<dos/dostags.h>`, "Everything will be zero, except
+/// cli_FailLevel (10) and cli_Background (DOSTRUE)". `FreeDosObject`
+/// frees the four buffers along with the structure. This is only the
+/// object, as real `AllocDosObject` returns it: it is not attached to
+/// this runtime's own `pr_CLI`, which a caller that wants that installs
+/// itself.
+const DOS_CLI: u32 = 4;
+/// `sizeof(struct StandardPacket)`: `struct Message` (20) plus `struct
+/// DosPacket` (`dp_Link`, `dp_Port`, `dp_Type`, `dp_Res1`, `dp_Res2`,
+/// `dp_Arg1`..`dp_Arg7`, 4 each = 48) = 68.
+const STANDARD_PACKET_SIZE: u32 = 68;
+/// Byte offset of `sp_Pkt` within `struct StandardPacket`, i.e.
+/// `sizeof(struct Message)`. `dp_Link` is the packet's first field.
+const SP_PKT_OFFSET: u32 = 20;
+/// Byte offset of `ln_Name` within `struct Node`, the start of a
+/// `struct Message` (`ln_Succ`, `ln_Pred` 4 each, `ln_Type`, `ln_Pri` 1
+/// each = 10).
+const LN_NAME_OFFSET: u32 = 10;
+/// `ADO_Dummy` per `<dos/dostags.h>`: `TAG_USER + 2000`.
+const ADO_DUMMY: u32 = 0x8000_0000 + 2000;
+/// `ADO_DirLen`: size in bytes of `cli_SetName`'s buffer.
+const ADO_DIR_LEN: u32 = ADO_DUMMY + 2;
+/// `ADO_CommNameLen`: size in bytes of `cli_CommandName`'s buffer.
+const ADO_COMM_NAME_LEN: u32 = ADO_DUMMY + 3;
+/// `ADO_CommFileLen`: size in bytes of `cli_CommandFile`'s buffer.
+const ADO_COMM_FILE_LEN: u32 = ADO_DUMMY + 4;
+/// `ADO_PromptLen`: size in bytes of `cli_Prompt`'s buffer.
+const ADO_PROMPT_LEN: u32 = ADO_DUMMY + 5;
+/// Size of each `DOS_CLI` buffer whose tag isn't given: "dos will use
+/// it's preferred values" (`<dos/dostags.h>`); AROS uses 255 for all
+/// four.
+const CLI_BUFFER_DEFAULT: u32 = 255;
+/// `RETURN_ERROR` (10), per `<dos/dos.h>`: a fresh CLI's `cli_FailLevel`.
+const RETURN_ERROR: u32 = 10;
+/// The `DOS_CLI` buffers: each `struct CommandLineInterface` field that
+/// holds one, and the tag that sizes it.
+const CLI_BUFFERS: [(u32, u32); 4] = [
+    (crate::exectask::CLI_SET_NAME_OFFSET, ADO_DIR_LEN),
+    (crate::exectask::CLI_COMMAND_NAME_OFFSET, ADO_COMM_NAME_LEN),
+    (crate::exectask::CLI_COMMAND_FILE_OFFSET, ADO_COMM_FILE_LEN),
+    (crate::exectask::CLI_PROMPT_OFFSET, ADO_PROMPT_LEN),
+];
 /// `sizeof(struct RDArgs)` per `<dos/rdargs.h>`: `RDA_Source` (a
 /// `struct CSource`: `CS_Buffer`/`CS_Length`/`CS_CurChr`, 4 each = 12)
 /// plus `RDA_DAList`/`RDA_Buffer`/`RDA_BufSiz`/`RDA_ExtHelp`/
@@ -1802,9 +1855,10 @@ const RDARGS_STRUCT_SIZE: u32 = 32;
 /// afterward) -- so `tags` is accepted but never read here, matching
 /// real behavior for this specific type exactly rather than only
 /// approximating it. [`DOS_EXALLCONTROL`] is the same shape of case: a
-/// zeroed `sizeof(struct ExAllControl)` block. Every other `type`
-/// fails loudly (see [`DOS_RDARGS`]'s doc) rather than silently
-/// returning a same-shaped-but-non-functional block. Found needed
+/// zeroed `sizeof(struct ExAllControl)` block. [`DOS_STDPKT`] and
+/// [`DOS_CLI`] are documented on their constants; with them every type
+/// `<dos/dos.h>` defines is implemented, and any other fails loudly.
+/// Found needed
 /// running the real `AmiSnap` binary, which calls
 /// `AllocDosObject(DOS_RDARGS, NULL)` to build the `RDArgs` its own
 /// `ReadArgs()` call needs.
@@ -1835,37 +1889,74 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
         return Ok(());
     }
 
-    let struct_size = match object_type {
-        DOS_RDARGS => RDARGS_STRUCT_SIZE,
-        DOS_EXALLCONTROL => crate::dosexall::EXALLCONTROL_SIZE,
-        DOS_FIB => crate::doslock::FIB_SIZE,
+    let tags = ctx.cpu.data_register(DataRegister(2));
+    let object = match object_type {
+        DOS_EXALLCONTROL => alloc_dos_block(ctx, object_type, crate::dosexall::EXALLCONTROL_SIZE)?,
+        DOS_FIB => alloc_dos_block(ctx, object_type, crate::doslock::FIB_SIZE)?,
+        DOS_STDPKT => {
+            let sp = alloc_dos_block(ctx, object_type, STANDARD_PACKET_SIZE)?;
+            let pkt = sp + SP_PKT_OFFSET;
+            ctx.mem.write_u32(sp + LN_NAME_OFFSET, pkt);
+            ctx.mem.write_u32(pkt, sp);
+            pkt
+        }
+        DOS_CLI => {
+            let cli = alloc_dos_block(ctx, object_type, crate::exectask::CLI_STRUCT_SIZE)?;
+            ctx.mem
+                .write_u32(cli + crate::exectask::CLI_FAIL_LEVEL_OFFSET, RETURN_ERROR);
+            ctx.mem
+                .write_u32(cli + crate::exectask::CLI_BACKGROUND_OFFSET, DOSTRUE);
+            for (offset, tag) in CLI_BUFFERS {
+                let item = crate::utility::find_tag_item_impl(&*ctx.mem, tag, tags);
+                let len = if item == 0 {
+                    CLI_BUFFER_DEFAULT
+                } else {
+                    ctx.mem.read_u32(item + 4)
+                };
+                // The length byte plus the string; zeroed, so an empty BSTR.
+                let buf = alloc_dos_block(ctx, object_type, len.saturating_add(1))?;
+                ctx.mem.write_u32(cli + offset, bptr_from_addr(buf));
+            }
+            cli
+        }
+        DOS_RDARGS => alloc_dos_block(ctx, object_type, RDARGS_STRUCT_SIZE)?,
         _ => {
             return Err(DispatchError::HandlerFailed {
                 library: "dos.library".to_string(),
                 lvo: -228,
                 handler_name: "AllocDosObject".to_string(),
                 message: format!(
-                    "AllocDosObject(type={object_type}): only DOS_FILEHANDLE \
-                     ({DOS_FILEHANDLE}), DOS_RDARGS ({DOS_RDARGS}), DOS_EXALLCONTROL \
-                     ({DOS_EXALLCONTROL}), and DOS_FIB ({DOS_FIB}) are implemented -- see \
-                     DOS_RDARGS's doc for why the other types aren't"
+                    "AllocDosObject(type={object_type}): not a type <dos/dos.h> defines \
+                     (DOS_FILEHANDLE {DOS_FILEHANDLE} .. DOS_RDARGS {DOS_RDARGS})"
                 ),
             });
         }
     };
 
-    let addr =
-        ctx.heap
-            .alloc(&mut *ctx.mem, struct_size)
-            .map_err(|e| DispatchError::HandlerFailed {
-                library: "dos.library".to_string(),
-                lvo: -228,
-                handler_name: "AllocDosObject".to_string(),
-                message: format!(
-                    "AllocDosObject(type={object_type}): guest heap allocation failed: {e}"
-                ),
-            })?;
-    for i in 0..struct_size {
+    ctx.cpu.set_data_register(DataRegister(0), object);
+    Ok(())
+}
+
+/// Allocates a zeroed `size`-byte block on the guest heap for
+/// `AllocDosObject(object_type)`. Heap exhaustion fails the run loudly,
+/// as it always has here, rather than returning `NULL`.
+fn alloc_dos_block<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    object_type: u32,
+    size: u32,
+) -> Result<u32, DispatchError> {
+    let addr = ctx
+        .heap
+        .alloc(&mut *ctx.mem, size)
+        .map_err(|e| DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -228,
+            handler_name: "AllocDosObject".to_string(),
+            message: format!(
+                "AllocDosObject(type={object_type}): guest heap allocation failed: {e}"
+            ),
+        })?;
+    for i in 0..size {
         ctx.mem.write_u8(addr.wrapping_add(i), 0);
     }
     // After the zeroing, never before -- those writes heal shadow
@@ -1873,14 +1964,14 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     // initialisation. `false` because the block is zeroed, hence
     // initialised. See `crate::execmem::poison_allocation_edges`.
     crate::execmem::poison_allocation_edges(ctx, addr, false);
-    ctx.cpu.set_data_register(DataRegister(0), addr);
-    Ok(())
+    Ok(addr)
 }
 
 /// `FreeDosObject` (`D1` = `type`, `D2` = the object). No return value.
-/// Frees a [`DOS_FILEHANDLE`], [`DOS_RDARGS`], [`DOS_EXALLCONTROL`], or
-/// [`DOS_FIB`] block allocated by [`alloc_dos_object_handler`]; a `NULL`
-/// object is a documented-legal no-op (matches every other
+/// Frees an object [`alloc_dos_object_handler`] allocated: a
+/// [`DOS_STDPKT`] is passed as its `DosPacket` part, and a [`DOS_CLI`]
+/// takes its four buffers with it. A `NULL` object is a
+/// documented-legal no-op (matches every other
 /// free-half-of-a-pair convention in this runtime, e.g.
 /// `crate::execmem`'s `FreeVec`). Any other `type` fails loudly, same as
 /// the allocation side.
@@ -1904,29 +1995,38 @@ fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         return Ok(());
     }
 
-    if object_type != DOS_FILEHANDLE
-        && object_type != DOS_RDARGS
-        && object_type != DOS_EXALLCONTROL
-        && object_type != DOS_FIB
-    {
-        return Err(DispatchError::HandlerFailed {
+    match object_type {
+        DOS_FILEHANDLE => {
+            ctx.dos.dos_object_filehandles.remove(&addr);
+            ctx.dos.handles.remove(&addr);
+            free_dos_block(ctx, addr)
+        }
+        DOS_EXALLCONTROL | DOS_FIB | DOS_RDARGS => free_dos_block(ctx, addr),
+        DOS_STDPKT => free_dos_block(ctx, addr.wrapping_sub(SP_PKT_OFFSET)),
+        DOS_CLI => {
+            for (offset, _) in CLI_BUFFERS {
+                let buf = ctx.mem.read_u32(addr + offset);
+                if buf != 0 {
+                    free_dos_block(ctx, addr_from_bptr(buf))?;
+                }
+            }
+            free_dos_block(ctx, addr)
+        }
+        _ => Err(DispatchError::HandlerFailed {
             library: "dos.library".to_string(),
             lvo: -234,
             handler_name: "FreeDosObject".to_string(),
             message: format!(
-                "FreeDosObject(type={object_type}): only DOS_FILEHANDLE ({DOS_FILEHANDLE}), \
-                 DOS_RDARGS ({DOS_RDARGS}), DOS_EXALLCONTROL ({DOS_EXALLCONTROL}), and DOS_FIB \
-                 ({DOS_FIB}) are implemented -- see DOS_RDARGS's doc for why the other types \
-                 aren't"
+                "FreeDosObject(type={object_type}): not a type <dos/dos.h> defines \
+                 (DOS_FILEHANDLE {DOS_FILEHANDLE} .. DOS_RDARGS {DOS_RDARGS})"
             ),
-        });
+        }),
     }
+}
 
-    if object_type == DOS_FILEHANDLE {
-        ctx.dos.dos_object_filehandles.remove(&addr);
-        ctx.dos.handles.remove(&addr);
-    }
-
+/// Frees one block [`alloc_dos_block`] (or, for `DOS_FILEHANDLE`,
+/// `alloc_file_handle`) allocated.
+fn free_dos_block<C: Cpu>(ctx: &mut HandlerContext<'_, C>, addr: u32) -> Result<(), DispatchError> {
     // Before the free, while the extent is still queryable.
     crate::execmem::poison_freed_block(ctx, addr);
     ctx.heap
@@ -3694,12 +3794,153 @@ mod tests {
         }
     }
 
+    /// `move.l Ds,Dd`.
+    fn move_d_to_d(src: u16, dst: u16) -> u16 {
+        0x2000 | (dst << 9) | src
+    }
+
+    /// Runs `AllocDosObject(object_type, NULL)` and returns the runtime
+    /// with the new object's address (the program's exit code).
+    fn alloc_dos_object_run(object_type: u32) -> (Runtime<M68kCpu>, u32) {
+        let mut words = Vec::new();
+        push_move_imm_to_d(&mut words, 1, object_type);
+        push_move_imm_to_d(&mut words, 2, 0); // no tags
+        push_jsr(&mut words, 6, -228); // AllocDosObject(a6)
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        (rt, code as u32)
+    }
+
+    /// Runs `AllocDosObject(object_type, NULL)` then `FreeDosObject` on
+    /// the result, and returns the runtime with the (now freed) object.
+    fn alloc_free_dos_object_run(object_type: u32) -> (Runtime<M68kCpu>, u32) {
+        let mut words = Vec::new();
+        push_move_imm_to_d(&mut words, 1, object_type);
+        push_move_imm_to_d(&mut words, 2, 0); // no tags
+        push_jsr(&mut words, 6, -228); // AllocDosObject(a6)
+        words.push(move_d0_to_d(3)); // D3 = the object
+        push_move_imm_to_d(&mut words, 1, object_type);
+        words.push(move_d_to_d(3, 2)); // D2 = the object
+        push_jsr(&mut words, 6, -234); // FreeDosObject(a6)
+        words.push(move_d_to_d(3, 0)); // exit code = the object
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        (rt, code as u32)
+    }
+
+    #[test]
+    fn end_to_end_alloc_dos_object_stdpkt_returns_the_linked_dos_packet() {
+        let (mut rt, pkt) = alloc_dos_object_run(DOS_STDPKT);
+        let sp = pkt - SP_PKT_OFFSET;
+        assert_eq!(
+            rt.heap_mut().size_of_live_alloc(sp),
+            Some(STANDARD_PACKET_SIZE)
+        );
+        assert_eq!(
+            rt.memory().read_u32(sp + LN_NAME_OFFSET),
+            pkt,
+            "ln_Name -> sp_Pkt"
+        );
+        assert_eq!(rt.memory().read_u32(pkt), sp, "dp_Link -> sp_Msg");
+    }
+
+    #[test]
+    fn end_to_end_alloc_dos_object_cli_defaults() {
+        let (mut rt, cli) = alloc_dos_object_run(DOS_CLI);
+        assert_eq!(
+            rt.heap_mut().size_of_live_alloc(cli),
+            Some(crate::exectask::CLI_STRUCT_SIZE)
+        );
+        let mut buffers = Vec::new();
+        for (offset, _) in CLI_BUFFERS {
+            let buf = addr_from_bptr(rt.memory().read_u32(cli + offset));
+            assert_eq!(
+                rt.heap_mut().size_of_live_alloc(buf),
+                Some(CLI_BUFFER_DEFAULT + 1),
+                "buffer at CLI offset {offset}"
+            );
+            assert_eq!(
+                rt.memory().read_u8(buf),
+                0,
+                "empty BSTR at CLI offset {offset}"
+            );
+            buffers.push(offset);
+        }
+        for i in (0..crate::exectask::CLI_STRUCT_SIZE).step_by(4) {
+            let value = rt.memory().read_u32(cli + i);
+            if i == crate::exectask::CLI_FAIL_LEVEL_OFFSET {
+                assert_eq!(value, RETURN_ERROR);
+            } else if i == crate::exectask::CLI_BACKGROUND_OFFSET {
+                assert_eq!(value, DOSTRUE);
+            } else if !buffers.contains(&i) {
+                assert_eq!(value, 0, "CLI offset {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn end_to_end_alloc_dos_object_cli_sizes_buffers_from_tags() {
+        // The tag list { ADO_PromptLen, 40 }, { TAG_DONE } on the stack.
+        let mut words = Vec::new();
+        for value in [0u32, 0, 40, ADO_PROMPT_LEN] {
+            words.push(0x2F3C); // move.l #imm,-(sp)
+            words.push((value >> 16) as u16);
+            words.push(value as u16);
+        }
+        words.push(0x240F); // move.l sp,d2: the tags
+        push_move_imm_to_d(&mut words, 1, DOS_CLI);
+        push_jsr(&mut words, 6, -228); // AllocDosObject(a6)
+        words.extend_from_slice(&[0x4FEF, 0x0010]); // lea 16(sp),sp
+        words.push(RTS);
+
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let cli = rt.run(&mut out, None).expect("run should succeed") as u32;
+        for (offset, tag) in CLI_BUFFERS {
+            let buf = addr_from_bptr(rt.memory().read_u32(cli + offset));
+            // 41 for the prompt, rounded up to a longword by the heap.
+            let expected = if tag == ADO_PROMPT_LEN {
+                44
+            } else {
+                CLI_BUFFER_DEFAULT + 1
+            };
+            assert_eq!(
+                rt.heap_mut().size_of_live_alloc(buf),
+                Some(expected),
+                "buffer at CLI offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_free_dos_object_frees_stdpkt_and_cli() {
+        let (mut rt, pkt) = alloc_free_dos_object_run(DOS_STDPKT);
+        assert_eq!(rt.heap_mut().size_of_live_alloc(pkt - SP_PKT_OFFSET), None);
+
+        let (mut rt, cli) = alloc_free_dos_object_run(DOS_CLI);
+        assert_eq!(rt.heap_mut().size_of_live_alloc(cli), None);
+        for (offset, _) in CLI_BUFFERS {
+            let buf = addr_from_bptr(rt.memory().read_u32(cli + offset));
+            assert_eq!(
+                rt.heap_mut().size_of_live_alloc(buf),
+                None,
+                "buffer at CLI offset {offset}"
+            );
+        }
+    }
+
     #[test]
     fn end_to_end_alloc_dos_object_unknown_type_fails_loudly() {
         let mut words = vec![
-            move_imm_to_d(1), // D1 = DOS_CLI (4), not implemented
+            move_imm_to_d(1), // D1 = 6, not a type <dos/dos.h> defines
             0,
-            4,
+            6,
             move_imm_to_d(2),
             0,
             0,
@@ -3711,7 +3952,7 @@ mod tests {
         let mut out = Vec::new();
         let err = rt
             .run(&mut out, None)
-            .expect_err("unimplemented AllocDosObject type should fail loudly");
+            .expect_err("an unknown AllocDosObject type should fail loudly");
         match err {
             crate::dispatch::RuntimeError::Dispatch(DispatchError::HandlerFailed {
                 library,

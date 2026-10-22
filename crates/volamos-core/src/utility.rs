@@ -197,7 +197,7 @@ fn next_tag_item_impl<M: AddressSpace>(mem: &M, mut cur: u32) -> (u32, u32) {
 /// `ti_Tag` equals `tag_val`, honoring `TAG_MORE`/`TAG_SKIP`/`TAG_IGNORE`
 /// traversal via [`next_tag_item_impl`]. Returns the found item's address,
 /// or `0` if not found.
-fn find_tag_item_impl<M: AddressSpace>(mem: &M, tag_val: u32, list: u32) -> u32 {
+pub(crate) fn find_tag_item_impl<M: AddressSpace>(mem: &M, tag_val: u32, list: u32) -> u32 {
     let mut cur = list;
     loop {
         let (found, resume) = next_tag_item_impl(mem, cur);

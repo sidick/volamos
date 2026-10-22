@@ -408,7 +408,22 @@ pub const PROCESS_STRUCT_SIZE: u32 = 230;
 /// `sizeof(struct CommandLineInterface)` per `<dos/dosextens.h>`: 16
 /// fields, all 4 bytes each (`LONG`/`BPTR`/`BSTR`, every one
 /// pointer-or-longword-sized) = 64.
-const CLI_STRUCT_SIZE: u32 = 64;
+pub(crate) const CLI_STRUCT_SIZE: u32 = 64;
+/// `cli_SetName`: `BSTR`, offset 4 within `struct CommandLineInterface`
+/// (after `cli_Result2`): the buffer holding the current directory's
+/// name. Written by `crate::dosfile`'s `AllocDosObject(DOS_CLI)`, along
+/// with the other three buffers below.
+pub(crate) const CLI_SET_NAME_OFFSET: u32 = 4;
+/// `cli_FailLevel`: `LONG`, offset 20 (`cli_CommandName` 16 + 4).
+pub(crate) const CLI_FAIL_LEVEL_OFFSET: u32 = 20;
+/// `cli_Prompt`: `BSTR`, offset 24 (`cli_FailLevel` 20 + 4).
+pub(crate) const CLI_PROMPT_OFFSET: u32 = 24;
+/// `cli_CommandFile`: `BSTR`, offset 36 (`cli_StandardInput` 28,
+/// `cli_CurrentInput` 32, then this).
+pub(crate) const CLI_COMMAND_FILE_OFFSET: u32 = 36;
+/// `cli_Background`: `LONG`, offset 44 (`cli_CommandFile` 36,
+/// `cli_Interactive` 40, then this).
+pub(crate) const CLI_BACKGROUND_OFFSET: u32 = 44;
 /// `cli_CommandName`: `BSTR`, offset 16 within `struct
 /// CommandLineInterface` (`cli_Result2`/`cli_SetName`/`cli_CommandDir`/
 /// `cli_ReturnCode` 4 each = 16, `cli_CommandName` is the 5th field).
