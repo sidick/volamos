@@ -3348,6 +3348,70 @@ mod tests {
         }
     }
 
+    /// Issue #181 symptom 1: a denormal `double` round-tripped through an
+    /// FPU register (`fmoved <mem>,%fp0` then `fmoved %fp0,<mem>`) came
+    /// back as all-zero bytes -- the real 68881/Amiberry's 68040 FPU
+    /// preserve it exactly. Traced to the `m68k` crate's FMOVE-to-double
+    /// store path (`fpu_write_dest`'s `fmt == 5` case): fixed upstream in
+    /// m68k 0.14.7 (`fpu: correct extended exponent and rounding
+    /// behavior`, `fpu: round FMOVE to single, double and integer
+    /// formats`, #185), which replaced a lossy `FloatX80::to_f64()`
+    /// truncation with `softfloat::to_f64_bits`'s real
+    /// denormalize-and-round path. Both bit patterns from the issue are
+    /// checked: `0x00007ff0` (the smallest-magnitude case) and
+    /// `0x000fffff_ffffffff` (the largest denormal double).
+    #[test]
+    fn fmove_d_register_round_trip_preserves_denormals_issue_181() {
+        for (hi_in, lo_in) in [(0x0000_0000u32, 0x0000_7ff0u32), (0x000F_FFFF, 0xFFFF_FFFF)] {
+            let entry = TRAP_TABLE_END;
+            let src_addr = entry + 0x400;
+            let dst_addr = entry + 0x500;
+            let mut mem = FlatMemory::new(0x4_0000);
+            // fmoved (src_addr).l,%fp0 ; fmoved %fp0,(dst_addr).l ; rts
+            load_words(
+                &mut mem,
+                entry,
+                &[
+                    0xF239,
+                    0x5400, // fmoved <abs.l>,%fp0
+                    (src_addr >> 16) as u16,
+                    src_addr as u16,
+                    0xF239,
+                    0x7400, // fmoved %fp0,<abs.l>
+                    (dst_addr >> 16) as u16,
+                    dst_addr as u16,
+                    0x4E75, // rts
+                ],
+            );
+            mem.write_u32(src_addr, hi_in);
+            mem.write_u32(src_addr + 4, lo_in);
+            // Poisoned with a non-matching pattern so a no-op FMOVE (the
+            // pre-0.14.7 bug) can't accidentally read back as a pass.
+            mem.write_u32(dst_addr, 0xFFFF_FFFF);
+            mem.write_u32(dst_addr + 4, 0xFFFF_FFFF);
+
+            let cpu = M68kCpu::with_config(crate::backend::CpuType::M68020, true);
+            let mut rt = Runtime::new(
+                cpu,
+                mem,
+                StartConfig {
+                    entry,
+                    load_end: entry + 0x600,
+                    ..StartConfig::default()
+                },
+            );
+            let mut out = Vec::new();
+            rt.run(&mut out, None).expect("run should succeed");
+            let hi_out = rt.memory().read_u32(dst_addr);
+            let lo_out = rt.memory().read_u32(dst_addr + 4);
+            assert_eq!(
+                (hi_out, lo_out),
+                (hi_in, lo_in),
+                "denormal double {hi_in:08x}{lo_in:08x} must round-trip through fp0 unchanged"
+            );
+        }
+    }
+
     /// Builds a runtime with a fresh CPU/memory and a program consisting
     /// only of `words`, loaded at `TRAP_TABLE_END`. Memory is sized
     /// generously (128 KiB) so the fixed 64 KiB stack region and a
