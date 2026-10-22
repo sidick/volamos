@@ -6,13 +6,28 @@
 //! A lock is, on the guest side, a 20-byte `struct FileLock` allocated on
 //! the guest heap (real AmigaOS layout: `fl_Link` `BPTR` at offset 0,
 //! `fl_Key` `LONG` at offset 4, `fl_Access` `LONG` at offset 8, `fl_Task`
-//! at offset 12, `fl_Volume` at offset 16 -- the last two are always
-//! zeroed here, since nothing in this runtime inspects them and this
-//! isn't a real multi-process AmigaOS). `Lock()` writes the requested
-//! access mode into `fl_Access` and a debug id into `fl_Key`, purely so a
-//! guest- or host-side debugger inspecting the struct sees something
-//! meaningful there -- exactly [`crate::dosfile`]'s `FileHandle`/
-//! `fh_Arg1` pattern, reused verbatim.
+//! at offset 12, `fl_Volume` at offset 16). `Lock()` writes the
+//! requested access mode into `fl_Access` and a debug id into `fl_Key`,
+//! purely so a guest- or host-side debugger inspecting the struct sees
+//! something meaningful there -- exactly [`crate::dosfile`]'s
+//! `FileHandle`/`fh_Arg1` pattern, reused verbatim. `fl_Volume` is still
+//! always zeroed -- nothing in this runtime inspects it, and there's no
+//! real multi-volume `DosList` entry it could meaningfully point at
+//! (see `crate::dosdevlist`'s module docs). `fl_Task`, however, is
+//! *not* zeroed (issue #186, a reversal of this module's original
+//! choice): every lock's `fl_Task` points at the same synthetic
+//! filesystem handler `MsgPort` a `FileHandle`'s `fh_Type` does
+//! ([`crate::dosfile::DosState::fs_port_addr`]), because a real
+//! `ixemul.library`-linked program's `__plock()` sends a raw
+//! `ACTION_LOCATE_OBJECT` packet straight to a lock's own `fl_Task` to
+//! resolve the next path component -- exactly the real, documented
+//! AmigaOS idiom (the RKRM's own `Lock()` implementation notes say
+//! `fl_Task` "shall point to a `MsgPort` through which the maintaining
+//! file system can be contacted"). [`DosState::new_lock`] is the single
+//! site every lock-creation call (`Lock`, `ParentDir`, `DupLock`,
+//! `CurrentDir`'s restore, `CreateDir`, `GetDeviceProc`'s internal
+//! lock, etc. -- they all funnel through it) goes through, so there's
+//! no second place that still zeroes it and needs separate auditing.
 //!
 //! The struct's guest *address* keys a host-side registry entry
 //! ([`LockEntry`], in [`crate::dosfile::DosState::locks`]) holding the
@@ -157,6 +172,10 @@ const FILE_LOCK_SIZE: u32 = 20;
 const FL_KEY_OFFSET: u32 = 4;
 /// Byte offset of `fl_Access` within `struct FileLock`.
 const FL_ACCESS_OFFSET: u32 = 8;
+/// Byte offset of `fl_Task` within `struct FileLock` -- see
+/// [`DosState::new_lock`]'s doc for why this is now populated (issue
+/// #186) rather than always zeroed.
+const FL_TASK_OFFSET: u32 = 12;
 
 /// `sizeof(struct FileInfoBlock)`: 260 bytes. Allocated by the *guest
 /// program*, never by this runtime -- see [`fill_fib`].
@@ -230,6 +249,24 @@ impl DosState {
         let key = self.next_lock_id;
         let addr = alloc_lock_struct(heap, mem, key, access)
             .map_err(|_| crate::dosfile::ERROR_NO_FREE_STORE)?;
+        // `fl_Task` (issue #186): every lock now points at the same
+        // synthetic filesystem handler port a `FileHandle`'s `fh_Type`
+        // does ([`crate::dosfile::DosState::fs_port_addr`]), so a
+        // program that sends a raw `DosPacket` to `lock->fl_Task` (e.g.
+        // `ixemul.library`'s `__plock()`, which locates objects with
+        // `ACTION_LOCATE_OBJECT` sent straight to a lock's own task)
+        // reaches [`crate::dospkt::handle_fs_packet`] exactly like a
+        // `fh_Type`-addressed send already does -- see this module's
+        // former "always zeroed here" doc, now obsolete now that
+        // something in this runtime *does* inspect `fl_Task`. This is
+        // safe for every existing lock-creation site: they all funnel
+        // through this one function, there's no second, bypassing path
+        // that creates a `FileLock` directly, and `fl_Task` being a
+        // real, PutMsg-interceptable port rather than `0` changes
+        // nothing observable for a guest that (like every other caller
+        // so far) never sends it packets at all.
+        let fl_task = self.fs_port_addr(heap, mem)?;
+        mem.write_u32(addr.wrapping_add(FL_TASK_OFFSET), fl_task);
         self.locks.insert(
             addr,
             LockEntry {
@@ -264,6 +301,31 @@ impl DosState {
             resolved.amiga_path,
             access_mode,
         )
+    }
+
+    /// The packet-level `Lock`: `ACTION_LOCATE_OBJECT` (RKRM
+    /// `packet-documentation.md`). Like [`Self::lock`], but resolves
+    /// `name` relative to an existing lock (`parent_lock_addr`, `0` for
+    /// "relative to the root of the currently inserted volume") instead
+    /// of the process's current directory -- via
+    /// [`crate::dosfile::DosState::combine_lock_path`], the same helper
+    /// [`crate::dosfile::DosState::open_into_handle`] uses for the
+    /// matching `ACTION_FINDINPUT`/`ACTION_FINDOUTPUT`/`ACTION_FINDUPDATE`
+    /// packets. `mode` is `dp_Arg3` verbatim ([`SHARED_LOCK`] or
+    /// [`EXCLUSIVE_LOCK`] -- the RKRM notes some callers pass garbage
+    /// here and file systems should treat it as `SHARED_LOCK`, but this
+    /// just stores whatever's given, same as [`Self::lock`] already
+    /// does for the library-call path).
+    pub fn locate_object(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        parent_lock_addr: u32,
+        name: &str,
+        mode: i32,
+    ) -> Result<u32, i32> {
+        let combined = self.combine_lock_path(parent_lock_addr, name)?;
+        self.lock(heap, mem, &combined, mode)
     }
 
     /// `CreateDir(name)`: creates a new, empty directory -- its parent
@@ -1525,6 +1587,84 @@ mod tests {
             .lock(&mut heap, &mut mem, "SYS:sub", SHARED_LOCK)
             .expect("lock should succeed");
         assert_ne!(bptr, 0);
+    }
+
+    // --- issue #186: fl_Task, combine_lock_path, locate_object ---
+
+    #[test]
+    fn new_lock_populates_fl_task_with_the_fs_handler_port() {
+        let tmp = TempDir::new("flTask");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .expect("lock should succeed");
+        let addr = addr_from_bptr(bptr);
+        let fl_task = mem.read_u32(addr.wrapping_add(FL_TASK_OFFSET));
+        assert_ne!(fl_task, 0, "fl_Task should no longer be zeroed");
+        let expected = dos
+            .fs_port_addr(&mut heap, &mut mem)
+            .expect("fs port should be allocatable");
+        assert_eq!(fl_task, expected, "fl_Task should be the fs handler port");
+    }
+
+    #[test]
+    fn locate_object_resolves_relative_to_a_parent_lock() {
+        let tmp = TempDir::new("locateobj");
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let parent = dos
+            .lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK)
+            .expect("lock SYS: should succeed");
+        let child = dos
+            .locate_object(
+                &mut heap,
+                &mut mem,
+                addr_from_bptr(parent),
+                "sub",
+                SHARED_LOCK,
+            )
+            .expect("ACTION_LOCATE_OBJECT should resolve SYS:/sub");
+        assert_ne!(child, 0);
+        assert_eq!(
+            dos.locks.get(&addr_from_bptr(child)).unwrap().host_path,
+            tmp.path().join("sub")
+        );
+    }
+
+    #[test]
+    fn locate_object_with_empty_name_locks_the_same_object_as_the_parent() {
+        let tmp = TempDir::new("locateobjempty");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let parent = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .expect("lock should succeed");
+        let same = dos
+            .locate_object(&mut heap, &mut mem, addr_from_bptr(parent), "", SHARED_LOCK)
+            .expect("empty name should dup-lock the same object");
+        assert_eq!(
+            dos.locks.get(&addr_from_bptr(same)).unwrap().host_path,
+            tmp.path().join("f.txt")
+        );
+    }
+
+    #[test]
+    fn locate_object_on_an_unknown_parent_lock_is_invalid_lock() {
+        let tmp = TempDir::new("locateobjbad");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let err = dos
+            .locate_object(&mut heap, &mut mem, 0x1234, "sub", SHARED_LOCK)
+            .unwrap_err();
+        assert_eq!(err, ERROR_INVALID_LOCK);
     }
 
     #[test]

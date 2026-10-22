@@ -61,8 +61,10 @@
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::dosfile::ERROR_ACTION_NOT_KNOWN;
-use crate::guestmem::addr_from_bptr;
+use crate::dosfile::{
+    ERROR_ACTION_NOT_KNOWN, ERROR_OBJECT_NOT_FOUND, MODE_NEWFILE, MODE_OLDFILE, MODE_READWRITE,
+};
+use crate::guestmem::{addr_from_bptr, read_bstr, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 
@@ -78,6 +80,21 @@ const ACTION_WRITE: u32 = 87;
 const ACTION_END: u32 = 1007;
 const ACTION_SEEK: u32 = 1008;
 
+// Issue #186 (ixemul's AllocDosObject(DOS_FILEHANDLE) + raw packet
+// I/O): the open/lock/examine/link packet types `handle_fs_packet` now
+// also answers. `ACTION_FINDINPUT`/`ACTION_FINDOUTPUT`/
+// `ACTION_FINDUPDATE`'s numeric values are literally `MODE_OLDFILE`/
+// `MODE_NEWFILE`/`MODE_READWRITE` (RKRM `packet-documentation.md`:
+// "`Open()`... copies the packet type from its second argument"), so
+// they're aliased from `crate::dosfile` rather than re-declared, to
+// keep the two definitions from ever drifting apart.
+const ACTION_FINDINPUT: u32 = MODE_OLDFILE as u32;
+const ACTION_FINDOUTPUT: u32 = MODE_NEWFILE as u32;
+const ACTION_FINDUPDATE: u32 = MODE_READWRITE as u32;
+const ACTION_LOCATE_OBJECT: u32 = 8;
+const ACTION_EXAMINE_FH: u32 = 1034;
+const ACTION_READ_LINK: u32 = 1024;
+
 // --- struct DosPacket field offsets (dos/dosextens.h) -- all LONGs. ---
 
 /// `dp_Port`: the `MsgPort` the handler sends the packet back to once
@@ -91,6 +108,8 @@ const DP_RES2: u32 = 16;
 const DP_ARG1: u32 = 20;
 const DP_ARG2: u32 = 24;
 const DP_ARG3: u32 = 28;
+/// `dp_Arg4` -- only `ACTION_READ_LINK` (issue #186) uses this one.
+const DP_ARG4: u32 = 32;
 
 const ID_VALIDATED: u32 = 82;
 const ID_DOS_DISK: u32 = 0x444F_5300;
@@ -270,6 +289,102 @@ pub fn handle_fs_packet<C: Cpu>(
                 (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32)
             }
         }
+        // ACTION_LOCATE_OBJECT (8): Arg1 = parent FileLock BPTR (0 =
+        // volume root), Arg2 = BPTR to BSTR of the object name, Arg3 =
+        // lock mode (SHARED_LOCK/EXCLUSIVE_LOCK). Res1 = BPTR to the
+        // new FileLock, or 0 + Res2 on error -- *not* the -1 failure
+        // convention the I/O actions above use: a lock's BPTR can
+        // legitimately be any value, so "no lock" is reported the same
+        // way Lock() itself reports it in D0 (0/NULL).
+        ACTION_LOCATE_OBJECT => {
+            let lock_addr = addr_from_bptr(arg1);
+            let name_addr = addr_from_bptr(arg2);
+            let name = String::from_utf8_lossy(&read_bstr(ctx.mem, name_addr)).into_owned();
+            match ctx
+                .dos
+                .locate_object(ctx.heap, ctx.mem, lock_addr, &name, arg3 as i32)
+            {
+                Ok(bptr) => (bptr, 0),
+                Err(code) => (0, code as u32),
+            }
+        }
+        // ACTION_FINDINPUT (1005, == MODE_OLDFILE) / ACTION_FINDOUTPUT
+        // (1006, == MODE_NEWFILE) / ACTION_FINDUPDATE (1004, ==
+        // MODE_READWRITE): Arg1 = BPTR to the caller's own FileHandle
+        // (already allocated via AllocDosObject(DOS_FILEHANDLE)), Arg2
+        // = BPTR to parent FileLock (0 = volume root), Arg3 = BPTR to
+        // BSTR of the path. Res1 = boolean. The packet's own `action`
+        // (== dp_Type) *is* the access mode to open with -- see the
+        // consts' own docs for why that's not a coincidence.
+        ACTION_FINDINPUT | ACTION_FINDOUTPUT | ACTION_FINDUPDATE => {
+            let fh_addr = addr_from_bptr(arg1);
+            let lock_addr = addr_from_bptr(arg2);
+            let name_addr = addr_from_bptr(arg3);
+            let name = String::from_utf8_lossy(&read_bstr(ctx.mem, name_addr)).into_owned();
+            match ctx
+                .dos
+                .open_into_handle(fh_addr, lock_addr, &name, action as i32)
+            {
+                Ok(()) => (DOSTRUE, 0),
+                Err(code) => (DOSFALSE, code as u32),
+            }
+        }
+        // ACTION_EXAMINE_FH (1034): Arg1 = fh_Arg1 of the FileHandle
+        // being examined (a raw value, not a BPTR -- same convention
+        // as ACTION_READ/WRITE/SEEK's own Arg1 above), Arg2 = APTR
+        // (not BPTR) to a FileInfoBlock to fill, same raw-pointer
+        // convention the ExamineFH LVO handler's own D2 uses. Res1 =
+        // boolean.
+        ACTION_EXAMINE_FH => match ctx.dos.examine_fh(ctx.mem, arg1, arg2) {
+            Ok(()) => (DOSTRUE, 0),
+            Err(code) => (DOSFALSE, code as u32),
+        },
+        // ACTION_READ_LINK (1024): Arg1 = BPTR to a FileLock the path
+        // in Arg2 is relative to, Arg2 = APTR (*not* a BSTR -- the
+        // RKRM is explicit this one's path argument differs from
+        // every other packet's) to a NUL-terminated C string path,
+        // Arg3 = APTR to a target buffer, Arg4 = buffer size. Res1 =
+        // length of the resolved path on success, -1 if no soft link
+        // is found at that path (the RKRM's own cited FFS convention:
+        // ERROR_OBJECT_NOT_FOUND is "the right choice" there, see
+        // packet-documentation.md's ACTION_READ_LINK section), or -2 +
+        // ERROR_LINE_TOO_LONG if the buffer is too small.
+        //
+        // Reuses crate::doslock::DosState::read_link -- the same real
+        // *host* symlink primitive issue #160 added for the
+        // MakeLink/ReadLink library calls -- rather than fabricating a
+        // second, hand-rolled "no symlinks" answer: a packet-level
+        // caller gets a real resolved target if a host symlink exists
+        // at that spot, and the documented clean failure otherwise.
+        // This doesn't implement the RKRM's full multi-directory,
+        // cross-assign soft-link scan (resolving a link buried in the
+        // *middle* of a longer path, absolute-vs-relative link-target
+        // merging) -- `read_link` only ever checks the exact
+        // `(lock, path)` pair it's given, one component at a time,
+        // which is also exactly how a real `ixemul.library`
+        // `__plock()` calls this packet (issue #186's own text). No
+        // corpus binary has needed more than that yet.
+        ACTION_READ_LINK => {
+            let lock_addr = addr_from_bptr(arg1);
+            let path = String::from_utf8_lossy(&read_c_string(ctx.mem, arg2)).into_owned();
+            let buf = arg3;
+            let size = ctx.mem.read_u32(pkt + DP_ARG4) as i32;
+            match ctx.dos.read_link(lock_addr, &path) {
+                Ok(target) => {
+                    let capacity = (size - 1).max(0) as usize;
+                    if target.len() > capacity {
+                        (0xFFFF_FFFE, crate::dospattern::ERROR_LINE_TOO_LONG as u32)
+                    } else {
+                        for (i, b) in target.iter().enumerate() {
+                            ctx.mem.write_u8(buf.wrapping_add(i as u32), *b);
+                        }
+                        ctx.mem.write_u8(buf.wrapping_add(target.len() as u32), 0);
+                        (target.len() as u32, 0)
+                    }
+                }
+                Err(_) => (RESULT_ERROR, ERROR_OBJECT_NOT_FOUND as u32),
+            }
+        }
         _ => (RESULT_ERROR, ERROR_ACTION_NOT_KNOWN as u32),
     };
 
@@ -336,6 +451,83 @@ mod tests {
             mem.write_u16(offset, w);
             offset += 2;
         }
+    }
+
+    // --- issue #186's end-to-end test needs a handful of opcodes none
+    // of the existing helpers cover (register-to-register moves other
+    // than D0->D1, address-register loads, and absolute-address
+    // load/store) -- each derived by hand from the 68000 PRM's MOVE/
+    // shift encoding tables and cross-checked against an existing,
+    // already-passing instruction in this same file (noted per
+    // function) rather than trusted blind.
+
+    /// `MOVE.L Dsrc,Ddst` (register direct to register direct). Cross-
+    /// checked against the existing `MOVE_L_D0_D1` constant (`0x2200`):
+    /// `move_reg_to_reg(1, 0) == 0x2200`.
+    fn move_reg_to_reg(dst: u16, src: u16) -> u16 {
+        0x2000 | (dst << 9) | src
+    }
+    /// `MOVEA.L Dsrc,Adst`. Cross-checked against
+    /// `run_packet_program`'s own `0x2640` ("MOVEA.L D0,A3"):
+    /// `movea_reg(3, 0) == 0x2640`.
+    fn movea_reg(dst_a: u16, src_d: u16) -> u16 {
+        0x2040 | (dst_a << 9) | src_d
+    }
+    /// `MOVEA.L #imm,Adst` (`imm` follows as two words, hi then lo).
+    /// Cross-checked against `run_packet_program`'s own `0x227C`/
+    /// `0x207C` ("MOVEA.L #MSG,A1"/"MOVEA.L #RPORT,A0"):
+    /// `movea_imm(1) == 0x227C`, `movea_imm(0) == 0x207C`.
+    fn movea_imm(dst_a: u16) -> u16 {
+        0x207C | (dst_a << 9)
+    }
+    /// `MOVE.L (disp,Asrc),Ddst` (`disp` follows as one word). Cross-
+    /// checked against the disk-info test's own `0x2228` ("MOVE.L
+    /// (8,A0),D1"): `move_disp_to_d(1, 0) == 0x2228`.
+    fn move_disp_to_d(dst_d: u16, src_a: u16) -> u16 {
+        0x2028 | (dst_d << 9) | src_a
+    }
+    /// `MOVE.L Dsrc,(xxx).L` (the absolute address follows as two
+    /// words, hi then lo). Cross-checked against
+    /// `run_packet_program`'s own `0x23EB` ("MOVE.L (36,A3),(xxx).L" --
+    /// same destination-EA bits, different source EA): both encode
+    /// destination mode 7/register 1 (absolute long) in bits 11-6.
+    fn move_d_to_abs(src_d: u16) -> u16 {
+        0x23C0 | src_d
+    }
+    /// `MOVE.L (xxx).L,Ddst` (the absolute address follows as two
+    /// words, hi then lo) -- the mirror image of [`move_d_to_abs`]:
+    /// same mode-7/register-1 "absolute long" encoding, now in the
+    /// *source* EA bits instead of the destination's.
+    fn move_abs_to_d(dst_d: u16) -> u16 {
+        0x2039 | (dst_d << 9)
+    }
+    /// `LSR.L #2,Ddst` (converts a guest heap address to the `BPTR`
+    /// it's shifted by, the same relationship [`crate::guestmem::
+    /// bptr_from_addr`] computes host-side). Cross-checked against the
+    /// disk-info test's sibling instruction `0xE580` ("ASL.L #2,D0"):
+    /// identical count/size/immediate bits, only the direction bit (set
+    /// here for *right*, there for *left*) and the AS/LS type bits
+    /// differ.
+    fn lsr_l_2_d(dst_d: u16) -> u16 {
+        0xE488 | dst_d
+    }
+    fn push_word_pair(words: &mut Vec<u16>, value: u32) {
+        words.push((value >> 16) as u16);
+        words.push(value as u16);
+    }
+
+    /// Sanity-checks the hand-derived opcode helpers above against
+    /// instructions this file's own, already-passing tests use
+    /// elsewhere -- catches an encoding mistake here before it can
+    /// manifest as a confusing failure in the real end-to-end test
+    /// below.
+    #[test]
+    fn opcode_helpers_match_known_good_instructions() {
+        assert_eq!(move_reg_to_reg(1, 0), MOVE_L_D0_D1, "move.l d0,d1");
+        assert_eq!(movea_reg(3, 0), 0x2640, "movea.l d0,a3");
+        assert_eq!(movea_imm(1), 0x227C, "movea.l #imm,a1");
+        assert_eq!(movea_imm(0), 0x207C, "movea.l #imm,a0");
+        assert_eq!(move_disp_to_d(1, 0), 0x2228, "move.l (8,a0),d1");
     }
 
     #[test]
@@ -633,5 +825,239 @@ mod tests {
         );
         assert_eq!(mem.read_u32(pkt + DP_RES1), RESULT_ERROR, "-1, not 0");
         assert_eq!(mem.read_u32(pkt + DP_RES2), ERROR_ACTION_NOT_KNOWN as u32);
+    }
+
+    // --- issue #186: AllocDosObject(DOS_FILEHANDLE) + packet-level
+    // ACTION_LOCATE_OBJECT/ACTION_FINDOUTPUT, reproducing the real
+    // ixemul.library call sequence as closely as this test harness can
+    // manage at the m68k-instruction level. ---
+
+    /// `AllocDosObject(DOS_FILEHANDLE, NULL)` then immediately
+    /// `FreeDosObject(DOS_FILEHANDLE, obj)` -- the simplest possible
+    /// proof that both new `type` cases reach real trap dispatch
+    /// cleanly (no `DispatchError`, i.e. neither side hits the
+    /// "unimplemented type" guard nor a bogus heap-free). The fuller
+    /// open/lock/packet dance below is a separate test so a failure
+    /// here points straight at `alloc_dos_object_handler`/
+    /// `free_dos_object_handler` rather than anywhere else.
+    #[test]
+    fn end_to_end_alloc_and_free_dos_filehandle_roundtrip() {
+        const DOS_FILEHANDLE: u32 = 0;
+        let mut words = Vec::new();
+        push_move_imm_to_d(&mut words, 1, DOS_FILEHANDLE);
+        push_move_imm_to_d(&mut words, 2, 0); // tags = NULL
+        push_jsr(&mut words, 6, -228); // AllocDosObject(a6) -> D0 = addr
+        words.push(move_reg_to_reg(2, 0)); // D2 = addr (FreeDosObject's object arg)
+        push_move_imm_to_d(&mut words, 1, DOS_FILEHANDLE);
+        push_jsr(&mut words, 6, -234); // FreeDosObject(a6)
+        words.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + (words.len() as u32) * 2 + 0x100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None)
+            .expect("AllocDosObject(DOS_FILEHANDLE) then FreeDosObject should not error");
+    }
+
+    /// The full real-world sequence issue #186 is about:
+    /// `AllocDosObject(DOS_FILEHANDLE)` to get a `FileHandle` of its
+    /// own, `Lock("SYS:")` to get a directory lock, a raw
+    /// `ACTION_LOCATE_OBJECT` packet sent to that lock's `fl_Task` to
+    /// resolve a subdirectory by name (exactly `ixemul.library`'s
+    /// `__plock()`), then a raw `ACTION_FINDOUTPUT` packet -- using the
+    /// `AllocDosObject`'d `FileHandle` and the lock `ACTION_LOCATE_OBJECT`
+    /// just returned -- to create a new file in that subdirectory
+    /// (exactly `ixemul.library`'s `__open()`). Both packets are sent
+    /// to the same port (the `FileHandle`'s own `fh_Type`, read back out
+    /// of guest memory -- it's the same synthetic port a lock's
+    /// `fl_Task` carries, see `doslock.rs`'s module docs). Routing,
+    /// `ACTION_WRITE`/`ACTION_READ`/`ACTION_END`, and the matching
+    /// `FreeDosObject` close-out are already covered by
+    /// `end_to_end_action_read_packet_via_raw_putmsg` (above, via the
+    /// ordinary `Open()`-sourced handle) and
+    /// `crate::dosfile`'s/`crate::doslock`'s own direct `DosState` unit
+    /// tests -- this test's job is specifically the new `AllocDosObject(
+    /// DOS_FILEHANDLE)` + `ACTION_LOCATE_OBJECT` + `ACTION_FINDOUTPUT`
+    /// wiring, proven through real trap dispatch rather than by calling
+    /// `DosState` methods directly.
+    #[test]
+    fn end_to_end_allocdosobject_locate_object_and_findoutput_via_raw_putmsg() {
+        let dir = TempDir::new("pkt-filehandle");
+        std::fs::create_dir(dir.path.join("sub")).unwrap();
+
+        let mut words = Vec::new();
+
+        // AllocDosObject(DOS_FILEHANDLE, NULL) -> D0 = fh addr.
+        push_move_imm_to_d(&mut words, 1, 0); // DOS_FILEHANDLE
+        push_move_imm_to_d(&mut words, 2, 0); // tags = NULL
+        push_jsr(&mut words, 6, -228); // AllocDosObject(a6)
+        words.push(move_reg_to_reg(3, 0)); // D3 = fh addr (kept for later)
+        words.push(lsr_l_2_d(0)); // D0 = fh BPTR
+        let pkt2_arg1_patch = words.len();
+        words.push(move_d_to_abs(0)); // MOVE.L D0,(pkt2+DP_ARG1).L
+        push_word_pair(&mut words, 0); // patched below
+
+        // Read fh_Type (offset 8) off the FileHandle we just got, so
+        // both packets below know which port to PutMsg to.
+        words.push(movea_reg(3, 3)); // A3 = fh addr
+        words.push(move_disp_to_d(4, 3)); // D4 = (FH_TYPE_OFFSET,A3)
+        words.push(crate::dosfile::FH_TYPE_OFFSET as u16);
+
+        // Lock("SYS:", SHARED_LOCK) -> D0 = lock1 BPTR.
+        let sysname_idx = words.len();
+        push_move_imm_to_d(&mut words, 1, 0); // D1 = &"SYS:" (patched)
+        push_move_imm_to_d(&mut words, 2, crate::doslock::SHARED_LOCK as u32);
+        push_jsr(&mut words, 6, -84); // Lock(a6)
+        let pkt1_arg1_patch = words.len();
+        words.push(move_d_to_abs(0)); // MOVE.L D0,(pkt1+DP_ARG1).L
+        push_word_pair(&mut words, 0); // patched below
+
+        // Switch to exec.library for PutMsg/GetMsg.
+        words.push(movea_imm(6)); // A6 = #EXEC_LIBRARY_BASE (patched)
+        push_word_pair(&mut words, crate::dispatch::EXEC_LIBRARY_BASE);
+
+        // PutMsg(pkt1's message) to fh_Type, then GetMsg the reply.
+        words.push(movea_reg(0, 4)); // A0 = D4 (port)
+        let msg1_idx = words.len();
+        words.push(movea_imm(1)); // A1 = &msg1 (patched)
+        push_word_pair(&mut words, 0);
+        push_jsr(&mut words, 6, -366); // PutMsg(a6)
+        let rport1_idx = words.len();
+        words.push(movea_imm(0)); // A0 = &rport (patched)
+        push_word_pair(&mut words, 0);
+        push_jsr(&mut words, 6, -372); // GetMsg(a6)
+
+        // Read pkt1's dp_Res1 (the ACTION_LOCATE_OBJECT result lock) and
+        // store it into pkt2's dp_Arg2 (FINDOUTPUT's parent lock).
+        let pkt1_res1_idx = words.len();
+        words.push(move_abs_to_d(0)); // D0 = (pkt1+DP_RES1)
+        push_word_pair(&mut words, 0);
+        let pkt2_arg2_patch = words.len();
+        words.push(move_d_to_abs(0)); // (pkt2+DP_ARG2) = D0
+        push_word_pair(&mut words, 0);
+
+        // PutMsg(pkt2's message) to fh_Type, then GetMsg the reply.
+        words.push(movea_reg(0, 4)); // A0 = D4 (port)
+        let msg2_idx = words.len();
+        words.push(movea_imm(1)); // A1 = &msg2 (patched)
+        push_word_pair(&mut words, 0);
+        push_jsr(&mut words, 6, -366); // PutMsg(a6)
+        let rport2_idx = words.len();
+        words.push(movea_imm(0)); // A0 = &rport (patched)
+        push_word_pair(&mut words, 0);
+        push_jsr(&mut words, 6, -372); // GetMsg(a6)
+        words.push(RTS);
+
+        // --- Layout the data region right after the code, 4-byte
+        // aligned throughout (every BSTR/packet/message/port address
+        // below is passed as a BPTR somewhere, which requires it). ---
+        let base = (TRAP_TABLE_END + (words.len() as u32) * 2 + 3) & !3;
+        let sysname_addr = base;
+        let subname_addr = sysname_addr + 8; // C string "SYS:\0", padded
+        let pkt1 = subname_addr + 8; // BSTR len=3 "sub", padded
+        let msg1 = pkt1 + 36;
+        let pkt2 = msg1 + 16;
+        let msg2 = pkt2 + 36;
+        let rport = msg2 + 16;
+        let filename_addr = rport + 36; // BSTR len=7 "new.txt"
+
+        words[sysname_idx + 1] = (sysname_addr >> 16) as u16;
+        words[sysname_idx + 2] = sysname_addr as u16;
+        words[pkt2_arg1_patch + 1] = ((pkt2 + DP_ARG1) >> 16) as u16;
+        words[pkt2_arg1_patch + 2] = (pkt2 + DP_ARG1) as u16;
+        words[pkt1_arg1_patch + 1] = ((pkt1 + DP_ARG1) >> 16) as u16;
+        words[pkt1_arg1_patch + 2] = (pkt1 + DP_ARG1) as u16;
+        words[msg1_idx + 1] = (msg1 >> 16) as u16;
+        words[msg1_idx + 2] = msg1 as u16;
+        words[rport1_idx + 1] = (rport >> 16) as u16;
+        words[rport1_idx + 2] = rport as u16;
+        words[pkt1_res1_idx + 1] = ((pkt1 + DP_RES1) >> 16) as u16;
+        words[pkt1_res1_idx + 2] = (pkt1 + DP_RES1) as u16;
+        words[pkt2_arg2_patch + 1] = ((pkt2 + DP_ARG2) >> 16) as u16;
+        words[pkt2_arg2_patch + 2] = (pkt2 + DP_ARG2) as u16;
+        words[msg2_idx + 1] = (msg2 >> 16) as u16;
+        words[msg2_idx + 2] = msg2 as u16;
+        words[rport2_idx + 1] = (rport >> 16) as u16;
+        words[rport2_idx + 2] = rport as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        crate::guestmem::write_c_string(&mut mem, sysname_addr, b"SYS:");
+        crate::guestmem::write_bstr(&mut mem, subname_addr, b"sub");
+        crate::guestmem::write_bstr(&mut mem, filename_addr, b"new.txt");
+
+        mem.write_u32(pkt1 + DP_PORT, rport);
+        mem.write_u32(pkt1 + DP_TYPE, ACTION_LOCATE_OBJECT);
+        mem.write_u32(
+            pkt1 + DP_ARG2,
+            crate::guestmem::bptr_from_addr(subname_addr),
+        );
+        mem.write_u32(pkt1 + DP_ARG3, crate::doslock::SHARED_LOCK as u32);
+        mem.write_u32(msg1 + crate::execlist::LN_NAME, pkt1);
+
+        mem.write_u32(pkt2 + DP_PORT, rport);
+        mem.write_u32(pkt2 + DP_TYPE, ACTION_FINDOUTPUT);
+        mem.write_u32(
+            pkt2 + DP_ARG3,
+            crate::guestmem::bptr_from_addr(filename_addr),
+        );
+        mem.write_u32(msg2 + crate::execlist::LN_NAME, pkt2);
+
+        crate::execlist::init_list_header(&mut mem, rport + crate::execlist::MP_MSGLIST);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: filename_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), dir.path.clone())],
+            assigns: vec![],
+            auto_assign_root: None,
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .expect("build vfs");
+        rt.set_vfs(vfs);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+
+        assert_eq!(
+            code as u32, msg2,
+            "GetMsg must find packet 2's reply already queued"
+        );
+        assert_ne!(
+            mem.read_u32(pkt1 + DP_RES1),
+            0,
+            "ACTION_LOCATE_OBJECT should produce a real lock on SYS:sub"
+        );
+        assert_eq!(mem.read_u32(pkt1 + DP_RES2), 0);
+        assert_eq!(
+            mem.read_u32(pkt2 + DP_RES1),
+            DOSTRUE,
+            "ACTION_FINDOUTPUT should succeed"
+        );
+        assert_eq!(mem.read_u32(pkt2 + DP_RES2), 0);
+        assert!(
+            dir.path.join("sub").join("new.txt").is_file(),
+            "ACTION_FINDOUTPUT should have created SYS:sub/new.txt on the host"
+        );
     }
 }

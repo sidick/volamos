@@ -275,6 +275,15 @@ mod tests {
         let tmp = TempDir::new("unit-free");
         fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
         let (mut heap, mut mem, mut dos) = setup(tmp.path());
+        // Pre-warm the lazily-created filesystem handler port (issue
+        // #186: every lock now populates `fl_Task` with it, so the
+        // *first* lock ever created in a `DosState`'s lifetime also
+        // pays for this one-time, never-freed allocation -- see
+        // `DosState::fs_port_addr`'s doc). Allocating it before
+        // `free_before` is captured keeps this test measuring only the
+        // lock's own, genuinely round-trippable cost.
+        dos.fs_port_addr(&mut heap, &mut mem)
+            .expect("fs port should be allocatable");
         let free_before = heap.free_bytes();
 
         let addr = get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:f.txt", 0).unwrap();

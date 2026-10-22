@@ -63,7 +63,7 @@
 //! don't have an exact AmigaOS equivalent, so the mapping is a documented
 //! judgment call, not a spec).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -244,6 +244,45 @@ pub fn map_vfs_error(err: &VfsError) -> i32 {
         VfsError::AssignLoop { .. } => ERROR_OBJECT_NOT_FOUND,
         VfsError::InvalidPath { .. } => ERROR_INVALID_COMPONENT_NAME,
         VfsError::Io { .. } => ERROR_ACTION_NOT_KNOWN,
+    }
+}
+
+/// Opens `host_path` per `access_mode` (`MODE_OLDFILE`/`MODE_NEWFILE`/
+/// `MODE_READWRITE`) -- the actual host [`OpenOptions`] logic shared by
+/// [`DosState::open_resolved`] (the `Open`/library-call path) and
+/// [`DosState::open_into_handle`] (the `ACTION_FINDINPUT`/
+/// `ACTION_FINDOUTPUT`/`ACTION_FINDUPDATE` packet-level path, issue
+/// #186) -- both need the exact same "how do I actually open this
+/// host file for this access mode" decision, just with a different
+/// caller-supplied `FileHandle` to register the result into.
+fn open_host_file_for_mode(host_path: &std::path::Path, access_mode: i32) -> Result<File, i32> {
+    if access_mode == MODE_NEWFILE {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(host_path)
+            .map_err(|e| map_io_error(&e))
+    } else if access_mode == MODE_READWRITE {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(host_path)
+            .map_err(|e| map_io_error(&e))
+    } else {
+        // MODE_OLDFILE (and OpenFromLock's own always-existing-file
+        // case, which calls this with MODE_OLDFILE regardless of the
+        // lock's access mode -- see that method's doc): read+write,
+        // falling back to read-only.
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(host_path)
+            .or_else(|_| OpenOptions::new().read(true).open(host_path))
+            .map_err(|e| map_io_error(&e))
     }
 }
 
@@ -466,6 +505,21 @@ pub struct DosState {
     /// count, not per-device (this runtime's VFS has no real cache to
     /// size). Starts at a plausible FFS default.
     pub(crate) fs_buffers: i32,
+
+    // --- issue #186: AllocDosObject(DOS_FILEHANDLE) + packet-level
+    // file I/O (ixemul). ---
+    /// Guest `FileHandle` addresses allocated via
+    /// `AllocDosObject(DOS_FILEHANDLE, ...)` rather than through
+    /// `Open`/`OpenFromLock`'s own [`Self::alloc_file_handle`] call --
+    /// see [`Self::close`]'s doc for why this distinction matters: a
+    /// handle in this set must *not* have its heap block freed by
+    /// `Close`/`ACTION_END`, only by a later, explicit
+    /// `FreeDosObject(DOS_FILEHANDLE, ...)`, matching real AmigaOS's
+    /// "whoever `AllocDosObject`'d it is the one who frees it" pairing
+    /// (a real `ixemul.library` `__close()` sends a raw `ACTION_END`
+    /// packet, then calls `FreeDosObject` itself -- see `dospkt.rs`'s
+    /// `handle_fs_packet` doc for the packet sequence).
+    pub(crate) dos_object_filehandles: HashSet<u32>,
 }
 
 impl DosState {
@@ -501,6 +555,7 @@ impl DosState {
             dos_list_active: Vec::new(),
             volume_task_ids: HashMap::new(),
             fs_buffers: 30,
+            dos_object_filehandles: HashSet::new(),
         }
     }
 
@@ -668,39 +723,114 @@ impl DosState {
         amiga_path: String,
         access_mode: i32,
     ) -> Result<u32, i32> {
-        let file = if access_mode == MODE_NEWFILE {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&host_path)
-                .map_err(|e| map_io_error(&e))?
-        } else if access_mode == MODE_READWRITE {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&host_path)
-                .map_err(|e| map_io_error(&e))?
-        } else {
-            // MODE_OLDFILE (and OpenFromLock's own always-existing-file
-            // case, which calls this with MODE_OLDFILE regardless of the
-            // lock's access mode -- see that method's doc): read+write,
-            // falling back to read-only.
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&host_path)
-                .or_else(|_| OpenOptions::new().read(true).open(&host_path))
-                .map_err(|e| map_io_error(&e))?
-        };
-
+        let file = open_host_file_for_mode(&host_path, access_mode)?;
         let addr = self.alloc_file_handle(heap, mem, false)?;
         self.handles
             .insert(addr, HostHandle::HostFile(file, amiga_path, host_path));
         Ok(bptr_from_addr(addr))
+    }
+
+    /// Resolves a packet-level `(parent lock, relative name)` pair down
+    /// to a single Amiga path string, per the RKRM's `ACTION_LOCATE_OBJECT`
+    /// contract (`packet-documentation.md`, reused verbatim by
+    /// `ACTION_FINDINPUT`/`ACTION_FINDOUTPUT`/`ACTION_FINDUPDATE`): "the
+    /// location of the object... is logically formed by appending the
+    /// path in `dp_Arg2` to the directory identified by the lock in
+    /// `dp_Arg1`." `parent_lock_addr == 0` means "relative to the root of
+    /// the currently inserted volume" (here: resolved exactly like a
+    /// plain, lock-free name, via the process's own `Vfs` state); a
+    /// non-zero lock looks up its already-normalized
+    /// [`crate::doslock::LockEntry::amiga_path`] and appends `name` with
+    /// a `/` separator -- matching how [`crate::doslock::DosState::
+    /// parent_dir`] and `CurrentDir` already reconstruct Amiga paths from
+    /// a lock, rather than trying to resolve relative to a bare host
+    /// path (which can't recover assign/volume ambiguity the way an
+    /// Amiga path string can -- see this module's "`CurrentDir` and
+    /// Amiga-path reconstruction" doc in `doslock.rs`).
+    ///
+    /// An empty `name` locks/opens the *same* object the parent lock
+    /// already does -- the RKRM's own documented special case ("if the
+    /// string in `dp_Arg2` is empty, the object to be locked is
+    /// identical to the object locked by `dp_Arg1`"), handled here by
+    /// simply not appending anything.
+    ///
+    /// Fails with [`ERROR_INVALID_LOCK`] if `parent_lock_addr != 0` isn't
+    /// a currently-open lock.
+    pub(crate) fn combine_lock_path(
+        &self,
+        parent_lock_addr: u32,
+        name: &str,
+    ) -> Result<String, i32> {
+        if parent_lock_addr == 0 {
+            return Ok(name.to_string());
+        }
+        let entry = self
+            .locks
+            .get(&parent_lock_addr)
+            .ok_or(ERROR_INVALID_LOCK)?;
+        if name.is_empty() {
+            Ok(entry.amiga_path.clone())
+        } else if entry.amiga_path.ends_with(':') {
+            // A volume-root lock's own `amiga_path` already ends in
+            // `:` (e.g. `"SYS:"`) -- appending another `/` would
+            // produce `"SYS:/sub"`, which this runtime's path parser
+            // (like real AmigaDOS) reads as *the volume root's own
+            // parent* followed by `sub`, not as `sub` inside the
+            // root: a leading `/` right after the volume name is the
+            // same "go up a directory" token `/` is everywhere else in
+            // an Amiga path, and a volume root has no parent to go up
+            // to. Concatenating directly (`"SYS:sub"`) is what every
+            // other Amiga-path-building call site in this runtime
+            // already does for the same reason (e.g. `ParentDir`'s own
+            // `format!("{vol}:{}", comps.join("/"))`).
+            Ok(format!("{}{}", entry.amiga_path, name))
+        } else {
+            Ok(format!("{}/{}", entry.amiga_path, name))
+        }
+    }
+
+    /// The packet-level open: `ACTION_FINDINPUT`/`ACTION_FINDOUTPUT`/
+    /// `ACTION_FINDUPDATE` (RKRM `packet-documentation.md` -- each
+    /// packet type's own numeric value is literally the matching
+    /// `MODE_*` constant, see [`MODE_OLDFILE`]/[`MODE_NEWFILE`]/
+    /// [`MODE_READWRITE`]'s docs, so `access_mode` here is exactly the
+    /// packet's own `dp_Type`).
+    ///
+    /// Unlike [`Self::open`], this never allocates a `FileHandle` of its
+    /// own: the real contract (same RKRM section, "the `FileHandle`
+    /// shall be created by `AllocDosObject()`... the packets... then
+    /// identify the file by the `fh_Arg1` element") is that the *caller*
+    /// already allocated one via `AllocDosObject(DOS_FILEHANDLE)` --
+    /// `fh_addr` is that struct's own guest address (same value as its
+    /// `fh_Arg1`, per [`Self::alloc_file_handle`]). This just resolves
+    /// `name` relative to `parent_lock_addr` (via [`Self::combine_lock_path`]),
+    /// opens the host file per `access_mode` (via
+    /// [`open_host_file_for_mode`], the same helper [`Self::open_resolved`]
+    /// uses), and registers it in `self.handles` keyed by `fh_addr` --
+    /// exactly what every other packet/LVO handler already looks up by.
+    pub fn open_into_handle(
+        &mut self,
+        fh_addr: u32,
+        parent_lock_addr: u32,
+        name: &str,
+        access_mode: i32,
+    ) -> Result<(), i32> {
+        let combined = self.combine_lock_path(parent_lock_addr, name)?;
+        let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        let resolve_mode = match access_mode {
+            MODE_OLDFILE => ResolveMode::MustExist,
+            MODE_NEWFILE | MODE_READWRITE => ResolveMode::ParentMustExist,
+            _ => return Err(ERROR_ACTION_NOT_KNOWN),
+        };
+        let resolved = vfs
+            .resolve_with_amiga_path(&combined, resolve_mode)
+            .map_err(|e| map_vfs_error(&e))?;
+        let file = open_host_file_for_mode(&resolved.host_path, access_mode)?;
+        self.handles.insert(
+            fh_addr,
+            HostHandle::HostFile(file, resolved.amiga_path, resolved.host_path),
+        );
+        Ok(())
     }
 
     /// `OpenFromLock(lock)`: opens the object `lock` refers to, reusing
@@ -800,12 +930,32 @@ impl DosState {
     /// closing an `Input()`/`Output()` default handle -- real `Close` on
     /// those succeeds without actually releasing anything), `false` if
     /// `addr` isn't a currently-open handle (caller sets `IoErr()`).
+    ///
+    /// Also the backing for `ACTION_END` (`dospkt.rs`'s
+    /// `handle_fs_packet`): closing the host resource is identical
+    /// either way, but whether the guest `FileHandle` struct's *heap
+    /// block* gets freed here depends on how it was allocated (issue
+    /// #186). A handle `Open`/`OpenFromLock` allocated themselves (via
+    /// [`Self::alloc_file_handle`]) is library-managed memory that
+    /// `Close` is responsible for freeing, same as always. A handle in
+    /// [`Self::dos_object_filehandles`] -- i.e. one the guest itself
+    /// `AllocDosObject(DOS_FILEHANDLE)`'d and is now driving with raw
+    /// packets -- is *not* freed here: real AmigaOS pairs that
+    /// allocation with an explicit, later `FreeDosObject(DOS_FILEHANDLE,
+    /// ...)` call (which is what actually frees the struct; see
+    /// [`free_dos_object_handler`]'s doc), and freeing it early here
+    /// would make that `FreeDosObject` call fail against an
+    /// already-freed block for a real, correctly-written program (a
+    /// real `ixemul.library` `__close()` does exactly "send
+    /// `ACTION_END`, then `FreeDosObject`").
     pub fn close(&mut self, heap: &mut GuestHeap, addr: u32) -> bool {
         if self.input_handle == Some(addr) || self.output_handle == Some(addr) {
             return true;
         }
         if self.handles.remove(&addr).is_some() {
-            let _ = heap.free(addr);
+            if !self.dos_object_filehandles.contains(&addr) {
+                let _ = heap.free(addr);
+            }
             true
         } else {
             false
@@ -1599,15 +1749,22 @@ fn set_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
-/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- one of the three
-/// `AllocDosObject` `type`s this runtime implements (see
-/// [`alloc_dos_object_handler`]'s doc for why). The other documented
-/// types (`DOS_FILEHANDLE` 0, `DOS_STDPKT` 3, `DOS_CLI` 4) aren't --
-/// `DOS_FILEHANDLE`/`DOS_CLI` in particular would need real
-/// integration with this runtime's own `FileHandle`/`pr_CLI`
-/// bookkeeping to be genuinely usable, not just a same-shaped zeroed
-/// block, so a real implementation of those is deferred until a corpus
-/// binary actually needs one.
+/// `DOS_FILEHANDLE` (0), per `<dos/dos.h>` -- a real `struct FileHandle`,
+/// built with the exact same [`DosState::alloc_file_handle`] call
+/// `Open`/`OpenFromLock` use internally (not a generic zeroed block --
+/// see [`alloc_dos_object_handler`]'s doc). Implemented for issue #186:
+/// `ixemul.library`'s `__open()` does this as the first step of opening
+/// any filesystem-backed file, then drives the rest of the I/O with raw
+/// packets (see `dospkt.rs`'s `handle_fs_packet`) instead of further
+/// library calls. `DOS_STDPKT` (3) and `DOS_CLI` (4) remain
+/// unimplemented -- no corpus binary has needed either yet, and `DOS_CLI`
+/// in particular would need real integration with this runtime's own
+/// `pr_CLI` bookkeeping to be genuinely usable, not just a same-shaped
+/// zeroed block.
+const DOS_FILEHANDLE: u32 = 0;
+/// `DOS_RDARGS` (5), per `<dos/dos.h>` -- one of the `AllocDosObject`
+/// `type`s this runtime implements as a plain zeroed block (see
+/// [`alloc_dos_object_handler`]'s doc for why).
 const DOS_RDARGS: u32 = 5;
 /// `DOS_EXALLCONTROL` (1): the `struct ExAllControl` that `ExAll`
 /// requires to be allocated through `AllocDosObject` (see
@@ -1654,6 +1811,30 @@ const RDARGS_STRUCT_SIZE: u32 = 32;
 fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let object_type = ctx.cpu.data_register(DataRegister(1));
 
+    if object_type == DOS_FILEHANDLE {
+        let addr = ctx
+            .dos
+            .alloc_file_handle(ctx.heap, ctx.mem, false)
+            .map_err(|code| DispatchError::HandlerFailed {
+                library: "dos.library".to_string(),
+                lvo: -228,
+                handler_name: "AllocDosObject".to_string(),
+                message: format!(
+                    "AllocDosObject(DOS_FILEHANDLE): guest heap allocation failed (IoErr {code})"
+                ),
+            })?;
+        // Marks this handle as owned by the guest (not by `Open`'s own
+        // `alloc_file_handle` call) -- see [`DosState::close`]'s doc for
+        // why this distinction matters for a later `FreeDosObject`.
+        ctx.dos.dos_object_filehandles.insert(addr);
+        // Same "zeroed, hence initialised" poisoning rule as the
+        // generic path below -- `alloc_file_handle` zeroes the block
+        // before writing `fh_Arg1`/`fh_Type`.
+        crate::execmem::poison_allocation_edges(ctx, addr, false);
+        ctx.cpu.set_data_register(DataRegister(0), addr);
+        return Ok(());
+    }
+
     let struct_size = match object_type {
         DOS_RDARGS => RDARGS_STRUCT_SIZE,
         DOS_EXALLCONTROL => crate::dosexall::EXALLCONTROL_SIZE,
@@ -1664,9 +1845,10 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
                 lvo: -228,
                 handler_name: "AllocDosObject".to_string(),
                 message: format!(
-                    "AllocDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}), \
-                     DOS_EXALLCONTROL ({DOS_EXALLCONTROL}), and DOS_FIB ({DOS_FIB}) are \
-                     implemented -- see DOS_RDARGS's doc for why the other types aren't"
+                    "AllocDosObject(type={object_type}): only DOS_FILEHANDLE \
+                     ({DOS_FILEHANDLE}), DOS_RDARGS ({DOS_RDARGS}), DOS_EXALLCONTROL \
+                     ({DOS_EXALLCONTROL}), and DOS_FIB ({DOS_FIB}) are implemented -- see \
+                     DOS_RDARGS's doc for why the other types aren't"
                 ),
             });
         }
@@ -1696,11 +1878,24 @@ fn alloc_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
 }
 
 /// `FreeDosObject` (`D1` = `type`, `D2` = the object). No return value.
-/// Frees a [`DOS_RDARGS`], [`DOS_EXALLCONTROL`], or [`DOS_FIB`] block
-/// allocated by [`alloc_dos_object_handler`]; a `NULL` object is a
-/// documented-legal no-op (matches every other free-half-of-a-pair
-/// convention in this runtime, e.g. `crate::execmem`'s `FreeVec`). Any
-/// other `type` fails loudly, same as the allocation side.
+/// Frees a [`DOS_FILEHANDLE`], [`DOS_RDARGS`], [`DOS_EXALLCONTROL`], or
+/// [`DOS_FIB`] block allocated by [`alloc_dos_object_handler`]; a `NULL`
+/// object is a documented-legal no-op (matches every other
+/// free-half-of-a-pair convention in this runtime, e.g.
+/// `crate::execmem`'s `FreeVec`). Any other `type` fails loudly, same as
+/// the allocation side.
+///
+/// `DOS_FILEHANDLE` gets one extra step before the generic heap free:
+/// if the handle is still open (the guest sent `ACTION_END` -- or never
+/// did), [`DosState::handles`] still has an entry for it, since
+/// [`DosState::close`] deliberately leaves a `dos_object_filehandles`
+/// member's heap block alone (see that method's doc). Dropping that
+/// entry here, before the free, closes the underlying host file (best
+/// effort -- a program that skips `ACTION_END` and frees anyway is
+/// behaving non-standardly, but shouldn't leak a host file descriptor
+/// over it) and un-marks the address, so an ordinary `Open`-allocated
+/// handle at the same address later doesn't inherit a stale
+/// `dos_object_filehandles` entry.
 fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let object_type = ctx.cpu.data_register(DataRegister(1));
     let addr = ctx.cpu.data_register(DataRegister(2));
@@ -1709,17 +1904,27 @@ fn free_dos_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         return Ok(());
     }
 
-    if object_type != DOS_RDARGS && object_type != DOS_EXALLCONTROL && object_type != DOS_FIB {
+    if object_type != DOS_FILEHANDLE
+        && object_type != DOS_RDARGS
+        && object_type != DOS_EXALLCONTROL
+        && object_type != DOS_FIB
+    {
         return Err(DispatchError::HandlerFailed {
             library: "dos.library".to_string(),
             lvo: -234,
             handler_name: "FreeDosObject".to_string(),
             message: format!(
-                "FreeDosObject(type={object_type}): only DOS_RDARGS ({DOS_RDARGS}), \
-                 DOS_EXALLCONTROL ({DOS_EXALLCONTROL}), and DOS_FIB ({DOS_FIB}) are implemented \
-                 -- see DOS_RDARGS's doc for why the other types aren't"
+                "FreeDosObject(type={object_type}): only DOS_FILEHANDLE ({DOS_FILEHANDLE}), \
+                 DOS_RDARGS ({DOS_RDARGS}), DOS_EXALLCONTROL ({DOS_EXALLCONTROL}), and DOS_FIB \
+                 ({DOS_FIB}) are implemented -- see DOS_RDARGS's doc for why the other types \
+                 aren't"
             ),
         });
+    }
+
+    if object_type == DOS_FILEHANDLE {
+        ctx.dos.dos_object_filehandles.remove(&addr);
+        ctx.dos.handles.remove(&addr);
     }
 
     // Before the free, while the extent is still queryable.
@@ -1957,6 +2162,116 @@ mod tests {
             ..Default::default()
         })
         .expect("build vfs")
+    }
+
+    // --- issue #186: AllocDosObject(DOS_FILEHANDLE)/FreeDosObject,
+    // combine_lock_path, open_into_handle, and the close()/
+    // dos_object_filehandles interaction. ---
+
+    #[test]
+    fn combine_lock_path_with_no_parent_lock_is_the_bare_name() {
+        let dos = DosState::new(None);
+        assert_eq!(dos.combine_lock_path(0, "SYS:f.txt").unwrap(), "SYS:f.txt");
+    }
+
+    #[test]
+    fn combine_lock_path_on_an_unknown_lock_is_invalid_lock() {
+        let dos = DosState::new(None);
+        let err = dos.combine_lock_path(0x1234, "f.txt").unwrap_err();
+        assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    fn open_into_handle_resolves_relative_to_a_parent_lock_and_creates_the_file() {
+        let tmp = TempDir::new("open-into-handle");
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let lock_bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:", crate::doslock::SHARED_LOCK)
+            .expect("lock SYS: should succeed");
+
+        // Exactly what AllocDosObject(DOS_FILEHANDLE) does host-side --
+        // see alloc_dos_object_handler's doc.
+        let fh_addr = dos
+            .alloc_file_handle(&mut heap, &mut mem, false)
+            .expect("alloc_file_handle should succeed");
+        dos.dos_object_filehandles.insert(fh_addr);
+
+        dos.open_into_handle(fh_addr, addr_from_bptr(lock_bptr), "new.txt", MODE_NEWFILE)
+            .expect("ACTION_FINDOUTPUT-equivalent open should succeed");
+
+        assert!(tmp.path().join("new.txt").is_file());
+
+        // The handle is now live under its own address, keyed the same
+        // way ACTION_READ/WRITE/SEEK/END already look it up (fh_Arg1 ==
+        // fh_addr, see alloc_file_handle's doc).
+        dos.write(fh_addr, b"hello").expect("write should succeed");
+        assert_eq!(
+            fs::read(tmp.path().join("new.txt")).unwrap(),
+            b"hello",
+            "open_into_handle's HostFile should be the real, writable file"
+        );
+    }
+
+    #[test]
+    fn open_into_handle_on_an_unknown_parent_lock_is_invalid_lock() {
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(Some(vfs_over(&std::env::temp_dir())));
+        let fh_addr = dos.alloc_file_handle(&mut heap, &mut mem, false).unwrap();
+        let err = dos
+            .open_into_handle(fh_addr, 0x1234, "f.txt", MODE_OLDFILE)
+            .unwrap_err();
+        assert_eq!(err, ERROR_INVALID_LOCK);
+    }
+
+    #[test]
+    fn close_on_a_dos_object_filehandle_does_not_free_its_heap_block() {
+        // The whole point of issue #186's `dos_object_filehandles`
+        // bookkeeping: a real `ixemul.library` `__close()` sends a raw
+        // `ACTION_END` packet (-> `DosState::close`), then calls
+        // `FreeDosObject` itself. If `close` already freed the heap
+        // block, that `FreeDosObject` would fail against an
+        // already-freed address for a completely correct program. This
+        // asserts the heap block survives `close` and is still
+        // freeable afterward (simulating the later `FreeDosObject`).
+        let tmp = TempDir::new("close-dos-object");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let fh_addr = dos.alloc_file_handle(&mut heap, &mut mem, false).unwrap();
+        dos.dos_object_filehandles.insert(fh_addr);
+        dos.open_into_handle(fh_addr, 0, "SYS:f.txt", MODE_NEWFILE)
+            .expect("open should succeed");
+
+        assert!(dos.close(&mut heap, fh_addr), "close should succeed");
+        heap.free(fh_addr)
+            .expect("the heap block must still be live for FreeDosObject to free");
+    }
+
+    #[test]
+    fn close_on_an_ordinary_open_allocated_handle_still_frees_its_heap_block() {
+        // The pre-existing behavior for handles `Open`/`OpenFromLock`
+        // allocate themselves must not regress: those remain
+        // library-managed memory that `Close` itself frees.
+        let tmp = TempDir::new("close-ordinary");
+        fs::write(tmp.path().join("f.txt"), b"hi").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let bptr = dos
+            .open(&mut heap, &mut mem, "SYS:f.txt", MODE_OLDFILE)
+            .expect("open should succeed");
+        let addr = addr_from_bptr(bptr);
+
+        assert!(dos.close(&mut heap, addr), "close should succeed");
+        heap.free(addr)
+            .expect_err("the heap block should already have been freed by close");
     }
 
     // --- DosState unit tests (no CPU/guest program involved) ---
