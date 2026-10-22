@@ -3,11 +3,11 @@
 //! of, per the NDK autodoc's own worked example. Real `RawDoFmt` calls
 //! back into a guest-supplied `PutChProc` once per output character
 //! (including a final `NUL`), so this handler is one of two in the
-//! runtime that step the CPU itself mid-handler, rather than only
-//! reading/writing registers and memory -- see [`call_put_ch_proc`].
-//! `Supervisor` (below) is the other, for the same underlying reason:
-//! both need to run a guest-supplied routine synchronously and get its
-//! result back before the enclosing library call can itself return.
+//! runtime that run a guest-supplied routine synchronously and resume
+//! once it's done -- see [`start_put_ch_loop`]. `Supervisor` (below) is
+//! the other, for the same underlying reason: both need a guest routine
+//! to run to completion (and may make ordinary library calls along the
+//! way) before the enclosing library call can itself return.
 //!
 //! # Format string syntax
 //!
@@ -34,116 +34,103 @@
 //! substituted values, and the final `NUL` -- goes through the guest's
 //! own `PutChProc(Char, PutChData)` (`D0` = char, `A3` = the pass-
 //! through `PutChData`), a real m68k subroutine (`stuffChar` in the NDK
-//! example: `move.b d0,(a3)+; rts`). [`call_put_ch_proc`] executes it
-//! for real: push a sentinel return address ([`crate::dispatch::
-//! EXIT_STUB_ADDR`], reused here purely as an address this runtime never
-//! writes real code at -- not for its `Runtime::run` "whole program
-//! done" meaning, since this is a raw `Cpu::step` loop this module
-//! drives itself, not `Runtime::run`'s dispatch loop), set up `D0`/`A3`/
-//! `PC`, then step until `PC` reaches that sentinel (i.e. the callee's
-//! own `rts` returned) or a step budget is exhausted. If the callee
-//! itself traps into another library call, that's out of scope --
-//! real-world `PutChProc`s (`stuffChar` and dos.library's own file-
-//! writing variants used by `Printf`/`VPrintf`) are simple, no known
-//! corpus target's `RawDoFmt`-supplied callback calls back out further
-//! -- and is reported as a clean [`DispatchError`] rather than silently
-//! hanging or corrupting guest state.
+//! example: `move.b d0,(a3)+; rts`).
+//!
+//! An earlier implementation here executed `PutChProc` by stepping the
+//! CPU itself, in a private loop -- which, per `crate::dispatch::
+//! ContinuationStack`'s module doc, could not support the callee making
+//! any further library call of its own (issue #192). [`start_put_ch_loop`]
+//! instead chains one [`crate::dispatch::ContinuationStack::trampoline`]
+//! call per output character (including the final `NUL`): the format
+//! string is rendered up front, purely host-side (no guest calls needed
+//! for that part), and then each byte is sent through a trampolined call
+//! to `PutChProc`, with the continuation from one call kicking off the
+//! next. This handler's own invocation returns as soon as the *first*
+//! trampoline is queued; the rest of the loop runs as a sequence of
+//! further handler dispatches (the `CONTINUATION_SLOT` stub, see that
+//! type's docs), exactly like any other trampoline user -- there's
+//! nothing RawDoFmt-specific about the mechanism, just about how many
+//! times it's invoked in a row.
 
-use crate::cpu::{AddressRegister, Cpu, DataRegister, StopReason};
-use crate::dispatch::{
-    DispatchError, EXEC_LIBRARY_BASE, EXIT_STUB_ADDR, HandlerContext, LibraryTable,
-};
+use crate::cpu::{AddressRegister, Cpu, DataRegister};
+use crate::dispatch::{DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable};
 use crate::guestmem::{addr_from_bptr, read_bstr, read_c_string};
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
 
-/// Hard cap on how many instructions one `PutChProc` callout may take
-/// before this runtime gives up and reports a stuck callback rather than
-/// hanging forever on a guest bug.
-const CALLOUT_STEP_BUDGET: u32 = 100_000;
-
-/// Executes the guest's `PutChProc(char, put_ch_data)` for real (see the
-/// module docs), returning the (possibly mutated, e.g. `(a3)+`-style
-/// pointer bumps) value of `A3` afterward so the caller can thread it
-/// into the next callout.
-fn call_put_ch_proc<C: Cpu>(
-    cpu: &mut C,
-    mem: &mut C::Memory,
+/// State threaded through the chain of trampolined `PutChProc` calls --
+/// see [`start_put_ch_loop`]'s doc for the overall mechanism.
+struct PutChLoopState {
     put_ch_proc: u32,
-    char_byte: u8,
+    /// The fully rendered output (from [`render_format`]), *not*
+    /// including the final `NUL` -- `RawDoFmt` always sends that as one
+    /// extra call after every byte here, see [`put_ch_loop_step`].
+    rendered: Vec<u8>,
+    /// Index into `rendered` of the next byte to send. `rendered.len()`
+    /// itself means "send the final NUL next"; anything past that means
+    /// the whole sequence is done.
+    index: usize,
+    /// `RawDoFmt`'s own `D0` result (one past the last data-stream byte
+    /// consumed) -- computed once, up front, and written to `D0` only
+    /// once the last `PutChProc` call has returned.
+    final_data_ptr: u32,
+}
+
+/// Runs one more step of the `PutChProc` chain [`start_put_ch_loop`]
+/// started: sends the next pending byte (or the final `NUL`) through a
+/// trampolined call to `PutChProc`, with this same function as the
+/// continuation for the *next* step -- or, once every byte (including the
+/// `NUL`) has been sent, writes `RawDoFmt`'s own `D0` result and finishes.
+/// `put_ch_data` is `PutChProc`'s own `A3` result from the previous call
+/// (or, for the very first call, `RawDoFmt`'s original `A3` argument) --
+/// real `PutChProc`s like `stuffChar` mutate it (`(a3)+`-style) and expect
+/// the next call to see the updated value.
+fn put_ch_loop_step<C: Cpu + 'static>(
+    ctx: &mut HandlerContext<'_, C>,
+    mut state: PutChLoopState,
     put_ch_data: u32,
-) -> Result<u32, DispatchError> {
-    let saved_pc = cpu.pc();
-    let saved_sp = cpu.address_register(AddressRegister(7));
-    let saved_d0 = cpu.data_register(DataRegister(0));
-    let saved_a3 = cpu.address_register(AddressRegister(3));
-
-    let sp = saved_sp.wrapping_sub(4);
-    mem.write_u32(sp, EXIT_STUB_ADDR);
-    cpu.set_address_register(AddressRegister(7), sp);
-    cpu.set_data_register(DataRegister(0), u32::from(char_byte));
-    cpu.set_address_register(AddressRegister(3), put_ch_data);
-    cpu.set_pc(put_ch_proc);
-
-    let mut steps = 0u32;
-    while cpu.pc() != EXIT_STUB_ADDR {
-        if steps >= CALLOUT_STEP_BUDGET {
-            return Err(DispatchError::HandlerFailed {
-                library: "exec.library".to_string(),
-                lvo: -522,
-                handler_name: "RawDoFmt".to_string(),
-                message: format!(
-                    "PutChProc at {put_ch_proc:#010x} did not return within \
-                     {CALLOUT_STEP_BUDGET} steps -- possible infinite loop \
-                     or missing rts"
-                ),
-            });
-        }
-        match cpu.step(mem) {
-            StopReason::Step => {}
-            StopReason::Halted => {
-                return Err(DispatchError::HandlerFailed {
-                    library: "exec.library".to_string(),
-                    lvo: -522,
-                    handler_name: "RawDoFmt".to_string(),
-                    message: format!("PutChProc at {put_ch_proc:#010x} halted the CPU"),
-                });
-            }
-            StopReason::Trap(info) => {
-                return Err(DispatchError::HandlerFailed {
-                    library: "exec.library".to_string(),
-                    lvo: -522,
-                    handler_name: "RawDoFmt".to_string(),
-                    message: format!(
-                        "PutChProc at {put_ch_proc:#010x} trapped at \
-                         {:#010x} ({:?}) -- calling back into another \
-                         library call from a RawDoFmt PutChProc isn't \
-                         supported",
-                        info.pc, info.kind
-                    ),
-                });
-            }
-            StopReason::PcOutOfBounds { pc } => {
-                return Err(DispatchError::HandlerFailed {
-                    library: "exec.library".to_string(),
-                    lvo: -522,
-                    handler_name: "RawDoFmt".to_string(),
-                    message: format!(
-                        "PutChProc at {put_ch_proc:#010x} ran the program \
-                         counter off the end of guest memory (reached {pc:#010x})"
-                    ),
-                });
-            }
-        }
-        steps += 1;
+) -> Result<(), DispatchError> {
+    if state.index > state.rendered.len() {
+        ctx.cpu
+            .set_data_register(DataRegister(0), state.final_data_ptr);
+        return Ok(());
     }
 
-    let result_a3 = cpu.address_register(AddressRegister(3));
-    cpu.set_pc(saved_pc);
-    cpu.set_address_register(AddressRegister(7), saved_sp);
-    cpu.set_data_register(DataRegister(0), saved_d0);
-    cpu.set_address_register(AddressRegister(3), saved_a3);
-    Ok(result_a3)
+    let char_byte = state.rendered.get(state.index).copied().unwrap_or(0);
+    state.index += 1;
+
+    ctx.cpu
+        .set_data_register(DataRegister(0), u32::from(char_byte));
+    ctx.cpu
+        .set_address_register(AddressRegister(3), put_ch_data);
+    let put_ch_proc = state.put_ch_proc;
+    ctx.continuations
+        .trampoline(ctx.cpu, ctx.mem, put_ch_proc, move |ctx| {
+            let put_ch_data = ctx.cpu.address_register(AddressRegister(3));
+            put_ch_loop_step(ctx, state, put_ch_data)
+        });
+    Ok(())
+}
+
+/// Kicks off the `PutChProc` chain for `rendered` (plus the mandatory
+/// trailing `NUL`), starting with `put_ch_data` = `RawDoFmt`'s own `A3`
+/// argument. Returns as soon as the first trampolined call is queued --
+/// the rest of the chain runs across further handler dispatches, see this
+/// module's docs.
+fn start_put_ch_loop<C: Cpu + 'static>(
+    ctx: &mut HandlerContext<'_, C>,
+    put_ch_proc: u32,
+    put_ch_data: u32,
+    rendered: Vec<u8>,
+    final_data_ptr: u32,
+) -> Result<(), DispatchError> {
+    let state = PutChLoopState {
+        put_ch_proc,
+        rendered,
+        index: 0,
+        final_data_ptr,
+    };
+    put_ch_loop_step(ctx, state, put_ch_data)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,11 +375,13 @@ pub(crate) fn render_format(
 /// [`DispatchError`] rather than silently doing nothing), `A3` =
 /// `PutChData`). `D0` = one past the last data-stream byte consumed
 /// (matching real V36+ `RawDoFmt`).
-fn raw_do_fmt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+fn raw_do_fmt_handler<C: Cpu + 'static>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
     let fmt_addr = ctx.cpu.address_register(AddressRegister(0));
-    let mut data_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let data_ptr = ctx.cpu.address_register(AddressRegister(1));
     let put_ch_proc = ctx.cpu.address_register(AddressRegister(2));
-    let mut put_ch_data = ctx.cpu.address_register(AddressRegister(3));
+    let put_ch_data = ctx.cpu.address_register(AddressRegister(3));
 
     if put_ch_proc == 0 {
         return Err(DispatchError::HandlerFailed {
@@ -407,23 +396,12 @@ fn raw_do_fmt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 
     let fmt = read_c_string(ctx.mem, fmt_addr);
     let (rendered, final_data_ptr) = render_format(ctx.mem, &fmt, data_ptr);
-    data_ptr = final_data_ptr;
 
-    for &byte in &rendered {
-        put_ch_data = call_put_ch_proc(ctx.cpu, ctx.mem, put_ch_proc, byte, put_ch_data)?;
-    }
     // "the procedure is called with a NULL Char at the end of the
     // format string" -- always, even though the NUL itself is never
-    // part of `rendered`.
-    call_put_ch_proc(ctx.cpu, ctx.mem, put_ch_proc, 0, put_ch_data)?;
-
-    ctx.cpu.set_data_register(DataRegister(0), data_ptr);
-    Ok(())
+    // part of `rendered`; put_ch_loop_step accounts for that extra call.
+    start_put_ch_loop(ctx, put_ch_proc, put_ch_data, rendered, final_data_ptr)
 }
-
-/// Hard cap on how many instructions one `Supervisor` callout may take
-/// -- see [`CALLOUT_STEP_BUDGET`]'s use for `PutChProc`.
-const SUPERVISOR_STEP_BUDGET: u32 = 100_000;
 
 /// `exec.library`'s `Supervisor` (LVO -30: `A5` = a routine to call in
 /// supervisor mode, `struct { LONG (*)() }`). `D0` = whatever the
@@ -434,9 +412,7 @@ const SUPERVISOR_STEP_BUDGET: u32 = 100_000;
 /// which the call/return sequence naturally handles), and drops back to
 /// the caller's original privilege level on return -- the routine sees
 /// (and, other than `D0`, can freely leave changed in) the same
-/// registers the caller had, unlike [`call_put_ch_proc`]'s `RawDoFmt`
-/// callback, which restores everything but its own `A3` contract
-/// afterward.
+/// registers the caller had.
 ///
 /// **The routine must terminate with `RTE`, not `RTS`** -- the real,
 /// documented `Supervisor` contract (confirmed the hard way: an early
@@ -446,83 +422,51 @@ const SUPERVISOR_STEP_BUDGET: u32 = 100_000;
 /// straight off the end of guest memory). This runtime has no user/
 /// supervisor privilege distinction at all (every guest instruction
 /// already executes as if privileged), so there's nothing to actually
-/// elevate: this pushes a real exception-style stack frame (`SR` then
-/// `PC`, 6 bytes, matching every other real 68000 exception this
-/// runtime delivers -- see [`crate::cpu::Cpu::take_hardware_exception`]'s
-/// doc) with `PC` = [`EXIT_STUB_ADDR`], sets `PC` to the routine, then
-/// steps until the routine's own `RTE` pops that frame back off, the
-/// same technique `call_put_ch_proc` uses for `RawDoFmt`'s `PutChProc`.
+/// elevate -- but the routine's own `RTE` still needs a real
+/// exception-style stack frame (`SR` then `PC`, 6 bytes, matching every
+/// other real 68000 exception this runtime delivers -- see
+/// [`crate::cpu::Cpu::take_hardware_exception`]'s doc) to pop.
+///
+/// # Trampolined, not stepped (issue #192)
+///
+/// An earlier implementation here stepped the CPU itself, in a private
+/// loop, exactly like `call_put_ch_proc` used to for `RawDoFmt` -- and
+/// inherited the identical limitation: a routine that made any further
+/// library call of its own had no way to have that call routed through
+/// [`crate::dispatch::LibraryTable::dispatch`] from inside a nested
+/// `Cpu::step` loop, and the private loop reported it as an error instead.
+/// `ixemul.library`'s own `expunge()` cleanup -- which every ixemul-linked
+/// program runs on exit -- is a real, non-buggy routine that hits exactly
+/// this: it calls `Supervisor` to restore a bus-error vector, and
+/// something reached from there makes an ordinary library call.
+///
+/// This now uses [`crate::dispatch::ContinuationStack::trampoline_rte`],
+/// the `RTE`-aware sibling of the trampoline primitive several other
+/// handlers already use (see that method's doc for exactly how it adapts
+/// the primitive's `RTS`-based convention to `Supervisor`'s `RTE`-based
+/// one): it pushes the routine's own entry point plus the exception-style
+/// frame its `RTE` will pop, and queues a continuation to run once that
+/// happens. The continuation here is trivial -- an empty `Ok(())` --
+/// because the frame's `PC` already lands back on the real caller's own
+/// return address once the routine's `RTE` and this handler's own
+/// synthetic `rts` have both been consumed (see `trampoline_rte`'s doc
+/// for why no register ever needs restoring by hand here): the real
+/// caller's `D0` is simply whatever the routine itself left there,
+/// exactly the documented `Supervisor` result, and every other register
+/// the routine didn't touch was never touched by this handler either.
 /// Found missing while running the real `CPU` command (Workbench 3.1.4
 /// `C:`), which wraps its direct `CACR`-register access in `Supervisor`
 /// (a real, privileged `movec` instruction on 68020+) even though
 /// `CacheControl` already answers its query -- defensive real-world
 /// code, not a bug.
-fn supervisor_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+fn supervisor_handler<C: Cpu + 'static>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
     let routine = ctx.cpu.address_register(AddressRegister(5));
-    let saved_sp = ctx.cpu.address_register(AddressRegister(7));
-    let saved_pc = ctx.cpu.pc();
     let saved_sr = ctx.cpu.sr();
 
-    let sp = saved_sp.wrapping_sub(6);
-    ctx.mem.write_u16(sp, saved_sr);
-    ctx.mem.write_u32(sp.wrapping_add(2), EXIT_STUB_ADDR);
-    ctx.cpu.set_address_register(AddressRegister(7), sp);
-    ctx.cpu.set_pc(routine);
-
-    let mut steps = 0u32;
-    while ctx.cpu.pc() != EXIT_STUB_ADDR {
-        if steps >= SUPERVISOR_STEP_BUDGET {
-            return Err(DispatchError::HandlerFailed {
-                library: "exec.library".to_string(),
-                lvo: -30,
-                handler_name: "Supervisor".to_string(),
-                message: format!(
-                    "routine at {routine:#010x} did not return within \
-                     {SUPERVISOR_STEP_BUDGET} steps -- possible infinite loop \
-                     or missing rts"
-                ),
-            });
-        }
-        match ctx.cpu.step(ctx.mem) {
-            StopReason::Step => {}
-            StopReason::Halted => {
-                return Err(DispatchError::HandlerFailed {
-                    library: "exec.library".to_string(),
-                    lvo: -30,
-                    handler_name: "Supervisor".to_string(),
-                    message: format!("routine at {routine:#010x} halted the CPU"),
-                });
-            }
-            StopReason::Trap(info) => {
-                return Err(DispatchError::HandlerFailed {
-                    library: "exec.library".to_string(),
-                    lvo: -30,
-                    handler_name: "Supervisor".to_string(),
-                    message: format!(
-                        "routine at {routine:#010x} trapped at {:#010x} ({:?}) \
-                         -- calling back into another library call from a \
-                         Supervisor routine isn't supported",
-                        info.pc, info.kind
-                    ),
-                });
-            }
-            StopReason::PcOutOfBounds { pc } => {
-                return Err(DispatchError::HandlerFailed {
-                    library: "exec.library".to_string(),
-                    lvo: -30,
-                    handler_name: "Supervisor".to_string(),
-                    message: format!(
-                        "routine at {routine:#010x} ran the program counter \
-                         off the end of guest memory (reached {pc:#010x})"
-                    ),
-                });
-            }
-        }
-        steps += 1;
-    }
-
-    ctx.cpu.set_pc(saved_pc);
-    ctx.cpu.set_address_register(AddressRegister(7), saved_sp);
+    ctx.continuations
+        .trampoline_rte(ctx.cpu, ctx.mem, routine, saved_sr, |_ctx| Ok(()));
     Ok(())
 }
 
@@ -854,8 +798,32 @@ mod tests {
         assert_eq!(code, 0x1234, "D1 set before Supervisor should survive it");
     }
 
+    // There used to be a test here for "a Supervisor routine that never
+    // returns is a clean error, not a hang" -- it relied on the old
+    // private-step-loop implementation's own step budget, which doesn't
+    // exist anymore (issue #192's whole point is that a Supervisor
+    // routine now runs through the *ordinary* dispatch loop, the same one
+    // that drives every other guest instruction). An infinite loop inside
+    // a Supervisor routine now hangs exactly the same way an infinite
+    // loop anywhere else in a guest program already does -- this was
+    // never a general infinite-loop guarantee this runtime provides, only
+    // a side effect of the old implementation's own private budget, and
+    // losing it is the necessary, intentional cost of letting the
+    // routine make real library calls through the real dispatch loop.
+
     #[test]
-    fn supervisor_routine_that_never_returns_is_a_clean_error_not_a_hang() {
+    fn supervisor_routine_can_make_a_nested_library_call() {
+        // The regression this migration (issue #192) fixes: a real
+        // ixemul-linked program's exit cleanup calls Supervisor() to
+        // restore a bus-error vector, and something reached from there
+        // makes an ordinary library call -- which the old step-loop
+        // implementation could not route through dispatch and reported
+        // as "calling back into another library call from a Supervisor
+        // routine isn't supported". Here the routine calls RawMayGetChar
+        // (an ordinary, already-registered exec.library LVO) and proves
+        // it really ran by negating its documented D0 result (-1) into 1
+        // before returning via RTE -- a value only reachable if the
+        // nested call actually dispatched and returned.
         let mut words = movea_exec_base_to_a6().to_vec();
         let routine_idx = words.len();
         words.push(move_imm_to_a(5)); // A5 = routine (patched)
@@ -864,21 +832,24 @@ mod tests {
         words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
         words.push(RTS);
 
-        // bra.s $ (an infinite self-loop, never RTEs).
-        const ROUTINE: [u16; 1] = [0x60FE];
+        // jsr RawMayGetChar(a6) ; neg.l d0 ; rte
+        let mut routine = jsr_disp16_a6(-510).to_vec();
+        routine.push(0x4480); // neg.l d0
+        routine.push(0x4E73); // rte
         let routine_idx_words = words.len();
-        words.extend_from_slice(&ROUTINE);
+        words.extend_from_slice(&routine);
         let routine_addr = TRAP_TABLE_END + (routine_idx_words as u32) * 2;
         words[routine_idx + 1] = (routine_addr >> 16) as u16;
         words[routine_idx + 2] = routine_addr as u16;
 
         let mut rt = runtime_with_program(&words);
         let mut out = Vec::new();
-        let err = rt.run(&mut out, None).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("did not return"),
-            "unexpected message: {message}"
+        let code = rt
+            .run(&mut out, None)
+            .expect("a nested library call from inside a Supervisor routine should now succeed");
+        assert_eq!(
+            code, 1,
+            "RawMayGetChar's documented D0=-1 result, negated, proves the nested call really ran"
         );
     }
 }

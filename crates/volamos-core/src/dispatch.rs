@@ -1584,16 +1584,21 @@ type Continuation<C> = Box<dyn FnOnce(&mut HandlerContext<'_, C>) -> Result<(), 
 ///
 /// This is the fix for a real, already-documented limitation:
 /// `execfmt.rs`'s `RawDoFmt` `PutChProc` callout and `Supervisor`
-/// handler both step the CPU themselves, in a private loop, to call back
-/// into guest code synchronously -- and both explicitly do *not* support
-/// the stepped routine making further library calls (see
-/// `call_put_ch_proc`'s doc comment: "calling back into another library
-/// call from a RawDoFmt PutChProc isn't supported"), because a nested
-/// `Cpu::step` loop has no way to route a trap through
+/// handler used to step the CPU themselves, in a private loop, to call
+/// back into guest code synchronously -- and both explicitly did *not*
+/// support the stepped routine making further library calls, because a
+/// nested `Cpu::step` loop has no way to route a trap through
 /// [`LibraryTable::dispatch`] without reentering [`Runtime::run`] itself.
 /// The trampoline sidesteps the problem entirely by not stepping at all:
 /// it lets the *existing* dispatch loop do the work, split across two
-/// (or more) handler invocations instead of one.
+/// (or more) handler invocations instead of one. Both call sites have
+/// since been migrated onto this primitive (issue #192) --
+/// `call_put_ch_proc`'s private loop was replaced by a chain of
+/// trampolined calls, one per output character, and `supervisor_handler`
+/// by [`ContinuationStack::trampoline_rte`], a variant of this primitive
+/// that accounts for `Supervisor`'s real contract (the routine terminates
+/// with `RTE`, not `RTS`) -- see that method's own doc for how it adapts
+/// this mechanism's `RTS`-based convention to an `RTE`-based one.
 ///
 /// # Mechanism
 ///
@@ -1712,6 +1717,69 @@ impl<C: Cpu> ContinuationStack<C> {
         // own local pushes -- see this type's "Mechanism" doc.
         let sp = sp.wrapping_sub(4);
         mem.write_u32(sp, CONTINUATION_STUB_ADDR);
+        // Then push subroutine_entry on top: the very next thing
+        // Runtime::run's post-dispatch rts (for *this* handler) pops.
+        let sp = sp.wrapping_sub(4);
+        mem.write_u32(sp, subroutine_entry);
+        cpu.set_address_register(AddressRegister(7), sp);
+
+        self.pending.push(Box::new(continuation));
+    }
+
+    /// Like [`ContinuationStack::trampoline`], but arranges for the
+    /// subroutine to return via a real `RTE` instead of an `RTS` --
+    /// `exec.library`'s `Supervisor` is the one real AmigaOS contract this
+    /// runtime implements where the callee's own documented return
+    /// instruction is `RTE`, not `RTS` (see `crate::execfmt::
+    /// supervisor_handler`'s doc for the full real-hardware rationale).
+    ///
+    /// [`ContinuationStack::trampoline`] pushes a plain 4-byte return
+    /// address (`RTS`'s own pop shape); an `RTE`-terminated routine
+    /// instead pops a real 6-byte m68k exception-style frame -- a `u16`
+    /// `SR` at the lower address followed by a `u32` `PC` (matching every
+    /// other real exception frame this runtime delivers, see
+    /// `Cpu::take_hardware_exception`'s doc). This pushes exactly that
+    /// frame, with `PC` set to [`CONTINUATION_STUB_ADDR`] so the
+    /// subroutine's `rte` lands back on the trampoline stub exactly like
+    /// an `RTS`-terminated one would, then pushes `subroutine_entry` on
+    /// top of it so [`Runtime::run`]'s generic post-dispatch `rts` (for
+    /// *this* handler's own return) still enters the subroutine the same
+    /// way `trampoline` does -- everything past that first entry is
+    /// identical to the plain `RTS` case; only the frame shape the
+    /// subroutine's own return instruction consumes differs. In
+    /// particular, no special-casing is needed in `Runtime::run` itself:
+    /// the subroutine's `rte` is an ordinary instruction the CPU core
+    /// executes on its own, and it lands PC on [`CONTINUATION_STUB_ADDR`]
+    /// exactly as if an `RTS` had popped it there, so the very next step
+    /// traps into [`continuation_stub_handler`] through the completely
+    /// ordinary trap-dispatch path, same as any other library call.
+    ///
+    /// `sr` is the status-register value the subroutine's `RTE` will
+    /// restore once it returns -- ordinarily the caller's own current
+    /// `SR`, unchanged, since this runtime has no real supervisor/user
+    /// privilege distinction to elevate (every guest instruction already
+    /// executes as if privileged); see `supervisor_handler`'s doc for why
+    /// passing the caller's own `SR` straight through is the right choice
+    /// rather than synthesizing a different one.
+    pub fn trampoline_rte<F>(
+        &mut self,
+        cpu: &mut C,
+        mem: &mut C::Memory,
+        subroutine_entry: u32,
+        sr: u16,
+        continuation: F,
+    ) where
+        F: FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError> + 'static,
+    {
+        let sp = cpu.address_register(AddressRegister(7));
+        // Push the RTE-style exception frame first (deeper on the stack)
+        // so it's what the subroutine's own `rte` pops once it has
+        // consumed its own local pushes -- mirroring `trampoline`'s
+        // "push CONTINUATION_STUB_ADDR first" ordering, just with a
+        // 6-byte frame instead of a bare 4-byte address.
+        let sp = sp.wrapping_sub(6);
+        mem.write_u16(sp, sr);
+        mem.write_u32(sp.wrapping_add(2), CONTINUATION_STUB_ADDR);
         // Then push subroutine_entry on top: the very next thing
         // Runtime::run's post-dispatch rts (for *this* handler) pops.
         let sp = sp.wrapping_sub(4);
