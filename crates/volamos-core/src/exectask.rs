@@ -3023,6 +3023,62 @@ mod tests {
     }
 
     #[test]
+    fn dl_timereq_idiom_fetches_io_device_and_calls_read_eclock() {
+        // libnix's clock() (clock.o in libnix20.a) bypasses
+        // OpenDevice/DoIO entirely: it reads
+        // ((struct DosLibrary*)DOSBase)->dl_TimeReq->io_Device directly
+        // and calls through it at LVO -60 (ReadEClock). Before
+        // dl_TimeReq was populated this read back the sentinel prefill
+        // left at DOS_LIBRARY_BASE's unmodeled positive offsets, so the
+        // call jumped through a bogus address and crashed -- see
+        // dispatch::DOS_DL_TIMEREQ_OFFSET's doc.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = movea_dos_base_to_a6().to_vec(); // A6 = DOS_LIBRARY_BASE
+        words.push(0x206E); // movea.l (58,a6),a0 -- A0 = dl_TimeReq
+        words.push(0x003A);
+        words.push(0x2C68); // movea.l (0x14,a0),a6 -- A6 = io_Device
+        words.push(0x0014);
+        words.push(move_imm_to_a(0)); // A0 = dest eclock (patched)
+        let dest_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x4EAE); // jsr -60(a6) -- ReadEClock
+        words.push(0xFFC4);
+        words.push(RTS);
+
+        let dest_addr = entry + (words.len() as u32) * 2 + 16;
+        words[dest_idx] = (dest_addr >> 16) as u16;
+        words[dest_idx + 1] = dest_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: dest_addr + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, ECLOCK_PAL_HZ as i32,
+            "ReadEClock's D0 return (eclock ticks/sec)"
+        );
+        assert_ne!(
+            rt.memory().read_u32(dest_addr),
+            0,
+            "or the eclock high word"
+        );
+    }
+
+    #[test]
     fn add_time_carries_micro_overflow_into_seconds() {
         // AddTime via its real LVO with A6 pointed straight at
         // TIMER_DEVICE_BASE (skipping OpenDevice -- the vector table is

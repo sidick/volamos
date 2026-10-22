@@ -352,6 +352,41 @@ pub const MATHIEEEDOUBTRANS_LIBRARY_BASE: u32 = 0x17B0;
 /// `crate::exectask`'s timer handlers.
 pub const TIMER_DEVICE_BASE: u32 = 0x19B0;
 
+/// Byte offset of `struct DosLibrary`'s `dl_TimeReq` field from
+/// [`DOS_LIBRARY_BASE`] (real NDK `dos/dosextens.h` struct layout):
+/// `LibNode` ([`LIB_STRUCT_SIZE`], 34) + `dl_Root`/`dl_GV`/`dl_Root2`
+/// (4 each, 12) + `dl_Unused[12]` (12) = 58. Real `dos.library` keeps an
+/// internal `timerequest` permanently open on `timer.device` here for its
+/// own time-arithmetic use; libnix's `clock()` (and other guest code)
+/// exploits the documented RKRM idiom `TimerBase =
+/// TimerIO->tr_node.io_Device` to call straight through it (e.g. `jsr
+/// -60(a6)` = `ReadEClock`, see [`TIMER_DEVICE_BASE`]'s doc for the
+/// `SubTime`/`PhxAss` precedent of the same idiom) without ever calling
+/// `OpenDevice`/`DoIO` itself. Found via a libnix `clock()` crash:
+/// without this field populated, it read back whatever the sentinel
+/// prefill left there, so the fast-path jumped through a bogus address.
+pub(crate) const DOS_DL_TIMEREQ_OFFSET: u32 = 58;
+
+/// Guest address of a small, permanently-resident fake `timerequest`
+/// pointed to by `dl_TimeReq` (see [`DOS_DL_TIMEREQ_OFFSET`]) -- carved
+/// from the same `0x0800`..`0x0BAC` headroom [`UTILITY_LIBRARY_BASE`]'s
+/// doc describes between `dos.library`'s base and `utility.library`'s
+/// own jump table, well clear of both. Only its `io_Device` field (at
+/// [`DOS_TIMEREQ_IO_DEVICE_OFFSET`]) is ever read -- real guest code
+/// exploiting this idiom calls straight through `io_Device`'s own LVOs
+/// rather than issuing `DoIO`/`SendIO` on this request, so the rest of a
+/// real `timerequest` (`io_Command`/`tr_time`/etc.) is never populated.
+pub(crate) const DOS_TIMEREQ_ADDR: u32 = DOS_LIBRARY_BASE + 0x40;
+
+/// `io_Device`'s byte offset within a `timerequest`/`IORequest` (`struct
+/// Message` is 20 bytes; see `crate::exectask`'s identical offset for
+/// real `OpenDevice`-built requests).
+const DOS_TIMEREQ_IO_DEVICE_OFFSET: u32 = 20;
+
+/// Total span zeroed at [`DOS_TIMEREQ_ADDR`] -- enough to cover
+/// [`DOS_TIMEREQ_IO_DEVICE_OFFSET`]'s `u32`, with a little headroom.
+const DOS_TIMEREQ_SIZE: u32 = 24;
+
 /// Real `mathffp.library` base address -- same chunked layout as
 /// [`MATHTRANS_LIBRARY_BASE`], in the `0x1A00`..`0x1C00` chunk. Deepest
 /// real LVO: `SPCeil` at `-96` (per its `.fd` file, `##bias 30` then 12
@@ -2499,6 +2534,20 @@ impl<C: Cpu + 'static> Runtime<C> {
             TIMER_DEVICE_BASE.wrapping_add(LIB_NODE_TYPE_OFFSET),
             NT_DEVICE,
         );
+
+        // dl_TimeReq: give dos.library a real (fake) persistent
+        // timerequest whose io_Device is TIMER_DEVICE_BASE, exactly as
+        // OpenDevice("timer.device") already does for guest-initiated
+        // opens (see exectask::open_device_handler) -- see
+        // DOS_DL_TIMEREQ_OFFSET's doc for why this matters.
+        for addr in DOS_TIMEREQ_ADDR..(DOS_TIMEREQ_ADDR + DOS_TIMEREQ_SIZE) {
+            mem.write_u8(addr, 0);
+        }
+        mem.write_u32(
+            DOS_TIMEREQ_ADDR + DOS_TIMEREQ_IO_DEVICE_OFFSET,
+            TIMER_DEVICE_BASE,
+        );
+        mem.write_u32(DOS_LIBRARY_BASE + DOS_DL_TIMEREQ_OFFSET, DOS_TIMEREQ_ADDR);
 
         // Real struct ExecBase (NDK exec/execbase.h) extends well past
         // struct Library -- SoftVer, ChkBase, the Capture vectors,
