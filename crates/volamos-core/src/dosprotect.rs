@@ -28,7 +28,7 @@
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::dosfile::map_io_error;
+use crate::dosfile::{DosState, map_io_error};
 use crate::dosmeta;
 use crate::guestmem::read_c_string;
 use crate::lvos::dos::DOS_LVOS;
@@ -42,6 +42,31 @@ const DOSFALSE: u32 = 0;
 /// system refuses to modify the file" (write-protected).
 const FIBF_WRITE: u32 = 1 << 2;
 
+/// `SetProtection`'s work on `name` (resolved like the library call's),
+/// shared with the `ACTION_SET_PROTECT` packet ([`crate::dospkt`]).
+pub(crate) fn set_protection(dos: &DosState, name: &str, mask: u32) -> Result<(), i32> {
+    let vfs = dos
+        .vfs
+        .as_ref()
+        .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+    let host_path = vfs
+        .resolve(name, ResolveMode::MustExist)
+        .map_err(|e| crate::dosfile::map_vfs_error(&e))?;
+    let mut perms = fs::metadata(&host_path)
+        .map_err(|e| map_io_error(&e))?
+        .permissions();
+    perms.set_readonly(mask & FIBF_WRITE != 0);
+    fs::set_permissions(&host_path, perms).map_err(|e| map_io_error(&e))?;
+
+    let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
+    sidecar_meta.prot = mask;
+    // Best-effort: a sidecar write failure shouldn't fail the whole
+    // call when the real host permission change (the primary,
+    // always-real effect) already succeeded above.
+    let _ = dosmeta::write_sidecar(&host_path, &sidecar_meta);
+    Ok(())
+}
+
 /// `SetProtection` (`D1` = name `CString*`, `D2` = protection mask).
 /// `D0` = `DOSTRUE`/`DOSFALSE` (+ `IoErr()` set on failure).
 fn set_protection_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -49,31 +74,7 @@ fn set_protection_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
     let mask = ctx.cpu.data_register(DataRegister(2));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
 
-    let result = (|| -> Result<(), i32> {
-        let vfs = ctx
-            .dos
-            .vfs
-            .as_ref()
-            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
-        let host_path = vfs
-            .resolve(&name, ResolveMode::MustExist)
-            .map_err(|e| crate::dosfile::map_vfs_error(&e))?;
-        let mut perms = fs::metadata(&host_path)
-            .map_err(|e| map_io_error(&e))?
-            .permissions();
-        perms.set_readonly(mask & FIBF_WRITE != 0);
-        fs::set_permissions(&host_path, perms).map_err(|e| map_io_error(&e))?;
-
-        let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
-        sidecar_meta.prot = mask;
-        // Best-effort: a sidecar write failure shouldn't fail the whole
-        // call when the real host permission change (the primary,
-        // always-real effect) already succeeded above.
-        let _ = dosmeta::write_sidecar(&host_path, &sidecar_meta);
-        Ok(())
-    })();
-
-    match result {
+    match set_protection(ctx.dos, &name, mask) {
         Ok(()) => ctx.cpu.set_data_register(DataRegister(0), DOSTRUE),
         Err(code) => {
             ctx.dos.set_io_err(code);

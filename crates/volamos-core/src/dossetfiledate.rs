@@ -16,7 +16,7 @@
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::dosfile::map_io_error;
+use crate::dosfile::{DosState, map_io_error};
 use crate::dosmeta;
 use crate::guestmem::read_c_string;
 use crate::lvos::dos::DOS_LVOS;
@@ -30,36 +30,44 @@ const DS_DAYS_OFFSET: u32 = 0;
 const DS_MINUTE_OFFSET: u32 = 4;
 const DS_TICK_OFFSET: u32 = 8;
 
+/// `SetFileDate`'s work on `name` (resolved like the library call's),
+/// with the `struct DateStamp` at `date_ptr`; shared with the
+/// `ACTION_SET_DATE` packet ([`crate::dospkt`]).
+pub(crate) fn set_file_date(
+    dos: &DosState,
+    mem: &dyn AddressSpace,
+    name: &str,
+    date_ptr: u32,
+) -> Result<(), i32> {
+    let days = mem.read_u32(date_ptr.wrapping_add(DS_DAYS_OFFSET)) as i32;
+    let minute = mem.read_u32(date_ptr.wrapping_add(DS_MINUTE_OFFSET)) as i32;
+    let tick = mem.read_u32(date_ptr.wrapping_add(DS_TICK_OFFSET)) as i32;
+
+    let vfs = dos
+        .vfs
+        .as_ref()
+        .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+    let host_path = vfs
+        .resolve(name, ResolveMode::MustExist)
+        .map_err(|e| crate::dosfile::map_vfs_error(&e))?;
+    // Touch the target so a missing object fails cleanly
+    // (SetFileDate has no other host-side effect to fail on
+    // otherwise -- same convention as crate::dosnote's SetComment).
+    std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
+
+    let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
+    sidecar_meta.date = (days, minute, tick);
+    dosmeta::write_sidecar(&host_path, &sidecar_meta).map_err(|e| map_io_error(&e))
+}
+
 /// `SetFileDate` (`D1` = name `CString*`, `D2` = `struct DateStamp*`).
 /// `D0` = `DOSTRUE`/`DOSFALSE` (+ `IoErr()` set on failure).
 fn set_file_date_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.data_register(DataRegister(1));
     let date_ptr = ctx.cpu.data_register(DataRegister(2));
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
-    let days = ctx.mem.read_u32(date_ptr.wrapping_add(DS_DAYS_OFFSET)) as i32;
-    let minute = ctx.mem.read_u32(date_ptr.wrapping_add(DS_MINUTE_OFFSET)) as i32;
-    let tick = ctx.mem.read_u32(date_ptr.wrapping_add(DS_TICK_OFFSET)) as i32;
 
-    let result = (|| -> Result<(), i32> {
-        let vfs = ctx
-            .dos
-            .vfs
-            .as_ref()
-            .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
-        let host_path = vfs
-            .resolve(&name, ResolveMode::MustExist)
-            .map_err(|e| crate::dosfile::map_vfs_error(&e))?;
-        // Touch the target so a missing object fails cleanly
-        // (SetFileDate has no other host-side effect to fail on
-        // otherwise -- same convention as crate::dosnote's SetComment).
-        std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
-
-        let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
-        sidecar_meta.date = (days, minute, tick);
-        dosmeta::write_sidecar(&host_path, &sidecar_meta).map_err(|e| map_io_error(&e))
-    })();
-
-    match result {
+    match set_file_date(ctx.dos, ctx.mem, &name, date_ptr) {
         Ok(()) => ctx.cpu.set_data_register(DataRegister(0), DOSTRUE),
         Err(code) => {
             ctx.dos.set_io_err(code);
