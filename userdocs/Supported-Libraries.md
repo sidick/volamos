@@ -54,9 +54,18 @@ Changelog.
   `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK`/`ACTION_END`,
   `ACTION_LOCATE_OBJECT` (`Lock`), `ACTION_FINDINPUT`/
   `ACTION_FINDOUTPUT`/`ACTION_FINDUPDATE` (`Open`), `ACTION_EXAMINE_FH`,
-  `ACTION_READ_LINK`, and `ACTION_DISK_INFO`/`ACTION_INFO`/
-  `ACTION_IS_FILESYSTEM` sent to a volume's own task. Any other packet
-  type fails cleanly with `ERROR_ACTION_NOT_KNOWN`.
+  `ACTION_READ_LINK`, `ACTION_CREATE_DIR`/`ACTION_DELETE_OBJECT`/
+  `ACTION_RENAME_OBJECT`/`ACTION_MAKE_LINK` (hard and soft),
+  `ACTION_SET_PROTECT`/`ACTION_SET_DATE`/`ACTION_SET_OWNER`/
+  `ACTION_SET_FILE_SIZE`, `ACTION_WAIT_CHAR`, and
+  `ACTION_DISK_INFO`/`ACTION_INFO`/`ACTION_IS_FILESYSTEM` sent to a
+  volume's own task. Every lock's `fl_Task` and `GetDeviceProc`'s
+  `dvp_Port` point at this same synthetic handler port, so a caller
+  that resolves it itself (as `ixemul.library`'s `__plock()` does)
+  reaches it too. Any other packet type fails cleanly with
+  `ERROR_ACTION_NOT_KNOWN`; an unknown action's `Res1` is `DOSFALSE`,
+  not `-1`, matching real `dos.library` for callers that read it as a
+  boolean.
 - Path strings: `SplitName` (alongside `AddPart`/`FilePart`/`PathPart`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
@@ -138,7 +147,10 @@ Changelog.
   ignores the chip/fast flags, so an allocation's answer depends only
   on where the heap placed it.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
-  `ExecBase` field, not a call), `CacheControl`, `Supervisor`.
+  `ExecBase` field, not a call), `CacheControl`, `Supervisor` (enters
+  the routine through a real exception frame — a 68010+ format-0
+  vector word included — so it may make further library calls and
+  `RTE` anywhere, not just back to the caller).
 
 ## utility.library
 
@@ -182,7 +194,10 @@ bug in volamos.
 
 Real time-arithmetic (`AddTime`/`SubTime`/`CmpTime`/`ReadEClock`/
 `GetSysTime`) via the documented `io_Device`-as-library-base idiom
-real AmigaOS code uses to call these functions.
+real AmigaOS code uses to call these functions. `dos.library`'s
+`DOSBase->dl_TimeReq` is a real `timerequest` with its `io_Device`
+pointing here too, for callers (e.g. libnix's `clock()`) that read it
+directly instead of going through `OpenDevice`.
 
 ## Deliberately out of scope
 

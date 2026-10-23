@@ -3,6 +3,66 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.13
+
+- **`ixemul.library`-linked programs run a full round of path-based
+  file I/O** (issues #186, #196) — `ixemul`'s `__plock()` resolves
+  every path itself via `GetDeviceProc()` then raw `DosPacket`s sent
+  straight to `dvp_Port`, which this runtime left `NULL`, so every
+  path-based call (`open()`, `mkdir()`, `stat()`, `rename()`,
+  `unlink()`, `opendir()`) failed with `ENOENT` before any packet was
+  even sent. `GetDeviceProc` now returns the same synthetic filesystem
+  packet port every lock's `fl_Task`/handle's `fh_Type` already does.
+  With a real destination, `handle_fs_packet` now answers the rest of
+  the path actions ixemul sends — `ACTION_CREATE_DIR`,
+  `ACTION_DELETE_OBJECT`, `ACTION_RENAME_OBJECT`, `ACTION_MAKE_LINK`
+  (hard and soft), `ACTION_SET_PROTECT`, `ACTION_SET_DATE`,
+  `ACTION_SET_OWNER`, `ACTION_SET_FILE_SIZE`, `ACTION_WAIT_CHAR`, and
+  `ACTION_DISK_INFO` — plus `dos.library`'s `Info()` call ixemul makes
+  when resolving a path through `/`. An unknown packet action's
+  `Res1` is now `DOSFALSE` rather than `-1`, which a caller reading it
+  as a boolean (ixemul's `mkdir()`) previously misread as success.
+  Verified against the real `ixemul.library` 80.1 SDK: a test program
+  covering mkdir, open/create, read/write/lseek, fstat, ftruncate,
+  `O_APPEND`, `O_EXCL`, `ENOENT`, rename, opendir/readdir, unlink, and
+  rmdir now passes all 21 checks on `--cpu 68000` and `68020`, with and
+  without `--sanitize`.
+
+- **`exec.library`'s `Supervisor()` enters its routine through a real
+  exception frame** (issue #192) — it used to push a 6-byte 68000
+  frame regardless of the emulated CPU, so a 68010+'s `RTE` (which
+  reads a format word after the PC) ran off the end of guest memory on
+  `--cpu 68020`/`68040`. `Supervisor()` now switches to supervisor mode
+  and the supervisor stack and pushes the frame the model's `RTE`
+  actually pops — SR, PC, and on a 68010+ a format-0 vector word —
+  the same way a real hardware exception does. This also fixes a
+  second, independent gap: the routine may now make its own library
+  calls and `RTE` anywhere, not just back to its caller, which
+  unblocks `ixemul.library`'s `expunge()` cleanup (`sigreturn()`'s
+  `Supervisor()`-based `longjmp()`) on normal program exit. gcc's
+  `setjmp`/`longjmp` execute-testsuite cases now pass against both
+  `ixemul` 47.3 and 80.1 at every optimization level.
+
+- **libnix's `clock()` no longer crashes** — it reads
+  `DOSBase->dl_TimeReq->io_Device` directly and calls through it at
+  `ReadEClock`'s LVO instead of going through `OpenDevice`/`DoIO`, a
+  documented RKRM idiom real `dos.library` relies on internally.
+  `dl_TimeReq` previously held whatever the sentinel prefill left
+  there; it's now a real `timerequest` pointing at `timer.device`,
+  exactly as an explicit `OpenDevice("timer.device")` already
+  produces.
+
+- **`AllocDosObject`/`FreeDosObject`** gain the two remaining
+  `<dos/dos.h>` types: `DOS_STDPKT` (a `StandardPacket` linked the
+  documented way for `SendPkt`/`WaitPkt`) and `DOS_CLI` (a
+  `CommandLineInterface` with its four `BSTR` buffers sized per
+  `<dos/dostags.h>`'s `ADO_*Len` tags). Every object type the header
+  defines is now implemented.
+
+- Fixed a guest-heap leak in `Lock`'s `new_lock`: if allocating the
+  synthetic filesystem port failed right after the `FileLock` struct
+  itself was allocated, the `FileLock` block was never freed.
+
 ## 0.12
 
 - **`ixemul.library`-linked programs run file I/O** (issue #186) —
