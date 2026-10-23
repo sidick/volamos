@@ -2060,8 +2060,7 @@ pub(crate) const DEFAULT_FILE_SYS_TASK: u32 = 1;
 /// why raw packets are out of scope), never to actually dereference it,
 /// so a real backing `MsgPort` struct isn't needed. Real
 /// `GetFileSysTask` never returns `NULL` on a booted system, so `0`
-/// would be the wrong choice here (unlike [`crate::dosdevproc`]'s
-/// `dvp_Port`, which real callers do check for `NULL`)). Doesn't touch
+/// would be the wrong choice here). Doesn't touch
 /// `IoErr()`, matching the real function.
 fn get_file_sys_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.cpu

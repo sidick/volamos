@@ -5,26 +5,26 @@
 //! binary: it calls `GetDeviceProc` (after `Lock`+`CurrentDir` on the
 //! target's containing directory) before deleting anything.
 //!
-//! # Scope: no real handler processes or packets
+//! # The handler port
 //!
 //! Real `GetDeviceProc` returns a `struct DevProc` whose `dvp_Port` is
 //! the real `MsgPort` of the handler/file-system process responsible
-//! for the path -- callers that go on to build and send a `DosPacket`
-//! to it expect a live process answering on the other end. This
-//! runtime has no such processes (see `crate::execlist`'s module docs:
-//! its message-port primitives are single-threaded scaffolding, not a
-//! real multi-task packet round-trip), so `dvp_Port` is always `0`
-//! (`NULL`) here. What this runtime *can* do faithfully is the locking
-//! half: `dvp_Lock`, a [`crate::doslock::SHARED_LOCK`] on the target's
-//! containing directory -- confirmed as `GetDeviceProc`'s actual role
-//! for e.g. `CreateDir()` internally, per the RKRM's own packet
-//! documentation ("The lock in `dp_Arg1` is the directory to which the
-//! path in `dp_Arg2` is relative. The `CreateDir()` function obtains it
-//! from `GetDeviceProc()`"). A corpus binary that only uses the
-//! returned lock (as opposed to sending it raw packets over
-//! `dvp_Port`) works correctly against this; one that needs the packet
-//! round-trip will hit the next unhandled call at `dvp_Port` usage
-//! instead of crashing silently on a `NULL`-dereference here.
+//! for the path, and callers go on to send `DosPacket`s to it. This
+//! runtime has no handler processes, but it has one filesystem packet
+//! port ([`crate::dosfile::DosState::fs_port_addr`]) whose `PutMsg` is
+//! answered host-side by [`crate::dospkt::handle_fs_packet`] (issue
+//! #186); every lock's `fl_Task` and every handle's `fh_Type` already
+//! name it, and `dvp_Port` does too. ixemul.library resolves every path
+//! that way (`__plock()`: `GetDeviceProc`, then `ACTION_LOCATE_OBJECT`
+//! and the action itself to `dvp_Port`), and gives up with
+//! `ERROR_OBJECT_NOT_FOUND` when `dvp_Port` is `NULL`.
+//!
+//! `dvp_Lock` is a [`crate::doslock::SHARED_LOCK`] on the target's
+//! containing directory -- `GetDeviceProc`'s actual role for e.g.
+//! `CreateDir()` internally, per the RKRM's own packet documentation
+//! ("The lock in `dp_Arg1` is the directory to which the path in
+//! `dp_Arg2` is relative. The `CreateDir()` function obtains it from
+//! `GetDeviceProc()`").
 //!
 //! Multi-assign iteration (`GetDeviceProc` called again with a
 //! previous, non-`NULL` result to advance to the next directory of a
@@ -97,9 +97,18 @@ fn get_device_proc(
     };
 
     let lock_bptr = dos.lock(heap, mem, &dir_part, SHARED_LOCK)?;
+    // The packet port every lock's fl_Task and handle's fh_Type name:
+    // see the module docs.
+    let port = match dos.fs_port_addr(heap, mem) {
+        Ok(port) => port,
+        Err(code) => {
+            dos.unlock(heap, addr_from_bptr(lock_bptr));
+            return Err(code);
+        }
+    };
     match heap.alloc(&mut *mem, DEVPROC_SIZE) {
         Ok(addr) => {
-            mem.write_u32(addr + DVP_PORT_OFFSET, 0);
+            mem.write_u32(addr + DVP_PORT_OFFSET, port);
             mem.write_u32(addr + DVP_LOCK_OFFSET, lock_bptr);
             mem.write_u32(addr + DVP_FLAGS_OFFSET, 0);
             mem.write_u32(addr + DVP_DEVNODE_OFFSET, 0);
@@ -230,10 +239,10 @@ mod tests {
 
         let addr = get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:work/f.txt", 0).unwrap();
         assert_ne!(addr, 0);
-        assert_eq!(
-            mem.read_u32(addr + DVP_PORT_OFFSET),
-            0,
-            "no real handler process"
+        let port = mem.read_u32(addr + DVP_PORT_OFFSET);
+        assert!(
+            dos.is_fs_handler_port(port),
+            "dvp_Port should be the filesystem packet port"
         );
         let lock_bptr = mem.read_u32(addr + DVP_LOCK_OFFSET);
         assert_ne!(lock_bptr, 0);
@@ -379,7 +388,11 @@ mod tests {
         assert_ne!(code, 0, "should return a non-NULL DevProc*");
 
         let addr = code as u32;
-        assert_eq!(rt.memory().read_u32(addr + DVP_PORT_OFFSET), 0);
+        assert_ne!(
+            rt.memory().read_u32(addr + DVP_PORT_OFFSET),
+            0,
+            "dvp_Port should be the filesystem packet port"
+        );
         let lock_bptr = rt.memory().read_u32(addr + DVP_LOCK_OFFSET);
         assert_ne!(lock_bptr, 0, "dvp_Lock should be a real lock");
     }
