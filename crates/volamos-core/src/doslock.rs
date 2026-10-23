@@ -265,7 +265,13 @@ impl DosState {
         // real, PutMsg-interceptable port rather than `0` changes
         // nothing observable for a guest that (like every other caller
         // so far) never sends it packets at all.
-        let fl_task = self.fs_port_addr(heap, mem)?;
+        let fl_task = match self.fs_port_addr(heap, mem) {
+            Ok(fl_task) => fl_task,
+            Err(e) => {
+                let _ = heap.free(addr);
+                return Err(e);
+            }
+        };
         mem.write_u32(addr.wrapping_add(FL_TASK_OFFSET), fl_task);
         self.locks.insert(
             addr,
