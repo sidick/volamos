@@ -203,6 +203,15 @@ pub trait Cpu {
     /// this method.
     fn take_hardware_exception(&mut self, mem: &mut Self::Memory, kind: TrapKind) -> bool;
 
+    /// Enters supervisor mode the way the CPU enters an exception, with
+    /// a frame that returns to `return_pc` in the current `SR`: switches
+    /// to the supervisor stack (clearing the trace bits), then pushes the
+    /// frame the emulated model's own `RTE` pops -- `SR` and `PC` on a
+    /// 68000, plus a format 0 vector word (`$20`, privilege violation) on
+    /// a 68010 and later. `exec.library`'s `Supervisor` enters its routine
+    /// through this, see `crate::execfmt::supervisor_handler`.
+    fn push_exception_frame(&mut self, mem: &mut Self::Memory, return_pc: u32);
+
     /// Accumulated real m68k CPU cycles consumed so far, for a backend
     /// that tracks them at all -- see
     /// [`crate::backend::M68kCpu::set_clock_mhz`] (the CLI's

@@ -893,6 +893,31 @@ impl Cpu for M68kCpu {
         true
     }
 
+    fn push_exception_frame(&mut self, mem: &mut Self::Memory, return_pc: u32) {
+        let old_sr = self.core.get_sr();
+        // Supervisor mode, on the supervisor stack, without trace: what
+        // exception entry does before it writes the frame.
+        self.core.set_sr((old_sr | 0x2000) & !0xC000);
+        let top = self.address_register(AddressRegister(7));
+        let size = if self.core.cpu_type == CpuType::M68000 {
+            6
+        } else {
+            8
+        };
+        let sp = top.wrapping_sub(size);
+        self.set_address_register(AddressRegister(7), sp);
+        // Publish the push to the sanitizer before writing the frame,
+        // as its own per-instruction hook does for a guest push.
+        if let Some(shadow) = mem.shadow_mut() {
+            shadow.update_stack_pointer(sp);
+        }
+        AddressSpace::write_u16(mem, sp, old_sr);
+        AddressSpace::write_u32(mem, sp.wrapping_add(2), return_pc);
+        if size == 8 {
+            AddressSpace::write_u16(mem, sp.wrapping_add(6), 0x0020);
+        }
+    }
+
     fn emulated_cycles(&self) -> u64 {
         self.cycles
     }

@@ -419,54 +419,39 @@ fn raw_do_fmt_handler<C: Cpu + 'static>(
 /// implementation here pushed a plain `RTS`-style return address, and
 /// the real `CPU` command's routine promptly executed a bare `rte`
 /// with nothing valid on the stack, sending the program counter
-/// straight off the end of guest memory). This runtime has no user/
-/// supervisor privilege distinction at all (every guest instruction
-/// already executes as if privileged), so there's nothing to actually
-/// elevate -- but the routine's own `RTE` still needs a real
-/// exception-style stack frame (`SR` then `PC`, 6 bytes, matching every
-/// other real 68000 exception this runtime delivers -- see
-/// [`crate::cpu::Cpu::take_hardware_exception`]'s doc) to pop.
+/// straight off the end of guest memory).
 ///
-/// # Trampolined, not stepped (issue #192)
-///
-/// An earlier implementation here stepped the CPU itself, in a private
-/// loop, exactly like `call_put_ch_proc` used to for `RawDoFmt` -- and
-/// inherited the identical limitation: a routine that made any further
-/// library call of its own had no way to have that call routed through
-/// [`crate::dispatch::LibraryTable::dispatch`] from inside a nested
-/// `Cpu::step` loop, and the private loop reported it as an error instead.
-/// `ixemul.library`'s own `expunge()` cleanup -- which every ixemul-linked
-/// program runs on exit -- is a real, non-buggy routine that hits exactly
-/// this: it calls `Supervisor` to restore a bus-error vector, and
-/// something reached from there makes an ordinary library call.
-///
-/// This now uses [`crate::dispatch::ContinuationStack::trampoline_rte`],
-/// the `RTE`-aware sibling of the trampoline primitive several other
-/// handlers already use (see that method's doc for exactly how it adapts
-/// the primitive's `RTS`-based convention to `Supervisor`'s `RTE`-based
-/// one): it pushes the routine's own entry point plus the exception-style
-/// frame its `RTE` will pop, and queues a continuation to run once that
-/// happens. The continuation here is trivial -- an empty `Ok(())` --
-/// because the frame's `PC` already lands back on the real caller's own
-/// return address once the routine's `RTE` and this handler's own
-/// synthetic `rts` have both been consumed (see `trampoline_rte`'s doc
-/// for why no register ever needs restoring by hand here): the real
-/// caller's `D0` is simply whatever the routine itself left there,
-/// exactly the documented `Supervisor` result, and every other register
-/// the routine didn't touch was never touched by this handler either.
-/// Found missing while running the real `CPU` command (Workbench 3.1.4
-/// `C:`), which wraps its direct `CACR`-register access in `Supervisor`
-/// (a real, privileged `movec` instruction on 68020+) even though
-/// `CacheControl` already answers its query -- defensive real-world
-/// code, not a bug.
+/// The routine is entered the way real `Supervisor` enters it, through
+/// an exception: [`Cpu::push_exception_frame`] switches to supervisor
+/// mode and the supervisor stack and pushes the frame the emulated CPU
+/// model's own `RTE` pops (a format 0 frame on a 68010 and later, whose
+/// `RTE` reads a format word the 68000's 6-byte frame does not have),
+/// returning straight to the caller in its own `SR`. Nothing in this
+/// runtime waits for the routine to return: it runs in the ordinary
+/// dispatch loop, so it can make library calls of its own (issue #192:
+/// `ixemul.library`'s `expunge()` cleanup does), and its `RTE` may go
+/// somewhere else entirely -- `ixemul.library`'s `longjmp()` is a
+/// `Supervisor` routine that rewrites the frame's `PC` and `SR` and sets
+/// `USP`, so that its `RTE` lands at the `setjmp()` in user mode.
 fn supervisor_handler<C: Cpu + 'static>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
     let routine = ctx.cpu.address_register(AddressRegister(5));
-    let saved_sr = ctx.cpu.sr();
-
-    ctx.continuations
-        .trampoline_rte(ctx.cpu, ctx.mem, routine, saved_sr, |_ctx| Ok(()));
+    // The caller's `jsr -30(a6)` left its return address on top of its
+    // stack, where Runtime::run's post-dispatch `rts` would pop it: it
+    // goes into the exception frame instead, for the routine's `RTE`.
+    let sp = ctx.cpu.address_register(AddressRegister(7));
+    let return_pc = ctx.mem.read_u32(sp);
+    ctx.cpu
+        .set_address_register(AddressRegister(7), sp.wrapping_add(4));
+    ctx.cpu.push_exception_frame(ctx.mem, return_pc);
+    // The post-dispatch `rts` enters the routine, on top of the frame.
+    let sp = ctx.cpu.address_register(AddressRegister(7)).wrapping_sub(4);
+    ctx.cpu.set_address_register(AddressRegister(7), sp);
+    if let Some(shadow) = ctx.mem.shadow_mut() {
+        shadow.update_stack_pointer(sp);
+    }
+    ctx.mem.write_u32(sp, routine);
     Ok(())
 }
 
@@ -644,10 +629,14 @@ mod tests {
     }
 
     fn runtime_with_program(words: &[u16]) -> Runtime<M68kCpu> {
+        runtime_with_program_on(words, M68kCpu::new())
+    }
+
+    fn runtime_with_program_on(words: &[u16], cpu: M68kCpu) -> Runtime<M68kCpu> {
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, TRAP_TABLE_END, words);
         Runtime::new(
-            M68kCpu::new(),
+            cpu,
             mem,
             StartConfig {
                 entry: TRAP_TABLE_END,
@@ -851,5 +840,123 @@ mod tests {
             code, 1,
             "RawMayGetChar's documented D0=-1 result, negated, proves the nested call really ran"
         );
+    }
+
+    /// `moveq #42,d0 ; rte` through `Supervisor`, on `cpu`: the exit code.
+    fn run_supervisor_moveq_42(cpu: M68kCpu) -> i32 {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(RTS);
+        let routine_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words.extend_from_slice(&[0x702A, 0x4E73]); // moveq #42,d0 ; rte
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+        let mut rt = runtime_with_program_on(&words, cpu);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn supervisor_pushes_the_frame_a_68020_rte_pops() {
+        // A 68010 or later RTE reads a format word after the PC, which
+        // the 68000's 6-byte frame does not have.
+        assert_eq!(run_supervisor_moveq_42(M68kCpu::new()), 42);
+        for cpu_type in [
+            m68k::CpuType::M68010,
+            m68k::CpuType::M68020,
+            m68k::CpuType::M68040,
+        ] {
+            assert_eq!(
+                run_supervisor_moveq_42(M68kCpu::with_config(cpu_type, false)),
+                42,
+                "{cpu_type:?}"
+            );
+        }
+    }
+
+    /// A routine that rewrites its frame's `PC` and `RTE`s there instead
+    /// of back to the caller -- what `ixemul.library`'s `longjmp()` does
+    /// -- then a second `Supervisor` call from the new place, which must
+    /// not be confused by the first never returning.
+    fn run_supervisor_rte_elsewhere(cpu: M68kCpu) -> i32 {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(0x7001); // moveq #1,d0 -- not reached
+        words.push(RTS);
+
+        // routine: move.l #target,2(sp) ; rte
+        let routine_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let target_patch = words.len() + 1;
+        words.extend_from_slice(&[0x2F7C, 0, 0, 0x0002, 0x4E73]);
+
+        // target: a second Supervisor call, whose routine returns 9
+        let target_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let routine2_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine2 (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(RTS);
+        let routine2_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words.extend_from_slice(&[0x7009, 0x4E73]); // moveq #9,d0 ; rte
+
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+        words[target_patch] = (target_addr >> 16) as u16;
+        words[target_patch + 1] = target_addr as u16;
+        words[routine2_idx + 1] = (routine2_addr >> 16) as u16;
+        words[routine2_idx + 2] = routine2_addr as u16;
+        let mut rt = runtime_with_program_on(&words, cpu);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn supervisor_routine_may_rte_somewhere_else() {
+        assert_eq!(run_supervisor_rte_elsewhere(M68kCpu::new()), 9);
+        assert_eq!(
+            run_supervisor_rte_elsewhere(M68kCpu::with_config(m68k::CpuType::M68020, false)),
+            9
+        );
+    }
+
+    #[test]
+    fn supervisor_from_user_mode_runs_the_routine_in_supervisor_mode() {
+        // Drop to user mode on a stack of its own (USP), call Supervisor,
+        // and return the routine's SR & S: the routine must run in
+        // supervisor mode, and its RTE must bring the program back to user
+        // mode on the user stack, where the final rts finds its address.
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.extend_from_slice(&[
+            0x2417, // move.l (sp),d2 -- the program's return address
+            0x204F, // movea.l sp,a0
+            0x90FC, 0x0400, // suba.w #$400,a0
+            0x2102, // move.l d2,-(a0)
+            0x4E60, // move.l a0,usp
+            0x027C, 0xDFFF, // andi.w #$dfff,sr -- user mode, A7 = USP
+        ]);
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.push(RTS);
+        let routine_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        // move.w sr,d0 ; andi.l #$2000,d0 ; rte
+        words.extend_from_slice(&[0x40C0, 0x0280, 0x0000, 0x2000, 0x4E73]);
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+        let mut rt = runtime_with_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0x2000, "the routine ran with the S bit set");
     }
 }
