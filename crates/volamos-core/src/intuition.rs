@@ -1,105 +1,14 @@
-//! `intuition.library`: a thin stub -- `DisplayAlert`, `AutoRequest`,
-//! `EasyRequestArgs`, `CurrentTime`, matching vamos's own scope for this
-//! library ("just enough that a console tool calling a stray Intuition
-//! function doesn't crash. No real windowing/GUI"), added closing a gap
-//! found comparing volamos's coverage against vamos's own
-//! (`docs/plan.md`'s dated entry). This runtime has no display and never
-//! renders anything -- every function here does the least a headless
-//! runtime honestly can, not a real GUI implementation.
+//! Headless `intuition.library` support provides inspectable screen and
+//! window structures, but no rendering or user input. A default public
+//! screen is created lazily; windows attach to it, and custom screens
+//! are unsupported. Requesters return documented defaults
+//! (`AutoRequest`: `TRUE`; `EasyRequestArgs`: `0`). `DisplayAlert`
+//! follows `exec.library` alert semantics, and `CurrentTime` reads the
+//! host clock.
 //!
-//! # The default screen: real struct, no pixels
-//!
-//! Unlike the rest of this module, there *is* now a `Screen`/`Window`
-//! model, deliberately minimal: a single, always-available default
-//! public screen (`"Workbench"`, 640x200x1 -- a plain NTSC lores
-//! non-interlace mode, the same one a stock KS/WB 3.1 boot without a
-//! Workbench disk comes up in), lazily allocated on first use as a real
-//! `struct Screen` in guest memory ([`ensure_default_screen`]) with
-//! honest `Width`/`Height`/`Flags`/embedded `ViewPort`/`RastPort`/
-//! `BitMap` fields -- [`lock_pub_screen_handler`]/
-//! [`get_screen_data_handler`] read real data off it, not canned
-//! answers. There is deliberately no support for opening *additional*
-//! or *custom* screens (`OpenScreen` stays unregistered/unhandled) --
-//! see `docs/plan.md`'s dated entry for the reasoning: almost every
-//! guest program that touches Intuition just wants to query the one
-//! screen that's always there, not create its own.
-//!
-//! `OpenWindow`/`CloseWindow` extend the same idea to windows: a guest
-//! that opens a window gets back a real `struct Window` -- correctly
-//! wired `WScreen`/`RPort`/`UserPort` pointers, so any code that merely
-//! *holds onto* the handle (passes it to another library call, reads
-//! its geometry, polls its `UserPort` for messages) sees consistent,
-//! honest data -- but nothing is ever drawn into its `RastPort`, and
-//! its `UserPort` never receives an `IntuiMessage` (there's no user
-//! input to report -- same limitation as `AutoRequest`/
-//! `EasyRequestArgs` below). A program that actually expects to *see*
-//! its window, or that blocks forever waiting for an `IDCMP` message
-//! that will never arrive, won't work here -- an inherent limit of a
-//! headless runtime, not something worth working around with fake
-//! input.
-//!
-//! Struct layouts (`SCR_*`/`WIN_*`/`VP_*`/`RP_*`/`BM_*` byte-offset
-//! consts below) are hand-computed from the NDK 3.2 headers
-//! (`intuition/screens.h`, `intuition/intuition.h`, `graphics/view.h`,
-//! `graphics/rastport.h`, `graphics/gfx.h`) using m68k's natural
-//! (word, not long) struct alignment -- same provenance discipline as
-//! `doslock.rs`'s `FL_*`/`FIB_*` consts. Two deliberate approximations:
-//! `struct Layer_Info` (embedded in `Screen`) is reserved as an opaque
-//! zeroed blob sized generously rather than field-accurate, since
-//! nothing in this runtime (there's no `layers.library`) ever reads its
-//! fields; and `struct Window`'s private tail past `MoreFlags` (per the
-//! header's own "Intuition Private, DO NOT USE" comment) isn't
-//! reproduced at all.
-//!
-//! # `DisplayAlert`: reuses `exec.library`'s own `Alert` handling
-//!
-//! Real `DisplayAlert` is Intuition's own presentation layer for the
-//! same Guru-Meditation-style alert `exec.library`'s `Alert` (see
-//! `crate::exectask::alert_handler`) triggers when Intuition is
-//! available to draw it -- same `AT_DeadEnd` semantics (a dead-end
-//! alert means the guest declared system integrity can't be
-//! guaranteed), just with a custom message string and height instead of
-//! a numeric code. This handler mirrors `alert_handler` exactly: always
-//! logs to stderr unconditionally (a real alert is never silent on real
-//! hardware), dead-end fails loudly via
-//! [`DispatchError::HandlerFailed`], recoverable returns `TRUE`
-//! (`D0`) as if the user dismissed it instantly (there's no display to
-//! wait on input from).
-//!
-//! # `AutoRequest`/`EasyRequestArgs`: no display, no real choice to report
-//!
-//! Both real functions show a requester and report *which button the
-//! user pressed*. With no display, there's no user input to honestly
-//! report -- these return a fixed default (`AutoRequest`: `TRUE`,
-//! matching its positive/default gadget; `EasyRequestArgs`: `0`, its
-//! documented "leftmost gadget" result) rather than trying to guess
-//! which choice a real user would have made. A caller that actually
-//! branches on the result differently per button will see the wrong
-//! branch -- an inherent limitation of a headless stub, not something
-//! this runtime can resolve without a real display.
-//!
-//! # `GetScreenData`/`LockPubScreen`/`UnlockPubScreen`: the default
-//! screen, honestly
-//!
-//! `GetScreenData` now copies real `struct Screen` fields (from the
-//! default screen -- see "The default screen" above) into the caller's
-//! buffer, `min(size, sizeof(struct Screen))` bytes of it, and returns
-//! `TRUE`. `LockPubScreen` returns the default screen's address for a
-//! `NULL` name or a name matching it (case-sensitively -- see
-//! [`lock_pub_screen_handler`]); any other name honestly fails with
-//! `NULL`, since no other public screen actually exists here.
-//! `UnlockPubScreen` is a no-op (this runtime doesn't track lock
-//! counts; there's only ever the one screen and it never actually
-//! closes).
-//!
-//! # `CurrentTime`: the one genuinely real function here
-//!
-//! Unlike the requester functions, `CurrentTime` has an honest, correct
-//! answer even headlessly: the real host wall-clock time. Reuses
-//! [`crate::exectask::host_time_secs_micro`], the same AmigaOS-epoch
-//! (1978-01-01) seconds-plus-microseconds source
-//! `timer.device`'s`GetSysTime` already uses -- `CurrentTime`'s own
-//! Autodoc documents the identical epoch/units.
+//! Struct offsets follow NDK 3.2 headers and m68k word alignment.
+//! `Layer_Info` is reserved as an opaque zeroed region, and the private
+//! `Window` tail after `MoreFlags` is omitted.
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, HandlerContext, LibraryTable};
@@ -136,8 +45,7 @@ const SCR_VIEWPORT: u32 = 44;
 const SCR_RASTPORT: u32 = 84;
 /// Byte offset of the embedded `struct BitMap` within `struct Screen`.
 const SCR_BITMAP: u32 = 184;
-/// Byte offset of the (opaque, zeroed) `struct Layer_Info` within
-/// `struct Screen` -- reserved space only, see the module docs.
+/// Byte offset of the reserved, zeroed `struct Layer_Info` region.
 const SCR_LAYERINFO: u32 = 224;
 const SCR_LAYERINFO_SIZE: u32 = 88;
 const SCR_FIRSTGADGET: u32 = 312;
@@ -177,8 +85,7 @@ const BM_DEPTH: u32 = 5;
 
 // ---- struct Window (intuition/intuition.h) -----------------------------
 
-/// `sizeof(struct Window)` up to (and including) `MoreFlags` -- the
-/// header's own documented public boundary, see the module docs.
+/// `sizeof(struct Window)` through the public `MoreFlags` field.
 const WINDOW_SIZE: u32 = 136;
 const WIN_NEXTWINDOW: u32 = 0;
 const WIN_LEFTEDGE: u32 = 4;
@@ -248,10 +155,7 @@ const NW_SCREEN: u32 = 30;
 /// `BOOL` `TRUE`, per `<exec/types.h>`.
 const DTRUE: u32 = 1;
 
-/// Host-side `intuition.library` state: just the default screen's guest
-/// address, lazily filled in by [`ensure_default_screen`] on first use
-/// (mirroring how `OpenLibrary`'s fake libraries are created lazily on
-/// first `OpenLibrary`, not eagerly at boot). See the module docs.
+/// Host-side state: the lazily allocated default screen address.
 pub struct IntuitionState {
     default_screen: Option<u32>,
 }
@@ -270,10 +174,8 @@ impl Default for IntuitionState {
     }
 }
 
-/// Returns the guest address of the always-available default public
-/// screen (`"Workbench"`, 640x200x1), allocating and initializing it on
-/// first call. See the module docs for what is and isn't honestly
-/// modeled.
+/// Returns the default public screen (`"Workbench"`, 640x200x1),
+/// allocating and initializing it on first use.
 fn ensure_default_screen<M: AddressSpace>(
     state: &mut IntuitionState,
     heap: &mut GuestHeap,
@@ -358,9 +260,8 @@ fn ensure_default_screen<M: AddressSpace>(
 const AT_DEAD_END: u32 = 0x8000_0000;
 
 /// `DisplayAlert` (`D0` = `alertNumber`, `A0` = `string` `CString*`,
-/// `D1` = `height`, ignored -- a real display-layout hint this runtime
-/// has no display to apply). `D0` = `TRUE`/`FALSE` (`BOOL`) -- see the
-/// module docs.
+/// `D1` = `height`, ignored because this runtime has no display.
+/// `D0` = `TRUE` for recoverable alerts; dead-end alerts fail dispatch.
 fn display_alert_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let alert_num = ctx.cpu.data_register(DataRegister(0));
     let string_ptr = ctx.cpu.address_register(AddressRegister(0));
@@ -392,9 +293,8 @@ fn display_alert_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 }
 
 /// `AutoRequest` (`A0` = window, `A1`/`A2`/`A3` = body/positive/negative
-/// `IntuiText*`, `D0`-`D3` = flags/width/height -- all ignored, no
-/// display to show any of it on). `D0` = `TRUE` unconditionally -- see
-/// the module docs.
+/// `IntuiText*`, `D0`-`D3` = flags/width/height, all ignored. `D0` is
+/// always `TRUE` because this runtime has no display or user input.
 fn auto_request_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.cpu.set_data_register(DataRegister(0), 1);
     Ok(())
@@ -402,8 +302,7 @@ fn auto_request_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 
 /// `EasyRequestArgs` (`A0` = window, `A1` = `struct EasyStruct*`, `A2` =
 /// `IDCMP` pointer, `A3` = args -- all ignored). `D0` = `0` (the
-/// documented "leftmost gadget" result) unconditionally -- see the
-/// module docs.
+/// documented "leftmost gadget" result) unconditionally.
 fn easy_request_args_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.cpu.set_data_register(DataRegister(0), 0);
     Ok(())
@@ -412,8 +311,8 @@ fn easy_request_args_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
 /// `GetScreenData` (`A0` = buffer, `D0` = buffer size, `D1` = screen
 /// type, `A1` = screen -- `D1`/`A1` ignored, this runtime has only the
 /// one default screen regardless of requested type). Copies
-/// `min(size, sizeof(struct Screen))` bytes of the real default screen
-/// into the buffer; `D0` = `TRUE`. See the module docs.
+/// `min(size, sizeof(struct Screen))` bytes of the default screen into
+/// the buffer; `D0` = `TRUE`.
 fn get_screen_data_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let buffer = ctx.cpu.address_register(AddressRegister(0));
     let size = ctx.cpu.data_register(DataRegister(0));
@@ -429,8 +328,7 @@ fn get_screen_data_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 
 /// `LockPubScreen` (`A0` = `CONST_STRPTR` screen name, or `NULL` for
 /// the default public screen). Returns the default screen's address
-/// for `NULL` or a name matching it; any other name returns `NULL` --
-/// see the module docs.
+/// for `NULL` or the exact name `"Workbench"`; other names return `NULL`.
 fn lock_pub_screen_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(0));
     let matches_default = if name_ptr == 0 {
@@ -448,8 +346,8 @@ fn lock_pub_screen_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     Ok(())
 }
 
-/// `UnlockPubScreen` (`A0` = name, ignored; `A1` = screen). No-op --
-/// see the module docs.
+/// `UnlockPubScreen` (`A0` = name, ignored; `A1` = screen). No-op;
+/// this runtime does not track screen locks.
 fn unlock_pub_screen_handler<C: Cpu>(
     _ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
@@ -463,9 +361,8 @@ fn unlock_pub_screen_handler<C: Cpu>(
 /// window's screen's `BitMap`; `UserPort`/`WindowPort` are a real
 /// no-op `struct MsgPort` (see [`crate::execlist`]'s `GetMsg`/
 /// `WaitPort` -- it will simply never receive an `IntuiMessage`, there
-/// being no user input to report). `D0` = the new `Window*`, or `0` on
-/// guest-heap exhaustion (real `OpenWindow`'s own documented failure
-/// return). See the module docs.
+/// being no user input to report). `D0` = the new `Window*`, or `0` if
+/// guest-heap allocation fails.
 fn open_window_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let new_window = ctx.cpu.address_register(AddressRegister(0));
 
@@ -600,7 +497,7 @@ fn close_window_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 }
 
 /// `CurrentTime` (`A0` = `ULONG*` seconds out-param, `A1` = `ULONG*`
-/// micros out-param). No return value. See the module docs.
+/// micros out-param). No return value; both outputs use the Amiga epoch.
 fn current_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let seconds_ptr = ctx.cpu.address_register(AddressRegister(0));
     let micros_ptr = ctx.cpu.address_register(AddressRegister(1));

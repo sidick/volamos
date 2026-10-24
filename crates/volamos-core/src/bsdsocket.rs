@@ -1,237 +1,40 @@
-//! `bsdsocket.library`: real TCP/UDP networking via a **host-socket
-//! passthrough** -- guest `socket()`/`connect()`/`send()`/`recv()`/...
-//! calls translate directly onto real host OS sockets (the `socket2`
-//! crate), not an embedded guest-visible TCP/IP stack. See
-//! `crates/dispatch.rs`'s [`crate::dispatch::Runtime::enable_bsdsocket`]
-//! and the originating design research (GitHub issue) for the full
-//! rationale; the short version: Copperline (the cycle-exact Amiga
-//! emulator this project uses for ground-truth testing) has a real,
-//! conformance-tested `bsdsocket.library` implementation with exactly
-//! two transports -- an embedded `smoltcp` stack (needed only because
-//! *it* requires cycle-exact determinism) and a host-socket passthrough
-//! backend (`transport = "host"`, its "Amiberry-style" option). volamos
-//! has no determinism constraint, so the host-socket shape -- not the
-//! embedded-stack one -- is the directly applicable model, and this
-//! module follows Copperline's own host-side primitives closely (real
-//! non-blocking `socket2::Socket`s, a plain handle table, the same
-//! `sock_open`/`sock_connect`/`sock_send`/`sock_recv`/... shape) minus
-//! the WASM linear-memory-copy boundary Copperline's plugin architecture
-//! needs and this runtime doesn't (LVO handlers already have direct
-//! `&mut dyn AddressSpace` access).
+//! `bsdsocket.library` maps guest socket calls to host TCP/UDP sockets
+//! using `socket2`; it does not provide a guest-side network stack.
 //!
-//! # Opt-in, not always-on
+//! # Registration and scope
 //!
-//! Unlike `locale.library`/`intuition.library`/`mathffp.library` (real,
-//! always-registered libraries this runtime treats as ROM-resident,
-//! matching real KS/WB 3.1), `bsdsocket.library` is **not** part of this
-//! project's KS/WB 3.1 baseline -- on real hardware it only exists if a
-//! third-party TCP/IP stack (AmiTCP/Miami/Genesis/Roadshow) is installed,
-//! and giving guest code real host network access is a meaningfully
-//! different trust boundary than local filesystem access (which this
-//! runtime already gates behind explicit `-V`/`-a` opt-in). So this
-//! library is only registered when [`crate::dispatch::Runtime::
-//! enable_bsdsocket`] is called explicitly (wired to a CLI flag), never
-//! unconditionally from [`crate::dispatch::Runtime::new`] -- without
-//! that opt-in, `OpenLibrary("bsdsocket.library", 0)` behaves exactly
-//! like it does today (not found, matching a real bare KS/WB 3.1
-//! system with no TCP stack installed).
+//! The library is registered only when
+//! [`crate::dispatch::Runtime::enable_bsdsocket`] is enabled, keeping
+//! host network access opt-in. Implemented calls cover IPv4 TCP/UDP,
+//! socket options, `WaitSelect`, socket events, DNS, and service/protocol
+//! lookups. `ObtainSocket` and its release variants return
+//! `EOPNOTSUPP`; network database lookups return `NULL`. Other
+//! unimplemented LVOs remain unknown calls.
 //!
-//! # Scope: a first, real slice, not the whole LVO surface
+//! # Socket behavior
 //!
-//! Implements `socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
-//! `sendto`/`recvfrom`/`shutdown`/`getsockname`/`getpeername`/
-//! `CloseSocket`/`getdtablesize`/`Errno`/`SetErrnoPtr`/`Inet_NtoA`/
-//! `inet_addr`/`gethostbyname`/`IoctlSocket`/`setsockopt`/`getsockopt`/
-//! `SocketBaseTagList`/`WaitSelect`/`Dup2Socket`/`vsyslog`/
-//! `GetSocketEvents`/`SetSocketSignals`/`gethostbyaddr`/`getservbyname`/
-//! `getservbyport`/`getprotobyname`/`getprotobynumber`/`gethostname`/
-//! `gethostid`/`sendmsg`/`recvmsg`/`Inet_LnaOf`/`Inet_NetOf`/
-//! `Inet_MakeAddr`/`inet_network` -- real outbound and inbound TCP, plus UDP, real error
-//! reporting through the documented `Errno()`/`SetErrnoPtr()` mechanism,
-//! real forward *and* reverse DNS lookups, and real services/protocols
-//! database lookups, all via the host's own resolver/libc (see "DNS: a
-//! real, blocking host lookup" below), the
-//! socket option set a real conformance suite (`bsdsocktest`'s own
-//! `sockopt` test category) actually exercises: `SO_REUSEADDR`/
-//! `SO_KEEPALIVE`/`SO_LINGER`/`SO_SNDBUF`/`SO_RCVBUF`/`SO_SNDTIMEO`/
-//! `SO_RCVTIMEO`/`SO_ERROR`/`SO_TYPE`/`TCP_NODELAY` -- all real
-//! `socket2` calls against the host socket, not roundtrip-only storage
-//! (`SO_ERROR` in particular has real BSD "read consumes the pending
-//! error" semantics, via `socket2`'s own `take_error`), and real
-//! `select()`-shaped multiplexing via `WaitSelect` (Unix-only -- see
-//! "WaitSelect: real poll(2), not a busy-loop" below).
-//! `ObtainSocket`/`ReleaseSocket`/`ReleaseCopyOfSocket`/`getnetbyname`/
-//! `getnetbyaddr` are all registered (so a caller that unconditionally
-//! tries any of them doesn't crash the whole run on an unhandled-call
-//! trap) but never back a real result: `ObtainSocket`/`ReleaseSocket`/
-//! `ReleaseCopyOfSocket` always honestly fail with `EOPNOTSUPP` (see
-//! [`release_socket_handler`]'s doc comment for why a real cross-process
-//! handoff isn't possible here); `getnetbyname`/`getnetbyaddr` always
-//! return `NULL` (see [`getnetbyname_handler`]'s doc comment for why the
-//! real `/etc/networks` database isn't worth wiring up). `IoctlSocket`
-//! implements `FIONBIO` (see "Blocking by default" below) and
-//! `FIONREAD` (Unix-only, a real `ioctl(2)` on the underlying host
-//! socket -- no portable `socket2` equivalent) -- `FIOASYNC` is still
-//! genuinely unimplemented (calling it traps as an ordinary
-//! unknown-call, same as any other library's unimplemented LVO in this
-//! codebase -- see [`crate::lvos::bsdsocket`]'s module docs for why this
-//! table only lists what's implemented, not the full ABI; no real
-//! conformance test needs it).
+//! Sockets are blocking by default. `IoctlSocket(FIONBIO)` opts into
+//! non-blocking mode. `WaitSelect` uses `poll(2)` on Unix and returns
+//! `EOPNOTSUPP` elsewhere. Because guest execution is single-tasked,
+//! its signal mask is checked before polling; no guest signal can arrive
+//! while the host call is blocked.
 //!
-//! # Blocking by default
+//! `SO_EVENTMASK` arms per-socket `FD_*` events, and
+//! `GetSocketEvents` drains detected events. Event-armed sockets are
+//! polled alongside the caller's `WaitSelect` descriptors. `FD_CONNECT`
+//! detection is omitted.
 //!
-//! Every socket [`socket_handler`]/[`accept_handler`] hand back starts
-//! in the OS default **blocking** mode -- the real BSD/AmigaOS default
-//! -- not forced non-blocking. This module's first slice got this
-//! backwards (every socket was unconditionally
-//! `set_nonblocking(true)`'d, with no way to opt out at all): found
-//! running a real, unmodified consumer (MicroPython's Amiga port,
-//! `ports/amiga/modsocket.c`), whose own `connect()` wrapper has no
-//! `EINPROGRESS` handling whatsoever -- it assumes a synchronous
-//! `connect()`, and only ever asks for non-blocking mode explicitly via
-//! `IoctlSocket(fd, FIONBIO, ...)` (gated behind Python's
-//! `settimeout()`/`setblocking()`, which a caller that never touches
-//! either never triggers). Forcing every socket non-blocking regardless
-//! made every simple, default-mode socket program's very first
-//! `connect()` fail with a spurious `EINPROGRESS` it had no way to
-//! recover from. [`ioctl_socket_handler`] implements the one `IoctlSocket`
-//! command (`FIONBIO`) real socket code actually needs to opt into
-//! non-blocking mode explicitly; a blocking `connect`/`accept`/`send`/
-//! `recv` on a socket that hasn't asked for that just blocks the host
-//! thread until the real I/O completes -- the same "trust the host,
-//! real blocking calls are fine" posture `gethostbyname` already uses,
-//! not a shortcut.
+//! # Errors and lookups
 //!
-//! # `WaitSelect`: real `poll(2)`, not a busy-loop
+//! `Errno()` uses fixed BSD error numbers translated from common
+//! `std::io::ErrorKind` values, rather than host-specific errno values.
+//! DNS and service/protocol lookups use host facilities and return IPv4
+//! addresses only. Lookup failures use the library `Errno()` channel.
+//! Guest `hostent` data remains valid until the next lookup, matching the
+//! reusable result buffer behavior.
 //!
-//! [`wait_select_handler`] translates a real AmigaOS `WaitSelect` call
-//! (BSD `select()` plus an Exec signal mask -- a real Roadshow Autodoc,
-//! see that function's own doc for the exact contract) directly onto a
-//! real `libc::poll(2)` call against the underlying host file
-//! descriptors (`socket2::Socket::as_raw_fd`) -- Unix only (`#[cfg(unix)]`;
-//! this runtime's own Windows support is unverified at runtime already,
-//! see `docs/plan.md`'s notes, so `WaitSelect` on Windows returns
-//! `EOPNOTSUPP` rather than a guess). This is the same "trust the host"
-//! posture every other blocking call in this module already takes
-//! (`connect`, `gethostbyname`, ...): the host kernel's own `poll(2)`
-//! already solves "is this fd ready" correctly for every socket state
-//! this backend can produce (a listening socket's `POLLIN` meaning "a
-//! connection is pending `accept()`", a connecting socket's `POLLOUT`
-//! meaning "the handshake finished", ...), so there's no reason to
-//! reimplement any of that by hand.
-//!
-//! **The `signals` parameter, and why this runtime doesn't need to poll
-//! for it mid-wait**: real `WaitSelect` also races the file-descriptor
-//! wait against an Exec signal mask, waking on whichever happens first.
-//! Because this runtime is single-tasking and non-preemptive -- no other
-//! guest code can run concurrently to `Signal()` the waiting task while
-//! `WaitSelect` is blocked inside a single host `poll(2)` call -- a
-//! signal can only ever already be pending *before* the call starts,
-//! never arrive *during* it. So [`wait_select_handler`] checks
-//! `tc_SigRecvd` against the requested mask exactly once, up front:
-//! matching real semantics either way ("no socket ready" + "a signal was
-//! already pending" `=>` return `0` without ever calling `poll(2)` at
-//! all) but skipping the "wake immediately if a signal arrives mid-wait"
-//! case, since that case is structurally unreachable in this runtime's
-//! own task model -- not a missing feature, just a state this
-//! architecture can't produce. `crate::exectask::TC_SIGRECVD` is the
-//! same field `SetSignal`/`Wait`/`Signal` already maintain.
-//!
-//! # `SO_EVENTMASK`/`GetSocketEvents`: real per-socket event detection
-//!
-//! `SO_EVENTMASK` ([`setsockopt_handler`]/[`getsockopt_handler`]) arms a
-//! set of `FD_*` bits (`FD_READ`/`FD_WRITE`/`FD_ACCEPT`/`FD_CLOSE`/
-//! `FD_ERROR` -- real `<libraries/bsdsocket.h>` values) on one socket;
-//! `SocketBaseTagList`'s `SBTC_SIGEVENTMASK` tag arms an Exec signal bit
-//! to raise whenever any armed event fires on any socket;
-//! `GetSocketEvents` drains one pending `(fd, bits)` pair at a time,
-//! round-robin across sockets that have one. There is no dedicated
-//! "check for events" call in the real API -- real programs discover
-//! events by calling `WaitSelect` (often with every `fd_set` `NULL` and
-//! only the signal armed, since the events themselves aren't in any
-//! `fd_set`), so [`wait_select_poll`] is where detection actually
-//! happens: every event-armed socket rides along in the very same real
-//! `poll(2)` call as the caller's own explicit `fd_set` interests
-//! (a *single* `poll(2)` covers both, so a real event unblocks a
-//! `WaitSelect(0, NULL, NULL, NULL, &tv, &sigmask)` call early exactly
-//! like real hardware) -- see that function's own doc comment for the
-//! `poll(2)`-revents-to-`FD_*`-bits classification, including how a
-//! listening socket's `POLLIN` becomes `FD_ACCEPT` instead of `FD_READ`,
-//! and how `FD_CLOSE` is disambiguated from real pending data via a
-//! zero-consuming `peek`. Deliberately does not attempt `FD_CONNECT`
-//! detection (see that function's doc for why treating an already-
-//! writable connected socket as "connect just completed" would misfire
-//! on every call) -- `bsdsocktest`'s own `FD_CONNECT` test tolerates
-//! this, since a synchronous/fast loopback `connect()` returning `0`
-//! directly is one of its explicitly documented-acceptable outcomes.
-//!
-//! # Errno: real BSD numbering, not the host's own
-//!
-//! `Errno()`/`SetErrnoPtr()` report the fixed BSD `errno` numbering
-//! `bsdsocket.library` itself documents (`<sys/errno.h>` from a real
-//! Roadshow NDK) -- not whatever the *host* OS's own errno numbering
-//! happens to be (which differs across macOS/Linux/Windows). [`translate_errno`]
-//! maps a [`std::io::Error`] to this fixed numbering via
-//! [`std::io::ErrorKind`] (the common socket-relevant cases only, same
-//! set Copperline's own translator falls back to when a raw host errno
-//! doesn't have a direct mapping) -- not by inspecting the host's raw OS
-//! errno at all, a deliberate simplification versus Copperline's more
-//! thorough platform-specific table; expand this if a real corpus binary
-//! needs a specific errno this doesn't yet produce.
-//!
-//! # DNS: a real, blocking host lookup
-//!
-//! `gethostbyname` resolves via `(name, 0u16).to_socket_addrs()` --
-//! `std::net`'s standard, portable way to invoke the host OS's own
-//! resolver (`getaddrinfo` under the hood), the same "trust the host" spirit
-//! as everything else in this module. Unlike Copperline's own
-//! `hostsocket-plugin` (which needs a `resolve_start`/`resolve_poll`
-//! background-thread-plus-non-blocking-poll dance specifically because a
-//! WASM plugin can't block its host's emulation thread), this runtime has
-//! no such constraint -- a library call handler already runs synchronously
-//! on the guest's own call boundary, so a plain blocking call here is
-//! consistent with how every other host I/O in this codebase already
-//! works (`Open`, `Seek`, ...), not a shortcut.
-//!
-//! Only `AF_INET` (IPv4) results are surfaced, matching this module's
-//! `AF_INET`-only scope elsewhere; a name that resolves to IPv6-only
-//! addresses reports as not found. Real `<netdb.h>` documents lookup
-//! failures via a separate `extern int h_errno` global "left" by
-//! `gethostbyname`/`gethostbyaddr` -- but no LVO in the real
-//! `bsdsocket_lib.fd` ever sets one via a registered pointer the way
-//! `SetErrnoPtr` does for plain `errno`, meaning on real AmigaOS this
-//! value is read back through the *same* `Errno()` channel this module
-//! already implements (a real, if slightly surprising, historical
-//! AmigaOS quirk, not a simplification here) -- so a failed
-//! `gethostbyname` reports one of `<netdb.h>`'s own `HOST_NOT_FOUND`/
-//! `TRY_AGAIN`/`NO_DATA` codes through [`BsdSocketState::set_errno`],
-//! exactly like every other failing call in this module.
-//!
-//! The returned `struct hostent` (real Roadshow `<netdb.h>` layout: five
-//! 4-byte fields, `h_name`/`h_aliases`/`h_addrtype`/`h_length`/
-//! `h_addr_list`, 20 bytes) and everything it points to live on the
-//! guest heap and are rebuilt fresh on every call -- real
-//! `gethostbyname`'s own documented contract is a reused, overwritten-
-//! by-the-next-call static buffer, not a caller-freed allocation (there
-//! is no `FreeHostent`-style LVO in the real ABI), so
-//! [`BsdSocketState::hostent_allocs`] frees the *previous* call's
-//! blocks at the start of the next one rather than ever handing
-//! ownership to the guest.
-//!
-//! # SnoopDos-style logging: `connect`/`accept` set `call_detail`
-//!
-//! [`connect_handler`]/[`accept_handler`] set [`HandlerContext::
-//! call_detail`] on every *meaningful* outcome (a completed or
-//! in-progress outbound connection, an accepted inbound one, or a real
-//! failure), printed by the CLI's `-s`/`--snoop` flag exactly like every
-//! other resource-opening call already does (`OpenLibrary`/`Open`, see
-//! [`crate::dispatch::open_library_common`]'s doc) -- no separate
-//! logging mechanism, just this module joining the existing convention.
-//! `accept`'s `EAGAIN` ("nothing waiting yet") is deliberately *not*
-//! logged: it's the overwhelmingly common outcome of a guest's own
-//! accept-loop polling, and logging it would be noise, not a real event
-//! -- the same "meaningful events only" posture `--snoop`'s own module
-//! doc already promises.
+//! `connect` and `accept` outcomes populate `call_detail` for
+//! `--snoop`; routine `EAGAIN` results from accept polling are omitted.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
