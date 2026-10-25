@@ -3526,19 +3526,26 @@ mod tests {
     #[test]
     fn end_to_end_set_arg_str_returns_previous_and_updates_get() {
         let words = [
+            0x2408, // move.l a0,d2: the argument string at startup
             move_imm_to_d(1),
             0,
             0x2A, // D1 = 42 (new argument string)
             jsr_disp16(6),
-            (-540i16) as u16, // SetArgStr(a6): D0 = old value (discarded)
+            (-540i16) as u16, // SetArgStr(a6): D0 = old pr_Arguments
+            0x9082,           // sub.l d2,d0: 0 if it was the startup A0
+            0x2600,           // move.l d0,d3
             jsr_disp16(6),
             (-534i16) as u16, // GetArgStr(a6): D0 = 42
+            0xD083,           // add.l d3,d0: still 42 if the old value matched
             RTS,
         ];
         let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
-        assert_eq!(code, 42);
+        assert_eq!(
+            code, 42,
+            "SetArgStr() should return the startup A0 buffer, and GetArgStr() the new value"
+        );
     }
 
     #[test]
