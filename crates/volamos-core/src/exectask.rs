@@ -732,6 +732,20 @@ fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     Ok(())
 }
 
+/// `SetTaskPri` (LVO -300): `A1` = `struct Task*`, `D0` = new priority.
+/// `D0` = the old priority, sign-extended. With a single task there is
+/// nothing to reschedule, so this only stores `ln_Pri`. clib2's exit
+/// code calls it to restore the priority its startup saved.
+fn set_task_pri_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let task = ctx.cpu.address_register(AddressRegister(1));
+    let new_pri = ctx.cpu.data_register(DataRegister(0)) as u8;
+    let old_pri = ctx.mem.read_u8(task + crate::execlist::LN_PRI) as i8;
+    ctx.mem.write_u8(task + crate::execlist::LN_PRI, new_pri);
+    ctx.cpu
+        .set_data_register(DataRegister(0), old_pri as i32 as u32);
+    Ok(())
+}
+
 /// `AT_DeadEnd` (bit 31, `0x80000000`), per `<exec/alerts.h>` -- set in
 /// `alertNum` when the condition is fatal (system integrity can no
 /// longer be guaranteed; a real kernel typically reboots or hangs
@@ -1578,6 +1592,7 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
         };
     }
     reg_exec!("FindTask", find_task_handler::<C>);
+    reg_exec!("SetTaskPri", set_task_pri_handler::<C>);
     reg_exec!("Alert", alert_handler::<C>);
     reg_exec!("SetSignal", set_signal_handler::<C>);
     reg_exec!("SetExcept", set_except_handler::<C>);
@@ -1756,6 +1771,34 @@ mod tests {
         let mut full = movea_dos_base_to_a6().to_vec();
         full.extend_from_slice(words);
         runtime_with_program(&full)
+    }
+
+    // --- SetTaskPri ---
+
+    #[test]
+    fn set_task_pri_returns_the_old_priority_sign_extended() {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(1)); // A1 = 0 (NULL)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-294)); // FindTask(NULL) -> D0
+        words.push(0x2240); // movea.l d0,a1
+        words.push(0x70FB); // moveq #-5,d0
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(task, -5)
+        words.push(0x7003); // moveq #3,d0
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(task, 3) -> D0 = -5
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -5, "the old priority, sign-extended");
+        assert_eq!(
+            rt.memory()
+                .read_u8(rt.current_task() + crate::execlist::LN_PRI) as i8,
+            3
+        );
     }
 
     // --- FindTask ---

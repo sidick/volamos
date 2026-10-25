@@ -2095,6 +2095,30 @@ fn set_file_sys_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
     Ok(())
 }
 
+/// `GetArgStr` (no args). `D0` = the process's `pr_Arguments`: the
+/// argument string the program was started with, which `Runtime::new`
+/// and `RunCommand` keep there (the same buffer as the startup `A0`).
+/// clib2's startup code reads its command line this way. Doesn't touch
+/// `IoErr()`, matching the real function.
+fn get_arg_str_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let args = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_ARGUMENTS_OFFSET);
+    ctx.cpu.set_data_register(DataRegister(0), args);
+    Ok(())
+}
+
+/// `SetArgStr` (`D1` = new argument string). `D0` = the previous
+/// `pr_Arguments`. Doesn't touch `IoErr()`, matching the real function.
+fn set_arg_str_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let new_args = ctx.cpu.data_register(DataRegister(1));
+    let field = ctx.current_task + crate::exectask::PR_ARGUMENTS_OFFSET;
+    let old_args = ctx.mem.read_u32(field);
+    ctx.mem.write_u32(field, new_args);
+    ctx.cpu.set_data_register(DataRegister(0), old_args);
+    Ok(())
+}
+
 /// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
 /// `BPTR`.
 fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -2224,6 +2248,8 @@ pub fn register_dos_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem:
     reg!("FreeDosObject", free_dos_object_handler::<C>);
     reg!("GetFileSysTask", get_file_sys_task_handler::<C>);
     reg!("SetFileSysTask", set_file_sys_task_handler::<C>);
+    reg!("GetArgStr", get_arg_str_handler::<C>);
+    reg!("SetArgStr", set_arg_str_handler::<C>);
     reg!("SelectInput", select_input_handler::<C>);
     reg!("SelectOutput", select_output_handler::<C>);
     reg!("IoErr", ioerr_handler::<C>);
@@ -3471,6 +3497,42 @@ mod tests {
             (-528i16) as u16, // SetFileSysTask(a6): D0 = old value (discarded)
             jsr_disp16(6),
             (-522i16) as u16, // GetFileSysTask(a6): D0 = 42
+            RTS,
+        ];
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn end_to_end_get_arg_str_returns_the_startup_a0_buffer() {
+        let words = [
+            0x2408, // move.l a0,d2: the argument string at startup
+            jsr_disp16(6),
+            (-534i16) as u16, // GetArgStr(a6): D0 = pr_Arguments
+            0x9082,           // sub.l d2,d0: 0 if they match
+            RTS,
+        ];
+        let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "GetArgStr() should return the buffer A0 pointed at"
+        );
+    }
+
+    #[test]
+    fn end_to_end_set_arg_str_returns_previous_and_updates_get() {
+        let words = [
+            move_imm_to_d(1),
+            0,
+            0x2A, // D1 = 42 (new argument string)
+            jsr_disp16(6),
+            (-540i16) as u16, // SetArgStr(a6): D0 = old value (discarded)
+            jsr_disp16(6),
+            (-534i16) as u16, // GetArgStr(a6): D0 = 42
             RTS,
         ];
         let mut rt = runtime_with_program_and_extra(&words, TRAP_TABLE_END, &[], None);
