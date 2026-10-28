@@ -1,6 +1,43 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "m68k is the correctness-critical CPU/FPU core, exact-pinned on purpose (see Cargo.toml) -- its own group, separate from every other Cargo bump, and never auto-merged. Each bump has a real history of needing hardware-comparison review (FINT/FINTRZ, extended-float rounding) before merge, not just a passing CI run.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["m68k"],
+      "groupName": "m68k",
+      "automerge": false
+    },
+    {
+      "description": "GitHub Actions (version and digest bumps, including the setup-python version pin) are low-risk and already CI-gated -- group them and auto-merge once checks pass.",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Docs tooling (mkdocs-material etc. in tools/docs-requirements.txt) doesn't touch runtime correctness -- group and auto-merge once checks pass.",
+      "matchManagers": ["pip_requirements"],
+      "groupName": "docs tooling",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "The Dockerfile's rust:alpine base image feeds every release binary -- pin its digest for supply-chain integrity, but keep bumps manually reviewed rather than auto-merged.",
+      "matchManagers": ["dockerfile"],
+      "groupName": "Docker base image",
+      "automerge": false
+    }
   ]
 }
