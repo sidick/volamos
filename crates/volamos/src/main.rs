@@ -1928,6 +1928,9 @@ fn build_nested_runtime(
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
     install_fpu_disabled_060_decline_stub(&mut runtime, cpu_type, fpu);
+    // A nested System()/Execute() run is still the real CLI process --
+    // see Runtime::enable_host_break_folding's doc (issue #210).
+    runtime.enable_host_break_folding();
     sanitize.reserve_debug_ports(&mut runtime).ok()?;
     if sanitize.dirty_heap {
         runtime.enable_dirty_heap();
@@ -2022,6 +2025,11 @@ fn build_runtime_with_vfs(
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
     install_fpu_disabled_060_decline_stub(&mut runtime, opts.cpu_type, opts.fpu);
+    // Only the real CLI opts into folding a host SIGINT/SIGTERM into the
+    // guest's SIGBREAKF_CTRL_C (issue #210) -- see
+    // Runtime::enable_host_break_folding's doc for why this is opt-in
+    // rather than Runtime::new's default.
+    runtime.enable_host_break_folding();
     opts.sanitize.reserve_debug_ports(&mut runtime)?;
     if let Some(vfs_config) = vfs_config {
         let vfs =

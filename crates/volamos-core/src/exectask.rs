@@ -2408,6 +2408,11 @@ mod tests {
             words.push(RTS);
             words
         });
+        // Opt in to the fold this test actually exercises (issue #210):
+        // without this, `rt.run`'s dispatch loop no longer touches
+        // PENDING_HOST_BREAK at all, and every other test module's own
+        // Runtime::run calls can't clobber this one's flag either.
+        rt.enable_host_break_folding();
 
         PENDING_HOST_BREAK.store(true, Ordering::SeqCst);
 
@@ -2435,6 +2440,9 @@ mod tests {
             words.push(RTS);
             words
         });
+        // See the opt-in comment in
+        // pending_host_break_folds_into_check_signal above.
+        rt.enable_host_break_folding();
 
         PENDING_HOST_BREAK.store(true, Ordering::SeqCst);
 

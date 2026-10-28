@@ -2187,6 +2187,19 @@ pub struct Runtime<C: Cpu> {
     /// Host-side `intuition.library` state -- see
     /// [`HandlerContext::intuition`]'s doc.
     intuition: crate::intuition::IntuitionState,
+    /// Opt-in (see [`Self::enable_host_break_folding`]) for whether
+    /// [`Self::run`]'s dispatch loop calls
+    /// [`exectask::fold_pending_host_break`] on every trap. Defaults to
+    /// `false`: [`exectask::PENDING_HOST_BREAK`] is a process-global
+    /// `static` (it has to be, so the `SIGINT`/`SIGTERM` handler can
+    /// reach it from anywhere), so an unconditional fold here would let
+    /// *any* `Runtime` in the process -- including every unrelated
+    /// test's own short-lived one, running concurrently on another
+    /// thread -- clobber a flag some other `Runtime` was relying on
+    /// (issue #210). Only a real CLI invocation (which actually wants
+    /// `Ctrl-C` to reach the guest as `SIGBREAKF_CTRL_C`) should call
+    /// `enable_host_break_folding`.
+    host_break_folding: bool,
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -2782,6 +2795,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             continuations: ContinuationStack::new(),
             bsdsocket: BsdSocketState::new(),
             intuition: crate::intuition::IntuitionState::new(),
+            host_break_folding: false,
         }
     }
 
@@ -2842,6 +2856,25 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut self.mem, BSDSOCKET_LIBRARY_BASE);
         self.registry
             .register_real("bsdsocket.library", BSDSOCKET_LIBRARY_BASE);
+    }
+
+    /// Opts this runtime into folding a pending host `SIGINT`/`SIGTERM`
+    /// (see [`exectask::fold_pending_host_break`]) into the guest's
+    /// `SIGBREAKF_CTRL_C` on every trap dispatched by [`Self::run`].
+    ///
+    /// Deliberately opt-in (issue #210): [`exectask::PENDING_HOST_BREAK`]
+    /// is a single process-global `static`, since the signal handler has
+    /// to be able to find it from anywhere. Folding it unconditionally
+    /// on every `Runtime::run` call would mean any two `Runtime`s alive
+    /// at once in the same process -- notably every other test module's
+    /// own short-lived `Runtime`s, run concurrently by the test runner --
+    /// could clobber each other's pending flag. A real CLI invocation
+    /// (`crates/volamos/src/main.rs`) should call this once, right after
+    /// constructing its `Runtime`, so `Ctrl-C` actually reaches the
+    /// guest; tests that don't care about host-break behavior should
+    /// leave it unset.
+    pub fn enable_host_break_folding(&mut self) {
+        self.host_break_folding = true;
     }
 
     /// Populates `PROGDIR:` (issue #17): if `host_dir` (the launched
@@ -3221,7 +3254,16 @@ impl<C: Cpu + 'static> Runtime<C> {
                     // this is the only place a compute-bound guest
                     // program is ever interrupted; see crate::exectask's
                     // module docs for the polling-granularity caveat.
-                    exectask::fold_pending_host_break(&mut self.mem, self.task);
+                    // Gated on the opt-in flag (see
+                    // Self::enable_host_break_folding's doc, issue
+                    // #210): PENDING_HOST_BREAK is a process-global
+                    // static, so an unconditional fold here would let
+                    // any Runtime -- including unrelated tests' own,
+                    // running concurrently -- clobber another one's
+                    // pending flag.
+                    if self.host_break_folding {
+                        exectask::fold_pending_host_break(&mut self.mem, self.task);
+                    }
 
                     // Stack-overflow check (Phase 3 stage 6): compare A7
                     // against the current task's tc_SPLower/tc_SPUpper,
