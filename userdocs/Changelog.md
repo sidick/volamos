@@ -3,6 +3,64 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.14
+
+- **`exec.library`'s `ObtainSemaphoreShared`/`AttemptSemaphoreShared`
+  implemented** (issue #189) — libpthread's `pthread_getspecific`/
+  `pthread_setspecific` take a shared lock, and libstdc++ calls them on
+  every `throw` when gcc is built with `--enable-threads=posix`, so
+  every C++ program built that way stopped at its first `throw` with
+  "unhandled library call" (952 of 960 failures in the
+  `m68k-amigaos-gcc` C++ testsuite). Semantics follow AROS's
+  `rom/exec/semaphores.c`: both route through the same
+  `InternalObtainSemaphore`/`InternalAttemptSemaphore` as their
+  exclusive counterparts with a NULL owner, so a free semaphore
+  obtained shared gets `ss_Owner = NULL`, and a shared or
+  exclusively-held semaphore blocks/fails the same way the exclusive
+  calls already do.
+
+- **`dos.library`'s `GetArgStr`/`SetArgStr` and `exec.library`'s
+  `SetTaskPri` implemented** (issue #193) — both were in the LVO
+  tables without handlers, so no program built with clib2
+  (`m68k-amigaos-gcc -mcrt=clib2`) could run: its startup code calls
+  `GetArgStr` to read the command line and its exit code calls
+  `SetTaskPri` to restore the priority the startup saved.
+  `GetArgStr` returns `pr_Arguments` (the same buffer `Runtime::new`/
+  `RunCommand` already populate); `SetArgStr` stores `D1` there and
+  returns the old value, the same pattern as `GetFileSysTask`/
+  `SetFileSysTask`; `SetTaskPri` stores the new priority in `ln_Pri`
+  and returns the old one sign-extended (nothing to reschedule with
+  only one task).
+
+- **`ReadArgs`/`FindArg` fixes** (issue #203): a host argument like
+  `ITER=0` is no longer force-quoted just because it contains `=`, so
+  `volamos -- prog ITER=0` now means what `prog ITER=0` means in a
+  shell — the keyword `ITER` with value `0` — matching AmigaOS and
+  vamos; and a template keyword with more than two `=`-separated names
+  (`HELP=--help=-h/S`) now matches every name, not just the first two.
+  Also, `ReadArgs(NULL)` now reads the command line from the process's
+  `Input()` filehandle buffer the way `RunCommand` actually populates
+  it, instead of the guest's own A0/D0 startup buffer — which C
+  startup code (e.g. vbcc's) edits in place while splitting it into
+  `argv`, corrupting a later `ReadArgs(NULL)` call that read the same
+  memory.
+
+- **`timer.device`'s `GetSysTime`/`ReadEClock` resolve real
+  microseconds** — without `--clock-mhz`, both (and Intuition's
+  `CurrentTime`) took the host time through `now_as_datestamp()`'s
+  1/50 s ticks, so every `tv_micro` was a multiple of 20000 and every
+  interval a program timed was a multiple of 20 ms, making `--jit`
+  timings useless for short runs. `host_time_secs_micro()` now reads
+  `SystemTime` directly and keeps real `subsec_micros()`; `DateStamp`
+  is unchanged.
+
+- Fixed a test race (issue #210): `Runtime::run`'s dispatch loop only
+  folds the process-global pending-host-break flag when a new
+  `Runtime::enable_host_break_folding()` opt-in is set (the real CLI
+  sets it; test-only `Runtime`s built by unrelated test modules don't),
+  so unrelated tests calling `Runtime::run` in parallel can no longer
+  clobber the two dedicated host-break tests' state.
+
 ## 0.13
 
 - **`ixemul.library`-linked programs run a full round of path-based

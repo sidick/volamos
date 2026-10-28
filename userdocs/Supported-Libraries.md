@@ -31,15 +31,20 @@ Changelog.
   concurrency).
 - Pattern matching: `MatchFirst`/`MatchNext`/`MatchEnd`/`ParsePattern`/
   `MatchPattern`(`NoCase`).
-- Argument parsing: `ReadArgs`/`FreeArgs` (the standard `ReadArgs`
-  template syntax every real `C:` command uses).
+- Argument parsing: `ReadArgs`/`FreeArgs`/`FindArg` (the standard
+  `ReadArgs` template syntax every real `C:` command uses, including
+  keywords with any number of `=`-separated names and a host
+  `KEY=value` argument matching the keyword `KEY`); `ReadArgs(NULL)`
+  reads the command line from the process's `Input()` buffer, the way
+  `RunCommand` actually populates it.
 - Environment variables: `GetVar`/`SetVar`/`DeleteVar`, backed by a
   real, directory-mapped `ENV:` volume.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.
 - Process/CLI: `Cli`/`GetProgramName`/`SetProgramName`/`MaxCli`/
-  `AllocDosObject`/`FreeDosObject` (`DOS_RDARGS`, `DOS_EXALLCONTROL`,
-  `DOS_FIB`, and `DOS_FILEHANDLE` — a real `FileHandle`, the same
-  allocation `Open` itself uses).
+  `GetArgStr`/`SetArgStr` (`pr_Arguments`, the same buffer startup
+  code's `A0` points at)/`AllocDosObject`/`FreeDosObject`
+  (`DOS_RDARGS`, `DOS_EXALLCONTROL`, `DOS_FIB`, and `DOS_FILEHANDLE` —
+  a real `FileHandle`, the same allocation `Open` itself uses).
 - `StartNotify`/`EndNotify`: `StartNotify` always fails cleanly with
   `ERROR_ACTION_NOT_KNOWN` (no filesystem-change notification
   machinery exists in this runtime at all) rather than crashing the
@@ -92,11 +97,14 @@ Changelog.
   ports (`CreateMsgPort`/`DeleteMsgPort`/`PutMsg`/`GetMsg`/`ReplyMsg`/
   `WaitPort`).
 - Tasks and signals: `FindTask`/`SetSignal`/`SetExcept`/`Wait`/
-  `Signal`/`AllocSignal`/`FreeSignal`/`Forbid`/`Permit`, including host
-  `SIGINT`/`SIGTERM` delivered to the guest as `SIGBREAKF_CTRL_C`.
+  `Signal`/`AllocSignal`/`FreeSignal`/`Forbid`/`Permit`/`SetTaskPri`,
+  including host `SIGINT`/`SIGTERM` delivered to the guest as
+  `SIGBREAKF_CTRL_C`.
 - The full `SignalSemaphore` API: `InitSemaphore`/`ObtainSemaphore`/
   `ReleaseSemaphore`/`AttemptSemaphore`/`FindSemaphore`/`AddSemaphore`/
-  `RemSemaphore`/`ObtainSemaphoreList`/`ReleaseSemaphoreList`.
+  `RemSemaphore`/`ObtainSemaphoreList`/`ReleaseSemaphoreList`/
+  `ObtainSemaphoreShared`/`AttemptSemaphoreShared` (AROS semantics: a
+  free semaphore obtained shared gets `ss_Owner = NULL`).
 - I/O requests: `OpenDevice`/`CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/
   `CheckIO`/`AbortIO`, `CreateIORequest`/`DeleteIORequest`.
 - `Alert`, `RawDoFmt`.
@@ -197,7 +205,9 @@ Real time-arithmetic (`AddTime`/`SubTime`/`CmpTime`/`ReadEClock`/
 real AmigaOS code uses to call these functions. `dos.library`'s
 `DOSBase->dl_TimeReq` is a real `timerequest` with its `io_Device`
 pointing here too, for callers (e.g. libnix's `clock()`) that read it
-directly instead of going through `OpenDevice`.
+directly instead of going through `OpenDevice`. Without `--clock-mhz`,
+`GetSysTime`/`ReadEClock` (and Intuition's `CurrentTime`) resolve real
+host microseconds, not 1/50 s ticks.
 
 ## Deliberately out of scope
 
