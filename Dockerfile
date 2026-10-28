@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 
 # Multi-arch static build (issue #19). `rust:alpine`'s default target is
 # already `*-unknown-linux-musl` for whatever platform buildx selects (via
@@ -6,7 +6,7 @@
 # statically by default, so no `--target`/cross-linker setup is needed:
 # each platform's build stage just compiles natively for itself, under
 # QEMU emulation when that platform isn't the host's own.
-FROM rust:alpine AS builder
+FROM rust:alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS builder
 
 ARG TARGETPLATFORM
 
@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 # distroless static + nonroot: no libc at all (matching the fully static
 # musl binary above), no shell, runs as an unprivileged user by default --
 # see docs/plan.md's Phase 6 section for why this over plain `scratch`.
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 COPY --from=builder /volamos /usr/local/bin/volamos
 # The project's own fixture corpus (small, hand-assembled AmigaOS test
