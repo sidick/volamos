@@ -1,0 +1,2208 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A Rust-native, Wine-style runtime for classic AmigaOS m68k CLI binaries">
+      
+      
+      
+        <link rel="canonical" href="https://sidick.github.io/volamos/v0.14/CLI-Reference/">
+      
+      
+        <link rel="prev" href="../Getting-Started/">
+      
+      
+        <link rel="next" href="../Configuration/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+    
+    
+      
+        <title>CLI Reference - volamos</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#cli-reference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="volamos" class="md-header__button md-logo" aria-label="volamos" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            volamos
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              CLI Reference
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/sidick/volamos" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    sidick/volamos
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="volamos" class="md-nav__button md-logo" aria-label="volamos" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    volamos
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/sidick/volamos" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    sidick/volamos
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting going
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting going
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Getting-Started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using volamos
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Using volamos
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#exit-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exit codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-verbose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -v, --verbose
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-s-snoop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -s, --snoop
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-volume-namehostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -V, --volume NAME:hostdir
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-a-assign-nametargettarget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -a, --assign NAME:target[+target...]
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cwd-amigapath" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cwd AMIGAPATH
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-auto-assign-hostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --auto-assign HOSTDIR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-defaults-no-defaults" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --defaults, --no-defaults
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-volumes-dir-hostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --volumes-dir HOSTDIR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-stack-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --stack SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-ram-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --ram SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cpu-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cpu MODEL
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-fpu-no-fpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --fpu, --no-fpu
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration Files
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Volumes-and-Assigns/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Volumes and Assigns
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Supported-Libraries/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Supported Libraries
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Differences-from-vamos/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Differences from vamos
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Help
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Help
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Building-from-Source/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Building from Source
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#exit-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exit codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-verbose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -v, --verbose
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-s-snoop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -s, --snoop
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-v-volume-namehostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -V, --volume NAME:hostdir
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-a-assign-nametargettarget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -a, --assign NAME:target[+target...]
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cwd-amigapath" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cwd AMIGAPATH
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-auto-assign-hostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --auto-assign HOSTDIR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-defaults-no-defaults" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --defaults, --no-defaults
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-volumes-dir-hostdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --volumes-dir HOSTDIR
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-stack-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --stack SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-ram-size" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --ram SIZE
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-cpu-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --cpu MODEL
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-fpu-no-fpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        --fpu, --no-fpu
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://github.com/sidick/volamos/edit/main/userdocs/CLI-Reference.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="cli-reference">CLI Reference<a class="headerlink" href="#cli-reference" title="Permanent link">&para;</a></h1>
+<div class="highlight"><pre><span></span><code>volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
+        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
+        [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
+        [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
+        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
+        [--emu68-debug] [--net] &lt;program&gt; [args...]
+</code></pre></div>
+<p><code>volamos --help</code> prints this same reference from the binary itself, and
+<code>volamos --version</code> prints the version (<code>--version</code> only — <code>-V</code> is
+<code>--volume</code>, as it always has been). A value-taking flag accepts both
+spellings: <code>--stack 256K</code> and <code>--stack=256K</code> are equivalent.</p>
+<p>Everything before <code>&lt;program&gt;</code> is a volamos flag; <code>&lt;program&gt;</code> is a host
+path to an AmigaOS hunk executable; everything after it is passed
+through verbatim as the <em>guest</em> program's own command-line arguments
+(<code>A0</code>/<code>D0</code>, the real AmigaOS startup convention) — a guest program that
+parses its own arguments (e.g. via <code>ReadArgs</code>) reads them from there,
+unaffected by anything volamos itself understood before <code>&lt;program&gt;</code>.</p>
+<p>A token before <code>&lt;program&gt;</code> that looks like a flag but isn't one is an
+error (with a did-you-mean suggestion), not silently treated as the
+program path. A program file whose name genuinely starts with <code>-</code> is
+still expressible as <code>./-foo</code>, or as <code>-- -foo</code> (<code>--</code> ends flag parsing;
+the next token is <code>&lt;program&gt;</code> no matter what it looks like).</p>
+<p>Every flag below can also be given a default value in <code>~/.volamos</code>/
+<code>.volamos</code> instead of retyping it every run — see
+<a href="../Configuration/">Configuration Files</a>.</p>
+<h2 id="exit-codes">Exit codes<a class="headerlink" href="#exit-codes" title="Permanent link">&para;</a></h2>
+<p>volamos propagates the <strong>guest program's own exit code</strong> on a normal
+run — whatever it returned in <code>D0</code> at <code>rts</code>, same as running it on a
+real Amiga would produce as its process return code. There is no
+volamos-specific exit code convention layered on top of that.</p>
+<p>volamos only ever produces its own exit code when the guest never got
+to run at all: <code>2</code> for a command-line parse error (an unknown or
+malformed flag, a bad <code>-V</code>/<code>-a</code> value, a missing <code>&lt;program&gt;</code> — the
+conventional usage-error code), and <code>1</code> when the command line parsed
+but the run couldn't start or crashed the runtime — the program path
+couldn't be read, didn't parse as a valid hunk executable, or the guest
+genuinely crashed the runtime (an unimplemented library call, a stack
+overflow, an invalid instruction). In every one of those cases volamos
+prints a diagnostic to stderr naming exactly what went wrong before
+exiting. <code>--help</code> and <code>--version</code> exit <code>0</code>.</p>
+<p>The one case where a normal run's own exit code is overridden: under
+<a href="#-sanitize"><code>--sanitize</code></a>, a run that reported any violation exits
+<code>99</code> instead of the guest's own code, so a harness that only checks
+the exit status doesn't pass a run that corrupted memory.</p>
+<h2 id="-v-verbose"><code>-v</code>, <code>--verbose</code><a class="headerlink" href="#-v-verbose" title="Permanent link">&para;</a></h2>
+<p>Logs every emulated library call to stderr as it happens — library
+name, LVO (library vector offset), and which handler serviced it:</p>
+<div class="highlight"><pre><span></span><code>volamos: dos.library(-948) -&gt; PutStr
+</code></pre></div>
+<p>The most detailed of the two logging flags; useful for understanding
+exactly what a guest program is doing, or diagnosing an unimplemented-
+call failure by seeing the last few calls that succeeded first.</p>
+<h2 id="-s-snoop"><code>-s</code>, <code>--snoop</code><a class="headerlink" href="#-s-snoop" title="Permanent link">&para;</a></h2>
+<p>A lighter-weight, <code>SnoopDos</code>-style alternative: logs only <em>resource-
+opening</em> calls (<code>OpenLibrary</code>/<code>OldOpenLibrary</code>, <code>Open</code>) — what was
+requested, and whether it resolved to a real/unimplemented library or
+succeeded/failed for a file:</p>
+<div class="highlight"><pre><span></span><code>snoop: library "dos.library" -&gt; base 0x00000800 (real)
+</code></pre></div>
+<p>Useful for quickly seeing which libraries and files a real, unfamiliar
+binary actually touches, without the full per-call firehose <code>-v</code>
+produces. If both <code>-v</code> and <code>-s</code> are given, <code>-v</code> wins — its own per-call
+output already includes the same detail inline.</p>
+<h2 id="-v-volume-namehostdir"><code>-V</code>, <code>--volume NAME:hostdir</code><a class="headerlink" href="#-v-volume-namehostdir" title="Permanent link">&para;</a></h2>
+<p>Maps an Amiga volume <code>NAME:</code> onto a real host directory. Repeatable —
+give it multiple times to map several volumes at once. See
+<a href="../Volumes-and-Assigns/">Volumes and Assigns</a> for the full path-
+resolution model.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>-V<span class="w"> </span>SRC:/home/me/project<span class="w"> </span>-V<span class="w"> </span>DEST:/tmp/out<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-a-assign-nametargettarget"><code>-a</code>, <code>--assign NAME:target[+target...]</code><a class="headerlink" href="#-a-assign-nametargettarget" title="Permanent link">&para;</a></h2>
+<p>Assigns a logical Amiga name <code>NAME:</code> to one or more existing Amiga path
+targets (each itself an already-mapped volume, or another assign),
+joined with <code>+</code> for a multi-assign search order — the real AmigaDOS
+<code>ASSIGN NAME: target1 ADD target2 ...</code> idiom. Repeatable. See
+<a href="../Volumes-and-Assigns/">Volumes and Assigns</a> for the exact search-
+order and recursive-assign semantics, with worked examples.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>-V<span class="w"> </span>SYS:/home/me/amiga<span class="w"> </span>-a<span class="w"> </span>LIBS:SYS:libsA+SYS:libsB<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-cwd-amigapath"><code>--cwd AMIGAPATH</code><a class="headerlink" href="#-cwd-amigapath" title="Permanent link">&para;</a></h2>
+<p>Sets the guest's initial current directory. Default: the first <code>-V</code>
+volume's root if any <code>-V</code> was given, else the first <code>-a</code> assign's
+root, else <code>root:</code> (relying on <code>--auto-assign</code> to resolve it — see
+below).</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>-V<span class="w"> </span>SRC:/home/me/project<span class="w"> </span>--cwd<span class="w"> </span>SRC:subdir<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-auto-assign-hostdir"><code>--auto-assign HOSTDIR</code><a class="headerlink" href="#-auto-assign-hostdir" title="Permanent link">&para;</a></h2>
+<p>A fallback for any volume/assign name volamos doesn't otherwise know
+about: <code>NAME:</code> resolves to <code>&lt;HOSTDIR&gt;/NAME</code> automatically, without
+needing an explicit <code>-V</code>/<code>-a</code> for every name a guest program might
+reference. See <a href="../Volumes-and-Assigns/">Volumes and Assigns</a>.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--auto-assign<span class="w"> </span>/home/me/amiga-volumes<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-defaults-no-defaults"><code>--defaults</code>, <code>--no-defaults</code><a class="headerlink" href="#-defaults-no-defaults" title="Permanent link">&para;</a></h2>
+<p>Whether the built-in standard-volume defaults (<code>SYS:</code>, <code>RAM:</code>, and the
+standard <code>C:</code>/<code>S:</code>/<code>LIBS:</code>/<code>DEVS:</code>/<code>ENVARC:</code>/<code>T:</code>/<code>ENV:</code> assigns onto
+them — see <a href="../Volumes-and-Assigns/#standard-defaults">Volumes and Assigns</a>)
+apply at all. On by default; <code>--no-defaults</code> turns them off, restoring
+the original "nothing configured means no filesystem at all" behavior:</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--no-defaults<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<p>An explicit <code>-V</code>/<code>-a</code> for a name a default would otherwise supply
+always wins — <code>-V SYS:~/amiga/wb31</code> shadows the default <code>SYS:</code>
+entirely, and its own real <code>C:</code>/<code>Libs:</code>/etc. come along with it, same
+as a real boot volume.</p>
+<h2 id="-volumes-dir-hostdir"><code>--volumes-dir HOSTDIR</code><a class="headerlink" href="#-volumes-dir-hostdir" title="Permanent link">&para;</a></h2>
+<p>Overrides where the default <code>SYS:</code> volume's host directory lives
+(default <code>~/.volamos.d/volumes</code>). Ignored if <code>--no-defaults</code> is given.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--volumes-dir<span class="w"> </span>/var/lib/volamos/volumes<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<h2 id="-stack-size"><code>--stack SIZE</code><a class="headerlink" href="#-stack-size" title="Permanent link">&para;</a></h2>
+<p>Overrides the guest stack region's size — default 64 KiB (65536
+bytes). <code>SIZE</code> is a plain byte count, optionally suffixed <code>K</code>/<code>k</code>
+(KiB) or <code>M</code>/<code>m</code> (MiB):</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--stack<span class="w"> </span>256K<span class="w"> </span>fixtures/hello
+volamos<span class="w"> </span>--stack<span class="w"> </span><span class="m">524288</span><span class="w"> </span>fixtures/hello<span class="w">   </span><span class="c1"># equivalent to --stack 512K</span>
+</code></pre></div>
+<p>A value below the runtime's own minimum is silently clamped up to it,
+mirroring real AmigaOS's own stack-size clamp behavior rather than
+erroring. See <a href="../Getting-Started/#4-see-a-runtime-safety-check-in-action">Getting Started</a>
+for what happens when a guest program actually overflows its stack.</p>
+<p>If <code>--stack</code> is close to or exceeds <code>--ram</code> (below), leaving no room
+for the loaded program and the runtime's own guest heap, volamos fails
+with a clear error rather than running at all:</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>volamos<span class="w"> </span>--ram<span class="w"> </span>8K<span class="w"> </span>--stack<span class="w"> </span>8K<span class="w"> </span>fixtures/hello
+volamos:<span class="w"> </span>--stack<span class="w"> </span><span class="m">8192</span><span class="w"> </span>is<span class="w"> </span>too<span class="w"> </span>large<span class="w"> </span><span class="k">for</span><span class="w"> </span>--ram<span class="w"> </span><span class="m">8192</span>:<span class="w"> </span>the<span class="w"> </span>loaded<span class="w"> </span>program<span class="w"> </span>ends
+at<span class="w"> </span>0x2224,<span class="w"> </span>and<span class="w"> </span>there<span class="w"> </span>must<span class="w"> </span>be<span class="w"> </span>room<span class="w"> </span><span class="k">for</span><span class="w"> </span>the<span class="w"> </span>stack<span class="w"> </span>plus<span class="w"> </span>at<span class="w"> </span>least<span class="w"> </span><span class="m">4096</span><span class="w"> </span>bytes
+of<span class="w"> </span>guest<span class="w"> </span>heap<span class="w"> </span>after<span class="w"> </span>that<span class="w"> </span>--<span class="w"> </span>increase<span class="w"> </span>--ram<span class="w"> </span>or<span class="w"> </span>decrease<span class="w"> </span>--stack
+</code></pre></div>
+<h2 id="-ram-size"><code>--ram SIZE</code><a class="headerlink" href="#-ram-size" title="Permanent link">&para;</a></h2>
+<p>Overrides the total guest address space — default 16 MiB (16777216
+bytes). Same <code>SIZE</code> syntax as <code>--stack</code>: a plain byte count, optionally
+suffixed <code>K</code>/<code>k</code> (KiB) or <code>M</code>/<code>m</code> (MiB):</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--ram<span class="w"> </span>4M<span class="w"> </span>fixtures/hello
+volamos<span class="w"> </span>--ram<span class="w"> </span>8M<span class="w"> </span>--stack<span class="w"> </span>1M<span class="w"> </span>fixtures/hello<span class="w">   </span><span class="c1"># room for a much larger stack</span>
+</code></pre></div>
+<p>The default comfortably covers the tiny CLI binaries volamos currently
+targets, with plenty of headroom for a larger-than-default <code>--stack</code>.
+Raise it if a guest program needs more address space than that (e.g. a
+larger <code>--stack</code>, or a program that allocates a lot via <code>AllocMem</code>).</p>
+<p><strong>Above 16 MiB needs <code>--cpu 68020</code> or later.</strong> A 68000 or 68010 has a
+24-bit address bus, so 16 MiB is all it can address at all. Since the
+guest stack sits at the top of the address space, a larger <code>--ram</code> would
+put the stack pointer at an address the CPU cannot express — so volamos
+refuses the combination rather than letting the program fail confusingly
+later on:</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>volamos<span class="w"> </span>--ram<span class="w"> </span>64M<span class="w"> </span>fixtures/hello
+volamos:<span class="w"> </span>--ram<span class="w"> </span><span class="m">67108864</span><span class="w"> </span>is<span class="w"> </span>more<span class="w"> </span>address<span class="w"> </span>space<span class="w"> </span>than<span class="w"> </span>a<span class="w"> </span><span class="m">68000</span><span class="w"> </span>can<span class="w"> </span>reach:<span class="w"> </span>that
+CPU<span class="w"> </span>has<span class="w"> </span>a<span class="w"> </span><span class="m">24</span>-bit<span class="w"> </span>address<span class="w"> </span>bus,<span class="w"> </span>so<span class="w"> </span>it<span class="w"> </span>can<span class="w"> </span>only<span class="w"> </span>address<span class="w"> </span><span class="m">16777216</span><span class="w"> </span>bytes,<span class="w"> </span>and<span class="w"> </span>the
+guest<span class="w"> </span>stack<span class="w"> </span>at<span class="w"> </span>the<span class="w"> </span>top<span class="w"> </span>of<span class="w"> </span>a<span class="w"> </span>larger<span class="w"> </span>space<span class="w"> </span>would<span class="w"> </span>be<span class="w"> </span>at<span class="w"> </span>an<span class="w"> </span>address<span class="w"> </span>it<span class="w"> </span>cannot
+express<span class="w"> </span>--<span class="w"> </span>ask<span class="w"> </span><span class="k">for</span><span class="w"> </span>a<span class="w"> </span><span class="m">32</span>-bit<span class="w"> </span>address<span class="w"> </span>bus<span class="w"> </span>with<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span><span class="o">(</span>or<span class="w"> </span>any<span class="w"> </span>later
+model<span class="o">)</span>,<span class="w"> </span>or<span class="w"> </span>lower<span class="w"> </span>the<span class="w"> </span>size<span class="w"> </span>to<span class="w"> </span><span class="m">16777216</span><span class="w"> </span>or<span class="w"> </span>less<span class="w"> </span><span class="o">(</span>--ram<span class="w"> </span>on<span class="w"> </span>the<span class="w"> </span><span class="nb">command</span><span class="w"> </span>line,
+<span class="nv">RAM</span><span class="o">=</span><span class="w"> </span><span class="k">in</span><span class="w"> </span>a<span class="w"> </span>config<span class="w"> </span>file<span class="o">)</span>
+
+$<span class="w"> </span>volamos<span class="w"> </span>--ram<span class="w"> </span>64M<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>fixtures/hello
+Hello<span class="w"> </span>from<span class="w"> </span>volamos
+</code></pre></div>
+<h2 id="-cpu-model"><code>--cpu MODEL</code><a class="headerlink" href="#-cpu-model" title="Permanent link">&para;</a></h2>
+<p>Picks the emulated CPU model. Default <code>68000</code> — the lowest common
+denominator every Kickstart 3.1 machine shares. One of: <code>68000</code>,
+<code>68010</code>, <code>68020</code>, <code>68ec020</code>, <code>68030</code>, <code>68ec030</code>, <code>68040</code>, <code>68ec040</code>,
+<code>68lc040</code>, <code>68060</code>, <code>scc68070</code>.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>fixtures/hello
+</code></pre></div>
+<p>A binary compiled for a CPU floor higher than the emulated model (e.g.
+<code>m68k-amigaos-gcc -m68020</code>, run under the default <code>--cpu 68000</code>) will
+typically fail its own startup-time CPU check rather than running with
+subtly wrong behavior — real toolchain startup code (<code>libnix</code> and
+similar) checks <code>ExecBase.AttnFlags</code> and calls <code>Alert()</code> if the
+running CPU doesn't meet what the binary was compiled for, and volamos
+implements that check faithfully. If a real binary you're running
+fails immediately with an <code>Alert</code> diagnostic, check what CPU floor it
+was actually compiled for.</p>
+<h2 id="-fpu-no-fpu"><code>--fpu</code>, <code>--no-fpu</code><a class="headerlink" href="#-fpu-no-fpu" title="Permanent link">&para;</a></h2>
+<p>Whether a coprocessor FPU is fitted. Only meaningful for
+<code>--cpu 68020</code>/<code>68030</code>, where the default is no FPU (a plug-in
+68881/68882 is genuinely optional on real hardware) — earlier models
+have no coprocessor interface at all, so F-line (FPU) instructions
+always trap on them regardless of this flag.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>--fpu<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<p>The full <code>68040</code> and <code>68060</code> always have their on-die FPU on real
+hardware — unlike <code>68020</code>/<code>68030</code>, there's no plug-in 68881/68882 to
+leave out — so for those two the FPU <strong>defaults present</strong>: a plain
+<code>--cpu 68040</code> or <code>--cpu 68060</code> means the full chip, FPU included, and
+<code>--fpu</code> is a harmless no-op ([issues</p>
+<h1 id="167httpsgithubcomsidickvolamosissues167174">167](https://github.com/sidick/volamos/issues/167)/<a href="https://github.com/sidick/volamos/issues/174">#174</a>).<a class="headerlink" href="#167httpsgithubcomsidickvolamosissues167174" title="Permanent link">&para;</a></h1>
+<p>With the FPU present, <code>AttnFlags</code> reports <code>AFF_68881|AFF_68882</code> as
+well as <code>AFF_FPU40</code>, matching a real 68040/68060 system booted with
+SetPatch (<code>68040.library</code>/<code>68060.library</code> loaded) — programs commonly
+test <code>AFF_68881</code> alone to mean "an FPU is present"
+(<a href="https://github.com/sidick/volamos/issues/175">issue #175</a>).
+<code>--no-fpu</code> combined with <code>--cpu 68040</code> is substituted to
+<code>--cpu 68ec040</code> instead of silently having no effect, which is what it
+did before this was fixed — <code>AttnFlags</code> told the guest there was no
+FPU while FPU instructions still executed, a combination no real chip
+has:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68040</span><span class="w"> </span>--no-fpu<span class="w"> </span>fixtures/hello
+<span class="go">volamos: --cpu 68040 --no-fpu: the full 68040 always has its on-die FPU on real</span>
+<span class="go">hardware, so running as --cpu 68ec040 instead (which really has no FPU) -- pass</span>
+<span class="go">--cpu 68ec040 or --cpu 68lc040 directly to avoid this note</span>
+<span class="go">Hello from volamos</span>
+</code></pre></div>
+<p>Pass <code>--cpu 68ec040</code>/<code>--cpu 68lc040</code> directly to skip the note.</p>
+<p>An <strong>explicit</strong> <code>--cpu 68060 --no-fpu</code> is a different case: it selects
+the genuinely FPU-less <code>68LC060</code>/<code>68EC060</code>, which the <code>m68k</code> crate
+models directly (unlike the 68040, there's no separate <code>CpuType</code> to
+substitute to). The crate's internal FPU-disabled exception delivery
+bypasses this runtime's usual guest-exception interception entirely —
+if the guest never installed its own FPU handler (the ordinary case
+for <code>-m68020-60 -m68881</code>-compiled code, which assumes the FPU just
+exists), it used to land on whatever garbage happened to be at the
+real vector-11 slot, surfacing as a baffling "continuation stub
+trapped ... with no pending continuation." That slot is now pre-seeded
+with a dedicated stub, so this reports a clean, attributable stop
+instead:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68060</span><span class="w"> </span>--no-fpu<span class="w"> </span>a-68060-fpu-binary
+<span class="go">volamos: a-68060-fpu-binary: unexpected CPU stop at 0x00002c02: Illegal { opcode: ... }</span>
+</code></pre></div>
+<p>A guest that installs its own real FPU-probe handler before executing
+any FPU instruction (the common "catch the exception, fall back to
+software float" idiom) is unaffected — that write simply overwrites
+the pre-seeded stub like any other guest memory write.</p>
+<div class="admonition note">
+<p class="admonition-title">Performance: software math libraries are faster than a real FPU</p>
+<p>Programs that do floating-point math through <code>mathffp.library</code>/
+<code>mathtrans.library</code>/<code>mathieeedoubbas.library</code> (the common path for
+code that doesn't require a real 68881/882 — e.g. most <code>--cpu 68000</code>
+binaries) run at full host CPU speed under volamos, since those
+libraries are implemented as genuine host <code>f64</code>/<code>f32</code> arithmetic,
+not emulated 1980s FPU hardware. Programs that instead execute real
+F-line FPU instructions (needing <code>--cpu 68020</code>+ and <code>--fpu</code>) go
+through the <code>m68k</code> crate's <em>interpreted</em> FPU emulation instead,
+which is considerably slower — confirmed with a real BYTEmark 2.2
+Fourier run: <code>--cpu 68000</code> (library math) scored an index of 1.46
+(faster than a 233 MHz AMD K6 reference machine); the same binary's
+real-FPU path under <code>--cpu 68020 --fpu</code> scored 0.09, in line with
+the rest of the suite's plain-interpreted-CPU results. <code>--fpu</code>
+doesn't force a program to use one path or the other — that's
+determined by how the program itself was written/compiled — it
+just decides whether real F-line instructions execute instead of
+trapping.</p>
+</div>
+<h2 id="-fpsp-emulate"><code>--fpsp-emulate</code><a class="headerlink" href="#-fpsp-emulate" title="Permanent link">&para;</a></h2>
+<p>Software-emulates the instructions a real 68060 removed from silicon
+— most FPU transcendentals (<code>FSIN</code>/<code>FCOS</code>/<code>FATAN</code>/<code>FETOX</code>/<code>FLOGN</code>/
+<code>FMOD</code>/<code>FSCALE</code>/<code>FINT</code>/<code>FGETEXP</code>/<code>FGETMAN</code>/<code>FSINCOS</code>/...) plus a
+handful of integer ops (<code>MOVEP</code>, <code>CHK2</code>/<code>CMP2</code>, misaligned <code>CAS</code>/
+<code>CAS2</code>, 64-bit <code>MUL</code>/<code>DIV</code>) — instead of taking the real "unimplemented
+instruction" exception a genuine 68060 does for them. Only meaningful
+with <code>--cpu 68060</code>; a no-op for every other <code>--cpu</code> model. Default:
+off — real 68060 hardware fidelity, matching every other <code>--cpu</code>
+model's default behavior.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68060</span><span class="w"> </span>--fpu<span class="w"> </span>--fpsp-emulate<span class="w"> </span>a-68040-fp-binary
+</code></pre></div>
+<p>On real hardware, that trap is exactly what lets AmigaOS's
+<code>68060.library</code> install FPSP/ISP software-emulation handlers at boot
+(via <code>SetPatch</code>) — which is how a 68040-FP-targeted binary keeps
+working on a real 68060 machine without ever being recompiled.
+volamos has no equivalent of that persistent, cross-process boot
+state (every invocation is a single, fresh guest process, with no
+"patch once at boot, every later process inherits it" mechanism), so
+loading a real <code>68060.library</code> isn't a viable substitute here — this
+flag gets you the same practical effect for a single run instead,
+without needing any real <code>68060.library</code>/<code>fpsp.library</code> file at all.</p>
+<p>CLI-only: unlike most flags on this page, <code>--fpsp-emulate</code> can't be
+set in <code>~/.volamos</code>/<code>.volamos</code> — silently swapping real hardware
+behavior (a trap) for software emulation is exactly the kind of thing
+a stale config file shouldn't be able to turn on for every future run
+in a directory.</p>
+<h2 id="-jit-no-jit"><code>--jit</code>, <code>--no-jit</code><a class="headerlink" href="#-jit-no-jit" title="Permanent link">&para;</a></h2>
+<p>Whether guest code runs through the <code>m68k</code> crate's trace JIT
+(<code>CpuCore::run_batch</code>) instead of stepping one instruction at a time.
+Default: off — the plain interpreter is this runtime's correctness
+reference, and every emulated library call still traps out to volamos
+identically either way, so <code>--jit</code> never changes a program's observable
+behavior, only its speed.</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--jit<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Where the win actually shows up</p>
+<p>volamos is a Wine-style HLE runtime: guest code traps out to Rust on
+essentially every AmigaOS library call, and the JIT only accelerates
+the CPU-bound work <em>between</em> those traps (compiling hot
+backward-branch loops). For trap-dense glue code that spends most of
+its time inside library calls, <code>--jit</code> has little to offer. For
+CPU-bound guest work — the case that actually motivated this flag —
+compiling a real 577-line C source (<code>sc guiprof.c</code>, SAS/C 6.58)
+dropped from ~3.1s to ~2.3s of CPU time (a ~25% reduction) with
+<code>--jit</code>, though wall-clock barely moved, since most of <code>sc</code>'s wall
+time isn't CPU-bound at all. Expect <code>--jit</code>'s benefit to scale with
+how CPU-heavy the guest program's own work is, not with how many
+library calls it makes. A purely CPU-bound benchmark shows the full
+effect: <a href="https://github.com/eembc/coremark">CoreMark 1.0</a> (<code>-O2
+-m68020 -msoft-float</code>, <code>--cpu 68020</code>) scores 198.2 iterations/sec
+interpreted and 537.1 with <code>--jit</code> (volamos 0.3) — for comparison,
+<code>vamos</code> scores 270.6 on the same binary with no JIT of its own.</p>
+<table>
+<thead>
+<tr>
+<th>Runtime</th>
+<th>CoreMark 1.0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vamos</code></td>
+<td>270.6</td>
+</tr>
+<tr>
+<td>volamos 0.2, interpreter</td>
+<td>105.9</td>
+</tr>
+<tr>
+<td>volamos 0.2, <code>--jit</code></td>
+<td>445.1</td>
+</tr>
+<tr>
+<td>volamos 0.3, interpreter</td>
+<td>198.2 (~1.9x faster than 0.2)</td>
+</tr>
+<tr>
+<td>volamos 0.3, <code>--jit</code></td>
+<td>537.1 (~1.2x faster than 0.2)</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="-clock-mhz-n"><code>--clock-mhz N</code><a class="headerlink" href="#-clock-mhz-n" title="Permanent link">&para;</a></h2>
+<p>Makes <code>timer.device</code>'s <code>ReadEClock</code> report <strong>emulated</strong> time — derived
+from the CPU's own emulated cycle count at <code>N</code> MHz — instead of host
+wall-clock time. <code>N</code> may be fractional (e.g. <code>--clock-mhz 25</code> or
+<code>--clock-mhz 7.14</code>). Default: off (host clock, as always). This exists
+for reproducible, host-load-independent compiler A/B benchmarks: two
+<code>ReadEClock</code> calls bracketing some guest work measure how many m68k
+cycles actually ran, not however long the host machine happened to take
+around them (which varies with scheduling noise, thermal throttling,
+whatever else is running on the box at the time).</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--clock-mhz<span class="w"> </span><span class="m">25</span><span class="w"> </span>fixtures/hello
+</code></pre></div>
+<p>Cannot be combined with an explicit <code>--jit</code>: the trace JIT
+(<code>CpuCore::run_batch</code>) never tracks a cycle count at all, so there would
+be nothing for <code>--clock-mhz</code> to derive <code>ReadEClock</code>'s reported time
+from. <code>--clock-mhz</code> implies the plain interpreter path either way
+(equivalent to <code>--no-jit</code>, the default) — only an <em>explicit</em> <code>--jit</code> on
+top of it is refused.</p>
+<p>Also cannot be combined with <a href="#-sanitize"><code>--sanitize</code></a>: the
+cycle-counted execution path <code>--clock-mhz</code> uses
+(<code>M68kCpu::run_via_cycles</code>) doesn't run the sanitizer's per-instruction
+shadow-map hooks at all, so <code>--sanitize</code> would silently check nothing
+while still printing a normal-looking summary — refused for the same
+"an explicit error beats a silently wrong answer" reason as the <code>--jit</code>
+conflict above.</p>
+<p>Only <code>ReadEClock</code> changes. <code>GetSysTime</code>, <code>TR_GETSYSTIME</code>, <code>DateStamp</code>,
+and <code>CurrentTime</code> all still read the real host clock — a benchmark run
+under <code>--clock-mhz</code> doesn't think it's 1978.</p>
+<p>When <code>--clock-mhz</code> is active, volamos also prints the run's total at
+exit, on stderr:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--clock-mhz<span class="w"> </span><span class="m">25</span><span class="w"> </span>./bench
+<span class="go">...program output...</span>
+<span class="go">volamos: 422158 emulated cycles, 0.016886 s at 25 MHz</span>
+<span class="go">volamos: 36581 instructions, 83754 bus accesses (66532 read / 17222 write), 11.54 cycles/instr, 2.29 accesses/instr</span>
+<span class="go">volamos: 183 native library calls ran in zero emulated cycles: exec.library/CopyMem x120, dos.library/Write x41, dos.library/Read x12, exec.library/AllocMem x6, dos.library/Open x2, and 2 more; CopyMem/CopyMemQuick moved 491520 bytes natively</span>
+</code></pre></div>
+<p>The second line exists to make a run's <strong>memory intensity</strong> visible from
+the run itself. volamos bills no bus wait states (see the warning below),
+so its emulated time is close to real hardware for arithmetic-bound code
+and very optimistic for bus-bound code — measured between 1.02x and 25x
+against cycle-paced hardware, monotonic in memory intensity
+(<a href="https://github.com/sidick/volamos/issues/105">issue #105</a>). Cycles and
+seconds alone don't say which end of that range a workload sits at;
+accesses per instruction does, with no second runtime to compare against.</p>
+<p>The third line exists because native library handlers run in <strong>zero
+emulated cycles</strong> (see the warning below): it reports how many library
+calls were serviced natively — the top handlers by call count, and the
+total bytes <code>CopyMem</code>/<code>CopyMemQuick</code> were asked to move, since a guest
+<code>memcpy</code> routed through exec's <code>CopyMem</code> is the classic way a
+benchmark's real work silently bypasses the cycle count. A run whose
+copying "took no time" now says so in its own output
+(<a href="https://github.com/sidick/volamos/issues/109">issue #109</a>, prompted by
+a real GCC-patch benchmark where a memcpy test "improved" 49% under
+volamos against 5% on real hardware). The line is omitted entirely when
+the guest made no library calls at all.</p>
+<p>Two things to know before reading the ratios:</p>
+<ul>
+<li><strong><code>read</code> includes instruction fetch.</strong> The bus methods can't tell a
+  fetch from a data read, so accesses/instr has a floor a little above
+  1.0, and it's the margin <em>above</em> that floor that indicates data
+  traffic. On two deliberately-opposite <code>-O2</code> loops: a byte-copy loop
+  measures 2.67 accesses/instr, a register-only arithmetic loop 1.27.</li>
+<li><strong><code>write</code> is the clean signal</strong>, carrying no fetch component — 819308
+  writes for that copy loop against 110 for the arithmetic one. That's why
+  the two are reported separately rather than only as a total.</li>
+</ul>
+<p>The line goes to stderr so a harness parsing the guest program's own
+stdout never sees it, and it is printed even when the run ends in an
+error — a benchmark that died part-way still burned the cycles it
+burned. Without <code>--clock-mhz</code> nothing is printed, because on the default
+execution path no cycle count exists to print (see the warning below).</p>
+<p>This makes an <em>uninstrumented</em> binary measurable: the guest does not
+have to call <code>ReadEClock</code> and report its own elapsed time. (<code>vamos -v</code>
+has reported an equivalent <code>total cycles:</code> line for its own runs all
+along; the two agree closely — the same <code>ehtest</code> binary measures 340,020
+cycles under volamos against vamos's 339,044 at 68000, and 157,436
+against 155,855 at <code>--cpu 68020</code>, despite entirely independent cycle
+models.)</p>
+<div class="admonition warning">
+<p class="admonition-title">Read this before trusting the numbers</p>
+<ul>
+<li><strong>This is the slowest execution mode volamos has.</strong> Measured with
+  <a href="https://github.com/eembc/coremark">CoreMark 1.0</a>
+  (<code>~/src/external/coremark/coremark.amiga</code>, <code>-O2 -m68020
+  -msoft-float</code>, <code>--cpu 68020</code>, host wall-clock throughput —
+  completed iterations divided by real elapsed seconds, three runs
+  averaged per mode, since <code>--clock-mhz</code> redefines the <code>ReadEClock</code>
+  CoreMark itself times against, so its <em>self-reported</em>
+  iterations/sec isn't a valid host-speed comparison once
+  <code>--clock-mhz</code> is active): the default interpreter (<code>--no-jit</code>)
+  manages ~217 iterations/sec, <code>--clock-mhz 25</code> (<code>CpuCore::
+  run_for_cycles</code>, the <code>m68k</code> crate's transaction-exact,
+  cycle-accurate path) manages ~97 — about <strong>2.2x slower</strong> than
+  <code>--no-jit</code>, and about <strong>7x slower</strong> than <code>--jit</code>'s ~680. It's
+  opt-in, for benchmarking, not for everyday use.</li>
+<li><strong>volamos's memory bus has no wait states.</strong> <code>FlatMemory</code> is a
+  flat <code>Vec&lt;u8&gt;</code> with no <code>sync</code>/bus-timing model at all — unlike
+  real Chip/Fast RAM, which real hardware (and
+  <a href="https://github.com/sidick/copperline">Copperline</a>, volamos's own
+  hardware-timing oracle) bills real contention cycles for.
+  Memory-bound guest code will still report a different emulated
+  time than real hardware for this reason, even with a
+  correctly-configured <code>--clock-mhz</code>.</li>
+<li><strong>Time spent inside volamos's own native-Rust library handlers is
+  free.</strong> Every <code>dos.library</code>/<code>exec.library</code>/... call this runtime
+  implements natively (see <a href="../Supported-Libraries/">Supported Libraries</a>) costs <em>zero</em> emulated cycles — it's host
+  code, not guest instructions. A workload dominated by, say,
+  <code>CopyMem</code> will report an emulated time implying it spent no time
+  there at all, because from the CPU's point of view, it didn't.
+  The native-calls line above is this caveat's counterweight: the
+  zero-cycle work is itemized, so it's visible even though it's
+  unbilled.</li>
+<li><strong>So is time spent inside a guest callback volamos single-steps
+  rather than runs</strong>, for the same reason: <code>RawDoFmt</code>'s
+  <code>PutChProc</code> callback and <code>Supervisor</code>'s routine are both executed
+  one instruction at a time through a separate, non-cycle-counting
+  path, so guest code reached that way is just as invisible to
+  <code>--clock-mhz</code> as a native library handler is.</li>
+<li><strong>A <code>System()</code>/<code>Execute()</code>-nested program gets its own, separate
+  cycle counter, starting back at zero.</strong> A parent process's
+  <code>ReadEClock</code> calls bracketing a <code>System()</code> call will see that
+  child's entire run as contributing (close to) zero elapsed time,
+  since the child's cycles accumulate into its own nested runtime
+  instance, never the parent's. This is deliberate (nesting a
+  shared counter through a separately-constructed <code>Runtime</code> would
+  be significant extra plumbing for a benchmarking edge case), but
+  it means a benchmark that shells out mid-measurement will
+  under-report.</li>
+</ul>
+</div>
+<h2 id="-cache"><code>--cache</code><a class="headerlink" href="#-cache" title="Permanent link">&para;</a></h2>
+<p>Models a direct-mapped instruction cache, sized by <code>--cpu</code> (256 bytes on
+68020/68030, 4096 bytes on 68040/68060 — 68000/68010 have no on-chip
+cache on real hardware, so this is a no-op there), so a loop larger than
+the cache — or extra code size from <code>-Os</code> vs <code>-O2</code>, block duplication,
+etc. — shows up in <a href="#-clock-mhz-n"><code>--clock-mhz</code></a> timings instead of
+every instruction fetch being treated as a free cache hit
+(<a href="https://github.com/sidick/volamos/issues/148">issue #148</a>).</p>
+<div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--clock-mhz<span class="w"> </span><span class="m">25</span><span class="w"> </span>--cache<span class="w"> </span>fixtures/hello
+</code></pre></div>
+<p>Meaningless without <code>--clock-mhz</code>: that's the only execution path that
+reports a cycle count for a modeled cache hit/miss to affect. Off by
+default so existing <code>--clock-mhz</code> numbers stay comparable across runs
+(opt in, as issue #148 asked).</p>
+<p><code>CacheClearU</code>/<code>CacheClearE</code> flush the model, matching real AmigaOS's own
+cache-coherency convention for self-modifying code and freshly loaded
+code.</p>
+<p>Two known gaps, both out of scope for issue #148 and left as follow-up:</p>
+<ul>
+<li><strong>No effect on <code>--cpu 68040</code>.</strong> The <code>m68k</code> crate's 68040 timing model
+  doesn't consult cache state at all yet (only 68020/68030/68060 do), so
+  <code>--cache</code> changes nothing measurable there besides
+  <code>CacheClearU</code>/<code>CacheClearE</code> bookkeeping.</li>
+<li><strong>No data cache or memory-wait-state modeling.</strong> The <code>m68k</code> crate has
+  no timing hooks for either yet, and <code>CacheControl</code>'s <code>CACRF_EnableI</code>
+  toggle isn't wired to the model — <code>--cache</code> is an unconditional
+  CLI-level choice for the whole run, not something a guest can turn
+  on/off at runtime.</li>
+</ul>
+<h2 id="-sanitize"><code>--sanitize</code><a class="headerlink" href="#-sanitize" title="Permanent link">&para;</a></h2>
+<p>Turns on shadow-memory checking of every guest memory access, to catch
+heap bugs that would otherwise corrupt memory silently. Default: off.</p>
+<p><code>m68k-amigaos-gcc</code> has no <code>-fsanitize=address</code>, and MMU-based tools like
+MuForce work at page granularity, so a one-byte overrun or a read just
+past the end of an allocation is invisible to them. volamos can do
+better because it <em>is</em> the allocator and every access already funnels
+through one place.</p>
+<p><div class="highlight"><pre><span></span><code>volamos<span class="w"> </span>--sanitize<span class="w"> </span>fixtures/memtest<span class="w"> </span>overrun
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>overrun: writing 1 byte past a 32-byte block
+sanitizer: 1 distinct violation(s):
+  invalid 1-byte write at 0x00002ee0 (heap redzone) from PC 0x00002af6
+</code></pre></div></p>
+<p>What it catches:</p>
+<ul>
+<li><strong>Heap overruns and underruns</strong>, in either direction and down to a
+  single byte, by placing poisoned redzones either side of every
+  <code>AllocMem</code>/<code>AllocVec</code>/<code>AllocPooled</code> block — including the padding
+  between the size a program asked for and the 8-byte-rounded size it
+  actually got.</li>
+<li><strong>Use-after-free</strong>, by poisoning a block on <code>FreeMem</code> and holding its
+  address out of circulation in a free quarantine, so the bug doesn't
+  hide behind an address that happens not to have been reused yet.</li>
+<li><strong>Bad buffers handed to library calls</strong>, for free: host-side handlers
+  write guest memory through the same checked path, so passing a
+  too-small buffer to a <code>dos.library</code> call is caught without any
+  per-function instrumentation.</li>
+<li><strong>Use-after-free and uninitialized reads through <code>exec.library</code>'s
+  <code>Allocate</code>/<code>Deallocate</code></strong> too (issue #83) — which matters because a C
+  program's <code>malloc</code> (under both libnix and newlib) takes a few big
+  blocks via <code>AllocVec</code> and then sub-allocates from its own pool with
+  <code>Allocate</code>, so most of a real C program's heap traffic goes through
+  <code>Allocate</code>, not <code>AllocMem</code> directly. Unlike the <code>AllocMem</code> family,
+  there are <strong>no redzones here</strong> — <code>Allocate</code> hands out memory from a
+  pool the <em>guest</em> owns and walks with its own pointers, so volamos
+  cannot grow a block without changing what the guest's own free-list
+  walk sees. This means a single-byte overrun past the end of a
+  <code>malloc</code>'d block (as opposed to a use-after-free, or a read of memory
+  <code>malloc</code> never initialized) is not yet caught; see issue #83's "Tier
+  2" for why that's a separate, bigger decision.</li>
+</ul>
+<p>It also catches two classes of stack bug:</p>
+<ul>
+<li><strong>Accesses below the stack pointer</strong> — reading or writing memory a
+  program has already released, or running off the bottom of the live
+  stack. Accesses within 64 bytes below the stack pointer are forgiven,
+  because on m68k a push <em>writes</em> below the stack pointer by definition
+  (<code>move.l d0,-(sp)</code> decrements as part of the store, and <code>MOVEM</code> can
+  move 64 bytes at once), so a stricter rule reports every subroutine
+  call any program makes. valgrind forgives the same window for the
+  same reason.</li>
+<li><strong>Return-address corruption</strong>, via a shadow call stack that records
+  the address each <code>JSR</code>/<code>BSR</code> pushes and verifies it at the matching
+  return:</li>
+</ul>
+<div class="highlight"><pre><span></span><code>return address corrupted at stack slot 0x00fffff8: expected 0x00002ace, found 0x00002ada from PC 0x00002ad8
+</code></pre></div>
+<p>This is stack-smash detection, and it is something valgrind does not
+  offer. It stays quiet on the legitimate <code>move.l #target,-(sp)</code> + <code>rts</code>
+  computed-jump idiom, which has no matching call, on <code>longjmp</code> returning
+  through a slot a later call reused, and it survives <code>StackSwap</code> (a
+  program moving to an entirely different stack).</p>
+<p>Violations are reported to stderr after the run, deduplicated by
+(PC, address, kind) with a hit count, and the guest is left to continue
+— this is a detector, not an enforcer, so one run surfaces every bug
+rather than dying at the first. A multi-byte access that straddles into
+poisoned memory reports once, at the first offending byte, rather than
+once per byte.</p>
+<p>When the run reported any violation, volamos exits with status 99
+instead of the program's own, so a test harness that only checks the
+exit status fails the run. A program started with <code>System()</code> or
+<code>Execute()</code> from inside the run still returns its own code to its
+caller.</p>
+<div class="admonition note">
+<p class="admonition-title">Verified against real software</p>
+<p><code>--sanitize</code> runs the real PhxAss assembler, real pLhA listing a
+102-file archive, and the real SAS/C 6.58 compiler with <strong>zero</strong>
+violations, and <code>sc</code>'s output object file is byte-identical to an
+unsanitized run's. Getting there took fixing several false-positive
+sources that unit tests could never have surfaced — a sanitizer that
+flags correct code is worse than no sanitizer, so if you do see a
+report from a program you believe is correct, it is worth filing.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">It forces the interpreter</p>
+<p><code>--sanitize</code> turns the JIT off even if <code>--jit</code> was also given. The
+JIT's fast path accesses guest memory through a raw pointer that
+bypasses the checks entirely, so the two cannot be combined — a
+sanitized JIT run would report a clean bill of health no matter what
+the program did. Expect a sanitized run to be slower accordingly.</p>
+</div>
+<h2 id="-sanitize-uninit"><code>--sanitize-uninit</code><a class="headerlink" href="#-sanitize-uninit" title="Permanent link">&para;</a></h2>
+<p>Adds reporting of <strong>uninitialized reads</strong> — memory that was allocated
+but never written — on top of <code>--sanitize</code>, which it implies. Off by
+default even when <code>--sanitize</code> is on.</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--sanitize-uninit<span class="w"> </span>fixtures/memtest<span class="w"> </span>uninitpartial
+<span class="go">uninitpartial: alloc 32 bytes, write offsets 0-15, read offset 20</span>
+<span class="go">sanitizer: 1 site(s), 1 violation(s):</span>
+<span class="go">  uninitialized 1-byte read at 0x00003154 from PC 0x00002c08</span>
+</code></pre></div>
+<p>Detection is <strong>byte-granular</strong>: that example writes the first 16 bytes
+of a 32-byte block and is still caught reading offset 20, so a partially
+initialized structure is detected rather than being treated as
+initialized because something in it was written. <code>AllocMem</code> with
+<code>MEMF_CLEAR</code> is genuinely initialized memory and never reports.</p>
+<div class="admonition note">
+<p class="admonition-title">Why this is a separate flag</p>
+<p>Uninitialized-read detection is the noisiest class in any
+sanitizer, and it is the one where legitimate patterns trip it: a
+whole-struct copy that includes padding bytes, or a table scan that
+touches never-used slots, are both real, correct code that reads
+bytes nobody wrote. valgrind ships suppression files precisely for
+this. Keeping <code>--sanitize</code> quiet by default is what makes it
+trustworthy, so this is opt-in.</p>
+<p>For calibration: with this flag, real pLhA listing a 102-file
+archive reports nothing at all, and the real PhxAss assembler
+reports 6 sites — of which one instruction walking a table accounts
+for 568 of the 574 individual violations.</p>
+</div>
+<h2 id="-sanitize-ignore-pc-addr"><code>--sanitize-ignore-pc ADDR</code><a class="headerlink" href="#-sanitize-ignore-pc-addr" title="Permanent link">&para;</a></h2>
+<p>Suppresses violations reported at guest PC <code>ADDR</code> (decimal, or hex with
+a <code>0x</code> prefix). Repeatable.</p>
+<p>This is for silencing a site you have already looked at and decided is
+not a bug, without needing a suppression file. Combined with the
+report's per-PC grouping it makes a noisy program tractable:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--sanitize-uninit<span class="w"> </span>...<span class="w"> </span>PhxAss<span class="w"> </span>...
+<span class="go">sanitizer: 6 site(s), 574 violation(s):</span>
+<span class="go">  ...</span>
+<span class="go">  PC 0x0000e14a: 568 uninitialized 4-byte reads, addresses 0x00038068-0x0003a3d8</span>
+<span class="go">  ...</span>
+
+<span class="gp">$ </span>volamos<span class="w"> </span>--sanitize-uninit<span class="w"> </span>--sanitize-ignore-pc<span class="w"> </span>0xe14a<span class="w"> </span>...<span class="w"> </span>PhxAss<span class="w"> </span>...
+<span class="go">sanitizer: 5 site(s), 6 violation(s):</span>
+<span class="go">  ...</span>
+</code></pre></div>
+<p>Note the report groups by PC in general: a site with many violations
+collapses to one line with a count and an address range, while a site
+with only a few prints each violation in full. That is deliberate — one
+instruction in a loop producing hundreds of near-identical lines is
+noise, but a single violation's detail (for a corrupted return address,
+the expected and actual addresses) is the whole diagnostic value and is
+never collapsed away.</p>
+<h2 id="source-locations-in-diagnostics">Source locations in diagnostics<a class="headerlink" href="#source-locations-in-diagnostics" title="Permanent link">&para;</a></h2>
+<p>When a program carries debug information, volamos annotates sanitizer
+violations with where in the source they happened, instead of only an
+address:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--sanitize<span class="w"> </span>memtest<span class="w"> </span>overrun
+<span class="go">sanitizer: 1 site(s), 1 violation(s):</span>
+<span class="go">  invalid 1-byte write at 0x000032a0 (heap redzone) from PC 0x00002b38 (at work:memtest.s:281)</span>
+</code></pre></div>
+<p>Nothing needs enabling — it is used automatically when present. Two
+sources are consulted, best first:</p>
+<ol>
+<li><strong><code>file:line</code></strong>, from a <code>HUNK_DEBUG</code> <code>LINE</code> block. Emitted by SAS/C
+   when asked (<code>sc DEBUG=LINE</code>) and by PhxAss (<code>LINEDEBUG</code>).</li>
+<li><strong><code>symbol+offset</code></strong>, from the binary's <code>HUNK_SYMBOL</code> table, when
+   there is no line coverage:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>return address corrupted at stack slot 0x00ffffe0: expected 0x00002b40,
+  found 0x41414141 from PC 0x00002b10 (at ___main+0x3c)
+</code></pre></div>
+<p>The raw PC is always kept alongside, because that is what you need to
+find the instruction in a disassembly.</p>
+<div class="admonition note">
+<p class="admonition-title">What each toolchain gives you</p>
+<p><strong>m68k-amigaos-gcc</strong> emits <em>stabs</em> debug info, which volamos does
+not decode, so <code>-g</code> alone does not produce <code>file:line</code> here. gcc
+binaries do carry a symbol table, though, so they get
+<code>symbol+offset</code> — the example above is a real gcc-built program.</p>
+<p><strong>SAS/C</strong> and <strong>PhxAss</strong> produce <code>LINE</code> blocks when asked, and those
+give true <code>file:line</code>.</p>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">Two honest limits on attribution</p>
+<p><strong>Line numbers point at statements, not instructions.</strong> <code>LINE</code> data
+is sparse — one entry per source line — so a PC between two entries
+is reported against the earlier one. That is the right answer for
+"which statement", not "which instruction".</p>
+<p><strong>Symbol attribution is only as good as the symbol table.</strong> <code>static</code>
+functions are not exported and so do not appear in <code>HUNK_SYMBOL</code> at
+all; a violation inside one is reported against the nearest
+preceding <em>exported</em> symbol, which can be a surprising name with a
+large offset. Prefer <code>file:line</code> where your toolchain can produce
+it.</p>
+</div>
+<h2 id="-dirty-heap"><code>--dirty-heap</code><a class="headerlink" href="#-dirty-heap" title="Permanent link">&para;</a></h2>
+<p>Fills every <code>AllocMem</code>/<code>AllocVec</code>/<code>AllocPooled</code> block allocated
+<strong>without</strong> <code>MEMF_CLEAR</code> with the byte <code>0xA5</code>, instead of leaving it as
+the zeros volamos's guest memory happens to start as.</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>fixtures/memtest<span class="w"> </span>zerodep
+<span class="go">zerodep: read 0 -- took the zero path (this is the bug: it only works because the memory happened to be zero)</span>
+
+<span class="gp">$ </span>volamos<span class="w"> </span>--dirty-heap<span class="w"> </span>fixtures/memtest<span class="w"> </span>zerodep
+<span class="go">zerodep: read non-zero -- took the garbage path</span>
+</code></pre></div>
+<p>Real <code>AllocMem</code> without <code>MEMF_CLEAR</code> returns whatever debris was in
+that memory — usually a previous allocation's leftovers. volamos's
+memory starts zeroed, so a program that relies on uncleared memory
+being zero works perfectly here while failing sporadically on real
+hardware, depending on what ran before it. This flag makes that debris
+real, so the bug shows up as a reproducible failure instead of hiding.</p>
+<p><code>MEMF_CLEAR</code> allocations are untouched: that is a documented guarantee
+of zeroed memory, and a program that asks for it gets zeros whatever
+debugging flags the host was given.</p>
+<p><code>0xA5</code> is the conventional debug poison, and it is chosen over <code>0x00</code>
+or <code>0xFF</code> for two reasons: it is unmistakable in a memory dump, and
+<code>0xA5A5A5A5</code> is an <strong>odd</strong> address — so a guest that reads it out of an
+uninitialized field and dereferences it as a pointer takes an address
+error on a 68000 immediately, rather than quietly reading somewhere
+plausible. A bug that announces itself beats one that limps on.</p>
+<div class="admonition note">
+<p class="admonition-title">Independent of <code>--sanitize</code></p>
+<p>This flag <strong>changes what the guest sees</strong>, whereas everything under
+<code>--sanitize</code> only observes. That distinction is deliberate and
+worth keeping: <code>--sanitize</code> can be trusted not to alter a program's
+behaviour (the real SAS/C compiler's output object file is
+byte-identical under it), so a behaviour change does not belong
+inside it.</p>
+<p>The two compose, though — <code>--dirty-heap --sanitize-uninit</code> both
+fills the memory <em>and</em> reports the reads — and <code>--dirty-heap</code> works
+on its own as a plain bug-shaker, with no shadow map and no
+slowdown.</p>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">What it cannot see</p>
+<p>Overflows <em>within</em> a stack frame — a 16-byte local overflowing into
+the local next to it — need compiler instrumentation to detect, and
+are invisible here for the same reason they're invisible to
+valgrind. Such corruption becomes visible only once it reaches
+something tracked: a return address, a heap redzone, or memory below
+the stack pointer.</p>
+<p><code>AvailMem</code> also legitimately reports less free memory under
+<code>--sanitize</code>, because redzone and quarantined bytes genuinely aren't
+available.</p>
+</div>
+<h2 id="-uae-debug"><code>--uae-debug</code><a class="headerlink" href="#-uae-debug" title="Permanent link">&para;</a></h2>
+<p>Enables UAE's debug facilities. One flag turns on both mechanisms:
+the <a href="#the-debug-sprintf-port">debug sprintf port</a> at <code>0xBFFF00</code> and the
+<a href="#the-uaelib-debug-log-trap"><code>uaelib</code> debug-log trap</a> at <code>0xF0FF60</code>.</p>
+<h3 id="the-debug-sprintf-port">The debug sprintf port<a class="headerlink" href="#the-debug-sprintf-port" title="Permanent link">&para;</a></h3>
+<p>The <strong>debug sprintf port</strong> at <code>0xBFFF00</code> is the memory-mapped
+debug channel WinUAE and amiberry expose when their <code>debug_mem</code> option
+is on. A guest formats text using nothing but stores to that address (no
+library call, no <code>dos.library</code>, works in code that has none of them
+open), and the text is written to <strong>stderr</strong>, exactly as formatted: no
+prefix, and no newline unless the format string has one.</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--uae-debug<span class="w"> </span>prog
+<span class="go">boot: stage=2 flags=$0000beef name=loader</span>
+</code></pre></div>
+<p>Off by default, and CLI-only — it is not settable from <code>~/.volamos</code>/
+<code>.volamos</code>, so a stale config file can't start diverting stores. With
+the flag off, a store to <code>0xBFFF00</code> behaves exactly as it always did.
+Nested <code>System()</code>/<code>Execute()</code>/<code>RunCommand()</code> programs inherit it.</p>
+<h3 id="protocol">Protocol<a class="headerlink" href="#protocol" title="Permanent link">&para;</a></h3>
+<p>All offsets are from <code>0xBFFF00</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Store</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>any size at <code>+0</code></td>
+<td>Push an argument (its value and width) on a 32-entry stack. Pushes beyond the 32nd are dropped.</td>
+</tr>
+<tr>
+<td><strong>long</strong> at <code>+4</code></td>
+<td>The value is a pointer to a NUL-terminated format string: format it with the pushed arguments, print it, and clear the stack.</td>
+</tr>
+<tr>
+<td><strong>long</strong> at <code>+8</code></td>
+<td>The value is a pointer to a <code>va_list</code>-style argument block in guest memory: from now on every format reads its arguments from there, packed with no padding (until the next push at <code>+0</code>).</td>
+</tr>
+</tbody>
+</table>
+<p>Byte and word stores to <code>+4</code>/<code>+8</code> are ignored. On a 68000/68010 a long
+store is two word bus cycles and UAE sees (and latches) them as such, so
+<code>+2</code>/<code>+6</code>/<code>+10</code> are routed too and a pair of <code>move.w</code> works the same as
+one <code>move.l</code>; on a 68020 and later only the exact offsets <code>+0</code>/<code>+4</code>/<code>+8</code>
+are routed. volamos picks this from <code>--cpu</code>.</p>
+<h3 id="format-codes">Format codes<a class="headerlink" href="#format-codes" title="Permanent link">&para;</a></h3>
+<p><code>%%</code>, <code>%c</code>, <code>%s</code> (C string), <code>%b</code> (BSTR), <code>%p</code> (printed <code>$%08x</code>), and
+<code>%x %X %d %i %u %o</code>, with the usual C flags (<code>-</code>, <code>+</code>, space, <code>#</code>, <code>0</code>),
+width and precision between the <code>%</code> and the code.</p>
+<div class="admonition warning">
+<p class="admonition-title">Integers are 16 bits unless you say <code>l</code></p>
+<p><code>%d</code> consumes a <strong>16-bit</strong> value and sign-extends it; <code>%x</code>/<code>%u</code>/<code>%o</code>
+zero-extend it. Print a 32-bit value with <code>%ld</code>/<code>%lx</code>/...; pointers
+for <code>%s</code>, <code>%b</code> and <code>%p</code> are always 32-bit. Forgetting the <code>l</code> prints
+the low half of the number — and with the <code>+8</code> argument block it
+also <em>misaligns every later argument</em>, because the block holds a
+2-byte slot for each plain integer and a 4-byte slot for each <code>l</code>
+one (and for each pointer).</p>
+</div>
+<p>An unknown or malformed directive (<code>%z</code>, <code>%*d</code>, ...) is printed
+literally and a <code>volamos: uae-debug:</code> warning goes to stderr; a
+directive with no argument left prints <code>0</code> (plus a warning). The
+<code>%[CYCLES]x</code> form UAE offers is not supported (see below).</p>
+<h3 id="using-it-from-a-program">Using it from a program<a class="headerlink" href="#using-it-from-a-program" title="Permanent link">&para;</a></h3>
+<p>C, with the stack protocol (<code>DBG</code> is a <code>volatile</code> pointer so the
+compiler can't merge or reorder the stores):</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#define DBG ((volatile unsigned long *)0xBFFF00)</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">dbg</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">fmt</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">DBG</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="p">)</span><span class="n">fmt</span><span class="p">;</span><span class="w"> </span><span class="p">}</span><span class="w">   </span><span class="cm">/* +4 */</span>
+
+<span class="cm">/* arguments are pushed in order, then the format prints them */</span>
+<span class="n">DBG</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">stage</span><span class="p">;</span><span class="w">                      </span><span class="cm">/* %d  (16-bit)  */</span>
+<span class="n">DBG</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">flags</span><span class="p">;</span><span class="w">                      </span><span class="cm">/* %lx (32-bit)  */</span>
+<span class="n">DBG</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="p">)</span><span class="n">name</span><span class="p">;</span><span class="w">        </span><span class="cm">/* %s            */</span>
+<span class="n">dbg</span><span class="p">(</span><span class="s">"boot: stage=%d flags=$%08lx name=%s</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+</code></pre></div>
+<p>(On a 68000 the compiler emits a <code>move.l</code> and volamos splits it into
+the word pair, so the same code works on every <code>--cpu</code>.) 68000
+assembly:</p>
+<div class="highlight"><pre><span></span><code>        move.l  #$FFFE,$BFFF00      ; push a value (prints as -2 with %d)
+        move.l  #msg,$BFFF04        ; print "n=%d\n"
+        ...
+msg:    dc.b    "n=%d",10,0
+</code></pre></div>
+<p>Or collect the arguments in memory and use the <code>+8</code> form — handy for a
+logging helper that already has a <code>va_list</code>-style block:</p>
+<div class="highlight"><pre><span></span><code>        move.l  #args,$BFFF08       ; switch to memory arguments
+        move.l  #msg,$BFFF04        ; msg = "n=%d name=%s\n"
+        rts
+args:   dc.w    5                   ; %d  (2 bytes)
+        dc.l    name                ; %s  (4 bytes)
+</code></pre></div>
+<h3 id="what-it-does-to-the-run">What it does to the run<a class="headerlink" href="#what-it-does-to-the-run" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Works at any <code>--ram</code>.</strong> The port is intercepted on the CPU's store
+  path <em>before</em> any memory lookup, so it is there with <code>--ram 1M</code> (where
+  <code>0xBFFF00</code> isn't RAM at all) and with the default 16 MiB (where it
+  is). A claimed store never reaches memory.</li>
+<li><strong>The JIT is off.</strong> The trace JIT writes guest memory through a raw
+  pointer that would bypass the port, so <code>--uae-debug</code> forces
+  <code>--no-jit</code> — silently overriding an explicit <code>--jit</code>, exactly as
+  <a href="#-sanitize"><code>--sanitize</code></a> does. It can be combined with
+  <code>--clock-mhz</code>.</li>
+<li><strong>The 12 bytes are kept out of the guest heap.</strong> When <code>0xBFFF00</code> lies
+  inside RAM, <code>AllocMem</code> and friends will never hand out an address in
+  <code>0xBFFF00..0xBFFF0C</code>, so <code>AvailMem</code> reports 12 bytes less (and
+  <code>MEMF_LARGEST</code> the larger of the two pieces on either side). If the
+  program image or the stack already covers that range (e.g. <code>--stack
+  8M</code> with the default RAM) the run refuses to start with an error
+  rather than corrupt memory — use a bigger <code>--ram</code> or a smaller
+  <code>--stack</code>.</li>
+<li><strong><code>--sanitize</code> is not bothered.</strong> Stores to the port are legitimate
+  device accesses and are never reported. Format strings and <code>%s</code>/<code>%b</code>
+  arguments are read through the checked path, so passing a pointer to
+  freed or out-of-bounds memory <em>is</em> reported.</li>
+<li><strong>Reads are not intercepted</strong> (the port is write-only in UAE too): a
+  read of <code>0xBFFF00..</code> returns whatever is in memory there.</li>
+<li><strong>Bounded.</strong> Strings are read up to 4095 bytes (an unmapped byte
+  ends one), and one message is at most 4095 bytes; nothing the guest
+  stores can hang or crash volamos.</li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">Differences from UAE</p>
+<p>volamos mirrors UAE's protocol, including its quirks, with these
+exceptions: missing arguments read as <code>0</code> (UAE prints whatever stale
+values earlier messages left on its stack); malformed directives
+are printed literally with a warning (UAE passes them to the host
+<code>printf</code>); <code>%[CYCLES]x</code> — which prints emulated cycles since the
+previous message — prints nothing and warns, as volamos has no
+cycle counter on this path; on a 68000 the <code>+8</code> pair uses the full
+combined pointer (UAE keeps only its low word).</p>
+</div>
+<h3 id="the-uaelib-debug-log-trap">The <code>uaelib</code> debug-log trap<a class="headerlink" href="#the-uaelib-debug-log-trap" title="Permanent link">&para;</a></h3>
+<p>UAE also exposes a <em>function</em>: a call to the address <code>0xF0FF60</code> enters
+its <code>uaelib</code> demultiplexer. volamos implements one mode of it, <strong>mode
+86</strong>, which logs a string — the call the vscode-amiga-debug toolchain
+uses. It is declared in amiberry's <code>uae_pragmas.h</code> as a C varargs
+function, so from C:</p>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">calltrap</span><span class="p">)(</span><span class="kt">int</span><span class="w"> </span><span class="n">arg0</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="p">)(</span><span class="kt">int</span><span class="w"> </span><span class="n">arg0</span><span class="p">,</span><span class="w"> </span><span class="p">...))</span><span class="mh">0xF0FF60</span><span class="p">;</span>
+
+<span class="n">calltrap</span><span class="p">(</span><span class="mi">86</span><span class="p">,</span><span class="w"> </span><span class="s">"reached stage 2"</span><span class="p">);</span>
+</code></pre></div>
+<p>writes this line to <strong>stderr</strong> and returns <code>1</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--uae-debug<span class="w"> </span>prog
+<span class="go">DBG: reached stage 2</span>
+</code></pre></div>
+<p>The convention is the plain C stack one, as in UAE: on entry <code>4(sp)</code>
+is the mode and <code>8(sp)</code> the string pointer (more arguments follow at
+<code>12(sp)</code>, ...); the result is returned in <code>D0</code> and the caller pops the
+arguments. In assembly:</p>
+<div class="highlight"><pre><span></span><code>        pea     msg
+        move.l  #86,-(sp)
+        jsr     $F0FF60
+        addq.l  #8,sp               ; D0 = 1
+        ...
+msg:    dc.b    "reached stage 2",0
+</code></pre></div>
+<ul>
+<li><strong>Bad pointers return <code>0</code></strong> and log nothing: a pointer outside RAM.
+  Like UAE, address <code>0</code> counts as valid and is read as a string (in
+  volamos that is the start of the trap table, so a NULL pointer logs
+  meaningless bytes rather than failing). Strings are read through the
+  checked path up to 4095 bytes.</li>
+<li><strong>Other modes return <code>0</code> and warn.</strong> Any mode other than 86 returns 0
+  — what "not supported" looks like to a program probing for UAE — and
+  prints one <code>volamos: uae-debug: unsupported uaelib mode N ...</code> line
+  to stderr, once per distinct mode, so the probe is visible.</li>
+<li><strong>Needs <code>--ram</code> of at least 16 MiB</strong> (the default). The trap lives at
+  <code>0xF0FF60</code>, a code address that has to be inside RAM. With a smaller
+  <code>--ram</code> a startup warning says the trap is inactive (the sprintf port
+  still works) and a <code>jsr</code> there fails like any jump outside memory.
+  Works on every <code>--cpu</code>, including the 24-bit 68000/68010.</li>
+<li><strong>Heap and stack.</strong> The two bytes of the trap opcode are kept out of
+  the guest heap; if the program image or the stack covers
+  <code>0xF0FF60</code> (e.g. <code>--stack 1M</code> or more with the default 16 MiB RAM)
+  the run refuses to start with an error.</li>
+<li><strong>JIT and <code>--sanitize</code>.</strong> As above, the flag as a whole forces
+  <code>--no-jit</code>. The trap's own opcode is never a <code>--sanitize</code> violation;
+  the string is read through the checked path, so a pointer into freed
+  memory <em>is</em> reported.</li>
+<li>Nested programs inherit it, and with the flag off nothing is planted:
+  a <code>jsr</code> to <code>0xF0FF60</code> behaves as it always did.</li>
+</ul>
+<h2 id="-emu68-debug"><code>--emu68-debug</code><a class="headerlink" href="#-emu68-debug" title="Permanent link">&para;</a></h2>
+<p>Enables <strong>Emu68's debug byte port</strong>. Emu68 (the PiStorm JIT) treats a
+<strong>byte-sized store to the absolute address <code>0xDEADBEEF</code></strong> as "print this
+character" on its debug console; its own <code>kprintf</code> is built on it, so
+software written for PiStorm often emits text this way. With the flag,
+that byte is written to <strong>stderr</strong>, raw and exactly as stored — no
+newline, no prefix, nothing buffered.</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>volamos<span class="w"> </span>--emu68-debug<span class="w"> </span>--cpu<span class="w"> </span><span class="m">68020</span><span class="w"> </span>prog
+<span class="go">Hi</span>
+</code></pre></div>
+<p>Off by default, and CLI-only — it is not settable from <code>~/.volamos</code>/
+<code>.volamos</code>, so a stale config file can't start diverting stores. With
+the flag off, a store to <code>0xDEADBEEF</code> behaves exactly as it always did
+(a silently dropped out-of-range write). Nested <code>System()</code>/<code>Execute()</code>/
+<code>RunCommand()</code> programs inherit it.</p>
+<div class="admonition warning">
+<p class="admonition-title">Needs a 32-bit CPU: use <code>--cpu 68020</code> or later</p>
+<p>The 68000 and 68010 have a 24-bit address bus, and the CPU core
+presents <code>0xDEADBEEF</code> to memory as <code>0x00ADBEEF</code>, so the port never
+triggers there. Emu68 itself only targets 32-bit CPUs. Since
+<code>--cpu</code> defaults to 68000, <code>--emu68-debug</code> alone prints nothing —
+volamos prints a one-line warning to stderr at startup saying so
+rather than refusing to run.</p>
+</div>
+<ul>
+<li><strong>Byte stores only.</strong> Word and long stores to <code>0xDEADBEEF</code> are not
+  special in Emu68 and are not here either; they fall through exactly as
+  without the flag. Loads are not intercepted.</li>
+<li><strong>The address is fixed.</strong> Emu68 also publishes it in its device tree
+  for future discovery; volamos has no device tree.</li>
+<li><strong>The JIT is off.</strong> Like <a href="#-uae-debug"><code>--uae-debug</code></a> and
+  <a href="#-sanitize"><code>--sanitize</code></a>, the flag forces <code>--no-jit</code> (silently
+  overriding <code>--jit</code>), since the JIT's raw-pointer stores would bypass
+  the port.</li>
+<li><strong>Works at any <code>--ram</code>.</strong> The store is intercepted before any memory
+  lookup. A <code>--ram</code> large enough to cover <code>0xDEADBEEF</code> (about 3.5 GiB)
+  has that one byte kept out of the guest heap.</li>
+<li><strong><code>--sanitize</code> is not bothered.</strong> Stores to the port are never
+  reported.</li>
+<li><strong>Combinable with <a href="#-uae-debug"><code>--uae-debug</code></a></strong>, which is a
+  different mechanism (formatted text through stores to <code>0xBFFF00</code>); the
+  two ports are independent.</li>
+</ul>
+<h3 id="using-it-from-a-program_1">Using it from a program<a class="headerlink" href="#using-it-from-a-program_1" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">dbg_putc</span><span class="p">(</span><span class="kt">char</span><span class="w"> </span><span class="n">c</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="mh">0xDEADBEEF</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">c</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">dbg_puts</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="n">dbg_putc</span><span class="p">(</span><span class="o">*</span><span class="n">s</span><span class="o">++</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<p>or in assembly:</p>
+<div class="highlight"><pre><span></span><code>        move.b  #'H',$DEADBEEF
+        move.b  #'i',$DEADBEEF
+        move.b  #10,$DEADBEEF
+</code></pre></div>
+<p>run with <code>volamos --emu68-debug --cpu 68020 prog</code>. Use <code>volatile</code> so the
+compiler cannot merge or drop the stores.</p>
+<h2 id="no-flags-at-all">No flags at all<a class="headerlink" href="#no-flags-at-all" title="Permanent link">&para;</a></h2>
+<p>With the <a href="../Volumes-and-Assigns/#standard-defaults">built-in defaults</a>
+active (the default), <code>SYS:</code>, <code>C:</code>, <code>S:</code>, <code>LIBS:</code>, <code>DEVS:</code>, <code>ENVARC:</code>,
+<code>RAM:</code>, <code>T:</code>, and <code>ENV:</code> all resolve out of the box even with no <code>-V</code>/
+<code>-a</code>/<code>--cwd</code>/<code>--auto-assign</code> given — backed by empty host directories
+created only on first actual use, so <a href="../Getting-Started/">Getting Started</a>'s
+first two examples (which never touch the filesystem at all) leave no
+trace on disk either way. Any other name still fails cleanly with an
+<code>IoErr()</code> — a typo isn't silently treated as a new empty volume.</p>
+<p>With <code>--no-defaults</code>, or if none of the above apply, no volume/assign
+filesystem is installed at all: <code>dos.library</code> path-based calls
+(<code>Open</code>, <code>Lock</code>, <code>Examine</code>, ...) fail cleanly with an <code>IoErr()</code>, but
+<code>Input</code>/<code>Output</code>/<code>PutStr</code>/<code>IoErr</code>/<code>SetIoErr</code> (and anything that doesn't
+touch a path) still work.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../Getting-Started/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Getting Started">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Getting Started
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../Configuration/" class="md-footer__link md-footer__link--next" aria-label="Next: Configuration Files">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Configuration Files
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      volamos — a Rust-native runtime for classic AmigaOS m68k CLI binaries. MIT OR Apache-2.0.
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.footer", "content.action.edit", "content.code.copy"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
+      
+    
+  </body>
+</html>
