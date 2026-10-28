@@ -35,6 +35,6 @@ permissions:
 
 jobs:
   docs:
-    uses: sidick/amiga-workflows/.github/workflows/docs.yml@v1
+    uses: sidick/amiga-workflows/.github/workflows/docs.yml@6ad7098bebba603db43f7c9e25706fa9047eeddc # v1
     with:
       version: ${{ inputs.version || github.ref_name }}

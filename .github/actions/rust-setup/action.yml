@@ -26,19 +26,19 @@ runs:
   steps:
     - name: Install Rust (no extra targets)
       if: inputs.targets == ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       with:
         components: ${{ inputs.components }}
 
     - name: Install Rust (with target)
       if: inputs.targets != ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       with:
         targets: ${{ inputs.targets }}
         components: ${{ inputs.components }}
 
     - name: Cache cargo
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
       with:
         path: |
           ~/.cargo/registry
