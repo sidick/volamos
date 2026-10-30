@@ -781,6 +781,12 @@ impl Cpu for M68kCpu {
                 BatchExit::WatchedPc { .. } => {
                     unreachable!("no watch_pcs are ever passed to run_batch")
                 }
+                BatchExit::BoundaryRequested => {
+                    unreachable!(
+                        "FlatMemory never overrides batch_boundary, whose default \
+                         implementation always returns false"
+                    )
+                }
                 BatchExit::AlineTrap { opcode } => {
                     return StopReason::Trap(TrapInfo {
                         kind: TrapKind::ALine { opcode },
