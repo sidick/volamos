@@ -300,6 +300,40 @@ pub fn classify(opcode: u16) -> ControlFlowOp {
     ControlFlowOp::Other
 }
 
+/// `CLR.{b,w,l} <ea>` = `0100 0010 ss mmm rrr` (`0x4200`-`0x42FF`), size
+/// `ss` at bits 7-6 (`00`=byte, `01`=word, `10`=long; `11` is an
+/// unassigned/illegal encoding on the 68000, not `CLR`).
+///
+/// True exactly when the destination is a memory effective address
+/// (`mode` != `000`, i.e. not `Dn` register-direct) -- the case where
+/// real 68000 silicon's `CLR` reads its destination before writing
+/// zero, a documented hardware quirk the 68010+ removed (see issue
+/// #222, and the `m68k` crate's own `exec_clr`, which gates the dummy
+/// read on `CpuType::M68000` and `mode != DataDirect` the same way).
+/// `mode == 000` takes the crate's internal register-RMW path, which
+/// never touches the bus at all, so there is no dummy *memory* read to
+/// exempt there -- only the sanitizer's shadow-memory checks need this,
+/// never registers.
+///
+/// Like [`classify`], this is a pure function of the opcode word alone
+/// and doesn't attempt to validate every addressing mode `CLR` actually
+/// permits (e.g. `mode == 001`, `An` direct, is illegal for `CLR` on
+/// real hardware) -- a caller only needs "would the crate's `exec_clr`
+/// take the memory-read branch", and being slightly over-inclusive on
+/// an encoding no real compiler emits is harmless (the suppression it
+/// gates would simply never trigger for that instruction).
+pub fn is_m68000_clr_with_memory_destination(opcode: u16) -> bool {
+    if opcode & 0xFF00 != 0x4200 {
+        return false;
+    }
+    let size = (opcode >> 6) & 0x3;
+    if size == 0b11 {
+        return false;
+    }
+    let mode = (opcode >> 3) & 0x7;
+    mode != 0b000
+}
+
 /// For a `BSR` opcode (as confirmed by [`classify`]), which of the
 /// three displacement encodings its low byte selects.
 ///
@@ -721,5 +755,40 @@ mod tests {
             // Re-classifying is idempotent/pure.
             assert_eq!(classify(opcode as u16), op);
         }
+    }
+
+    // ---- is_m68000_clr_with_memory_destination (issue #222) ----
+
+    #[test]
+    fn clr_with_a_memory_destination_is_detected_for_every_size() {
+        // CLR.L (a2) -- the issue's own repro (libnix malloc's
+        // clr.l a2@(32)), mode 010 = (An), register 2.
+        assert!(is_m68000_clr_with_memory_destination(0x4292));
+        // CLR.B (a0), mode 010, register 0.
+        assert!(is_m68000_clr_with_memory_destination(0x4210));
+        // CLR.W (a1)+, mode 011, register 1.
+        assert!(is_m68000_clr_with_memory_destination(0x4259));
+        // CLR.L abs.l, mode 111, register 001.
+        assert!(is_m68000_clr_with_memory_destination(0x42B9));
+    }
+
+    #[test]
+    fn clr_with_a_register_destination_is_not_detected() {
+        // CLR.L D0 -- mode 000: the crate's register-RMW path, no bus
+        // read at all, so nothing for this to exempt.
+        assert!(!is_m68000_clr_with_memory_destination(0x4280));
+        // CLR.B D7, CLR.W D3.
+        assert!(!is_m68000_clr_with_memory_destination(0x4207));
+        assert!(!is_m68000_clr_with_memory_destination(0x4243));
+    }
+
+    #[test]
+    fn clr_size_11_and_non_clr_opcodes_are_not_detected() {
+        // 0x42C0-0x42FF: size bits 11 is not a CLR encoding at all.
+        assert!(!is_m68000_clr_with_memory_destination(0x42D2));
+        // Neighbouring opcodes outside CLR's 0x4200-0x42FF byte range.
+        assert!(!is_m68000_clr_with_memory_destination(0x4000)); // NEGX
+        assert!(!is_m68000_clr_with_memory_destination(0x4400)); // NEG
+        assert!(!is_m68000_clr_with_memory_destination(0x0000)); // ORI
     }
 }

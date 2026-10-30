@@ -735,6 +735,21 @@ pub struct ShadowMap {
     /// [`Self::ignore_pc`]'s own doc for why this is a per-invocation
     /// flag rather than a suppression file.
     ignored_pcs: HashSet<u32>,
+    /// Set by the run loop for exactly the duration of one instruction's
+    /// execution when that instruction is a real 68000's `CLR <ea>` with
+    /// a memory destination (see [`Self::set_clr_dummy_read_pending`]).
+    /// On that one CPU, `CLR` genuinely reads its destination before
+    /// writing zero -- a documented hardware quirk the 68010+ removed --
+    /// but the value is discarded and the byte is about to become
+    /// [`ShadowState::Valid`] regardless, so it is not the kind of
+    /// uninitialized read `--sanitize-uninit` exists to catch (issue
+    /// #222). Only suppresses [`ViolationKind::UninitRead`]; an
+    /// [`ShadowState::Unaddressable`] destination still reports --
+    /// `CLR` through a bad pointer is a real bug the quirk doesn't
+    /// excuse. `Cell`-wrapped for the same reason as `suppressed`: the
+    /// run loop sets/clears it from [`Self::set_clr_dummy_read_pending`]
+    /// (`&self`), matching [`Self::check_read`]'s own signature.
+    clr_dummy_read_pending: Cell<bool>,
 }
 
 impl ShadowMap {
@@ -752,7 +767,19 @@ impl ShadowMap {
             call_stack: VecDeque::new(),
             dropped_call_frames: 0,
             ignored_pcs: HashSet::new(),
+            clr_dummy_read_pending: Cell::new(false),
         }
+    }
+
+    /// Marks (or clears) the real-68000 `CLR`-dummy-read exemption for
+    /// the single instruction about to execute (or that just finished)
+    /// -- see [`Self::clr_dummy_read_pending`]'s doc for what this
+    /// excuses and why. The run loop is responsible for calling this
+    /// with `true` immediately before such an instruction executes and
+    /// `false` immediately after every instruction (whether or not it
+    /// set `true`), so the exemption can never leak into the next one.
+    pub(crate) fn set_clr_dummy_read_pending(&self, pending: bool) {
+        self.clr_dummy_read_pending.set(pending);
     }
 
     /// The number of guest bytes this map covers.
@@ -1045,7 +1072,10 @@ impl ShadowMap {
     /// Checks one byte about to be read at `addr`, recording an
     /// [`ViolationKind::InvalidRead`] if it's [`ShadowState::
     /// Unaddressable`], or an [`ViolationKind::UninitRead`] if it's
-    /// [`ShadowState::Uninit`] and [`Self::report_uninit`] is on.
+    /// [`ShadowState::Uninit`] and [`Self::report_uninit`] is on --
+    /// unless [`Self::clr_dummy_read_pending`] excuses it (issue #222;
+    /// note this exemption applies only to `Uninit`, not
+    /// `Unaddressable`: a `CLR` through a bad pointer still reports).
     /// `size` is the size in bytes of the whole access this byte is
     /// part of (carried through purely for the [`Violation`]'s own
     /// `size` field/diagnostics, not used to decide anything here).
@@ -1062,7 +1092,7 @@ impl ShadowMap {
                 }
                 self.record(addr, size, ViolationKind::InvalidRead, reason)
             }
-            ShadowState::Uninit if self.report_uninit => {
+            ShadowState::Uninit if self.report_uninit && !self.clr_dummy_read_pending.get() => {
                 self.record(addr, size, ViolationKind::UninitRead, None)
             }
             ShadowState::Uninit | ShadowState::Valid => false,
@@ -1962,6 +1992,38 @@ mod tests {
         shadow.check_read(0, 1);
         assert_eq!(shadow.violation_count(), 1);
         assert_eq!(shadow.violations()[0].kind, ViolationKind::UninitRead);
+    }
+
+    #[test]
+    fn clr_dummy_read_pending_suppresses_uninit_read_but_not_unaddressable() {
+        // Issue #222: while the exemption is set, an Uninit read is
+        // silent even with report_uninit on...
+        let mut shadow = ShadowMap::new(16);
+        shadow.report_uninit = true;
+        shadow.mark_uninit(0, 4);
+        shadow.set_clr_dummy_read_pending(true);
+        shadow.check_read(0, 4);
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "a CLR dummy read of Uninit memory must not report"
+        );
+
+        // ...but a genuinely unaddressable destination still reports --
+        // the exemption is specifically for Uninit, not Unaddressable.
+        shadow.mark_unaddressable(8, 4, PoisonReason::Freed);
+        shadow.check_read(8, 4);
+        assert_eq!(
+            shadow.violation_count(),
+            1,
+            "CLR through a bad pointer is a real bug, not excused"
+        );
+
+        // Clearing the exemption (as the run loop does after every
+        // instruction) restores normal Uninit reporting.
+        shadow.set_clr_dummy_read_pending(false);
+        shadow.check_read(0, 4);
+        assert_eq!(shadow.violation_count(), 2);
     }
 
     #[test]

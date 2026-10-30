@@ -477,7 +477,24 @@ impl M68kCpu {
             return ControlFlowOp::Other;
         }
 
-        let op = m68kops::classify(mem.peek_u16(pc));
+        let opcode = mem.peek_u16(pc);
+        let op = m68kops::classify(opcode);
+
+        // Issue #222: a real 68000's `CLR <ea>` reads its memory
+        // destination before writing zero (the 68010+ removed this
+        // quirk), but the value is discarded and the byte is about to
+        // become valid anyway -- not what `--sanitize-uninit` exists to
+        // catch. Mark the exemption for exactly this one instruction;
+        // `sanitize_after_instruction` clears it unconditionally once
+        // the instruction has executed, so it can never leak into the
+        // next one. See `ShadowMap::clr_dummy_read_pending`'s doc.
+        if self.core.cpu_type == CpuType::M68000
+            && m68kops::is_m68000_clr_with_memory_destination(opcode)
+            && let Some(shadow) = mem.shadow_mut()
+        {
+            shadow.set_clr_dummy_read_pending(true);
+        }
+
         // Where the return address sits relative to A7 differs per
         // instruction, and getting it wrong would compare the wrong
         // bytes and invent corruption reports:
@@ -524,6 +541,10 @@ impl M68kCpu {
     fn sanitize_after_instruction(&mut self, mem: &mut FlatMemory, op: ControlFlowOp) {
         if mem.shadow().is_none() {
             return;
+        }
+
+        if let Some(shadow) = mem.shadow_mut() {
+            shadow.set_clr_dummy_read_pending(false);
         }
 
         let sp = self.address_register(AddressRegister(7));
@@ -974,6 +995,70 @@ mod tests {
         mem.enable_sanitizer();
 
         assert!(AddressBus::fast_mem(&mut mem).is_none());
+    }
+
+    #[test]
+    fn clr_l_memory_destination_does_not_false_positive_an_uninit_read() {
+        // Issue #222: a real 68000's CLR.L (A0) reads its destination
+        // before writing zero, but that read must not be reported as an
+        // uninitialized read once --sanitize-uninit (report_uninit) is
+        // on, since the value is discarded and the byte is about to
+        // become Valid anyway.
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let start = cpu.pc();
+        // 0x4290: CLR.L (A0)
+        load_words(&mut mem, start, &[0x4290]);
+        let dest = 0x2000u32;
+        cpu.set_address_register(AddressRegister(0), dest);
+
+        mem.enable_sanitizer();
+        mem.shadow_mut().unwrap().report_uninit = true;
+        mem.shadow_mut().unwrap().mark_uninit(dest, 4);
+
+        let reason = cpu.step(&mut mem);
+
+        assert_eq!(reason, StopReason::Step);
+        assert_eq!(
+            mem.shadow().unwrap().violation_count(),
+            0,
+            "CLR's 68000 dummy read of Uninit memory must not be reported"
+        );
+        assert_eq!(mem.peek_u32(dest), 0, "CLR must still zero the destination");
+    }
+
+    #[test]
+    fn clr_l_memory_destination_through_a_freed_pointer_still_reports() {
+        // The exemption above is specifically for Uninit, not
+        // Unaddressable: CLR through a genuinely bad pointer (e.g. a
+        // use-after-free) is a real bug it must not hide.
+        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let start = cpu.pc();
+        load_words(&mut mem, start, &[0x4290]); // CLR.L (A0)
+        let dest = 0x2000u32;
+        cpu.set_address_register(AddressRegister(0), dest);
+
+        mem.enable_sanitizer();
+        mem.shadow_mut()
+            .unwrap()
+            .mark_unaddressable(dest, 4, crate::sanitize::PoisonReason::Freed);
+
+        cpu.step(&mut mem);
+
+        let shadow = mem.shadow().unwrap();
+        // Exactly one violation describes the dummy read; the M68000's
+        // 16-bit data bus also splits the long write into two word
+        // cycles at different addresses (`splits_long_stores`), each
+        // its own InvalidWrite entry -- immaterial here, this test only
+        // cares that the read is not excused.
+        assert!(
+            shadow
+                .violations()
+                .iter()
+                .any(|v| v.kind == crate::sanitize::ViolationKind::InvalidRead
+                    && v.reason == Some(crate::sanitize::PoisonReason::Freed)),
+            "CLR through a freed pointer must still report its read: {:#?}",
+            shadow.violations()
+        );
     }
 
     #[test]
