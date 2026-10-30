@@ -1859,6 +1859,23 @@ fn open_library_common<C: Cpu>(
         if kind == LibraryKind::Loaded {
             return crate::execlib::reopen(ctx, name, base, requested_version);
         }
+        // Real Kickstart checks `lib_Version` with a 68000 `CMP.W`, so
+        // only the low word of `requested_version` matters -- same
+        // reasoning as `execlib::after_init`/`reopen`'s matching check
+        // for disk-loaded libraries (issue #92). This `Real`/`Faked`
+        // registry hit has no equivalent call-through-a-vector step to
+        // attach the check to (there's no real `Open` vector to run),
+        // so it's done directly here instead of being shared with
+        // `execlib`'s trampoline-based checks.
+        let lib_version = u32::from(ctx.mem.read_u16(base.wrapping_add(LIB_VERSION_OFFSET)));
+        let requested_version_word = requested_version as u16 as u32;
+        if lib_version < requested_version_word {
+            *ctx.call_detail = Some(format!(
+                "library {name:?} -> NULL (version {lib_version} < requested {requested_version_word})"
+            ));
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+            return Ok(());
+        }
         *ctx.call_detail = Some(format!("library {name:?} -> base {base:#010x} (real)"));
         ctx.cpu.set_data_register(DataRegister(0), base);
         return Ok(());
@@ -4225,6 +4242,20 @@ mod tests {
         words.push(imm as u16);
     }
 
+    /// `move.l #imm32,Dn` opcode (source: immediate long, destination:
+    /// data register direct). The immediate follows as two words.
+    fn move_imm_dn(n: u16) -> u16 {
+        0x203C | (n << 9)
+    }
+
+    /// Appends a `move.l #imm32,Dn` (3 words: opcode + hi + lo) to
+    /// `words`.
+    fn push_move_imm_dn(words: &mut Vec<u16>, dn: u16, imm: u32) {
+        words.push(move_imm_dn(dn));
+        words.push((imm >> 16) as u16);
+        words.push(imm as u16);
+    }
+
     /// Appends a `jsr <disp16>(An)` (2 words) to `words`.
     fn push_jsr(words: &mut Vec<u16>, an: u16, disp: i32) {
         words.push(jsr_disp16(an));
@@ -4517,6 +4548,93 @@ mod tests {
         assert_eq!(
             rt.mem.read_u16(base.wrapping_add(LIB_REVISION_OFFSET)),
             LIBRARY_REVISION
+        );
+    }
+
+    #[test]
+    fn open_library_of_real_builtin_library_fails_when_requested_version_too_high() {
+        // Issue #218: OpenLibrary("intuition.library", 99) returned a
+        // valid base (lib_Version 40) instead of NULL. The registry-hit
+        // branch for a `Real`/`Faked` library (unlike the `Loaded` --
+        // genuine disk-loaded -- branch, already checked since issue
+        // #92) never compared `lib_Version` against the requested
+        // version at all. D0 = 99 is the requested version; real
+        // Kickstart's check is a `CMP.W`, so only the low word matters.
+        let entry = TRAP_TABLE_END;
+        let name = b"intuition.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_move_imm_dn(&mut words, 0, 99); // D0 = requested version
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("intuition.library", 99) -> D0
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "OpenLibrary(\"intuition.library\", 99) should return NULL: \
+             lib_Version 40 < requested 99"
+        );
+    }
+
+    #[test]
+    fn open_library_of_real_builtin_library_succeeds_when_requested_version_satisfied() {
+        // The other half of issue #218's fix: a requested version at or
+        // below the real lib_Version (40) must still succeed exactly as
+        // before.
+        let entry = TRAP_TABLE_END;
+        let name = b"intuition.library\0";
+
+        let mut words = Vec::new();
+        push_movea_imm(&mut words, 1, 0); // A1 placeholder
+        push_move_imm_dn(&mut words, 0, 36); // D0 = requested version
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -552); // OpenLibrary("intuition.library", 36) -> D0
+        words.push(RTS);
+        let str_addr = entry + (words.len() as u32) * 2;
+        words[1] = (str_addr >> 16) as u16;
+        words[2] = str_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, str_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: str_addr + name.len() as u32 + 4,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            code as u32, 0,
+            "OpenLibrary(\"intuition.library\", 36) should succeed: 36 <= lib_Version 40"
         );
     }
 
