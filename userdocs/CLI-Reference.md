@@ -324,7 +324,7 @@ the pre-seeded stub like any other guest memory write.
 
 Software-emulates the instructions a real 68060 removed from silicon
 — most FPU transcendentals (`FSIN`/`FCOS`/`FATAN`/`FETOX`/`FLOGN`/
-`FMOD`/`FSCALE`/`FINT`/`FGETEXP`/`FGETMAN`/`FSINCOS`/...) plus a
+`FMOD`/`FSCALE`/`FGETEXP`/`FGETMAN`/`FSINCOS`/...) plus a
 handful of integer ops (`MOVEP`, `CHK2`/`CMP2`, misaligned `CAS`/
 `CAS2`, 64-bit `MUL`/`DIV`) — instead of taking the real "unimplemented
 instruction" exception a genuine 68060 does for them. Only meaningful

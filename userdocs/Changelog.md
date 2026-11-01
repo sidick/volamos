@@ -3,6 +3,40 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.15
+
+- **`exec.library`'s `OpenLibrary` checks the requested version for
+  every built-in library** (issue #218) — `OpenLibrary("intuition.library",
+  99)` returned a valid base (`lib_Version` 40) instead of `NULL`. The
+  registry-hit branch for a natively-implemented library (`exec`,
+  `dos`, `intuition`, the math libraries, ...) wrote the base straight
+  to `D0` without ever comparing `lib_Version` against the requested
+  version — unlike the disk-loaded-library path, which already did
+  this (issue #92's `CMP.W` fix). Both paths now agree.
+
+- **`--sanitize-uninit` no longer false-positives on the 68000's `CLR`
+  dummy read** (issue #222) — on real 68000 hardware, `CLR <ea>` reads
+  its memory destination before writing zero (removed on the 68010+);
+  the value is discarded and the byte becomes initialized regardless,
+  but `--sanitize-uninit` reported it as a genuine uninitialized read.
+  Any libnix program showed this through `malloc()`'s own
+  `clr.l`/`clr.b` zeroing, making the flag unusable for 68000 code — a
+  real program in the issue reported 33 false positives. The
+  exemption applies only to an otherwise-valid-but-uninitialized
+  destination; `CLR` through a genuinely bad pointer (e.g. a
+  use-after-free) still reports.
+
+- **`--fpsp-emulate`'s help text and docs no longer list `FINT`** —
+  the 68060 has `FINT`/`FINTRZ` in silicon; it's the 68040 that lacks
+  them. Issue #132 already fixed the actual emulation; this just
+  catches up the two instruction lists that were left behind.
+
+- **`m68k` crate bumped to 0.15.1** — fixes `FSIN`/`FCOS`/`FTAN` for
+  large operands, missing overflow/underflow reporting in
+  `FETOX`/`FSINH`/`FCOSH`, and move-rounding/zero-sign handling, plus
+  adds (currently unused by volamos) host-synchronization-boundary and
+  multi-region/read-only-fastmem primitives for future use.
+
 ## 0.14
 
 - **`exec.library`'s `ObtainSemaphoreShared`/`AttemptSemaphoreShared`
