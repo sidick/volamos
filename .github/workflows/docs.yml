@@ -5,11 +5,16 @@
 # is refreshed at release time (PRs get a strict build check in ci.yml's
 # docs-build job).
 #
-# workflow_dispatch exists for re-publishing a version after a docs-only
-# fix, or for a first publish ahead of the next release tag.
+# The normal trigger for this is release-please.yml's own `docs` job,
+# which calls this same reusable workflow directly once release-please
+# has actually tagged a release -- not a tags:['v*'] push trigger here,
+# since release-please creates tags with the default GITHUB_TOKEN and
+# GitHub blocks a GITHUB_TOKEN-authored event from triggering other
+# workflows. workflow_dispatch stays as the manual escape hatch: re-
+# publishing a version after a docs-only fix, or a first publish ahead
+# of a release.
 #
-# Live at https://sidick.github.io/volamos/ (first published via
-# workflow_dispatch ahead of volamos's first tagged release).
+# Live at https://sidick.github.io/volamos/.
 #
 # One-time repo setup (done): Settings -> Pages -> Source: "Deploy from a
 # branch" / gh-pages / root -- mike commits the built site to gh-pages
@@ -18,8 +23,6 @@
 name: Docs
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
@@ -37,4 +40,4 @@ jobs:
   docs:
     uses: sidick/amiga-workflows/.github/workflows/docs.yml@6ad7098bebba603db43f7c9e25706fa9047eeddc # v1
     with:
-      version: ${{ inputs.version || github.ref_name }}
+      version: ${{ inputs.version }}

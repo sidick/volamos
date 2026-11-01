@@ -1,0 +1,291 @@
+# Replaces the old hand-rolled release process (manual version bump
+# across both crates' Cargo.toml, hand-written Changelog.md prose, a
+# manually pushed `vX.Y` tag) with release-please: every push to main
+# opens/updates a single release PR tracking all `fix:`/`feat:`/
+# `BREAKING CHANGE` commits since the last release, and merging that PR
+# is what actually creates the tag and GitHub release.
+#
+# The release-type "rust" strategy (release-please-config.json's "."
+# package) understands this repo's workspace Cargo.toml directly: it
+# bumps crates/volamos/Cargo.toml *and* crates/volamos-core/Cargo.toml
+# to the same version in one PR (they always move in lockstep), plus
+# Cargo.lock -- no linked-versions plugin or extra-files needed for a
+# two-crate workspace that both present as one "volamos" release.
+#
+# Everything the old tags:['v*'] push trigger used to gate in ci.yml/
+# docs.yml (multi-arch Docker publish, standalone release binaries,
+# the GitHub release itself, the versioned docs deploy) now runs here
+# instead, gated on this job's own `release_created` output -- not a
+# separate tag-push event. That's a deliberate choice, not just
+# convenience: a tag/release that release-please-action creates with
+# the default GITHUB_TOKEN does NOT trigger other workflows (GitHub
+# blocks a GITHUB_TOKEN-authored event from recursively triggering
+# more workflow runs), so a tags:['v*'] trigger elsewhere would
+# silently never fire for a release-please-created tag.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        id: release
+
+  # Re-verifies the exact tagged commit before anything gets published
+  # from it -- the old workflow's release-binaries-* jobs depended on
+  # ci.yml's `test` job the same way; that dependency doesn't carry
+  # across workflow files, so it's reproduced here instead of just
+  # trusting that the release PR merge was gated on CI (this repo has
+  # no branch-protection required-checks rule enforcing that).
+  test:
+    name: Test (${{ matrix.os }})
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: ${{ runner.os }}
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all
+
+  docker:
+    name: Docker image (build and publish)
+    needs: [release-please, test]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/sidick/volamos:${{ needs.release-please.outputs.tag_name }}
+            ghcr.io/sidick/volamos:latest
+          cache-from: type=gha,scope=volamos-docker-builder
+          cache-to: type=gha,mode=max,scope=volamos-docker-builder
+
+  # Standalone per-arch binary zips (issue #25/#19) -- see ci.yml's old
+  # copy of these jobs (removed there) for the fuller history. Waits on
+  # `docker` for the same reason it always did: both build the same
+  # `builder` stage/platforms through the shared volamos-docker-builder
+  # gha cache scope, and only sequencing after `docker`'s push (which
+  # warms that cache for both platforms) avoids an independent
+  # from-scratch recompile here.
+  release-binaries-linux:
+    name: Standalone binary (${{ matrix.target }})
+    needs: [release-please, test, docker]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Extract static binary from the Dockerfile's builder stage
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          target: builder
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=volamos-docker-builder
+          cache-to: type=gha,mode=max,scope=volamos-docker-builder
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          name="volamos-${TAG}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "dist/volamos" "$name/"
+          chmod +x "$name/volamos"
+          tar czf "${name}.tar.gz" "$name"
+          echo "path=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-binary-${{ matrix.target }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+
+  release-binaries-macos:
+    name: Standalone binary (aarch64-apple-darwin)
+    needs: [release-please, test]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: release-macos
+          targets: aarch64-apple-darwin
+
+      - name: Build (release)
+        run: cargo build --release -p volamos --target aarch64-apple-darwin
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          name="volamos-${TAG}-aarch64-apple-darwin"
+          mkdir "$name"
+          cp target/aarch64-apple-darwin/release/volamos "$name/"
+          tar czf "${name}.tar.gz" "$name"
+          echo "path=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-binary-aarch64-apple-darwin
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+
+  release-binaries-windows:
+    name: Standalone binary (x86_64-pc-windows-gnu)
+    needs: [release-please, test]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: release-windows
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Build (release)
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release -p volamos --target x86_64-pc-windows-gnu
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          name="volamos-${TAG}-x86_64-pc-windows-gnu"
+          mkdir "$name"
+          cp target/x86_64-pc-windows-gnu/release/volamos.exe "$name/"
+          zip -r "${name}.zip" "$name"
+          echo "path=${name}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-binary-x86_64-pc-windows-gnu
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+
+  release-publish:
+    name: Attach binaries to the GitHub release
+    needs:
+      - release-please
+      - release-binaries-linux
+      - release-binaries-macos
+      - release-binaries-windows
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packaged binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-binary-*
+          path: dist
+          merge-multiple: true
+
+      # release-please-action already created the GitHub release itself
+      # (that's what `release_created` means) -- just attach the
+      # binaries, no create-or-update branching needed.
+      - name: Upload binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  docs:
+    name: Publish versioned docs
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: sidick/amiga-workflows/.github/workflows/docs.yml@6ad7098bebba603db43f7c9e25706fa9047eeddc # v1
+    with:
+      version: ${{ needs.release-please.outputs.tag_name }}
