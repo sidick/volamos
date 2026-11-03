@@ -949,6 +949,20 @@ fn free_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 /// same pass, so an overlapping copy (real `CopyMem`'s documented
 /// "not supported" case) still behaves predictably here instead of
 /// corrupting data depending on copy direction.
+///
+/// The value copy goes through [`crate::memory::AddressSpace::
+/// peek_u8`]/[`crate::memory::AddressSpace::poke_u8`], not the checked
+/// [`crate::memory::AddressSpace::read_u8`]/[`crate::memory::
+/// AddressSpace::write_u8`]: this handler only moves bytes, it never
+/// looks at them, so a checked read would report every `Uninit`
+/// source byte as a genuine uninitialized read and a checked write
+/// would wrongly promote it to `Valid` at the destination (issue #232
+/// -- a `realloc`-style copy of a half-filled buffer is exactly the
+/// common case this used to drown real reports under).
+/// [`crate::sanitize::ShadowMap::copy_range`] is the sanitizer's own
+/// explicit propagation for this access instead: an `Uninit` source
+/// byte stays `Uninit` at the destination, and an `Unaddressable` one
+/// (e.g. a copy sourced from freed memory) still reports.
 fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let source = ctx.cpu.address_register(AddressRegister(0));
     let dest = ctx.cpu.address_register(AddressRegister(1));
@@ -956,10 +970,13 @@ fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 
     let mut buf = Vec::with_capacity(size as usize);
     for i in 0..size {
-        buf.push(ctx.mem.read_u8(source.wrapping_add(i)));
+        buf.push(ctx.mem.peek_u8(source.wrapping_add(i)));
     }
     for (i, b) in buf.into_iter().enumerate() {
-        ctx.mem.write_u8(dest.wrapping_add(i as u32), b);
+        ctx.mem.poke_u8(dest.wrapping_add(i as u32), b);
+    }
+    if let Some(shadow) = ctx.mem.shadow_mut() {
+        shadow.copy_range(source, dest, size);
     }
     Ok(())
 }
@@ -1723,6 +1740,79 @@ mod tests {
         for (i, &b) in source.iter().enumerate() {
             assert_eq!(rt.memory().read_u8(dest_addr + i as u32), b);
         }
+    }
+
+    #[test]
+    fn copy_mem_propagates_uninit_shadow_state_without_reporting() {
+        // Issue #232: CopyMem's value-copy must not trip
+        // --sanitize-uninit on a half-filled source buffer, and the
+        // destination must inherit Uninit (not be healed to Valid),
+        // or a later genuine use of the copied-through tail would go
+        // uncaught.
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let source_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = source, patched below
+        words.push(0);
+        words.push(0);
+        let dest_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = dest, patched below
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = size
+        words.push(0);
+        words.push(8);
+        words.extend_from_slice(&jsr_disp16_a6(-624)); // CopyMem(a6)
+        words.push(RTS);
+
+        let source_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let dest_addr = source_addr + 32;
+        words[source_idx + 1] = (source_addr >> 16) as u16;
+        words[source_idx + 2] = source_addr as u16;
+        words[dest_idx + 1] = (dest_addr >> 16) as u16;
+        words[dest_idx + 2] = dest_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        // First 4 bytes of the source are written; the last 4 are
+        // left Uninit, mirroring a half-filled realloc source.
+        for i in 0..4u32 {
+            mem.write_u8(source_addr + i, b'x');
+        }
+        mem.enable_sanitizer();
+        mem.shadow_mut().unwrap().report_uninit = true;
+        mem.shadow_mut().unwrap().mark_valid(source_addr, 4);
+        mem.shadow_mut().unwrap().mark_uninit(source_addr + 4, 4);
+        mem.shadow_mut().unwrap().mark_uninit(dest_addr, 8);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: dest_addr + 8,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        let shadow = rt.memory().shadow().expect("sanitizer was enabled above");
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "CopyMem must not report a read of its Uninit source bytes"
+        );
+        assert_eq!(
+            shadow.state(dest_addr),
+            crate::sanitize::ShadowState::Valid,
+            "the first 4 copied bytes were Valid at the source"
+        );
+        assert_eq!(
+            shadow.state(dest_addr + 4),
+            crate::sanitize::ShadowState::Uninit,
+            "the last 4 copied bytes were Uninit at the source and must stay so"
+        );
     }
 
     /// Test: `LibraryTable`'s dispatch accounting (issue #109) counts

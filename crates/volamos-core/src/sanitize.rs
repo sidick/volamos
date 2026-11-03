@@ -1274,6 +1274,82 @@ impl ShadowMap {
         }
     }
 
+    /// Propagates shadow state for a `len`-byte native copy from `[src,
+    /// src + len)` to `[dest, dest + len)` -- for a handler
+    /// (`CopyMem`/`CopyMemQuick`) that only moves bytes and never looks
+    /// at their values (issue #232). The caller is expected to pair
+    /// this with its own unchecked value copy ([`crate::memory::
+    /// FlatMemory::peek_u8`]/[`crate::memory::FlatMemory::poke_u8`]):
+    /// this method is the *only* shadow bookkeeping for that access,
+    /// not an addition to the checked read/write path.
+    ///
+    /// Each destination byte ends up in exactly the source byte's
+    /// state: a [`ShadowState::Uninit`] source byte makes the
+    /// destination `Uninit` too, not the `Valid` an ordinary checked
+    /// write would promote it to. That distinction is the entire point
+    /// -- a `realloc`-style copy of a half-filled buffer must not turn
+    /// its unwritten tail into bytes that read as initialized, or a
+    /// later genuine use of that tail (now at a new address) would go
+    /// uncaught. No violation is reported for an `Uninit` (or `Valid`)
+    /// source: that silence is exactly what this method exists to
+    /// provide -- see the issue for why reporting here, on every byte
+    /// a copy merely moves without ever reading its value, buries the
+    /// real reports.
+    ///
+    /// A [`ShadowState::Unaddressable`] source byte still reports an
+    /// `InvalidRead` (the below-SP grace band applies the same way
+    /// [`Self::check_read_byte`] applies it): copying *from* a bad
+    /// pointer -- a use-after-free, say -- is a real bug this
+    /// exemption doesn't excuse, the same `Uninit`/`Unaddressable`
+    /// distinction the `CLR` dummy-read exemption draws (issue #222).
+    /// The destination byte for a reported source still ends up
+    /// `Valid`: there is nothing meaningful to propagate from a bad
+    /// read, and a write this runtime doesn't refuse outright always
+    /// still proceeds (see this module's "why violations, not panics"
+    /// doc).
+    ///
+    /// Reports at most once per *contiguous* run of `Unaddressable`
+    /// source bytes, at the run's first address -- not once per byte.
+    /// [`Self::check_read`]'s own "report the first offending byte"
+    /// convention assumes an access of at most 4 bytes, where `(pc,
+    /// addr, kind)` deduplication naturally collapses repeats; a
+    /// `CopyMem` can be arbitrarily large, so deduplicating by address
+    /// alone would log one violation per poisoned byte instead of one
+    /// per incident. A later, separate `Unaddressable` run further
+    /// along the same copy still reports again -- this collapses
+    /// repeats within one bad region, it doesn't cap the whole call to
+    /// one report.
+    pub(crate) fn copy_range(&mut self, src: u32, dest: u32, len: u32) {
+        let mut in_unaddressable_run = false;
+        for i in 0..len {
+            let s = src.wrapping_add(i);
+            let d = dest.wrapping_add(i);
+            let new_byte = match self.state(s) {
+                ShadowState::Unaddressable => {
+                    let reason = self.poison_reason(s);
+                    let within_grace = reason == Some(PoisonReason::BelowStackPointer)
+                        && self.below_sp_violation_is_within_grace_band(s);
+                    if !within_grace && !in_unaddressable_run {
+                        self.record(s, 1, ViolationKind::InvalidRead, reason);
+                    }
+                    in_unaddressable_run = true;
+                    VALID_BYTE
+                }
+                ShadowState::Uninit => {
+                    in_unaddressable_run = false;
+                    UNINIT_BYTE
+                }
+                ShadowState::Valid => {
+                    in_unaddressable_run = false;
+                    VALID_BYTE
+                }
+            };
+            if let Some(slot) = self.bytes.get_mut(d as usize) {
+                *slot = new_byte;
+            }
+        }
+    }
+
     /// Promotes a single `Uninit` byte to `Valid` without any checking
     /// -- the tail of a write whose violation has already been
     /// reported. See [`Self::check_write`].
@@ -2055,6 +2131,102 @@ mod tests {
         shadow.set_clr_dummy_read_pending(false);
         shadow.check_read(0, 4);
         assert_eq!(shadow.violation_count(), 2);
+    }
+
+    #[test]
+    fn copy_range_propagates_uninit_without_reporting_or_healing() {
+        // Issue #232's core ask: a copy of an Uninit source must leave
+        // the destination Uninit too, not heal it to Valid the way an
+        // ordinary checked write would, and must not report anything
+        // even with report_uninit on.
+        let mut shadow = ShadowMap::new(32);
+        shadow.report_uninit = true;
+        shadow.mark_uninit(0, 4);
+
+        shadow.copy_range(0, 16, 4);
+
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "copying Uninit bytes must not report a read"
+        );
+        assert_eq!(
+            shadow.state(16),
+            ShadowState::Uninit,
+            "the destination must inherit Uninit, not be healed to Valid"
+        );
+    }
+
+    #[test]
+    fn copy_range_propagates_valid_bytes_normally() {
+        let mut shadow = ShadowMap::new(32);
+        // Bytes start Valid by default (see ShadowMap::new's doc).
+        shadow.copy_range(0, 16, 4);
+        assert_eq!(shadow.violation_count(), 0);
+        assert_eq!(shadow.state(16), ShadowState::Valid);
+    }
+
+    #[test]
+    fn copy_range_still_reports_an_unaddressable_source_and_heals_the_destination() {
+        // The exemption above is specifically for Uninit, not
+        // Unaddressable: copying from a bad pointer (e.g. a
+        // use-after-free) is a real bug it must not hide. The
+        // destination still ends up Valid, same as any write this
+        // runtime doesn't refuse outright.
+        let mut shadow = ShadowMap::new(32);
+        shadow.mark_unaddressable(0, 4, PoisonReason::Freed);
+        // The destination starts Uninit to prove copy_range doesn't
+        // just leave it untouched on the Unaddressable path.
+        shadow.mark_uninit(16, 4);
+
+        shadow.copy_range(0, 16, 4);
+
+        assert_eq!(
+            shadow.violation_count(),
+            1,
+            "copying from a freed source must still be reported"
+        );
+        assert_eq!(shadow.violations()[0].kind, ViolationKind::InvalidRead);
+        assert_eq!(shadow.violations()[0].reason, Some(PoisonReason::Freed));
+        assert_eq!(
+            shadow.state(16),
+            ShadowState::Valid,
+            "the destination still ends up Valid, same as any other write"
+        );
+    }
+
+    #[test]
+    fn copy_range_reports_once_per_contiguous_unaddressable_run_not_once_per_byte() {
+        // A 4-byte Unaddressable run must report once, not four times
+        // (one per byte) -- `(pc, addr, kind)` dedup alone doesn't
+        // collapse this the way it does for check_read's bounded
+        // 1/2/4-byte accesses, since every byte here has a different
+        // addr. But two SEPARATE bad runs within one copy are two
+        // separate incidents and must both report.
+        let mut shadow = ShadowMap::new(64);
+        shadow.mark_unaddressable(0, 4, PoisonReason::Freed); // run 1
+        shadow.mark_valid(4, 4); // a gap back to normal memory
+        shadow.mark_unaddressable(8, 4, PoisonReason::Redzone); // run 2
+
+        shadow.copy_range(0, 32, 12);
+
+        assert_eq!(
+            shadow.violation_count(),
+            2,
+            "one report per contiguous bad run, not one per byte and not \
+             capped at one for the whole copy"
+        );
+        let kinds_and_reasons: Vec<_> = shadow
+            .violations()
+            .iter()
+            .map(|v| (v.kind, v.reason))
+            .collect();
+        assert!(
+            kinds_and_reasons.contains(&(ViolationKind::InvalidRead, Some(PoisonReason::Freed)))
+        );
+        assert!(
+            kinds_and_reasons.contains(&(ViolationKind::InvalidRead, Some(PoisonReason::Redzone)))
+        );
     }
 
     #[test]

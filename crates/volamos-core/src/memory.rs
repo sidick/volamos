@@ -168,6 +168,27 @@ pub trait AddressSpace {
         None
     }
 
+    /// Reads one byte without consulting the shadow map. Lives on the
+    /// trait for the same reason [`AddressSpace::shadow`] does:
+    /// `crate::execmem`'s `CopyMem`/`CopyMemQuick` handler (issue
+    /// #232) is generic over `C: Cpu` and so only ever sees its memory
+    /// as `C::Memory: AddressSpace`, never as the concrete
+    /// [`FlatMemory`] whose own [`FlatMemory::peek_u8`] this forwards
+    /// to. The default falls back to the checked [`AddressSpace::
+    /// read_u8`] -- reintroducing this issue's noise for a
+    /// hypothetical address space with no sanitizer concept at all is
+    /// harmless, since there is no shadow map there to report through.
+    fn peek_u8(&self, addr: u32) -> u8 {
+        self.read_u8(addr)
+    }
+
+    /// Write counterpart to [`AddressSpace::peek_u8`], forwarding to
+    /// [`FlatMemory::poke_u8`]. The default falls back to the checked
+    /// [`AddressSpace::write_u8`] for the same reason `peek_u8`'s does.
+    fn poke_u8(&mut self, addr: u32, value: u8) {
+        self.write_u8(addr, value);
+    }
+
     /// Invalidates the modeled instruction cache (`--cache`, issue
     /// #148), if one is installed.
     ///
@@ -470,6 +491,29 @@ impl FlatMemory {
         }
     }
 
+    /// Reads one byte without consulting the shadow map -- see
+    /// [`Self::peek_u16`] for why this exists. Unlike `peek_u16`/
+    /// `peek_u32`, not only for the sanitizer's own bookkeeping: also
+    /// used by [`crate::execmem`]'s `CopyMem`/`CopyMemQuick` (issue
+    /// #232), whose value-copy must not go through the checked path at
+    /// all -- [`crate::sanitize::ShadowMap::copy_range`] is what gives
+    /// the destination its correct final shadow state instead.
+    pub fn peek_u8(&self, addr: u32) -> u8 {
+        self.bytes.get(addr as usize).copied().unwrap_or(0)
+    }
+
+    /// Writes one byte without consulting the shadow map -- the write
+    /// counterpart of [`Self::peek_u8`], for the same `CopyMem`/
+    /// `CopyMemQuick` use. An ordinary checked write always promotes
+    /// `Uninit` to `Valid`, which is exactly wrong for a copy: an
+    /// `Uninit` source byte must stay `Uninit` at the destination (see
+    /// [`crate::sanitize::ShadowMap::copy_range`]'s doc).
+    pub fn poke_u8(&mut self, addr: u32, value: u8) {
+        if let Some(slot) = self.bytes.get_mut(addr as usize) {
+            *slot = value;
+        }
+    }
+
     /// Installs a fresh [`ShadowMap`] sized to this memory's length, so
     /// every subsequent access is checked against it -- see this
     /// module's doc and the CLI's `--sanitize` flag.
@@ -571,6 +615,14 @@ impl AddressSpace for FlatMemory {
             shadow.check_read(addr, 1);
         }
         self.bytes.get(addr as usize).copied().unwrap_or(0)
+    }
+
+    fn peek_u8(&self, addr: u32) -> u8 {
+        Self::peek_u8(self, addr)
+    }
+
+    fn poke_u8(&mut self, addr: u32, value: u8) {
+        Self::poke_u8(self, addr, value);
     }
 
     fn clear_fresh_block(&mut self, addr: u32, len: u32) {
