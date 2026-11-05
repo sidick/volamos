@@ -256,6 +256,7 @@ use crate::guestmem::{GuestHeap, bptr_from_addr, write_bstr, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
+use crate::taskswitch::TaskScheduler;
 
 // --- struct Task field offsets (bytes from the task's own address) ---
 // tc_Node (struct Node, offset 0..14) reuses execlist.rs's LN_* offsets
@@ -1126,48 +1127,68 @@ fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     let signal_set = ctx.cpu.data_register(DataRegister(0));
     let task = ctx.current_task;
     fold_pending_host_break(ctx.mem, task);
+    ctx.timers.fire_due(ctx.mem, ctx.tasks);
 
-    let recvd = ctx.mem.read_u32(task + TC_SIGRECVD);
-    let satisfied = recvd & signal_set;
-    if satisfied != 0 {
-        ctx.mem.write_u32(task + TC_SIGRECVD, recvd & !satisfied);
-        ctx.mem.write_u32(task + TC_SIGWAIT, 0);
-        ctx.cpu.set_data_register(DataRegister(0), satisfied);
-        return Ok(());
+    loop {
+        let recvd = ctx.mem.read_u32(task + TC_SIGRECVD);
+        let satisfied = recvd & signal_set;
+        if satisfied != 0 {
+            ctx.mem.write_u32(task + TC_SIGRECVD, recvd & !satisfied);
+            ctx.mem.write_u32(task + TC_SIGWAIT, 0);
+            ctx.cpu.set_data_register(DataRegister(0), satisfied);
+            return Ok(());
+        }
+
+        // Nothing satisfied: record what we were waiting for
+        // (best-effort fidelity -- a real kernel leaves tc_SigWait set
+        // exactly like this while the task is actually suspended),
+        // then try to block and switch to another runnable task
+        // (issue #121) rather than failing outright.
+        // `block_current_on_signal` takes `ctx.trap_pc`, not
+        // `ctx.cpu.pc()`, as the resume address -- see that method's
+        // and `crate::taskswitch`'s doc for why: resuming this task
+        // later means re-trapping into this exact `Wait` call from
+        // scratch, which is also why there's nothing here that
+        // "remembers" to deliver `satisfied` on wake -- the re-entered
+        // call above does that fresh.
+        ctx.mem.write_u32(task + TC_SIGWAIT, signal_set);
+        if ctx
+            .tasks
+            .block_current_on_signal(ctx.cpu, ctx.mem, ctx.trap_pc, signal_set)
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        // No other task is runnable. If a timer request is still
+        // pending (issue #237, sub-problem #2: e.g. a condvar-with-
+        // timeout `Wait` racing a `timerequest`'s signal against
+        // another task's), it is the only event left that could ever
+        // make progress in this single-process cooperative model --
+        // refusing to fire it early doesn't make the wait any more
+        // "real", it just turns an elapsed timer into a permanent
+        // deadlock. Fire the earliest one and retry; this loop ends
+        // either once something's satisfied or once there are no more
+        // pending timers to fall back on.
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            // No other task could ever satisfy this, and no pending
+            // timer either -- a real deadlock, not just "no
+            // scheduler": fail loudly instead of hanging the host
+            // process forever, the same posture every single-task
+            // stand-in in this module already used before issue #121's
+            // scheduler existed.
+            return Err(DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -318,
+                handler_name: "Wait".to_string(),
+                message: format!(
+                    "Wait({signal_set:#010x}) would deadlock: no other task is runnable, no \
+                     timer request is pending, and none of the requested signals are \
+                     currently pending in tc_SigRecvd"
+                ),
+            });
+        }
     }
-
-    // Nothing satisfied: record what we were waiting for (best-effort
-    // fidelity -- a real kernel leaves tc_SigWait set exactly like this
-    // while the task is actually suspended), then try to block and
-    // switch to another runnable task (issue #121) rather than failing
-    // outright. `block_current_on_signal` takes `ctx.trap_pc`, not
-    // `ctx.cpu.pc()`, as the resume address -- see that method's and
-    // `crate::taskswitch`'s doc for why: resuming this task later means
-    // re-trapping into this exact `Wait` call from scratch, which is
-    // also why there's nothing here that "remembers" to deliver
-    // `satisfied` on wake -- the re-entered call above does that fresh.
-    ctx.mem.write_u32(task + TC_SIGWAIT, signal_set);
-    if ctx
-        .tasks
-        .block_current_on_signal(ctx.cpu, ctx.mem, ctx.trap_pc, signal_set)
-        .is_ok()
-    {
-        return Ok(());
-    }
-
-    // No other task could ever satisfy this -- a real deadlock, not
-    // just "no scheduler": fail loudly instead of hanging the host
-    // process forever, the same posture every single-task stand-in in
-    // this module already used before issue #121's scheduler existed.
-    Err(DispatchError::HandlerFailed {
-        library: "exec.library".to_string(),
-        lvo: -318,
-        handler_name: "Wait".to_string(),
-        message: format!(
-            "Wait({signal_set:#010x}) would deadlock: no other task is runnable, and none \
-             of the requested signals are currently pending in tc_SigRecvd"
-        ),
-    })
 }
 
 /// `Signal` (LVO -324): `A1` = target task, `D0` = signal bits to set.
@@ -1211,11 +1232,14 @@ fn signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 /// `dos.library`'s `CheckSignal` (LVO -792): `D1` = mask of signals to
 /// check. Returns (and clears) the intersection of `tc_SigRecvd` and the
 /// mask, folding in any pending host break first -- see the module
-/// docs.
+/// docs -- and any due timer request (issue #237, sub-problem #2): a
+/// polling loop that uses `CheckSignal` instead of blocking in `Wait`
+/// still needs a `TR_ADDREQUEST`'s signal to actually arrive.
 fn check_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let mask = ctx.cpu.data_register(DataRegister(1));
     let task = ctx.current_task;
     fold_pending_host_break(ctx.mem, task);
+    ctx.timers.fire_due(ctx.mem, ctx.tasks);
 
     let recvd = ctx.mem.read_u32(task + TC_SIGRECVD);
     let hit = recvd & mask;
@@ -1458,6 +1482,9 @@ pub fn check_stack_bounds<M: AddressSpace>(
 const IOERR_OPENFAIL: i8 = -1;
 /// `IOERR_NOCMD` (`exec/errors.h`): "command not supported by device".
 const IOERR_NOCMD: i8 = -3;
+/// `IOERR_ABORTED` (`exec/errors.h`): "request terminated early" --
+/// what a real `AbortIO`'d request's `io_Error` ends up holding.
+const IOERR_ABORTED: i8 = -2;
 
 /// `struct IORequest.io_Device` byte offset.
 const IO_DEVICE_OFFSET: u32 = 20;
@@ -1548,6 +1575,166 @@ fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// `io_Device` this runtime doesn't recognize (shouldn't happen for a
 /// well-behaved caller, since only `timer.device` ever opens
 /// successfully) fails with [`IOERR_NOCMD`] rather than panicking.
+/// Tracks `TR_ADDREQUEST` requests [`send_io_handler`] handed back
+/// immediately but which haven't reached their deadline yet (issue
+/// #237, sub-problem #2). `DoIO` stays a synchronous host sleep (see
+/// [`run_io_request`]'s doc) -- there's only ever one caller to block,
+/// so "queue and wait" and "sleep now" really are the same thing there
+/// -- but `SendIO` must return immediately, matching its documented
+/// asynchronous contract, which real pthread/newlib condvar-with-
+/// timeout code genuinely relies on: it `SendIO`s a `timerequest`, then
+/// `Wait()`s on a mask combining the condvar's signal with the timer's
+/// own reply port's signal bit, expecting *either* to wake it. A
+/// timer that only ever completes via a blocking `std::thread::sleep`
+/// inside the trap handler that sent it defeats that entirely -- this
+/// single-threaded runtime can't run anything else (e.g. whatever
+/// would eventually set the condvar) while that sleep blocks, so the
+/// combined `Wait()` would still only ever see the timer's own bit,
+/// defeating the whole point of racing the two.
+///
+/// Since this runtime has no real wall-clock-driven background thread
+/// (it only ever makes progress when the guest CPU traps into a
+/// library call), completion is checked lazily, at the same two
+/// seams [`fold_pending_host_break`] already uses to fold in another
+/// asynchronous-ish event (`Wait`/`CheckSignal`): [`Self::fire_due`]
+/// fires anything whose deadline has genuinely passed. The remaining
+/// case -- every task blocked, nothing left that could ever make
+/// progress except a still-pending timer -- is exactly what
+/// [`Self::fire_earliest`] is for; see [`wait_handler`]'s retry loop.
+pub struct PendingTimers {
+    entries: Vec<PendingTimer>,
+}
+
+struct PendingTimer {
+    ioreq: u32,
+    deadline: std::time::Instant,
+}
+
+impl Default for PendingTimers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingTimers {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Registers `ioreq` (a `TR_ADDREQUEST` request already past
+    /// `SendIO`'s normal validation) as due at `deadline`.
+    fn push(&mut self, ioreq: u32, deadline: std::time::Instant) {
+        self.entries.push(PendingTimer { ioreq, deadline });
+    }
+
+    /// Whether `ioreq` is still pending (not yet completed) -- used by
+    /// [`check_io_handler`]'s "still queued" answer.
+    fn contains(&self, ioreq: u32) -> bool {
+        self.entries.iter().any(|e| e.ioreq == ioreq)
+    }
+
+    /// Removes `ioreq` without completing it (real `AbortIO`'s
+    /// contract: cancel, don't deliver). Returns whether it was
+    /// actually still pending.
+    fn remove(&mut self, ioreq: u32) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.ioreq != ioreq);
+        self.entries.len() != before
+    }
+
+    /// Completes and removes `ioreq` right now, regardless of its
+    /// deadline -- real `WaitIO`'s contract is to block until the
+    /// request is actually done, and there is nothing else host-side
+    /// that blocking could usefully wait for in the meantime. A no-op
+    /// if `ioreq` isn't (or is no longer) pending.
+    fn complete_now<M: AddressSpace>(
+        &mut self,
+        mem: &mut M,
+        tasks: &mut TaskScheduler,
+        ioreq: u32,
+    ) {
+        if self.remove(ioreq) {
+            complete_timer_request(mem, tasks, ioreq);
+        }
+    }
+
+    /// Completes and removes every entry whose deadline has already
+    /// passed. Called at the same two points [`fold_pending_host_break`]
+    /// already is (`Wait`, `CheckSignal`) -- the ordinary path for a
+    /// timer that genuinely elapsed while other guest code ran.
+    fn fire_due<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) {
+        let now = std::time::Instant::now();
+        let due: Vec<u32> = self
+            .entries
+            .iter()
+            .filter(|e| e.deadline <= now)
+            .map(|e| e.ioreq)
+            .collect();
+        self.entries.retain(|e| e.deadline > now);
+        for ioreq in due {
+            complete_timer_request(mem, tasks, ioreq);
+        }
+    }
+
+    /// Fires the single earliest-due pending request regardless of
+    /// whether its deadline has actually passed -- [`wait_handler`]'s
+    /// last resort when every task is blocked and a pending timer is
+    /// the only event left that could ever unblock anything: in a
+    /// single-process cooperative model, refusing to fire it early
+    /// doesn't make the wait any more "real", it only turns an elapsed
+    /// timer into a permanent deadlock. Returns whether anything was
+    /// fired.
+    fn fire_earliest<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) -> bool {
+        let Some((idx, _)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.deadline)
+        else {
+            return false;
+        };
+        let entry = self.entries.remove(idx);
+        complete_timer_request(mem, tasks, entry.ioreq);
+        true
+    }
+}
+
+/// Finishes a `TR_ADDREQUEST` request exactly the way real
+/// `timer.device` does: `io_Error` = 0, the request replied onto its
+/// own `mn_ReplyPort` (via [`crate::execlist::put_msg_impl`], same as
+/// a real `ReplyMsg`), and -- since this runtime's message ports never
+/// carry a real `AllocSignal`'d bit by default (see
+/// [`crate::execlist`]'s module doc), but a hand-built `timerequest`'s
+/// reply port, as real pthread/newlib code constructs one, genuinely
+/// does -- the port's own `mp_SigBit` OR'd into `mp_SigTask`'s
+/// `tc_SigRecvd`, with [`TaskScheduler::wake_if_signal_matches`] run
+/// exactly like [`signal_handler`] already does for a real `Signal()`.
+/// From the woken task's side, a completed timer and a real `Signal()`
+/// are indistinguishable, which is the whole point.
+fn complete_timer_request<M: AddressSpace>(mem: &mut M, tasks: &mut TaskScheduler, ioreq: u32) {
+    mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
+
+    let reply_port = mem.read_u32(ioreq + crate::execlist::MN_REPLYPORT);
+    if reply_port == 0 {
+        return;
+    }
+    crate::execlist::put_msg_impl(mem, reply_port, ioreq, crate::execlist::NT_REPLYMSG);
+
+    let sig_task = mem.read_u32(reply_port + crate::execlist::MP_SIGTASK);
+    if sig_task == 0 {
+        return;
+    }
+    let sig_bit = mem.read_u8(reply_port + crate::execlist::MP_SIGBIT);
+    let bit = 1u32 << sig_bit;
+    let recvd = mem.read_u32(sig_task + TC_SIGRECVD) | bit;
+    mem.write_u32(sig_task + TC_SIGRECVD, recvd);
+    if sig_task != tasks.current() {
+        tasks.wake_if_signal_matches(sig_task, recvd);
+    }
+}
+
 fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
     let device = mem.read_u32(ioreq + IO_DEVICE_OFFSET);
     if device != TIMER_DEVICE_BASE {
@@ -1605,25 +1792,44 @@ fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
 /// `exec.library`'s `SendIO` (LVO -462: `A1` = `struct IORequest*`).
 /// No return value (real `SendIO` is asynchronous and doesn't report
 /// success/failure directly -- the caller finds out via `WaitIO`/
-/// `CheckIO`/the reply message). Since this runtime completes every
-/// request synchronously (see [`do_io_handler`]), this just runs it
-/// immediately and replies the message so a caller that does
-/// `SendIO`+`WaitIO` (rather than `DoIO`) still gets a correctly
-/// completed request back without ever actually blocking.
+/// `CheckIO`/the reply message). `TR_GETSYSTIME`/`TR_SETSYSTIME` still
+/// complete immediately, same as `DoIO` -- there's no meaningful delay
+/// to defer. `TR_ADDREQUEST` (issue #237, sub-problem #2) is the one
+/// real asynchronous case: this registers it with [`PendingTimers`]
+/// and returns with the request genuinely still pending, instead of
+/// blocking this whole (single-threaded) runtime in a host sleep the
+/// way [`do_io_handler`]'s `DoIO` legitimately does -- see
+/// [`PendingTimers`]'s doc for why `SendIO` can't do that.
 fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
+    let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
+    if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
+        let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
+        let millis = u64::from(secs) * 1000 + u64::from(micro) / 1000;
+        ctx.timers.push(
+            ioreq,
+            std::time::Instant::now() + std::time::Duration::from_millis(millis),
+        );
+        return Ok(());
+    }
     let error = run_io_request(ctx.mem, ioreq);
     ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, error as u8);
     Ok(())
 }
 
 /// `exec.library`'s `WaitIO` (LVO -474: `A1` = `struct IORequest*`).
-/// `D0` = `io_Error`. Every request this runtime hands out is already
-/// complete by the time `SendIO`/`DoIO` returns (see their doc
-/// comments), so this just reads back `io_Error` -- there's never
-/// anything left to actually wait for.
+/// `D0` = `io_Error`. Every request this runtime hands out other than
+/// a `SendIO`'d `TR_ADDREQUEST` is already complete by the time
+/// `SendIO`/`DoIO` returns, so this just reads back `io_Error` for
+/// those. A still-pending timer request genuinely blocks a real
+/// `WaitIO` until it completes; since nothing else host-side could
+/// usefully happen in the meantime either way, this just completes it
+/// immediately (see [`PendingTimers::complete_now`]'s doc) rather than
+/// tracking actual wall-clock elapse.
 fn wait_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    ctx.timers.complete_now(ctx.mem, ctx.tasks, ioreq);
     let error = ctx.mem.read_u8(ioreq + IO_ERROR_OFFSET);
     ctx.cpu
         .set_data_register(DataRegister(0), error as i8 as i32 as u32);
@@ -1632,21 +1838,33 @@ fn wait_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
 
 /// `exec.library`'s `CheckIO` (LVO -468: `A1` = `struct IORequest*`).
 /// `D0` = the request pointer (matching real `CheckIO`'s "still
-/// non-`NULL` `A1` on completion" contract) -- every request here is
-/// always already complete, so this never returns `0` ("still
-/// pending").
+/// non-`NULL` `A1` on completion" contract) if complete, or `0` if
+/// still pending in [`PendingTimers`] -- the only request this runtime
+/// ever leaves genuinely incomplete (issue #237, sub-problem #2).
+/// Fires anything actually due first, same as [`wait_handler`]/
+/// [`check_signal_handler`].
 fn check_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
-    ctx.cpu.set_data_register(DataRegister(0), ioreq);
+    ctx.timers.fire_due(ctx.mem, ctx.tasks);
+    let result = if ctx.timers.contains(ioreq) { 0 } else { ioreq };
+    ctx.cpu.set_data_register(DataRegister(0), result);
     Ok(())
 }
 
 /// `exec.library`'s `AbortIO` (LVO -480: `A1` = `struct IORequest*`).
-/// No return value. A no-op -- every request here already completed
-/// synchronously by the time `AbortIO` could possibly be called on it,
-/// matching real `AbortIO`'s documented "no effect on an
-/// already-completed request" behavior.
-fn abort_io_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// No return value. Every request this runtime hands out other than a
+/// still-pending `TR_ADDREQUEST` has already completed synchronously
+/// by the time `AbortIO` could possibly be called on it, matching real
+/// `AbortIO`'s documented "no effect on an already-completed request"
+/// behavior. A still-pending timer is genuinely cancelled -- removed
+/// from [`PendingTimers`] without ever completing -- and `io_Error`
+/// set to `IOERR_ABORTED`, matching real `timer.device`.
+fn abort_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    if ctx.timers.remove(ioreq) {
+        ctx.mem
+            .write_u8(ioreq + IO_ERROR_OFFSET, IOERR_ABORTED as u8);
+    }
     Ok(())
 }
 
@@ -3247,6 +3465,131 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         (code, rt, ioreq_addr)
+    }
+
+    #[test]
+    fn send_io_add_request_completes_via_wait_without_blocking_the_host() {
+        // Issue #237, sub-problem #2: SendIO(TR_ADDREQUEST) must return
+        // immediately (not block this whole single-threaded runtime in
+        // a host sleep -- that would defeat the entire point of racing
+        // a timer against some other signal in a later Wait), and the
+        // later Wait() on the reply port's own signal bit must actually
+        // see it complete -- fired eagerly here (nothing else is
+        // runnable) via PendingTimers::fire_earliest rather than really
+        // waiting out a long deadline. A long requested duration
+        // (10 real seconds) with a fast test (checked via elapsed time)
+        // is exactly what proves this isn't secretly still sleeping.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        let name_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        let ioreq_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+
+        words.push(move_imm_to_a(1)); // A1 = ioreq, for SendIO
+        let a1_sendio_idx = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-462)); // SendIO
+
+        words.push(move_imm_to_d(0)); // D0 = the reply port's signal bit
+        words.push(0);
+        words.push(0x0010); // bit 4 -> 0x10
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(0)); // *marker = D0 (Wait's result)
+        words.push(RTS);
+
+        let name_addr = entry + (movea_exec_base_to_a6().len() + words.len()) as u32 * 2;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        let reply_port_addr = ioreq_addr + 64;
+        let marker_addr = reply_port_addr + 64;
+        let load_end = marker_addr + 16;
+
+        words[name_idx] = (name_addr >> 16) as u16;
+        words[name_idx + 1] = name_addr as u16;
+        words[ioreq_idx] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx + 1] = ioreq_addr as u16;
+        words[a1_sendio_idx] = (ioreq_addr >> 16) as u16;
+        words[a1_sendio_idx + 1] = ioreq_addr as u16;
+        words[marker_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_idx + 2] = marker_addr as u16;
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..64 {
+            mem.write_u8(ioreq_addr + i, 0);
+            mem.write_u8(reply_port_addr + i, 0);
+        }
+        mem.write_u32(marker_addr, 0);
+
+        // The timerequest's mn_ReplyPort, built by hand exactly like
+        // real pthread/newlib code would (a real AllocSignal'd bit, a
+        // real owning task) rather than via CreateMsgPort (whose
+        // placeholder mp_SigBit, per crate::execlist's module doc,
+        // isn't meant to be a real one).
+        crate::execlist::init_list_header(&mut mem, reply_port_addr + crate::execlist::MP_MSGLIST);
+        mem.write_u8(reply_port_addr + crate::execlist::MP_SIGBIT, 4);
+
+        let io_command_addr = ioreq_addr + IO_COMMAND_OFFSET;
+        mem.write_u16(io_command_addr, TR_ADDREQUEST);
+        mem.write_u32(ioreq_addr + crate::execlist::MN_REPLYPORT, reply_port_addr);
+        // 10 real seconds -- would make this test obviously too slow
+        // if SendIO still blocked on it synchronously.
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 10);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(reply_port_addr + crate::execlist::MP_SIGTASK, parent_task);
+
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            code, 0x10,
+            "exit code is whatever D0 held at RTS -- Wait's own return value, since \
+             nothing overwrites D0 between Wait and the marker write"
+        );
+        assert_eq!(
+            rt.memory().read_u32(marker_addr),
+            0x10,
+            "Wait(0x10) should return with the timer's own signal bit satisfied"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "SendIO(TR_ADDREQUEST) must not block the host for anywhere close to the \
+             requested 10s duration -- took {elapsed:?}"
+        );
     }
 
     #[test]

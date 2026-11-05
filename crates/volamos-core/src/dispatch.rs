@@ -926,6 +926,10 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// default (`"Workbench"`) public screen's guest address, lazily
     /// allocated on first use -- see [`crate::intuition`]'s module docs.
     pub intuition: &'a mut crate::intuition::IntuitionState,
+    /// Host-side `timer.device` state (issue #237, sub-problem #2):
+    /// `TR_ADDREQUEST` requests `SendIO`'d but not yet due -- see
+    /// [`exectask::PendingTimers`]'s docs.
+    pub timers: &'a mut exectask::PendingTimers,
 }
 
 /// A host-side implementation of one AmigaOS library call.
@@ -2281,6 +2285,9 @@ pub struct Runtime<C: Cpu> {
     /// Host-side `intuition.library` state -- see
     /// [`HandlerContext::intuition`]'s doc.
     intuition: crate::intuition::IntuitionState,
+    /// Host-side `timer.device` state -- see [`HandlerContext::
+    /// timers`]'s doc.
+    timers: exectask::PendingTimers,
     /// Opt-in (see [`Self::enable_host_break_folding`]) for whether
     /// [`Self::run`]'s dispatch loop calls
     /// [`exectask::fold_pending_host_break`] on every trap. Defaults to
@@ -2898,6 +2905,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             continuations: ContinuationStack::new(),
             bsdsocket: BsdSocketState::new(),
             intuition: crate::intuition::IntuitionState::new(),
+            timers: exectask::PendingTimers::new(),
             host_break_folding: false,
         }
     }
@@ -3423,6 +3431,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                         continuations: &mut self.continuations,
                         bsdsocket: &mut self.bsdsocket,
                         intuition: &mut self.intuition,
+                        timers: &mut self.timers,
                     };
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
