@@ -1633,6 +1633,17 @@ impl LibraryRegistry {
 /// consumes it; there's no scenario where it needs to run again.
 type Continuation<C> = Box<dyn FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError>>;
 
+/// One pending entry: the continuation itself, plus whether
+/// [`Runtime::run`]'s generic post-dispatch epilogue must be skipped once
+/// it finishes. `true` for anything pushed via [`ContinuationStack::
+/// trampoline_now`] (the caller already set `pc`/`sp` to the exact
+/// correct resume state itself, with nothing meaningful left on the
+/// guest stack for a "pop into `pc`" to find); `false` for
+/// [`ContinuationStack::trampoline`] (the whole point there *is* the
+/// generic epilogue's pop, to unwind back to whatever pushed
+/// `subroutine_entry`, or to a further chained trampoline).
+type PendingEntry<C> = (bool, Continuation<C>);
+
 /// The trampoline primitive (library/device-loading plan §2.1, phase
 /// "L2"): lets a [`LibraryHandler`] run an arbitrary guest subroutine --
 /// one that may itself make ordinary library calls, which is the whole
@@ -1744,7 +1755,17 @@ type Continuation<C> = Box<dyn FnOnce(&mut HandlerContext<'_, C>) -> Result<(), 
 /// usual -- the run is over either way, so an unpopped continuation or
 /// two is inert, not a leak worth detecting.
 pub struct ContinuationStack<C: Cpu> {
-    pending: Vec<Continuation<C>>,
+    pending: Vec<PendingEntry<C>>,
+    /// Set by [`continuation_stub_handler`] when the continuation it
+    /// just ran was pushed via [`Self::trampoline_now`] -- see
+    /// [`PendingEntry`]'s doc. [`Runtime::run`]'s generic post-dispatch
+    /// epilogue checks and clears this (via [`Self::take_skip_epilogue`])
+    /// immediately after every dispatch, right alongside its existing
+    /// [`crate::taskswitch::TaskScheduler::has_pending_switch`] check --
+    /// both are "don't run the generic pop-into-`pc` this time" signals,
+    /// just for different reasons (a switch not yet applied, vs. one a
+    /// continuation already fully applied itself).
+    skip_epilogue: bool,
 }
 
 impl<C: Cpu> Default for ContinuationStack<C> {
@@ -1758,7 +1779,14 @@ impl<C: Cpu> ContinuationStack<C> {
     pub fn new() -> Self {
         Self {
             pending: Vec::new(),
+            skip_epilogue: false,
         }
+    }
+
+    /// Takes (and clears) a pending epilogue-skip request -- see
+    /// [`Self::skip_epilogue`]'s doc.
+    pub fn take_skip_epilogue(&mut self) -> bool {
+        std::mem::take(&mut self.skip_epilogue)
     }
 
     /// Arranges for `subroutine_entry` to run next -- via
@@ -1790,7 +1818,36 @@ impl<C: Cpu> ContinuationStack<C> {
         mem.write_u32(sp, subroutine_entry);
         cpu.set_address_register(AddressRegister(7), sp);
 
-        self.pending.push(Box::new(continuation));
+        self.pending.push((false, Box::new(continuation)));
+    }
+
+    /// Like [`Self::trampoline`], but for a caller that is *not* a
+    /// [`LibraryHandler`] mid-dispatch -- issue #237's task-switch
+    /// machinery (`tc_Switch`/`tc_Launch`), called from
+    /// [`Runtime::run`]'s switch handling rather than from inside a
+    /// dispatched call. `trampoline` relies on the *generic* post-
+    /// dispatch epilogue to pop `subroutine_entry` into `pc` once the
+    /// calling handler returns; a caller with no such epilogue coming
+    /// (the switch logic runs after dispatch has already completed, or
+    /// in its place) has to set `pc` itself instead. Pushes only
+    /// [`CONTINUATION_STUB_ADDR`] -- there is nothing left for anything
+    /// else to pop off the stack.
+    pub fn trampoline_now<F>(
+        &mut self,
+        cpu: &mut C,
+        mem: &mut C::Memory,
+        subroutine_entry: u32,
+        continuation: F,
+    ) where
+        F: FnOnce(&mut HandlerContext<'_, C>) -> Result<(), DispatchError> + 'static,
+    {
+        let sp = cpu.address_register(AddressRegister(7));
+        let sp = sp.wrapping_sub(4);
+        mem.write_u32(sp, CONTINUATION_STUB_ADDR);
+        cpu.set_address_register(AddressRegister(7), sp);
+        cpu.set_pc(subroutine_entry);
+
+        self.pending.push((true, Box::new(continuation)));
     }
 }
 
@@ -1802,10 +1859,12 @@ impl<C: Cpu> ContinuationStack<C> {
 /// bug (see [`DispatchError::EmptyContinuationStack`]'s doc), not a
 /// state a correctly-behaving trampoline user can reach.
 fn continuation_stub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    let Some(continuation) = ctx.continuations.pending.pop() else {
+    let Some((skip_epilogue, continuation)) = ctx.continuations.pending.pop() else {
         return Err(DispatchError::EmptyContinuationStack { pc: ctx.pc });
     };
-    continuation(ctx)
+    let result = continuation(ctx);
+    ctx.continuations.skip_epilogue = skip_epilogue;
+    result
 }
 
 /// `exec.library`'s `OpenLibrary` handler (LVO -552): `A1` = pointer to
@@ -2330,6 +2389,64 @@ fn quote_arg_if_needed(arg: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The shared tail of every task switch (issue #237): commits the
+/// switch in `tasks`, restores `snapshot` into `cpu`, updates guest
+/// `ExecBase->ThisTask`, retargets the sanitizer's tracked stack
+/// region, and -- the one step deferred past the register restore --
+/// runs the *incoming* task's `tc_Launch` if it asked for one
+/// (`TF_LAUNCH` in `tc_Flags`), through [`ContinuationStack::
+/// trampoline_now`] exactly the way [`Runtime::apply_pending_task_switch`]
+/// already uses it for the outgoing task's `tc_Switch`. `tc_Launch`'s own
+/// continuation re-[`crate::cpu::restore`]s `snapshot` in full once
+/// `tc_Launch` itself returns -- not just `pc` -- because `tc_Launch` is
+/// an ordinary subroutine call (`jsr`/`rts`) under the normal 68k ABI,
+/// free to clobber `D0`/`D1`/`A0`/`A1` as scratch; the task's real resume
+/// state is this snapshot (taken before `tc_Launch` ran), not whatever
+/// happens to be live in the registers once it's done. `A7` ends up
+/// identical either way (the trampoline's own push/pop around the call
+/// nets to zero), but restoring the rest matters -- e.g. a task resuming
+/// inside `Wait` needs `D0` back to its own signal mask, not `tc_Launch`'s
+/// scratch leftovers.
+///
+/// A free function, not a method on [`Runtime`] or [`HandlerContext`],
+/// specifically so it's callable from both of this function's two real
+/// callers: `apply_pending_task_switch` itself (no `tc_Switch` to wait
+/// for, so this runs immediately with `Runtime`'s own fields) and the
+/// continuation that same method hands to `trampoline_now` when there
+/// *is* one (`tc_Switch` has just returned, and all that continuation
+/// gets is a `HandlerContext`, not a `Runtime`) -- both expose the same
+/// four pieces this needs (`cpu`/`mem`/`tasks`/`continuations`), just
+/// through different owning types.
+fn commit_task_switch<C: Cpu + 'static>(
+    cpu: &mut C,
+    mem: &mut C::Memory,
+    tasks: &mut TaskScheduler,
+    continuations: &mut ContinuationStack<C>,
+    // `(next task, its snapshot, its stack bounds)` -- exactly what
+    // `TaskScheduler::take_pending_restore` returns, bundled into one
+    // parameter (rather than four) so callers pass it straight through.
+    pending: (u32, crate::cpu::RegisterSnapshot, u32, u32),
+) {
+    let (next, snapshot, sp_lower, sp_upper) = pending;
+    tasks.commit(next);
+    crate::cpu::restore(cpu, &snapshot);
+    mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, next);
+    if let Some(shadow) = mem.shadow_mut() {
+        shadow.reset_stack_tracking(sp_lower, sp_upper, snapshot.a[7]);
+    }
+
+    let incoming_flags = mem.read_u8(next + exectask::TC_FLAGS);
+    if incoming_flags & exectask::TF_LAUNCH != 0 {
+        let tc_launch = mem.read_u32(next + exectask::TC_LAUNCH_OFFSET);
+        if tc_launch != 0 {
+            continuations.trampoline_now(cpu, mem, tc_launch, move |ctx| {
+                crate::cpu::restore(ctx.cpu, &snapshot);
+                Ok(())
+            });
+        }
+    }
 }
 
 impl<C: Cpu + 'static> Runtime<C> {
@@ -3296,29 +3413,54 @@ impl<C: Cpu + 'static> Runtime<C> {
     }
 
     /// Applies a switch [`TaskScheduler::block_current_on_signal`]/
-    /// [`TaskScheduler::yield_to_ready`] has already decided on (issue
-    /// #121): restores the newly-current task's saved registers into
-    /// the live `Cpu`, updates `self.task`/guest `ExecBase->ThisTask`
-    /// to match, and retargets the sanitizer's tracked stack region
-    /// (the same mechanism `exectask::stack_swap_handler` already uses
-    /// for a guest-initiated stack swap -- see `crate::taskswitch`'s
-    /// module doc for why only one stack is ever live at a time here).
-    /// Panics if there's no pending restore, which would mean
-    /// `self.tasks.current()` changed (or `yield_to_ready` returned
-    /// `true`) without actually recording one -- a `TaskScheduler` bug,
-    /// not a reachable runtime condition.
+    /// [`TaskScheduler::yield_to_ready`]/[`TaskScheduler::
+    /// terminate_current`] has already decided on (issue #121), honoring
+    /// the outgoing task's `tc_Switch` first if it asked for one (issue
+    /// #237, `TF_SWITCH` in `tc_Flags`): real hardware runs it, in the
+    /// outgoing task's own identity, before the task actually loses the
+    /// CPU. If there's one to run, it goes through [`ContinuationStack::
+    /// trampoline_now`] -- a real guest subroutine that may itself make
+    /// further library calls -- and the rest of the switch (the register
+    /// restore, and the incoming task's `tc_Launch` if *it* asked for
+    /// one) happens from that trampoline's own continuation once
+    /// `tc_Switch` returns, not here. With no `tc_Switch` to run, the
+    /// rest happens immediately, synchronously, exactly as before issue
+    /// #237 existed.
+    ///
+    /// Panics if there's no pending restore, which would mean a
+    /// `TaskScheduler` switch method reported success (or `yield_to_ready`
+    /// returned `true`) without actually recording one to apply -- a
+    /// `TaskScheduler` bug, not a reachable runtime condition.
     fn apply_pending_task_switch(&mut self) {
-        let (snapshot, sp_lower, sp_upper) = self
+        let pending = self
             .tasks
             .take_pending_restore()
             .expect("a task switch was signaled without a pending restore to apply");
-        crate::cpu::restore(&mut self.cpu, &snapshot);
-        self.task = self.tasks.current();
-        self.mem
-            .write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, self.task);
-        if let Some(shadow) = self.mem.shadow_mut() {
-            shadow.reset_stack_tracking(sp_lower, sp_upper, snapshot.a[7]);
+
+        let outgoing = self.task;
+        let outgoing_flags = self.mem.read_u8(outgoing + exectask::TC_FLAGS);
+        if outgoing_flags & exectask::TF_SWITCH != 0 {
+            let tc_switch = self.mem.read_u32(outgoing + exectask::TC_SWITCH_OFFSET);
+            if tc_switch != 0 {
+                self.continuations.trampoline_now(
+                    &mut self.cpu,
+                    &mut self.mem,
+                    tc_switch,
+                    move |ctx| {
+                        commit_task_switch(ctx.cpu, ctx.mem, ctx.tasks, ctx.continuations, pending);
+                        Ok(())
+                    },
+                );
+                return;
+            }
         }
+        commit_task_switch(
+            &mut self.cpu,
+            &mut self.mem,
+            &mut self.tasks,
+            &mut self.continuations,
+            pending,
+        );
     }
 
     /// Runs the guest program to completion, writing anything it prints
@@ -3334,6 +3476,15 @@ impl<C: Cpu + 'static> Runtime<C> {
         mut trace: Option<&mut dyn FnMut(&TraceEvent)>,
     ) -> Result<i32, RuntimeError> {
         loop {
+            // Issue #237: `self.tasks.commit()` (inside `apply_pending_
+            // task_switch`/its `tc_Switch`-deferred continuation) is the
+            // only place `TaskScheduler::current()` actually changes,
+            // which can happen partway through a trampolined `tc_Switch`/
+            // `tc_Launch` call -- i.e. partway through *this* loop, not
+            // only at its top. Resyncing here, every iteration, means
+            // `self.task` is always correct by the time anything below
+            // uses it, however a switch got here.
+            self.task = self.tasks.current();
             match self.cpu.run(&mut self.mem) {
                 StopReason::Step => unreachable!(
                     "Cpu::run only returns once execution stops (Trap or Halted), never Step"
@@ -3431,16 +3582,32 @@ impl<C: Cpu + 'static> Runtime<C> {
 
                     // Issue #121: the handler just dispatched may have
                     // blocked its own task (`Wait` with nothing
-                    // satisfied) and switched to a different one --
-                    // `crate::taskswitch`'s module doc explains why
-                    // that task's saved registers are already its
+                    // satisfied) and decided to switch to a different
+                    // one -- `crate::taskswitch`'s module doc explains
+                    // why that task's saved registers are already its
                     // correct resume state, so there is no generic
-                    // epilogue to run for it at all. Detected by
-                    // `self.tasks`'s current task no longer matching
-                    // `self.task` (still the blocking task's address,
-                    // not yet updated).
-                    if self.tasks.current() != self.task {
+                    // epilogue to run for it at all. Checked via
+                    // `has_pending_switch`, not `self.tasks.current() !=
+                    // self.task` (issue #237): `current()` deliberately
+                    // doesn't change until the switch is actually
+                    // applied, which can be deferred behind the
+                    // outgoing task's `tc_Switch`.
+                    if self.tasks.has_pending_switch() {
                         self.apply_pending_task_switch();
+                        continue;
+                    }
+
+                    // A continuation just ran that was pushed via
+                    // `ContinuationStack::trampoline_now` (issue #237's
+                    // task-switch commit, possibly chained into a
+                    // `tc_Launch` call) -- it already set `pc`/`sp` to
+                    // the exact correct resume state itself, so there is
+                    // nothing left on the guest stack for the generic
+                    // epilogue below to correctly pop. Unlike the check
+                    // above, this is a `continuation_stub_handler`
+                    // dispatch that already fully committed; see
+                    // `ContinuationStack::skip_epilogue`'s doc.
+                    if self.continuations.take_skip_epilogue() {
                         continue;
                     }
 
@@ -3485,10 +3652,11 @@ impl<C: Cpu + 'static> Runtime<C> {
                     // blocking case above). See `TaskScheduler::
                     // yield_requested`'s doc for why this has to happen
                     // here rather than inside the handler itself.
-                    if self.tasks.take_yield_request()
-                        && self.tasks.yield_to_ready(&self.cpu, &self.mem)
-                    {
-                        self.apply_pending_task_switch();
+                    if self.tasks.take_yield_request() {
+                        self.tasks.yield_to_ready(&self.cpu, &self.mem);
+                        if self.tasks.has_pending_switch() {
+                            self.apply_pending_task_switch();
+                        }
                     }
                 }
             }

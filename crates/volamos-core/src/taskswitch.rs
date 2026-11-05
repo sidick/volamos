@@ -56,8 +56,9 @@
 //!   to patch `D0` once this wakes" bookkeeping anywhere: a woken task
 //!   just re-enters `wait_handler`, which re-reads `tc_SigRecvd` fresh
 //!   and either completes for real this time or blocks again. The
-//!   caller must check [`TaskScheduler::current`] *before* running its
-//!   epilogue and skip it entirely if this method switched away.
+//!   caller must check [`TaskScheduler::has_pending_switch`] *before*
+//!   running its epilogue and skip it entirely if this method switched
+//!   away.
 //!
 //! - [`TaskScheduler::yield_to_ready`] is for `Permit`+`SFB_SAR` and
 //!   same-priority `SetTaskPri`. Here the library call genuinely has
@@ -78,6 +79,30 @@
 //! for this (see [`TaskScheduler::current`]'s callers in
 //! `crate::dispatch`), since it needs the newly-current task's stack
 //! bounds, which this module stores but the sanitizer lives outside of.
+//!
+//! # `tc_Switch`/`tc_Launch` (issue #237)
+//!
+//! Real `exec.library` calls the outgoing task's `tc_Switch` (if
+//! `TF_SWITCH` is set in `tc_Flags`) and the incoming task's
+//! `tc_Launch` (if `TF_LAUNCH` is set) at every switch -- real
+//! thread-local storage and newlib's per-task `errno` rely on this to
+//! point a global at the now-running task's own data. Both are real
+//! guest subroutines that may themselves make further library calls,
+//! so they run through [`crate::dispatch::ContinuationStack::
+//! trampoline_now`] (the main dispatch loop, not a tight step loop),
+//! exactly like any other guest code this runtime calls back into.
+//!
+//! This is why [`Self::current`] deliberately does *not* change the
+//! instant a switch is decided ([`Self::block_current_on_signal`]/
+//! [`Self::yield_to_ready`]/[`Self::terminate_current`] stage it, they
+//! don't commit it) -- [`Self::commit`] is the one place that
+//! actually happens, called by `crate::dispatch`'s switch-completion
+//! logic only once the outgoing task's `tc_Switch` (if any) has
+//! already run to completion on the outgoing task's own identity.
+//! `tc_Launch` runs the other way around: after `commit`, on the
+//! incoming task's newly-restored registers, with its real resume `pc`
+//! stashed in the trampoline's continuation closure and restored once
+//! `tc_Launch` itself returns.
 
 use crate::cpu::{Cpu, RegisterSnapshot};
 use crate::memory::AddressSpace;
@@ -139,9 +164,12 @@ pub struct TaskScheduler {
     current: u32,
     others: BTreeMap<u32, TaskRecord>,
     /// Set by a successful [`Self::block_current_on_signal`]/[`Self::
-    /// yield_to_ready`] call; taken (and cleared) by [`Self::
-    /// take_pending_restore`]. See that method's doc.
-    pending_restore: Option<TaskRecord>,
+    /// yield_to_ready`]/[`Self::terminate_current`] call; taken (and
+    /// cleared) by [`Self::take_pending_restore`]. Deliberately *not*
+    /// reflected in [`Self::current`] yet at this point -- see that
+    /// method's doc and [`Self::commit`]'s for why the two can
+    /// disagree for a while (issue #237's `tc_Switch`).
+    pending_restore: Option<(u32, TaskRecord)>,
     /// Set by [`Self::request_yield`] (`Permit`/`SetTaskPri`'s
     /// handlers), taken by [`Self::take_yield_request`]. Deliberately
     /// a flag rather than having those handlers call
@@ -182,9 +210,40 @@ impl TaskScheduler {
         std::mem::take(&mut self.yield_requested)
     }
 
-    /// The currently-running task's guest address.
+    /// The currently-running task's guest address -- **not** updated
+    /// the moment a switch is decided, only once it's actually
+    /// [`Self::commit`]ted. Between those two points (while a `tc_Switch`
+    /// the outgoing task asked for, issue #237, runs through the
+    /// trampoline), this still correctly reports the outgoing task:
+    /// `tc_Switch` genuinely hasn't lost the CPU yet by any real
+    /// hardware's definition, and anything it calls (a library
+    /// function reading `current_task`, a stack-bounds check) needs to
+    /// see *its* identity, not the task it's handing off to.
     pub fn current(&self) -> u32 {
         self.current
+    }
+
+    /// Whether a switch has been decided ([`Self::
+    /// block_current_on_signal`]/[`Self::yield_to_ready`]/[`Self::
+    /// terminate_current`] succeeded) but not yet [`Self::commit`]ted.
+    /// The caller checks this instead of comparing [`Self::current`]
+    /// against its own cached copy of the previously-running task,
+    /// since `current` deliberately doesn't change until `commit` does
+    /// (see that method's doc).
+    pub fn has_pending_switch(&self) -> bool {
+        self.pending_restore.is_some()
+    }
+
+    /// Actually switches [`Self::current`] to `next` -- the one place
+    /// that field changes. Called once the incoming task's registers
+    /// are about to be restored into the live `Cpu`, which for most
+    /// switches is immediately after [`Self::take_pending_restore`]
+    /// but, when the outgoing task's `tc_Switch` (issue #237) is
+    /// involved, only after that call returns (it runs through the
+    /// trampoline on the *outgoing* task's own identity/stack, which
+    /// must stay correct for its whole duration).
+    pub fn commit(&mut self, next: u32) {
+        self.current = next;
     }
 
     /// Whether `task` is a known *non-running* task (created via
@@ -292,25 +351,27 @@ impl TaskScheduler {
             .others
             .remove(&next)
             .expect("pick_ready only returns a known task");
-        self.current = next;
-        // Caller restores `next_record.snapshot` into `cpu` and
-        // retargets the sanitizer with `next_record.sp_lower/sp_upper`
-        // -- this method only owns the registry, not the live `Cpu`/
-        // `ShadowMap`, matching every other host-state field threaded
-        // through `HandlerContext` rather than reaching across them.
-        self.pending_restore = Some(next_record);
+        // Deliberately *not* `self.current = next` here -- see
+        // `Self::commit`'s doc. `Self::current` keeps reporting the
+        // blocking task until the caller actually restores `next`'s
+        // registers (immediately, or after `next`'s... no, after the
+        // *blocking* task's `tc_Switch` runs, if it asked for one).
+        self.pending_restore = Some((next, next_record));
         Ok(())
     }
 
-    /// Takes the register snapshot and stack bounds a successful
-    /// [`Self::block_current_on_signal`]/[`Self::yield_to_ready`] call
-    /// left for the caller to actually apply (restore into the live
-    /// `Cpu`, retarget the sanitizer). `None` if the last call didn't
-    /// switch.
-    pub fn take_pending_restore(&mut self) -> Option<(RegisterSnapshot, u32, u32)> {
+    /// Takes the next task's address, register snapshot, and stack
+    /// bounds a successful [`Self::block_current_on_signal`]/[`Self::
+    /// yield_to_ready`]/[`Self::terminate_current`] call left for the
+    /// caller to actually apply: restore the snapshot into the live
+    /// `Cpu`, retarget the sanitizer, and -- the one thing this method
+    /// does *not* do -- [`Self::commit`] the switch, since the caller
+    /// may need to run the outgoing task's `tc_Switch` first (issue
+    /// #237). `None` if the last call didn't switch.
+    pub fn take_pending_restore(&mut self) -> Option<(u32, RegisterSnapshot, u32, u32)> {
         self.pending_restore
             .take()
-            .map(|r| (r.snapshot, r.sp_lower, r.sp_upper))
+            .map(|(next, r)| (next, r.snapshot, r.sp_lower, r.sp_upper))
     }
 
     fn read_stack_bounds<M: AddressSpace>(mem: &M, task: u32) -> (u32, u32) {
@@ -370,8 +431,14 @@ impl TaskScheduler {
             .others
             .remove(&next)
             .expect("pick_ready only returns a known task");
-        self.current = next;
-        self.pending_restore = Some(next_record);
+        // Not `self.current = next` here either -- see `Self::commit`'s
+        // doc. A voluntary yield has no outgoing `tc_Switch` step (the
+        // yielding task's own library call already fully completed, by
+        // the time this is called -- see this method's doc), but the
+        // caller still commits via the same path as every other switch,
+        // for one reason: the *incoming* task may have `TF_LAUNCH` set,
+        // and `tc_Launch` must see `current()` already updated to it.
+        self.pending_restore = Some((next, next_record));
         true
     }
 
@@ -399,8 +466,13 @@ impl TaskScheduler {
             .others
             .remove(&next)
             .expect("pick_ready only returns a known task");
-        self.current = next;
-        self.pending_restore = Some(next_record);
+        // Not `self.current = next` -- see `Self::commit`'s doc. The
+        // terminating task is gone either way, but real hardware still
+        // calls its `tc_Switch` on this exact loss-of-CPU (the caller
+        // checks the *current* task's `TF_SWITCH`/`tc_Flags`
+        // generically for every switch, not specially for this one),
+        // so `current()` must keep reporting it until that's run.
+        self.pending_restore = Some((next, next_record));
         Ok(())
     }
 }

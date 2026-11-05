@@ -293,6 +293,28 @@ pub const TC_SPLOWER: u32 = 58;
 /// region's address one past the highest valid address. Maintained by
 /// [`create_current_task`] and [`stack_swap_handler`].
 pub const TC_SPUPPER: u32 = 62;
+/// `tc_Switch`: `APTR` (a function pointer), offset 66 -- immediately
+/// after `tc_SPUpper`. Called on the task *losing* the CPU at a switch
+/// (issue #237), if [`TF_SWITCH`] is set in `tc_Flags`. Never written
+/// by this module -- only read, by `crate::dispatch`'s switch
+/// machinery.
+pub const TC_SWITCH_OFFSET: u32 = 66;
+/// `tc_Launch`: `APTR`, offset 70 -- immediately after `tc_Switch`.
+/// Called on the task *getting* the CPU at a switch, if [`TF_LAUNCH`]
+/// is set. Same read-only treatment as `tc_Switch`.
+pub const TC_LAUNCH_OFFSET: u32 = 70;
+
+/// `TF_SWITCH` (bit 6, `0x40`) in `tc_Flags`, per `<exec/tasks.h>`:
+/// "call `tc_Switch` when this task loses the CPU." Real thread-local
+/// storage and newlib's per-task `errno` rely on this and
+/// [`TF_LAUNCH`] (issue #237) -- a task switch that doesn't honor them
+/// leaves a thread's `tc_Switch`/`tc_Launch` never called, so whatever
+/// global pointer they update (e.g. the active task's TLS block) keeps
+/// pointing at the previous task's.
+pub const TF_SWITCH: u8 = 1 << 6;
+/// `TF_LAUNCH` (bit 7, `0x80`): "call `tc_Launch` when this task gets
+/// the CPU." See [`TF_SWITCH`]'s doc.
+pub const TF_LAUNCH: u8 = 1 << 7;
 
 /// `sizeof(struct Task)` per `<exec/tasks.h>`.
 pub const TASK_STRUCT_SIZE: u32 = 92;
@@ -2667,6 +2689,175 @@ mod tests {
             code, 0x2A,
             "the parent should read the marker only the child task's own \
              code could have written, proving the child actually ran"
+        );
+    }
+
+    #[test]
+    fn task_switch_runs_tc_switch_and_tc_launch_on_the_outgoing_and_incoming_task() {
+        // Issue #237: when the parent loses the CPU (blocking in Wait,
+        // switching to the child) its tc_Switch must run, and when it
+        // gets the CPU back (the child Signals it and exits) its
+        // tc_Launch must run -- both real guest subroutines, not just
+        // flags this runtime ignores. Exercised on the parent for both
+        // halves (rather than needing the child's own, dynamically
+        // allocated struct patched from guest code): the parent's own
+        // task address is known before `rt.run()`, so TF_SWITCH/
+        // TF_LAUNCH and tc_Switch/tc_Launch can be poked in directly,
+        // same as the existing test patches the parent's task address
+        // into the child's Signal call.
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); Wait(SIGNAL); read marker ---
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: write the marker; Signal(parent, join signal); fall
+        // off the end into the task-exit stub ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x2A
+        words.push(0);
+        words.push(0x2A);
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+
+        let parent_task_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR
+
+        // --- tc_Switch: *switch_marker_addr = 0x53 ('S'); rts (into
+        // the trampoline's continuation stub, not a real caller) ---
+        let switch_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let switch_marker_imm_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = switch_marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x53
+        words.push(0);
+        words.push(0x53);
+        words.push(move_d0_to_a_indirect(0));
+        words.push(RTS);
+
+        // --- tc_Launch: *launch_marker_addr = 0x4C ('L'); rts ---
+        let launch_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+        let launch_marker_imm_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = launch_marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x4C
+        words.push(0);
+        words.push(0x4C);
+        words.push(move_d0_to_a_indirect(0));
+        words.push(RTS);
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let switch_marker_addr = marker_addr + 16;
+        let launch_marker_addr = switch_marker_addr + 16;
+        let tags_addr = launch_marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+        words[switch_marker_imm_idx + 1] = (switch_marker_addr >> 16) as u16;
+        words[switch_marker_imm_idx + 2] = switch_marker_addr as u16;
+        words[launch_marker_imm_idx + 1] = (launch_marker_addr >> 16) as u16;
+        words[launch_marker_imm_idx + 2] = launch_marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(switch_marker_addr, 0);
+        mem.write_u32(launch_marker_addr, 0);
+        // tags: [NP_ENTRY, child_entry], [TAG_DONE(0), 0]
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        let parent_task_patch_addr = entry + (parent_task_imm_idx as u32) * 2 + 2;
+        rt.memory_mut()
+            .write_u32(parent_task_patch_addr, parent_task);
+
+        // Give the parent TF_SWITCH/TF_LAUNCH and real tc_Switch/
+        // tc_Launch pointers -- the parent's own task struct, known and
+        // writable before the run starts, unlike the child's.
+        rt.memory_mut()
+            .write_u8(parent_task + TC_FLAGS, TF_SWITCH | TF_LAUNCH);
+        rt.memory_mut()
+            .write_u32(parent_task + TC_SWITCH_OFFSET, switch_entry);
+        rt.memory_mut()
+            .write_u32(parent_task + TC_LAUNCH_OFFSET, launch_entry);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x2A,
+            "the end-to-end CreateNewProc/Wait/Signal flow must still work \
+             with tc_Switch/tc_Launch wired in"
+        );
+        assert_eq!(
+            rt.memory().read_u32(switch_marker_addr),
+            0x53,
+            "tc_Switch must run when the parent loses the CPU (blocking in Wait)"
+        );
+        assert_eq!(
+            rt.memory().read_u32(launch_marker_addr),
+            0x4C,
+            "tc_Launch must run when the parent gets the CPU back (the child \
+             Signals and exits)"
         );
     }
 
