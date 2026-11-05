@@ -282,3 +282,86 @@ pub trait Cpu {
         None
     }
 }
+
+/// A complete snapshot of one task's architectural register state --
+/// everything a cooperative task switch (issue #121) needs to suspend a
+/// task and later resume it exactly where it left off.
+///
+/// Deliberately *not* a raw snapshot of a concrete backend's whole CPU
+/// core (e.g. `m68k::CpuCore`, which [`crate::backend::M68kCpu`] wraps):
+/// that type bundles non-architectural state alongside the real
+/// registers (a lazily-built per-core opcode decode cache, transient
+/// bookkeeping captured only during a batch run) and isn't `Clone`
+/// besides. This instead holds exactly the state [`Cpu`]'s own
+/// getters/setters expose, captured/restored one register at a time via
+/// [`capture`]/[`restore`] -- 18 calls each way, cheap, and correct for
+/// any `Cpu` implementation rather than tied to one backend's internals.
+///
+/// Deliberately **not** FPU state (`FP0`-`FP7`/`FPSR`/`FPCR`/`FPIAR`):
+/// nothing in scope for the first cooperative-switching slice runs
+/// FPU-using code across a switch point, and the [`Cpu`] trait doesn't
+/// expose FPU registers at all today. A task that switches away mid-FPU
+/// computation would lose that state -- a known gap, not yet a problem
+/// for anything this runtime's switch points (`Wait`/`Permit`+`SFB_SAR`/
+/// same-priority `SetTaskPri`) actually hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterSnapshot {
+    /// D0-D7.
+    pub d: [u32; NUM_DATA_REGISTERS],
+    /// A0-A7 (A7 is whichever stack -- user or supervisor -- was active
+    /// when captured; this runtime never models supervisor/user stack
+    /// separation, so there is only ever the one `A7` [`Cpu::
+    /// address_register`] already reports).
+    pub a: [u32; NUM_ADDRESS_REGISTERS],
+    /// The program counter.
+    pub pc: u32,
+    /// The full status register (condition codes + system byte).
+    pub sr: u16,
+}
+
+/// Captures `cpu`'s current architectural registers into a
+/// [`RegisterSnapshot`]. See that type's doc for what this deliberately
+/// does and doesn't cover.
+pub fn capture<C: Cpu>(cpu: &C) -> RegisterSnapshot {
+    let mut d = [0u32; NUM_DATA_REGISTERS];
+    let mut a = [0u32; NUM_ADDRESS_REGISTERS];
+    for (i, slot) in d.iter_mut().enumerate() {
+        *slot = cpu.data_register(DataRegister(i as u8));
+    }
+    for (i, slot) in a.iter_mut().enumerate() {
+        *slot = cpu.address_register(AddressRegister(i as u8));
+    }
+    RegisterSnapshot {
+        d,
+        a,
+        pc: cpu.pc(),
+        sr: cpu.sr(),
+    }
+}
+
+/// Writes every register in `snapshot` back into `cpu` -- the inverse of
+/// [`capture`], used to resume a task a switch previously suspended.
+///
+/// `sr` is restored *first*, deliberately before `a[7]`: the `m68k`
+/// crate's `set_sr` banks the stack pointer when the S bit changes
+/// (`backup_sp`s the live `A7` into the *old* mode's hidden USP/SSP
+/// slot, then `restore_sp`s from the *new* mode's slot) -- restoring
+/// `a[7]` first and `sr` after would have the SR write silently
+/// overwrite the just-restored `A7` with whatever stale value sits in
+/// the new mode's bank (`0` for a mode this task has never used
+/// before), undoing the restore. Found by a `CreateNewProc` child
+/// task's very first `JSR` pushing its return address at `A7 =
+/// 0xFFFFFFFC` instead of its real stack -- the child's initial
+/// snapshot's `sr` differed from the parent's live `sr` at the moment
+/// of the switch, and the old write-order let that SR write clobber
+/// the stack pointer this function had just set.
+pub fn restore<C: Cpu>(cpu: &mut C, snapshot: &RegisterSnapshot) {
+    cpu.set_sr(snapshot.sr);
+    for (i, &value) in snapshot.d.iter().enumerate() {
+        cpu.set_data_register(DataRegister(i as u8), value);
+    }
+    for (i, &value) in snapshot.a.iter().enumerate() {
+        cpu.set_address_register(AddressRegister(i as u8), value);
+    }
+    cpu.set_pc(snapshot.pc);
+}

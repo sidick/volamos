@@ -58,6 +58,7 @@ pub mod m68kops;
 pub mod mathlibs;
 pub mod memory;
 pub mod sanitize;
+pub mod taskswitch;
 pub mod uaedebug;
 pub mod uaelibdebug;
 pub mod utility;

@@ -67,6 +67,7 @@ use crate::exectask;
 use crate::guestmem::{DEFAULT_STACK_SIZE, GuestHeap, MIN_STACK_SIZE, read_c_string};
 use crate::lvos::{LvoEntry, find_by_lvo, find_by_name};
 use crate::memory::AddressSpace;
+use crate::taskswitch::TaskScheduler;
 use crate::vfs::{ResolveMode, Vfs};
 
 /// Number of distinct handler slots representable in an A-line opcode's
@@ -121,6 +122,13 @@ const CONTINUATION_SLOT: u16 = MAX_LIBRARY_SLOTS - 3;
 /// on ([`Runtime::enable_uaelib_debug`]). Not available to
 /// [`LibraryTable::register`].
 const UAELIB_SLOT: u16 = MAX_LIBRARY_SLOTS - 4;
+
+/// The slot index reserved for the task-exit stub at
+/// [`TASK_EXIT_STUB_ADDR`] (issue #121): like [`CONTINUATION_SLOT`],
+/// one fixed address shared by every `CreateNewProc` child task's
+/// initial stack, bound once via `register_fixed_slot`. Not available
+/// to [`LibraryTable::register`].
+const TASK_EXIT_SLOT: u16 = MAX_LIBRARY_SLOTS - 5;
 
 /// Size in bytes of the jump-table block [`open_library_handler`] carves
 /// out of the guest heap for each newly auto-created fake library.
@@ -256,7 +264,11 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     primitive's fixed "resume here after a
 ///                     trampolined guest subroutine's rts" address. See
 ///                     ContinuationStack's docs for the full mechanism.
-/// 0x00C6 .. 0x02CC   unused headroom
+/// 0x00C6 .. 0x00C8   TASK_EXIT_STUB_ADDR: a single A-line opcode word
+///                     bound to TASK_EXIT_SLOT -- every CreateNewProc
+///                     child task's initial stack return address (issue
+///                     #121). See crate::taskswitch's module doc.
+/// 0x00C8 .. 0x02CC   unused headroom
 /// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
@@ -605,6 +617,22 @@ const EXEC_BASE_SOFTVER_OFFSET: u32 = 34;
 /// "System: <model> <fpu> ..." based on it.
 const EXEC_BASE_ATTNFLAGS_OFFSET: u32 = 296;
 
+/// Byte offset of `ExecBase.SysFlags` from [`EXEC_LIBRARY_BASE`]: a
+/// `UWORD` at `LibNode` (34) + `SoftVer`/`LowMemChkSum` (4) +
+/// `ChkBase` (4) + `ColdCapture`/`CoolCapture`/`WarmCapture` (12) +
+/// `SysStkUpper`/`SysStkLower` (8) + `MaxLocMem` (4) + `DebugEntry`/
+/// `DebugData`/`AlertData`/`MaxExtMem` (16) + `ChkSum` (2) +
+/// `IntVects[16]` (192) + `ThisTask` (4) + `IdleCount`/`DispCount` (8) +
+/// `Quantum`/`Elapsed` (4) = 292 -- same field-by-field derivation as
+/// [`EXEC_BASE_ATTNFLAGS_OFFSET`]'s doc, stopping two fields earlier
+/// (`SysFlags` immediately follows `Elapsed`, immediately precedes
+/// `IDNestCnt`). Not modeled at all before issue #121: the only
+/// consumer is [`permit_handler`](crate::exectask::permit_handler)'s
+/// new `SFB_SAR` check (real `sched_yield()`'s mechanism --
+/// `Forbid(); SysBase->SysFlags |= 1<<15; Permit();` -- needs a real
+/// guest-readable/writable field to set that bit in and clear it from).
+pub(crate) const EXEC_BASE_SYSFLAGS_OFFSET: u32 = 292;
+
 /// `ExecBase.ThisTask` -- `<exec/execbase.h>`: `LibNode` (34) +
 /// `SoftVer` (2) + `LowMemChkSum` (2) + `ChkBase` (4) +
 /// `ColdCapture`/`CoolCapture`/`WarmCapture` (12) + `SysStkUpper`/
@@ -648,6 +676,17 @@ pub(crate) const CACHE_BITS_DEFAULT: u32 = 0xC000_3111;
 /// [`CACHE_BITS_ADDR`]'s cell, well clear of `dos.library`'s registered
 /// LVOs starting at `0x02CC`.
 pub const CONTINUATION_STUB_ADDR: u32 = 0x00C4;
+
+/// Guest address of the task-exit stub (issue #121) -- see
+/// [`crate::taskswitch`]'s module doc and [`crate::exectask::
+/// create_task`]'s doc. Sits in the same unused headroom immediately
+/// after [`CONTINUATION_STUB_ADDR`], well clear of `dos.library`'s
+/// registered LVOs starting at `0x02CC`. Every `CreateNewProc` child
+/// task's initial stack has this pushed as its return address, so a
+/// child that falls off the end of its `NP_Entry` without calling
+/// anything terminal itself traps here instead of resuming into
+/// whatever garbage happens to sit below its stack.
+pub const TASK_EXIT_STUB_ADDR: u32 = 0x00C6;
 
 /// Guest address of a single `ILLEGAL` (`0x4AFC`) opcode word, pre-seeded
 /// into vector 11's slot (`m68k::core::exceptions::vector::LINE_1111 * 4`
@@ -842,6 +881,23 @@ pub struct HandlerContext<'a, C: Cpu> {
     /// used by [`crate::execlist::create_msg_port_handler`] to fill in
     /// `mp_SigTask`.
     pub current_task: u32,
+    /// Guest address of the fake-jump-table A-line trap this call came
+    /// through -- `base + lvo`, same value [`HandlerContext::pc`]
+    /// carries for the shared fake-library-vector handler, but exposed
+    /// generally here (issue #121) because a handler that blocks its
+    /// own task (`Wait` with nothing satisfied) needs it as that task's
+    /// resume `pc`: the live `Cpu::pc()` has already advanced past the
+    /// trap into the next jump-table slot, which is meaningless to
+    /// resume at, while re-trapping at this exact address is what makes
+    /// "resume a blocked task" mean "re-enter the same library call
+    /// from scratch" -- see [`crate::taskswitch`]'s module doc.
+    pub trap_pc: u32,
+    /// Cooperative task-switching state (issue #121) -- see
+    /// [`crate::taskswitch`]'s module doc. `Wait`/`Signal`/`Permit`/
+    /// `SetTaskPri`/`CreateNewProc` are the only handlers that touch
+    /// this; everything else can ignore it exactly as before this
+    /// field existed.
+    pub tasks: &'a mut TaskScheduler,
     /// Slot a handler that opens a resource (`OpenLibrary`/
     /// `OldOpenLibrary`, `Open`) can fill in with a human-readable
     /// description of what it opened and the outcome -- see
@@ -1001,6 +1057,15 @@ pub enum DispatchError {
     /// legitimate guest program state -- reported loudly rather than
     /// treated as a silently-swallowed `rts`.
     EmptyContinuationStack { pc: u32 },
+    /// A `CreateNewProc` child task ran off the end of its `NP_Entry`
+    /// (reached the task-exit stub, issue #121) and no other task is
+    /// runnable to switch to -- an orphaned deadlock, not the ordinary
+    /// "a blocked `Wait`/`Signal` can't be satisfied" case (that's
+    /// [`DispatchError::HandlerFailed`], since it's a real library call
+    /// genuinely failing); reported the same way
+    /// [`DispatchError::EmptyContinuationStack`] is, since this is also
+    /// a fixed-stub condition rather than a library call.
+    TaskDeadlock,
 }
 
 impl fmt::Display for DispatchError {
@@ -1076,6 +1141,11 @@ impl fmt::Display for DispatchError {
                 "continuation stub trapped at {pc:#010x} with no pending continuation \
                  (guest jumped to the trampoline stub directly, or ContinuationStack \
                  bookkeeping is out of sync)"
+            ),
+            DispatchError::TaskDeadlock => write!(
+                f,
+                "a CreateNewProc child task exited and no other task is runnable: \
+                 every remaining task is blocked on a signal nothing will ever set"
             ),
         }
     }
@@ -1157,16 +1227,16 @@ impl<C: Cpu> LibraryTable<C> {
         handler: impl LibraryHandler<C> + 'static,
     ) -> u16 {
         let slot = self.next_slot;
-        // < UAELIB_SLOT, not just < FAKE_LIB_SLOT: UAELIB_SLOT and
-        // CONTINUATION_SLOT sit below FAKE_LIB_SLOT
+        // < TASK_EXIT_SLOT, not just < FAKE_LIB_SLOT: UAELIB_SLOT,
+        // CONTINUATION_SLOT, and TASK_EXIT_SLOT all sit below FAKE_LIB_SLOT
         // (MAX_LIBRARY_SLOTS - 2) and are bound via register_fixed_slot,
         // not through this counter -- an unbounded run of ordinary
-        // registrations must stop short of them too, or next_slot could
+        // registrations must stop short of all of them, or next_slot could
         // eventually collide with and silently overwrite their entries.
         assert!(
-            slot < UAELIB_SLOT,
+            slot < TASK_EXIT_SLOT,
             "LibraryTable: too many registered handlers (max {})",
-            UAELIB_SLOT - 1
+            TASK_EXIT_SLOT - 1
         );
         self.next_slot += 1;
 
@@ -2189,8 +2259,15 @@ pub struct Runtime<C: Cpu> {
     registry: LibraryRegistry,
     dos: DosState,
     /// Guest address of the fake "current task" struct -- see
-    /// [`HandlerContext::current_task`] and [`crate::exectask`].
+    /// [`HandlerContext::current_task`] and [`crate::exectask`]. Always
+    /// equal to `tasks.current()`; kept as its own field (rather than
+    /// calling `self.tasks.current()` everywhere) because it predates
+    /// [`TaskScheduler`] (issue #121) and most of this struct's methods
+    /// already take it as a plain `u32`.
     task: u32,
+    /// Cooperative task-switching state -- see [`crate::taskswitch`]'s
+    /// module doc and [`HandlerContext::tasks`].
+    tasks: TaskScheduler,
     /// The trampoline primitive's host-side pending-continuation stack
     /// -- see [`ContinuationStack`]'s docs. Held as its own field
     /// (rather than inside `registry`) for the aliasing/generics reasons
@@ -2536,6 +2613,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         table.register_fixed_slot(CONTINUATION_SLOT, continuation_stub_handler::<C>);
         mem.write_u16(CONTINUATION_STUB_ADDR, 0xA000 | CONTINUATION_SLOT);
 
+        // The task-exit stub (issue #121): bound once, to
+        // TASK_EXIT_STUB_ADDR -- see crate::taskswitch's module docs.
+        // Like CONTINUATION_SLOT above, there is only ever one such
+        // address, shared by every CreateNewProc child task's initial
+        // stack.
+        table.register_fixed_slot(TASK_EXIT_SLOT, exectask::task_exit_stub_handler::<C>);
+        mem.write_u16(TASK_EXIT_STUB_ADDR, 0xA000 | TASK_EXIT_SLOT);
+
         // AbsExecBase: guest address 4 holds EXEC_LIBRARY_BASE, the
         // pointer real startup code reads via `move.l 4,a6`. Written
         // after the sentinel prefill above so it isn't overwritten by
@@ -2809,6 +2894,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             registry,
             dos,
             task,
+            tasks: TaskScheduler::new(task),
             continuations: ContinuationStack::new(),
             bsdsocket: BsdSocketState::new(),
             intuition: crate::intuition::IntuitionState::new(),
@@ -3209,6 +3295,32 @@ impl<C: Cpu + 'static> Runtime<C> {
         Some((self.table.call_counts(), self.table.copy_mem_bytes()))
     }
 
+    /// Applies a switch [`TaskScheduler::block_current_on_signal`]/
+    /// [`TaskScheduler::yield_to_ready`] has already decided on (issue
+    /// #121): restores the newly-current task's saved registers into
+    /// the live `Cpu`, updates `self.task`/guest `ExecBase->ThisTask`
+    /// to match, and retargets the sanitizer's tracked stack region
+    /// (the same mechanism `exectask::stack_swap_handler` already uses
+    /// for a guest-initiated stack swap -- see `crate::taskswitch`'s
+    /// module doc for why only one stack is ever live at a time here).
+    /// Panics if there's no pending restore, which would mean
+    /// `self.tasks.current()` changed (or `yield_to_ready` returned
+    /// `true`) without actually recording one -- a `TaskScheduler` bug,
+    /// not a reachable runtime condition.
+    fn apply_pending_task_switch(&mut self) {
+        let (snapshot, sp_lower, sp_upper) = self
+            .tasks
+            .take_pending_restore()
+            .expect("a task switch was signaled without a pending restore to apply");
+        crate::cpu::restore(&mut self.cpu, &snapshot);
+        self.task = self.tasks.current();
+        self.mem
+            .write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, self.task);
+        if let Some(shadow) = self.mem.shadow_mut() {
+            shadow.reset_stack_tracking(sp_lower, sp_upper, snapshot.a[7]);
+        }
+    }
+
     /// Runs the guest program to completion, writing anything it prints
     /// (currently just `PutStr` output) to `out`. If `trace` is set, it's
     /// called once per dispatched library call (for `--verbose` logging)
@@ -3303,6 +3415,8 @@ impl<C: Cpu + 'static> Runtime<C> {
                         heap: &mut self.heap,
                         registry: &mut self.registry,
                         pc: info.pc,
+                        trap_pc: info.pc,
+                        tasks: &mut self.tasks,
                         dos: &mut self.dos,
                         current_task: self.task,
                         call_detail: &mut call_detail,
@@ -3313,6 +3427,21 @@ impl<C: Cpu + 'static> Runtime<C> {
                     let call_info = self.table.dispatch(opcode, &mut ctx)?;
                     if let Some(trace) = trace.as_deref_mut() {
                         trace(&call_info);
+                    }
+
+                    // Issue #121: the handler just dispatched may have
+                    // blocked its own task (`Wait` with nothing
+                    // satisfied) and switched to a different one --
+                    // `crate::taskswitch`'s module doc explains why
+                    // that task's saved registers are already its
+                    // correct resume state, so there is no generic
+                    // epilogue to run for it at all. Detected by
+                    // `self.tasks`'s current task no longer matching
+                    // `self.task` (still the blocking task's address,
+                    // not yet updated).
+                    if self.tasks.current() != self.task {
+                        self.apply_pending_task_switch();
+                        continue;
                     }
 
                     // Perform the RTS ourselves: pop the return address
@@ -3346,6 +3475,21 @@ impl<C: Cpu + 'static> Runtime<C> {
                     self.cpu
                         .set_address_register(AddressRegister(7), sp.wrapping_add(4));
                     self.cpu.set_pc(return_addr);
+
+                    // Issue #121: a voluntary yield (`Permit` after
+                    // `Forbid`+`SysFlags|=SFB_SAR`, or `SetTaskPri` to
+                    // the task's own current priority) requested during
+                    // dispatch, now that the library call it came from
+                    // has genuinely completed (the epilogue just above
+                    // is this task's real resume state, unlike the
+                    // blocking case above). See `TaskScheduler::
+                    // yield_requested`'s doc for why this has to happen
+                    // here rather than inside the handler itself.
+                    if self.tasks.take_yield_request()
+                        && self.tasks.yield_to_ready(&self.cpu, &self.mem)
+                    {
+                        self.apply_pending_task_switch();
+                    }
                 }
             }
         }

@@ -723,6 +723,197 @@ pub fn create_current_task<M: AddressSpace>(
     task
 }
 
+/// `TAG_USER`, per `<utility/tagitem.h>`.
+const TAG_USER: u32 = 0x8000_0000;
+/// `NP_Dummy`, per `<dos/dostags.h>`: `TAG_USER + 1000`. Every other
+/// `NP_*` tag is defined relative to this.
+const NP_DUMMY: u32 = TAG_USER + 1000;
+/// `NP_Entry` (`NP_Dummy + 3`): the child task's entry point. Required
+/// -- see [`create_new_proc_handler`]'s doc for why `NP_Seglist`
+/// (the other, mutually exclusive way real `CreateNewProc` accepts)
+/// isn't supported.
+const NP_ENTRY: u32 = NP_DUMMY + 3;
+/// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
+const NP_STACKSIZE: u32 = NP_DUMMY + 11;
+/// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
+/// string per the autodoc (not a `BSTR`).
+const NP_NAME: u32 = NP_DUMMY + 12;
+/// `NP_Priority` (`NP_Dummy + 13`).
+const NP_PRIORITY: u32 = NP_DUMMY + 13;
+
+/// Real `CreateNewProc`'s documented default `NP_StackSize`: 4000
+/// bytes.
+const DEFAULT_NP_STACKSIZE: u32 = 4000;
+/// Real `CreateNewProc`'s documented default `NP_Name`.
+const DEFAULT_NP_NAME: &str = "New Process";
+
+/// Builds a minimal `struct Process`/`struct Task` for a
+/// `dos.library/CreateNewProc` child task (issue #121) -- the same
+/// struct-`Process` layout [`create_current_task`] builds for the main
+/// task, but *not* its CLI-process fields: `pr_CIS`/`pr_COS`/
+/// `pr_ConsoleTask`/`pr_CLI` all stay `NULL`/zeroed. A real
+/// `CreateNewProc` caller that doesn't supply `NP_Input`/`NP_Output`
+/// gets real `Open("NIL:", ...)` handles for those on real AmigaOS;
+/// this runtime doesn't implement that, so they're left `NULL` instead
+/// of a silently wrong answer -- a documented simplification, not a
+/// forgotten field, since nothing [`create_new_proc_handler`] actually
+/// needs to support touches them (see its own doc for the exact
+/// scope).
+///
+/// Returns `None` (rather than panicking, unlike [`create_current_task`]
+/// -- which only ever runs once, at [`crate::dispatch::Runtime::new`]
+/// time, when the heap is essentially empty) if the guest heap has no
+/// room: `CreateNewProc` can be called at any point in a long-running
+/// guest program, so running out of heap here is a real, expected
+/// failure mode its caller needs to turn into a `NULL` result, not a
+/// host panic.
+fn create_task<M: AddressSpace>(
+    mem: &mut M,
+    heap: &mut GuestHeap,
+    name: &str,
+    priority: i8,
+    sp_lower: u32,
+    sp_upper: u32,
+) -> Option<u32> {
+    let task = heap.alloc(mem, PROCESS_STRUCT_SIZE).ok()?;
+    for i in 0..PROCESS_STRUCT_SIZE {
+        mem.write_u8(task.wrapping_add(i), 0);
+    }
+    mem.write_u8(task + LN_TYPE, NT_PROCESS);
+    mem.write_u8(task + crate::execlist::LN_PRI, priority as u8);
+
+    let name_bytes = name.as_bytes();
+    let name_addr = heap.alloc(mem, name_bytes.len() as u32 + 1).ok()?;
+    write_c_string(mem, name_addr, name_bytes);
+    mem.write_u32(task + LN_NAME, name_addr);
+
+    mem.write_u32(task + TC_SIGALLOC, SIG_SYSTEM_RESERVED);
+    mem.write_u32(task + TC_SPLOWER, sp_lower);
+    mem.write_u32(task + TC_SPUPPER, sp_upper);
+    init_msg_port_fields(mem, task + PR_MSGPORT_OFFSET, task);
+
+    Some(task)
+}
+
+/// `dos.library`'s `CreateNewProc` (LVO -498: `D1` = tag list). `D0` =
+/// the new `struct Process*`, or `NULL` on failure -- see issue #121
+/// and `crate::taskswitch`'s module doc for the scheduling this plugs
+/// a new task into.
+///
+/// Scope: only `NP_Entry` (required)/`NP_StackSize`/`NP_Name`/
+/// `NP_Priority` are read. `NP_Seglist` -- the other, mutually
+/// exclusive way real `CreateNewProc` accepts what to run (a seglist,
+/// as from `LoadSeg`, rather than a bare function pointer) -- isn't
+/// supported; every known caller that actually needs this runtime's
+/// `CreateNewProc` support (both the libpthread and native toolchain
+/// thread models, per issue #121's thread) always supplies `NP_Entry`.
+/// Every other tag (`NP_Input`/`NP_Output`/`NP_CurrentDir`/`NP_HomeDir`/
+/// `NP_Cli`/...) is silently ignored -- see [`create_task`]'s doc for
+/// why that's a documented simplification rather than a silent wrong
+/// answer.
+///
+/// The child's initial registers: `A7` = the top of its own freshly
+/// allocated stack (with [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
+/// pre-pushed as the return address for its outermost `rts`, exactly
+/// the way [`crate::dispatch::Runtime::new`] pre-pushes `EXIT_STUB_ADDR`
+/// for the main task's own outermost `rts`), `PC` = `NP_Entry`, every
+/// other register zeroed -- real `CreateNewProc`'s autodoc documents
+/// no argument-passing convention for the entry routine (unlike a
+/// normal program's `A0`/`D0` argv/argc), so there is nothing else to
+/// seed.
+fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let tags = ctx.cpu.data_register(DataRegister(1));
+
+    let entry_item = crate::utility::find_tag_item_impl(ctx.mem, NP_ENTRY, tags);
+    if entry_item == 0 {
+        return Err(DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -498,
+            handler_name: "CreateNewProc".to_string(),
+            message: "NP_Entry is required -- NP_Seglist (the other, mutually exclusive way \
+                      to specify what to run) is not supported"
+                .to_string(),
+        });
+    }
+    let entry = ctx.mem.read_u32(entry_item + 4);
+
+    let stack_size = {
+        let item = crate::utility::find_tag_item_impl(ctx.mem, NP_STACKSIZE, tags);
+        if item != 0 {
+            ctx.mem.read_u32(item + 4)
+        } else {
+            DEFAULT_NP_STACKSIZE
+        }
+    }
+    .max(crate::guestmem::MIN_STACK_SIZE);
+
+    let name = {
+        let item = crate::utility::find_tag_item_impl(ctx.mem, NP_NAME, tags);
+        if item != 0 {
+            let ptr = ctx.mem.read_u32(item + 4);
+            String::from_utf8_lossy(&crate::guestmem::read_c_string(ctx.mem, ptr)).into_owned()
+        } else {
+            DEFAULT_NP_NAME.to_string()
+        }
+    };
+
+    let priority = {
+        let item = crate::utility::find_tag_item_impl(ctx.mem, NP_PRIORITY, tags);
+        if item != 0 {
+            ctx.mem.read_u32(item + 4) as i8
+        } else {
+            ctx.mem.read_u8(ctx.current_task + crate::execlist::LN_PRI) as i8
+        }
+    };
+
+    let Ok(stack_block) = ctx.heap.alloc(ctx.mem, stack_size) else {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    };
+    let sp_upper = stack_block.wrapping_add(stack_size) & !3;
+    let sp = sp_upper.wrapping_sub(4);
+    ctx.mem.write_u32(sp, crate::dispatch::TASK_EXIT_STUB_ADDR);
+
+    let Some(task) = create_task(ctx.mem, ctx.heap, &name, priority, stack_block, sp_upper) else {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    };
+
+    let mut a = [0u32; 8];
+    a[7] = sp;
+    let snapshot = crate::cpu::RegisterSnapshot {
+        d: [0; 8],
+        a,
+        pc: entry,
+        // The parent's own current SR, not a hardcoded value: this
+        // runtime never models the user/supervisor distinction
+        // itself (every task just inherits whatever `CpuCore`'s own
+        // reset default is), and the `m68k` crate's `set_sr` banks
+        // the stack pointer on an S-bit change (see
+        // `crate::cpu::restore`'s doc) -- a child whose SR differs
+        // from everything else this runtime assumes would be a
+        // needless, confusing special case for no benefit.
+        sr: ctx.cpu.sr(),
+    };
+    ctx.tasks.spawn_ready(task, snapshot, stack_block, sp_upper);
+    ctx.cpu.set_data_register(DataRegister(0), task);
+    Ok(())
+}
+
+/// The stub handler bound to [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
+/// (issue #121): a `CreateNewProc` child task fell off the end of its
+/// `NP_Entry` without calling anything terminal itself. The current
+/// task (whichever one just `rts`'d into this stub) is gone -- see
+/// [`crate::taskswitch::TaskScheduler::terminate_current`]'s doc for
+/// what that does and doesn't clean up.
+pub(crate) fn task_exit_stub_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    ctx.tasks
+        .terminate_current(ctx.mem)
+        .map_err(|_| DispatchError::TaskDeadlock)
+}
+
 /// `FindTask` (LVO -294): `A1` = task name, or `NULL` for the current
 /// task. See the module docs' "`FindTask`" section.
 fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -733,9 +924,17 @@ fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 }
 
 /// `SetTaskPri` (LVO -300): `A1` = `struct Task*`, `D0` = new priority.
-/// `D0` = the old priority, sign-extended. With a single task there is
-/// nothing to reschedule, so this only stores `ln_Pri`. clib2's exit
-/// code calls it to restore the priority its startup saved.
+/// `D0` = the old priority, sign-extended. clib2's exit code calls it
+/// to restore the priority its startup saved.
+///
+/// Issue #121: setting a task's priority to the value it already had
+/// is a documented AmigaOS idiom for voluntarily yielding the CPU to
+/// any other task at the same priority -- requested here exactly like
+/// `Permit`'s `SFB_SAR` case, via `TaskScheduler::request_yield` (see
+/// its doc for why this only requests a yield rather than switching
+/// immediately). Only requested for the *current* task setting its own
+/// priority -- one task changing another's priority (real, if less
+/// common, usage) isn't a yield point for either of them.
 fn set_task_pri_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let task = ctx.cpu.address_register(AddressRegister(1));
     let new_pri = ctx.cpu.data_register(DataRegister(0)) as u8;
@@ -743,6 +942,9 @@ fn set_task_pri_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     ctx.mem.write_u8(task + crate::execlist::LN_PRI, new_pri);
     ctx.cpu
         .set_data_register(DataRegister(0), old_pri as i32 as u32);
+    if task == ctx.current_task && new_pri as i8 == old_pri {
+        ctx.tasks.request_yield();
+    }
     Ok(())
 }
 
@@ -917,7 +1119,9 @@ fn free_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 }
 
 /// `Wait` (LVO -318): `D0` = signal set to wait for. See the module
-/// docs' "`Wait`: trapping unrunnable blocking waits" section.
+/// docs' "`Wait`: trapping unrunnable blocking waits" section, and
+/// [`crate::taskswitch`]'s module doc for the issue #121 blocking path
+/// below, which replaces what used to be an unconditional failure.
 fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let signal_set = ctx.cpu.data_register(DataRegister(0));
     let task = ctx.current_task;
@@ -934,48 +1138,73 @@ fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
 
     // Nothing satisfied: record what we were waiting for (best-effort
     // fidelity -- a real kernel leaves tc_SigWait set exactly like this
-    // while the task is actually suspended) and fail loudly instead of
-    // hanging the host process forever.
+    // while the task is actually suspended), then try to block and
+    // switch to another runnable task (issue #121) rather than failing
+    // outright. `block_current_on_signal` takes `ctx.trap_pc`, not
+    // `ctx.cpu.pc()`, as the resume address -- see that method's and
+    // `crate::taskswitch`'s doc for why: resuming this task later means
+    // re-trapping into this exact `Wait` call from scratch, which is
+    // also why there's nothing here that "remembers" to deliver
+    // `satisfied` on wake -- the re-entered call above does that fresh.
     ctx.mem.write_u32(task + TC_SIGWAIT, signal_set);
+    if ctx
+        .tasks
+        .block_current_on_signal(ctx.cpu, ctx.mem, ctx.trap_pc, signal_set)
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // No other task could ever satisfy this -- a real deadlock, not
+    // just "no scheduler": fail loudly instead of hanging the host
+    // process forever, the same posture every single-task stand-in in
+    // this module already used before issue #121's scheduler existed.
     Err(DispatchError::HandlerFailed {
         library: "exec.library".to_string(),
         lvo: -318,
         handler_name: "Wait".to_string(),
         message: format!(
-            "Wait({signal_set:#010x}) would block forever: this is a single-tasking \
-             runtime with no other task to deliver a signal, and none of the requested \
-             signals are currently pending in tc_SigRecvd -- mirrors vamos's approach of \
-             trapping unrunnable blocking waits rather than deadlocking the host process"
+            "Wait({signal_set:#010x}) would deadlock: no other task is runnable, and none \
+             of the requested signals are currently pending in tc_SigRecvd"
         ),
     })
 }
 
 /// `Signal` (LVO -324): `A1` = target task, `D0` = signal bits to set.
-/// Only the fake current task exists in this runtime, so a `Signal` to
-/// any other address fails loudly (there's no other task it could
-/// plausibly refer to -- almost certainly a guest bug, e.g. a stale or
-/// uninitialized task pointer, worth surfacing rather than silently
-/// dropping).
+/// `target` must be the current task or a task [`crate::taskswitch::
+/// TaskScheduler`] actually knows about (issue #121: created via
+/// `CreateNewProc` and not yet exited) -- anything else fails loudly,
+/// since it can't plausibly refer to a real task (almost certainly a
+/// guest bug, e.g. a stale or uninitialized task pointer).
+///
+/// `Signal` itself never switches tasks, matching real hardware: it
+/// only marks a blocked target `Ready` if the newly-set bits intersect
+/// what it's waiting for. The target only actually runs once some
+/// later switch point (on either task) picks it -- see
+/// `crate::taskswitch`'s module doc.
 fn signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let target = ctx.cpu.address_register(AddressRegister(1));
     let signals = ctx.cpu.data_register(DataRegister(0));
 
-    if target != ctx.current_task {
+    if target != ctx.current_task && !ctx.tasks.is_known(target) {
         return Err(DispatchError::HandlerFailed {
             library: "exec.library".to_string(),
             lvo: -324,
             handler_name: "Signal".to_string(),
             message: format!(
-                "Signal({target:#010x}, {signals:#010x}): unknown task -- this runtime is \
-                 single-tasking, the only task that exists is the fake current task at \
-                 {:#010x}",
+                "Signal({target:#010x}, {signals:#010x}): unknown task -- not the current \
+                 task ({:#010x}) and not a task this runtime created",
                 ctx.current_task
             ),
         });
     }
 
     let recvd = ctx.mem.read_u32(target + TC_SIGRECVD);
-    ctx.mem.write_u32(target + TC_SIGRECVD, recvd | signals);
+    let recvd = recvd | signals;
+    ctx.mem.write_u32(target + TC_SIGRECVD, recvd);
+    if target != ctx.current_task {
+        ctx.tasks.wake_if_signal_matches(target, recvd);
+    }
     Ok(())
 }
 
@@ -1122,22 +1351,45 @@ fn stack_swap_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     Ok(())
 }
 
-/// `exec.library`'s `Forbid`/`Permit` (LVO -132/-138, no args, no
-/// return value): real `Forbid` disables task switching until a
-/// matching `Permit`, protecting a critical section (e.g. walking a
-/// shared list) from being preempted mid-scan. This runtime is
-/// single-threaded and never preempts the running guest task for
-/// anything (see the module docs' "fake current task" section), so
-/// there's nothing a critical section could ever be preempted by --
-/// both are true no-ops. Found missing running the real Workbench
-/// 3.1.4 `C:/Avail` binary, which calls `Forbid` before walking exec's
-/// memory-pool list and `Permit` after.
+/// `ExecBase.SysFlags`'s `SFB_SAR` bit (bit 15, `0x8000`) -- "Stop And
+/// Reschedule". Real `sched_yield()` on Amiga (`Forbid(); SysBase->
+/// SysFlags |= SFB_SAR; Permit();`) sets this directly in guest memory
+/// (not through any library call) between a no-op `Forbid` and the
+/// `Permit` that follows; [`permit_handler`] is what actually notices
+/// it (issue #121).
+const SFB_SAR: u16 = 1 << 15;
+
+/// `exec.library`'s `Forbid` (LVO -132, no args, no return value): real
+/// `Forbid` disables task switching until a matching `Permit`,
+/// protecting a critical section (e.g. walking a shared list) from
+/// being preempted mid-scan. Still a true no-op even after issue #121:
+/// this runtime has no preemption at all (switches only ever happen at
+/// a handler's own request -- see `crate::taskswitch`'s module doc), so
+/// there's nothing a critical section could be preempted by regardless
+/// of whether `Forbid` is in effect. Found missing running the real
+/// Workbench 3.1.4 `C:/Avail` binary, which calls `Forbid` before
+/// walking exec's memory-pool list and `Permit` after.
 fn forbid_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     Ok(())
 }
 
-/// See [`forbid_handler`].
-fn permit_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// `exec.library`'s `Permit` (LVO -138, no args, no return value). See
+/// [`forbid_handler`] for why ending a critical section is otherwise a
+/// no-op. Issue #121 adds the one thing it's not a no-op for: real
+/// `sched_yield()`'s `SFB_SAR` trick (see [`SFB_SAR`]'s doc). If the
+/// guest has set that bit in `ExecBase->SysFlags`, this clears it
+/// (real hardware consumes the request, it doesn't stay set) and
+/// requests a yield -- see `crate::taskswitch::TaskScheduler::
+/// request_yield`'s doc for why this only *requests* one rather than
+/// switching immediately.
+fn permit_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let sys_flags_addr =
+        crate::dispatch::EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_SYSFLAGS_OFFSET;
+    let sys_flags = ctx.mem.read_u16(sys_flags_addr);
+    if sys_flags & SFB_SAR != 0 {
+        ctx.mem.write_u16(sys_flags_addr, sys_flags & !SFB_SAR);
+        ctx.tasks.request_yield();
+    }
     Ok(())
 }
 
@@ -1615,16 +1867,22 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
     reg_exec!("CheckIO", check_io_handler::<C>);
     reg_exec!("AbortIO", abort_io_handler::<C>);
 
-    table
-        .register_by_name(
-            mem,
-            DOS_LIBRARY_BASE,
-            DOS_LVOS,
-            "dos.library",
-            "CheckSignal",
-            check_signal_handler::<C>,
-        )
-        .expect("CheckSignal should be in DOS_LVOS");
+    macro_rules! reg_dos {
+        ($name:literal, $handler:expr) => {
+            table
+                .register_by_name(
+                    mem,
+                    DOS_LIBRARY_BASE,
+                    DOS_LVOS,
+                    "dos.library",
+                    $name,
+                    $handler,
+                )
+                .unwrap_or_else(|e| panic!("{} should be in DOS_LVOS: {e}", $name));
+        };
+    }
+    reg_dos!("CheckSignal", check_signal_handler::<C>);
+    reg_dos!("CreateNewProc", create_new_proc_handler::<C>);
 
     // timer.device's library-style vectors, at their real device LVOs
     // (see this function's doc comment). Registered directly by offset
@@ -2270,8 +2528,154 @@ mod tests {
         );
     }
 
+    /// `MOVE.L D0,(A0)` (destination `(An)` indirect, source `Dn`
+    /// direct). Generalizes `move_d0_to_d`'s base opcode the same way
+    /// `movea_dn`-style helpers elsewhere in this crate generalize
+    /// `movea_imm`'s: `0x2000` (size long, dest reg 0, dest mode `000`
+    /// Dn, src mode `000` src reg `000`=D0) with the destination
+    /// register substituted in at bits 11-9 and its mode changed to
+    /// `010` ((An) indirect, bits 8-6).
+    fn move_d0_to_a_indirect(an: u16) -> u16 {
+        0x2080 | (an << 9)
+    }
+
+    /// `MOVE.L (A0),D0` (destination `Dn` direct, source `(An)`
+    /// indirect) -- the load counterpart of
+    /// [`move_d0_to_a_indirect`].
+    fn move_a_indirect_to_d0(an: u16) -> u16 {
+        0x2010 | an
+    }
+
     #[test]
-    fn wait_on_nothing_pending_fails_loudly_instead_of_blocking() {
+    fn create_new_proc_runs_a_second_task_that_signals_the_parent() {
+        // End-to-end exercise of issue #121's whole mechanism: CreateNewProc
+        // spawns a real second task; the parent blocks in Wait (switching to
+        // the child, the only Ready task); the child runs its own code (on
+        // its own stack, with its own registers -- proven by having it
+        // write a marker byte only it knows), Signals the parent (marking
+        // it Ready, without switching itself), then falls off the end into
+        // the task-exit stub (switching back to the parent); the parent's
+        // Wait call re-traps, now finds the signal satisfied, and resumes
+        // for real. The marker the child wrote is what the parent's exit
+        // code reports, so a wrong value anywhere in this chain -- the
+        // child never running, running on the wrong stack, or the parent
+        // resuming before the child actually ran -- fails the assertion.
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); Wait(SIGNAL); read marker ---
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: write the marker; Signal(parent, join signal); fall
+        // off the end into the task-exit stub ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x2A
+        words.push(0);
+        words.push(0x2A);
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+
+        let parent_task_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below,
+        words.push(0); // once the parent's task address is known --
+        words.push(0); // see this test's note on why it's patched
+        // post-construction rather than predicted here.
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR, pre-pushed on the
+        // child's own stack by CreateNewProc.
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        // tags: [NP_ENTRY, child_entry], [TAG_DONE(0), 0]
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        // The parent's task address depends on exactly how many heap
+        // allocations Runtime::new made before create_current_task
+        // (currently none, but that's an implementation detail this test
+        // shouldn't have to predict) -- read it back from the real
+        // Runtime instead of hardcoding it, and patch the child's
+        // immediate operand with the real value.
+        let parent_task = rt.current_task();
+        let parent_task_patch_addr = entry + (parent_task_imm_idx as u32) * 2 + 2;
+        rt.memory_mut()
+            .write_u32(parent_task_patch_addr, parent_task);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x2A,
+            "the parent should read the marker only the child task's own \
+             code could have written, proving the child actually ran"
+        );
+    }
+
+    #[test]
+    fn wait_on_nothing_pending_with_no_other_task_deadlocks_loudly() {
+        // Issue #121: Wait now tries to block-and-switch before
+        // failing, but with no other task ever created there is
+        // nothing to switch to, so this must still fail loudly rather
+        // than hang.
         let _guard = lock_host_break();
         let mut words = Vec::new();
         words.push(move_imm_to_d(0)); // D0 = 1 (nothing pending)
@@ -2285,8 +2689,8 @@ mod tests {
         let err = rt.run(&mut out, None).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("would block forever"),
-            "expected a would-block diagnostic, got: {msg}"
+            msg.contains("would deadlock"),
+            "expected a deadlock diagnostic, got: {msg}"
         );
     }
 
