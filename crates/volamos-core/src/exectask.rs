@@ -756,6 +756,27 @@ const NP_DUMMY: u32 = TAG_USER + 1000;
 /// (the other, mutually exclusive way real `CreateNewProc` accepts)
 /// isn't supported.
 const NP_ENTRY: u32 = NP_DUMMY + 3;
+/// `NP_Input` (`NP_Dummy + 4`): a `BPTR` filehandle, stored into the new
+/// process's `pr_CIS` exactly as given -- real `CreateNewProc` never
+/// validates it (`<dos/dostags.h>`'s own comment: default is
+/// `Open("NIL:",...)`, but a caller that supplies one just gets it
+/// stored verbatim, unchecked). Found missing (issue #237, sub-problem
+/// #3) via the real `t6-ctls-newlib` libpthread binary: AmigaPorts'
+/// `pthread_create()` passes the new thread's slot number through
+/// `NP_Input` (of all places -- not a real filehandle at all, just a
+/// convenient `BPTR`-shaped slot to smuggle a number through), and the
+/// thread's own entry reads it straight back out of `pr_CIS`. Silently
+/// ignoring the tag left `pr_CIS` `0`, so the thread read back slot 0
+/// (whose start function is `NULL`) instead of its real slot, jumped to
+/// address `0`, and ran off through zeroed low memory (`0x0000 0000` is
+/// a harmless `ori.b #0,d0`) until it happened to reach
+/// [`crate::dispatch::CONTINUATION_STUB_ADDR`] -- a coincidental crash
+/// landing, not an actual `ContinuationStack` bug, confirmed by
+/// codewiz's own `--uae-debug` trace (`parent: NP_Input 1` /
+/// `child: pr_CIS 0`).
+const NP_INPUT: u32 = NP_DUMMY + 4;
+/// `NP_Output` (`NP_Dummy + 5`): as [`NP_INPUT`], for `pr_COS`.
+const NP_OUTPUT: u32 = NP_DUMMY + 5;
 /// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
 const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
@@ -773,14 +794,16 @@ const DEFAULT_NP_NAME: &str = "New Process";
 /// Builds a minimal `struct Process`/`struct Task` for a
 /// `dos.library/CreateNewProc` child task (issue #121) -- the same
 /// struct-`Process` layout [`create_current_task`] builds for the main
-/// task, but *not* its CLI-process fields: `pr_CIS`/`pr_COS`/
-/// `pr_ConsoleTask`/`pr_CLI` all stay `NULL`/zeroed. A real
-/// `CreateNewProc` caller that doesn't supply `NP_Input`/`NP_Output`
-/// gets real `Open("NIL:", ...)` handles for those on real AmigaOS;
-/// this runtime doesn't implement that, so they're left `NULL` instead
-/// of a silently wrong answer -- a documented simplification, not a
-/// forgotten field, since nothing [`create_new_proc_handler`] actually
-/// needs to support touches them (see its own doc for the exact
+/// task, but *not* its CLI-process fields: `pr_ConsoleTask`/`pr_CLI`
+/// stay `NULL`/zeroed, and `pr_CIS`/`pr_COS` start zeroed here too --
+/// [`create_new_proc_handler`] fills them in right after this call if
+/// the caller passed `NP_Input`/`NP_Output` (see [`NP_INPUT`]'s doc).
+/// A real `CreateNewProc` caller that omits them gets real
+/// `Open("NIL:", ...)` handles instead; this runtime doesn't implement
+/// that, so they stay `NULL` in that case -- a documented
+/// simplification, not a forgotten field, since nothing
+/// [`create_new_proc_handler`] actually needs to support touches them
+/// otherwise (see its own doc for the exact
 /// scope).
 ///
 /// Returns `None` (rather than panicking, unlike [`create_current_task`]
@@ -823,14 +846,16 @@ fn create_task<M: AddressSpace>(
 /// and `crate::taskswitch`'s module doc for the scheduling this plugs
 /// a new task into.
 ///
-/// Scope: only `NP_Entry` (required)/`NP_StackSize`/`NP_Name`/
-/// `NP_Priority` are read. `NP_Seglist` -- the other, mutually
-/// exclusive way real `CreateNewProc` accepts what to run (a seglist,
-/// as from `LoadSeg`, rather than a bare function pointer) -- isn't
-/// supported; every known caller that actually needs this runtime's
-/// `CreateNewProc` support (both the libpthread and native toolchain
-/// thread models, per issue #121's thread) always supplies `NP_Entry`.
-/// Every other tag (`NP_Input`/`NP_Output`/`NP_CurrentDir`/`NP_HomeDir`/
+/// Scope: `NP_Entry` (required)/`NP_StackSize`/`NP_Name`/`NP_Priority`/
+/// `NP_Input`/`NP_Output` are read -- see [`NP_INPUT`]'s doc for why
+/// the latter two matter even to a caller not passing a real
+/// filehandle. `NP_Seglist` -- the other, mutually exclusive way real
+/// `CreateNewProc` accepts what to run (a seglist, as from `LoadSeg`,
+/// rather than a bare function pointer) -- isn't supported; every
+/// known caller that actually needs this runtime's `CreateNewProc`
+/// support (both the libpthread and native toolchain thread models,
+/// per issue #121's thread) always supplies `NP_Entry`. Every other
+/// tag (`NP_CloseInput`/`NP_CloseOutput`/`NP_CurrentDir`/`NP_HomeDir`/
 /// `NP_Cli`/...) is silently ignored -- see [`create_task`]'s doc for
 /// why that's a documented simplification rather than a silent wrong
 /// answer.
@@ -902,6 +927,18 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         return Ok(());
     };
 
+    // NP_Input/NP_Output: stored into pr_CIS/pr_COS exactly as given,
+    // unchecked -- see NP_INPUT's doc for why this matters even when
+    // the caller isn't passing a real filehandle.
+    if let item @ 1.. = crate::utility::find_tag_item_impl(ctx.mem, NP_INPUT, tags) {
+        let input = ctx.mem.read_u32(item + 4);
+        ctx.mem.write_u32(task + PR_CIS_OFFSET, input);
+    }
+    if let item @ 1.. = crate::utility::find_tag_item_impl(ctx.mem, NP_OUTPUT, tags) {
+        let output = ctx.mem.read_u32(item + 4);
+        ctx.mem.write_u32(task + PR_COS_OFFSET, output);
+    }
+
     let mut a = [0u32; 8];
     a[7] = sp;
     let snapshot = crate::cpu::RegisterSnapshot {
@@ -929,12 +966,27 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 /// task (whichever one just `rts`'d into this stub) is gone -- see
 /// [`crate::taskswitch::TaskScheduler::terminate_current`]'s doc for
 /// what that does and doesn't clean up.
+///
+/// Mirrors [`wait_handler`]'s pending-timer retry (issue #237, sub-
+/// problem #2 follow-up): `terminate_current` fails if no other task is
+/// `Ready`, but the only other task left might just be blocked in
+/// `Wait` on a still-pending `TR_ADDREQUEST`'s signal -- real, found
+/// work the timer would still deliver, not a genuine deadlock. Found by
+/// codewiz: a `pthread_join`-ing main task blocked in `Wait` while the
+/// joined thread's own timed wait is still pending hit exactly this --
+/// `terminate_current` saw nobody `Ready` and failed before the timer
+/// ever got a chance to wake main.
 pub(crate) fn task_exit_stub_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
-    ctx.tasks
-        .terminate_current(ctx.mem)
-        .map_err(|_| DispatchError::TaskDeadlock)
+    loop {
+        if ctx.tasks.terminate_current(ctx.mem).is_ok() {
+            return Ok(());
+        }
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            return Err(DispatchError::TaskDeadlock);
+        }
+    }
 }
 
 /// `FindTask` (LVO -294): `A1` = task name, or `NULL` for the current
@@ -2787,6 +2839,85 @@ mod tests {
     }
 
     #[test]
+    fn create_new_proc_honors_np_input_and_np_output() {
+        // Issue #237, sub-problem #3's real root cause: CreateNewProc
+        // used to silently ignore NP_Input/NP_Output, leaving the new
+        // task's pr_CIS/pr_COS at 0 even when the caller explicitly
+        // supplied them -- see NP_INPUT's doc for how that crashed a
+        // real libpthread binary (AmigaPorts' pthread_create smuggles
+        // the new thread's slot number through NP_Input, of all
+        // things, and the thread reads it straight back out of
+        // pr_CIS). Doesn't need the child to actually run -- just that
+        // CreateNewProc stored the tags into the new struct Process
+        // correctly.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = movea_dos_base_to_a6().to_vec();
+        let tags_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+        let marker_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(0)); // *marker = D0 (new task addr)
+        words.push(RTS);
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let child_entry = tags_addr + 64; // never actually run
+        let load_end = child_entry + 16;
+
+        words[tags_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_idx + 2] = tags_addr as u16;
+        words[marker_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_idx + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        // tags: [NP_ENTRY, child_entry], [NP_INPUT, 0x1234], [NP_OUTPUT, 0x5678], [TAG_DONE, 0]
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, NP_INPUT);
+        mem.write_u32(tags_addr + 12, 0x1234);
+        mem.write_u32(tags_addr + 16, NP_OUTPUT);
+        mem.write_u32(tags_addr + 20, 0x5678);
+        mem.write_u32(tags_addr + 24, 0);
+        mem.write_u32(tags_addr + 28, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        let child_task = rt.memory().read_u32(marker_addr);
+        assert_ne!(child_task, 0, "CreateNewProc should have succeeded");
+        assert_eq!(
+            rt.memory().read_u32(child_task + PR_CIS_OFFSET),
+            0x1234,
+            "NP_Input must be stored into pr_CIS exactly as given"
+        );
+        assert_eq!(
+            rt.memory().read_u32(child_task + PR_COS_OFFSET),
+            0x5678,
+            "NP_Output must be stored into pr_COS exactly as given"
+        );
+    }
+
+    #[test]
     fn create_new_proc_runs_a_second_task_that_signals_the_parent() {
         // End-to-end exercise of issue #121's whole mechanism: CreateNewProc
         // spawns a real second task; the parent blocks in Wait (switching to
@@ -3656,6 +3787,139 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         (code, rt, ioreq_addr)
+    }
+
+    #[test]
+    fn task_exit_wakes_a_task_blocked_only_on_a_pending_timer() {
+        // Issue #237, sub-problem #2 follow-up, found by codewiz: a
+        // CreateNewProc child falling off the end (task_exit_stub_
+        // handler -> terminate_current) used to fail outright if the
+        // only other task was blocked in Wait purely on a still-
+        // pending TR_ADDREQUEST's signal -- `pick_ready` only ever
+        // looks for `Ready` tasks, and a timer's wake is never that
+        // until it actually fires. The parent genuinely isn't
+        // deadlocked here (the timer would wake it on its own even if
+        // the child never exited), so the child falling off first
+        // must not report one either -- same "fire the only future
+        // event left" fix as wait_handler's own retry loop, just on
+        // the other side of the exact same race.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = movea_dos_base_to_a6().to_vec();
+        let tags_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        let name_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        let ioreq_idx1 = words.len();
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+
+        let ioreq_idx2 = words.len();
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-462)); // SendIO
+
+        words.push(move_imm_to_d(0)); // D0 = the reply port's signal bit
+        words.push(0);
+        words.push(0x0010); // bit 4 -> 0x10
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(0)); // *marker = D0 (Wait's result)
+        words.push(RTS);
+
+        // --- child: immediately falls off into the task-exit stub,
+        // without ever signalling the parent -- only the timer is left.
+        let child_entry = entry + (words.len() as u32) * 2;
+        words.push(RTS);
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let name_addr = code_end + 16;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        let reply_port_addr = ioreq_addr + 64;
+        let marker_addr = reply_port_addr + 64;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_idx + 2] = tags_addr as u16;
+        words[name_idx + 1] = (name_addr >> 16) as u16;
+        words[name_idx + 2] = name_addr as u16;
+        words[ioreq_idx1 + 1] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx1 + 2] = ioreq_addr as u16;
+        words[ioreq_idx2 + 1] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx2 + 2] = ioreq_addr as u16;
+        words[marker_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_idx + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..64 {
+            mem.write_u8(ioreq_addr + i, 0);
+            mem.write_u8(reply_port_addr + i, 0);
+        }
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        crate::execlist::init_list_header(&mut mem, reply_port_addr + crate::execlist::MP_MSGLIST);
+        mem.write_u8(reply_port_addr + crate::execlist::MP_SIGBIT, 4);
+        mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_ADDREQUEST);
+        mem.write_u32(ioreq_addr + crate::execlist::MN_REPLYPORT, reply_port_addr);
+        // 10 real seconds -- proves this resolves via the deadlock-
+        // path fast-forward, not an actual sleep/elapse.
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 10);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(reply_port_addr + crate::execlist::MP_SIGTASK, parent_task);
+
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("the parent must resume once the child exits, not deadlock");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            code, 0x10,
+            "the parent's Wait should resume with the timer's own bit satisfied"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must resolve via the fast-forward path, not a real 10s elapse -- took {elapsed:?}"
+        );
     }
 
     #[test]
