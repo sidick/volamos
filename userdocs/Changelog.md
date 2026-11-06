@@ -3,6 +3,98 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.16
+
+- **`dos.library`'s `CreateNewProc` implemented, with cooperative
+  task switching** (issue #121) — a second real guest task can now
+  exist and actually run, not just the one fake "current task" every
+  earlier release assumed. `Wait`/`Signal`/`Permit`/`SetTaskPri` all
+  gained real multi-task semantics (blocking, waking, voluntary
+  yielding), still entirely non-preemptive: a switch only happens at
+  one of those explicit points, never behind a task's back. This
+  unblocks both libpthread-based and native-toolchain thread models
+  under `m68k-amigaos-gcc`.
+
+- **`tc_Switch`/`tc_Launch` are called on every task switch** (issue
+  #237) — real `exec.library` calls the outgoing task's `tc_Switch`
+  and the incoming task's `tc_Launch`, which real thread-local storage
+  and newlib's per-task `errno` rely on; without them, a resumed task
+  saw another task's values. Both run as real guest subroutines
+  through the same trampoline primitive library calls already use for
+  multi-phase operations.
+
+- **`timer.device`'s `SendIO`/`WaitIO`/`CheckIO`/`AbortIO` are real
+  and asynchronous** (issue #237) — `SendIO` used to block the whole
+  (single-threaded) runtime in a host sleep before returning, which
+  defeated the entire point of racing a timer against some other
+  signal in a later `Wait`. A pending request now returns immediately
+  and completes lazily — fired for real, via a real reply-port signal,
+  once its deadline passes or (the last-resort case) once every other
+  task is blocked and nothing else could possibly make progress first.
+
+- **`CreateNewProc`'s `NP_Input`/`NP_Output`/`NP_Error`/
+  `NP_CloseInput`/`NP_CloseOutput`/`NP_CloseError`/`NP_ConsoleTask`/
+  `NP_WindowPtr`/`NP_Arguments` tags implemented** (issue #237) — all
+  silently ignored before. The AmigaPorts libpthread thread model
+  passes the new thread's slot number through `NP_Input`, of all
+  things, and reads it straight back out of `pr_CIS`; ignoring the tag
+  left a new thread reading slot 0 instead, jumping to a NULL start
+  function and crash-landing on an unrelated internal address by sheer
+  coincidence. Each child's `Input()`/`Output()` now returns its own
+  `pr_CIS`/`pr_COS`, not always the main task's.
+
+- **`--cpu 68040` traps the FPU instructions real 68040 silicon lacks**
+  (issue #217) — `FSIN`/`FCOS`/`FETOX`/`FLOGN`/the other transcendentals,
+  plus `FINT`/`FINTRZ`/`FSCALE`, used to execute natively as if on a
+  68881, the same gap `--cpu 68060` already closed for its own
+  (differently composed) unimplemented set. `--fpsp-emulate` now covers
+  both models. Needed an `m68k` crate upgrade (to 0.16.0) that added the
+  analogous trap gate for `CpuType::M68040`.
+
+- **A full-codebase review turned up and fixed 11 real bugs**,
+  spanning memory-safety/host-DoS issues and scheduler/correctness
+  gaps: a hunk's declared size could overflow the allocation-size
+  computation in `LoadSeg` (tiny real allocation, but a zero-fill loop
+  that still walked the full, un-wrapped size — corrupting adjacent
+  heap memory); `Send`/`Recv`/`SendTo`/`RecvFrom`/`SendMsg`/`RecvMsg`
+  allocated a buffer sized directly from an unbounded guest length
+  (up to ~4 GiB on a single call); a `tc_Switch`/`tc_Launch` hook that
+  itself blocked or yielded could re-enter its own hook mid-flight;
+  unvalidated `HUNK_HEADER` fields could reserve tens of gigabytes
+  before a single byte of the real file was read; `ParsePattern`'s
+  recursion depth was unbounded on the pattern string's own length;
+  a pending `timer.device` request could outlive the memory it
+  pointed at; and a few smaller gaps (`Dup2Socket` bypassing the
+  socket-table cap, a file ≥4 GiB silently reporting the wrong size
+  instead of saturating, `OpenWindow` trusting an unvalidated
+  `Screen*`). None of these had been reported — found by reviewing the
+  codebase directly, each with a dedicated regression test.
+
+- **`CopyMem`/`CopyMemQuick` propagate `--sanitize-uninit` state
+  instead of reporting it** (issue #232) — a `realloc()`-style copy of
+  a half-filled buffer (how newlib/clib2's `memcpy`/`memmove` and
+  libnix's `CopyMem`-based `realloc` all work) used to report every
+  uninitialized source byte as a genuine violation and heal every
+  destination byte to valid regardless, burying real reports under as
+  many as ~26,000 benign hits in one benchmark run. The destination
+  now gets exactly the source's shadow state, `Uninit` included,
+  reported once per contiguous bad run rather than per byte.
+
+- **`IEEEDPFix`/`IEEESPFix` saturate a `NaN` by its sign, not to `0`**
+  — matching AROS's `mathieeedoubbas.library`/`mathieeesingbas.library`,
+  which look only at the exponent and sign and treat `NaN` the same as
+  any other out-of-range value. Found via a real Kickstart 3.1 report
+  (AmigaPorts/newlib-cygwin#43): soft-float `lround(NAN)` should be
+  `LONG_MAX`, not `0`.
+
+- **`--sanitize-uninit` no longer false-positives on the 68000/68010's
+  `MOVEM` dummy read** — the same class of issue as #223's `CLR` fix,
+  for memory-to-register `MOVEM`'s documented extra read-and-discard
+  of the word just past the last register loaded. `gcc`'s own
+  `movem.l (sp)+,...` epilogue hit this on almost every function with
+  a non-trivial frame; a real `libnix` target-tests run under `--cpu
+  68000` went from 17 of 21 tests failing to 0.
+
 ## 0.15
 
 - **`exec.library`'s `OpenLibrary` checks the requested version for
