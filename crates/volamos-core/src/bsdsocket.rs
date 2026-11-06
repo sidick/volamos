@@ -742,6 +742,20 @@ fn is_connect_in_progress(e: &std::io::Error) -> bool {
     }
 }
 
+/// Clamps a guest-supplied byte length to the guest's own address
+/// space size: no real guest buffer can ever be larger than all of
+/// guest memory, so anything above that is necessarily a bogus or
+/// hostile length register, not a legitimately huge real buffer.
+/// `Send`/`Recv`/`SendTo`/`RecvFrom`/`SendMsg`/`RecvMsg` all take a
+/// raw, unchecked 32-bit length straight from a guest register or
+/// `struct iovec`; without this, a single call with `len` near
+/// `u32::MAX` would try to allocate up to 4 GiB in one `vec![0u8; n]`,
+/// which aborts the whole host process on allocation failure (not a
+/// catchable panic).
+fn clamp_guest_len(mem: &dyn AddressSpace, len: u32) -> usize {
+    (len as usize).min(mem.len())
+}
+
 /// `send(sock, buf, len, flags)`. `D0` = bytes sent, or `-1` with
 /// `Errno()` set (`EAGAIN` if it would block).
 fn send_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -749,7 +763,7 @@ fn send_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     let buf_ptr = ctx.cpu.address_register(AddressRegister(0));
     let len = ctx.cpu.data_register(DataRegister(1));
 
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; clamp_guest_len(ctx.mem, len)];
     for (i, b) in buf.iter_mut().enumerate() {
         *b = ctx.mem.read_u8(buf_ptr.wrapping_add(i as u32));
     }
@@ -786,7 +800,7 @@ fn recv_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     let flags = ctx.cpu.data_register(DataRegister(2)) as i32;
     let peek = flags & MSG_PEEK != 0;
 
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; clamp_guest_len(ctx.mem, len)];
     let Some(result) = with_socket(ctx, fd, |socket| {
         if peek {
             socket.peek(as_uninit_slice(&mut buf))
@@ -822,7 +836,7 @@ fn sendto_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let to_ptr = ctx.cpu.address_register(AddressRegister(1));
     let to = read_sockaddr_in(ctx.mem, to_ptr);
 
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; clamp_guest_len(ctx.mem, len)];
     for (i, b) in buf.iter_mut().enumerate() {
         *b = ctx.mem.read_u8(buf_ptr.wrapping_add(i as u32));
     }
@@ -855,7 +869,7 @@ fn recvfrom_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let len = ctx.cpu.data_register(DataRegister(1));
     let addr_ptr = ctx.cpu.address_register(AddressRegister(1));
 
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; clamp_guest_len(ctx.mem, len)];
     let Some(result) = with_socket(ctx, fd, |socket| {
         socket.recv_from(as_uninit_slice(&mut buf))
     }) else {
@@ -907,6 +921,14 @@ const IOVEC_SIZE: u32 = 8;
 fn read_iovecs(mem: &dyn AddressSpace, msg_ptr: u32) -> Vec<(u32, u32)> {
     let iov_ptr = mem.read_u32(msg_ptr.wrapping_add(8));
     let iov_len = mem.read_u32(msg_ptr.wrapping_add(12));
+    // `iov_len` is a raw, unchecked guest register -- cap the number of
+    // entries walked to however many whole `struct iovec`s could even
+    // fit in guest memory, the same "can't be real" reasoning as
+    // clamp_guest_len's doc: an `msg_iovlen` claiming more entries than
+    // that is necessarily bogus, not a real scatter/gather list, and
+    // would otherwise drive an up-to-4-billion-iteration loop here.
+    let max_entries = mem.len() as u32 / IOVEC_SIZE;
+    let iov_len = iov_len.min(max_entries);
     (0..iov_len)
         .map(|i| {
             let entry = iov_ptr.wrapping_add(i * IOVEC_SIZE);
@@ -925,6 +947,7 @@ fn sendmsg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
 
     let mut buf = Vec::new();
     for (base, len) in read_iovecs(ctx.mem, msg_ptr) {
+        let len = clamp_guest_len(ctx.mem, len) as u32;
         for i in 0..len {
             buf.push(ctx.mem.read_u8(base.wrapping_add(i)));
         }
@@ -959,8 +982,14 @@ fn recvmsg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let msg_ptr = ctx.cpu.address_register(AddressRegister(0));
 
     let iovecs = read_iovecs(ctx.mem, msg_ptr);
-    let total_len: u32 = iovecs.iter().map(|&(_, len)| len).sum();
-    let mut buf = vec![0u8; total_len as usize];
+    // Saturating, not a plain `.sum()`: each individual `len` is already
+    // capped by `read_iovecs`' own entry-count cap to fit in guest
+    // memory, but enough entries could still sum past `u32::MAX` --
+    // saturate rather than silently wrapping to a too-small total.
+    let total_len: u32 = iovecs
+        .iter()
+        .fold(0u32, |acc, &(_, len)| acc.saturating_add(len));
+    let mut buf = vec![0u8; clamp_guest_len(ctx.mem, total_len)];
 
     let Some(result) = with_socket(ctx, fd, |socket| socket.recv(as_uninit_slice(&mut buf))) else {
         return Ok(());
@@ -2684,6 +2713,27 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     };
     let src_listener = entry.is_listener;
     let src_connected = entry.connected;
+
+    let id = if new_fd < 0 {
+        ctx.bsdsocket.next_id
+    } else {
+        new_fd
+    };
+    // Only a genuinely new table entry needs the cap -- real dup2(2)
+    // reusing an already-open newfd implicitly closes and replaces it
+    // (the HashMap::insert below does that for free via SocketEntry's
+    // Drop), which doesn't grow the table. socket_handler/accept_handler
+    // enforce this same cap on every path that does grow it; this one
+    // didn't, letting a guest looping on Dup2Socket(old, -1) grow the
+    // real, open-host-fd table without bound.
+    if !ctx.bsdsocket.sockets.contains_key(&id)
+        && ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize
+    {
+        ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
+        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+        return Ok(());
+    }
+
     let dup = match entry.socket.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -2694,16 +2744,11 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         }
     };
 
-    let id = if new_fd < 0 {
-        let id = ctx.bsdsocket.next_id;
+    if new_fd < 0 {
         ctx.bsdsocket.next_id = ctx.bsdsocket.next_id.wrapping_add(1).max(1);
-        id
-    } else {
-        if new_fd >= ctx.bsdsocket.next_id {
-            ctx.bsdsocket.next_id = new_fd.wrapping_add(1).max(1);
-        }
-        new_fd
-    };
+    } else if new_fd >= ctx.bsdsocket.next_id {
+        ctx.bsdsocket.next_id = new_fd.wrapping_add(1).max(1);
+    }
     // A dup shares the underlying connection's state -- carry the
     // lifecycle flags over so event classification treats it like the
     // original (see SocketEntry::connected's doc).
@@ -2909,6 +2954,24 @@ mod tests {
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
     use crate::dispatch::{BSDSOCKET_LIBRARY_BASE, Runtime, StartConfig};
     use crate::memory::FlatMemory;
+
+    #[test]
+    fn clamp_guest_len_caps_at_the_address_space_size() {
+        // Code review finding: Send/Recv/SendTo/RecvFrom/SendMsg/
+        // RecvMsg all took a raw, unchecked guest length and allocated
+        // a Vec sized directly from it -- a length near u32::MAX would
+        // try to allocate up to 4 GiB in one call, aborting the host
+        // process on allocation failure. No real guest buffer can be
+        // larger than all of guest memory, so that's the natural cap.
+        let mem = FlatMemory::new(0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, 100), 100);
+        assert_eq!(clamp_guest_len(&mem, 0x1_0000), 0x1_0000);
+        assert_eq!(
+            clamp_guest_len(&mem, u32::MAX),
+            0x1_0000,
+            "must clamp to the address space's own size, not try to allocate ~4 GiB"
+        );
+    }
 
     fn load_words<M: AddressSpace>(mem: &mut M, addr: u32, words: &[u16]) {
         let mut offset = addr;

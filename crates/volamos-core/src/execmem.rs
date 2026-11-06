@@ -353,6 +353,13 @@ fn free_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let recorded = ctx.heap.size_of_live_alloc(addr);
     match recorded {
         Some(actual) if actual == rounded => {
+            // A still-pending SendIO(TR_ADDREQUEST) tracks its
+            // timerequest only by this exact address; a guest freeing
+            // it without AbortIO/WaitIO first would otherwise leave a
+            // dangling PendingTimers entry that later fires against
+            // whatever unrelated data a future allocation reuses this
+            // address for (see PendingTimer::owner_task's doc).
+            ctx.timers.remove(addr);
             // Before the free, while the extent is still queryable --
             // see `poison_freed_block`'s doc comment.
             poison_freed_block(ctx, addr);

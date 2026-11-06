@@ -357,7 +357,28 @@ pub(crate) fn build_seglist(
     // address and its payload address (alloc + SEG_HEADER_SIZE).
     let mut alloc_addrs: Vec<u32> = Vec::with_capacity(file.hunks.len());
     for hunk in &file.hunks {
-        let total = SEG_HEADER_SIZE.wrapping_add(hunk.reserved_size as u32);
+        // Checked, not wrapping: a hunk's declared `reserved_size` comes
+        // straight from the file's own (attacker-controllable) header
+        // size table, unbounded above beyond fitting in a u32 longword
+        // count. A wrapping add here would allocate far too little
+        // while the zero-fill loop below still walks the full,
+        // un-wrapped `reserved_size` -- corrupting whatever heap
+        // allocation happens to sit after the real, tiny block. Treat
+        // an overflow exactly like "doesn't fit": there is no amount of
+        // real guest RAM that could satisfy a request this large
+        // anyway.
+        let Some(total) = u64::from(SEG_HEADER_SIZE)
+            .checked_add(hunk.reserved_size as u64)
+            .and_then(|total| u32::try_from(total).ok())
+        else {
+            for &addr in &alloc_addrs {
+                let _ = heap.free(addr);
+            }
+            return Err(GuestHeapError::OutOfMemory {
+                requested: u32::MAX,
+                available: 0,
+            });
+        };
         match heap.alloc(&mut *mem, total) {
             Ok(addr) => alloc_addrs.push(addr),
             Err(e) => {
@@ -735,7 +756,18 @@ impl DosState {
         // fresh 0-indexed array).
         let mut alloc_addrs: Vec<u32> = Vec::with_capacity(node.hunks.len());
         for hunk in &node.hunks {
-            let total = SEG_HEADER_SIZE.wrapping_add(hunk.reserved_size as u32);
+            // Checked, not wrapping -- see build_seglist's matching
+            // check for why an overflowing declared size must fail
+            // cleanly here rather than under-allocating.
+            let Some(total) = u64::from(SEG_HEADER_SIZE)
+                .checked_add(hunk.reserved_size as u64)
+                .and_then(|total| u32::try_from(total).ok())
+            else {
+                for &addr in &alloc_addrs {
+                    let _ = heap.free(addr);
+                }
+                return Err(ERROR_NO_FREE_STORE);
+            };
             match heap.alloc(&mut *mem, total) {
                 Ok(addr) => alloc_addrs.push(addr),
                 Err(_) => {
@@ -1408,6 +1440,38 @@ mod tests {
 
         // Payload content: moveq #0,d0 ; rts.
         assert_eq!(mem.read_u32(payload_addr), 0x7000_4E75);
+    }
+
+    #[test]
+    fn build_seglist_rejects_a_reserved_size_that_overflows_the_allocation_total() {
+        // Code review finding: a hunk's reserved_size (parsed straight
+        // from the file's own, unvalidated header size field) could be
+        // large enough that SEG_HEADER_SIZE + reserved_size overflows
+        // u32. This must fail cleanly as OutOfMemory -- not wrap to a
+        // tiny real allocation while some other code path still walks
+        // the full, un-wrapped reserved_size (which used to corrupt
+        // unrelated heap memory and hang on the write loop).
+        let file = HunkFile {
+            hunks: vec![loader::Hunk {
+                kind: loader::HunkKind::Bss,
+                data: Vec::new(),
+                reserved_size: u32::MAX as usize,
+                relocs: Vec::new(),
+                debug_blocks: Vec::new(),
+                symbol_blocks: Vec::new(),
+            }],
+            overlay: None,
+        };
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+
+        let err = build_seglist(&file, &mut heap, &mut mem).expect_err(
+            "a reserved_size this large must be rejected, not silently under-allocated",
+        );
+        assert!(
+            matches!(err, GuestHeapError::OutOfMemory { .. }),
+            "expected OutOfMemory, got {err:?}"
+        );
     }
 
     #[test]

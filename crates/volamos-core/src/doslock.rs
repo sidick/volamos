@@ -611,7 +611,7 @@ impl DosState {
         let display_name = own_display_name(&amiga_path);
         let meta = std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
         let is_dir = meta.is_dir();
-        let size = if is_dir { 0 } else { meta.len() as u32 };
+        let size = if is_dir { 0 } else { fib_size(meta.len()) };
         fill_fib(mem, fib_addr, &display_name, is_dir, size, &host_path);
         Ok(())
     }
@@ -906,7 +906,7 @@ impl DosState {
 
         let meta = std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
         let is_dir = meta.is_dir();
-        let size = if is_dir { 0 } else { meta.len() as u32 };
+        let size = if is_dir { 0 } else { fib_size(meta.len()) };
         fill_fib(mem, fib_addr, &display_name, is_dir, size, &host_path);
 
         if is_dir {
@@ -954,7 +954,7 @@ impl DosState {
         let entry_path = host_path.join(&name);
         let meta = std::fs::metadata(&entry_path).map_err(|e| map_io_error(&e))?;
         let is_dir = meta.is_dir();
-        let size = if is_dir { 0 } else { meta.len() as u32 };
+        let size = if is_dir { 0 } else { fib_size(meta.len()) };
         fill_fib(mem, fib_addr, &name, is_dir, size, &entry_path);
         Ok(())
     }
@@ -1008,6 +1008,18 @@ pub(crate) fn sorted_dir_entries(host_path: &Path) -> Result<Vec<String>, i32> {
     }
     names.sort();
     Ok(names)
+}
+
+/// Clamps a host file's real `u64` length to `fib_Size`'s `u32` field.
+/// `fib_Size` is a 32-bit field on real AmigaOS too, so this mirrors a
+/// genuine hardware limitation rather than inventing a new one -- but
+/// a plain `as u32` truncation (rather than a clamp) silently *wraps*:
+/// a 4 GiB + 10 byte host file would report a `fib_Size` of 10, an
+/// arbitrary, wrong, and typically much *smaller* value that could
+/// mislead `Copy`/`List`/any size-checking guest logic far more than
+/// real AmigaOS's own honest "too big to represent" failure mode.
+fn fib_size(host_len: u64) -> u32 {
+    host_len.min(u32::MAX as u64) as u32
 }
 
 /// The "own name" of a lock's target, for `Examine`: the last component
@@ -1529,6 +1541,22 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn fib_size_clamps_rather_than_wrapping() {
+        // Code review finding: a plain `as u32` truncation silently
+        // wraps a >=4GiB host file's real length into an arbitrary,
+        // wrong, often much-smaller fib_Size -- clamping to u32::MAX
+        // is honest about the real 32-bit-field limitation instead.
+        assert_eq!(fib_size(0), 0);
+        assert_eq!(fib_size(100), 100);
+        assert_eq!(fib_size(u32::MAX as u64), u32::MAX);
+        assert_eq!(
+            fib_size(u32::MAX as u64 + 10),
+            u32::MAX,
+            "must clamp, not wrap to 10"
+        );
+    }
 
     /// A unique temp directory, cleaned up on drop.
     struct TempDir {

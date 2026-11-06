@@ -172,6 +172,21 @@ pub struct TaskScheduler {
     /// method's doc and [`Self::commit`]'s for why the two can
     /// disagree for a while (issue #237's `tc_Switch`).
     pending_restore: Option<(u32, TaskRecord)>,
+    /// Set for the whole duration of a `tc_Switch`/`tc_Launch`
+    /// trampoline (issue #237) -- see [`Self::begin_switch_hook`]'s doc
+    /// for why: a guest `tc_Switch`/`tc_Launch` routine is documented
+    /// as an ordinary subroutine that may make further library calls,
+    /// but [`Self::current`] deliberately lags the real switch decision
+    /// for exactly as long as one of these runs, which means a second,
+    /// nested switch decision staged while this is set (the routine
+    /// itself calling `Wait` and blocking, or `Permit`/`SetTaskPri` and
+    /// yielding) would re-read the *same* outgoing task's still-set
+    /// `TF_SWITCH` and re-enter its `tc_Switch` a second time, mid-
+    /// flight, corrupting the continuation stack and the eventual
+    /// commit. Checked (and refused) by [`Self::block_current_on_signal`]/
+    /// [`Self::yield_to_ready`]/[`Self::terminate_current`] instead of
+    /// letting that happen.
+    switch_hook_active: bool,
     /// Set by [`Self::request_yield`] (`Permit`/`SetTaskPri`'s
     /// handlers), taken by [`Self::take_yield_request`]. Deliberately
     /// a flag rather than having those handlers call
@@ -194,6 +209,7 @@ impl TaskScheduler {
             current: main_task,
             others: BTreeMap::new(),
             pending_restore: None,
+            switch_hook_active: false,
             yield_requested: false,
         }
     }
@@ -253,6 +269,20 @@ impl TaskScheduler {
     /// must stay correct for its whole duration).
     pub fn commit(&mut self, next: u32) {
         self.current = next;
+    }
+
+    /// Marks a `tc_Switch`/`tc_Launch` trampoline as in flight -- see
+    /// [`Self::switch_hook_active`]'s doc. Call before trampolining
+    /// into either hook; pair with [`Self::end_switch_hook`] once its
+    /// own completion continuation actually runs (the hook's guest code
+    /// has, by then, fully returned).
+    pub fn begin_switch_hook(&mut self) {
+        self.switch_hook_active = true;
+    }
+
+    /// Clears what [`Self::begin_switch_hook`] set.
+    pub fn end_switch_hook(&mut self) {
+        self.switch_hook_active = false;
     }
 
     /// Whether `task` is a known *non-running* task (created via
@@ -340,6 +370,13 @@ impl TaskScheduler {
         pc: u32,
         wait_mask: u32,
     ) -> Result<(), Deadlock> {
+        // See `switch_hook_active`'s doc: a `tc_Switch`/`tc_Launch`
+        // hook calling `Wait` and blocking here would re-enter the
+        // trampoline mid-flight for the same outgoing task. Refuse
+        // exactly like "nothing else is ready" rather than risk that.
+        if self.switch_hook_active {
+            return Err(Deadlock);
+        }
         let Some(next) = self.pick_ready(mem) else {
             return Err(Deadlock);
         };
@@ -422,6 +459,11 @@ impl TaskScheduler {
     /// [`Self::take_pending_restore`] either way (empty if this
     /// returned `false`).
     pub fn yield_to_ready<C: Cpu, M: AddressSpace>(&mut self, cpu: &C, mem: &M) -> bool {
+        // See `switch_hook_active`'s doc -- same reasoning as
+        // `block_current_on_signal`'s matching check.
+        if self.switch_hook_active {
+            return false;
+        }
         let Some(next) = self.pick_ready(mem) else {
             return false;
         };
@@ -468,6 +510,11 @@ impl TaskScheduler {
     /// short-lived CLI run, not a long-lived server spawning threads
     /// indefinitely), a harmless one-time leak.
     pub fn terminate_current<M: AddressSpace>(&mut self, mem: &M) -> Result<(), Deadlock> {
+        // See `switch_hook_active`'s doc -- same reasoning as
+        // `block_current_on_signal`'s matching check.
+        if self.switch_hook_active {
+            return Err(Deadlock);
+        }
         let Some(next) = self.pick_ready(mem) else {
             return Err(Deadlock);
         };
@@ -483,5 +530,87 @@ impl TaskScheduler {
         // so `current()` must keep reporting it until that's run.
         self.pending_restore = Some((next, next_record));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::M68kCpu;
+    use crate::memory::FlatMemory;
+
+    fn zero_snapshot() -> RegisterSnapshot {
+        RegisterSnapshot {
+            d: [0; 8],
+            a: [0; 8],
+            pc: 0,
+            sr: 0,
+        }
+    }
+
+    #[test]
+    fn switch_hook_active_refuses_block_current_on_signal_even_with_a_ready_task() {
+        // Code review finding: without this guard, a tc_Switch/
+        // tc_Launch hook (itself an ordinary subroutine that may call
+        // Wait) calling Wait() and finding another Ready task would
+        // stage a second, nested switch decision while current()
+        // still lags the first one -- the caller would then re-read
+        // the same outgoing task's still-set TF_SWITCH and re-enter
+        // its tc_Switch a second time, mid-flight. The guard must
+        // refuse exactly as if nothing were ready, leaving the
+        // already-Ready task completely untouched.
+        let main = 0x1000;
+        let other = 0x2000;
+        let mut tasks = TaskScheduler::new(main);
+        let mem = FlatMemory::new(0x4000);
+        let cpu = M68kCpu::new();
+        tasks.spawn_ready(other, zero_snapshot(), 0, 0x1000);
+
+        tasks.begin_switch_hook();
+        assert_eq!(
+            tasks.block_current_on_signal(&cpu, &mem, 0, 1),
+            Err(Deadlock),
+            "must refuse while a switch hook is in flight, even though `other` is Ready"
+        );
+        assert!(
+            tasks.others.contains_key(&other),
+            "the Ready task must be left completely untouched by the refused attempt"
+        );
+        assert!(
+            !tasks.has_pending_switch(),
+            "a refused attempt must not stage a switch"
+        );
+
+        tasks.end_switch_hook();
+        assert!(
+            tasks.block_current_on_signal(&cpu, &mem, 0, 1).is_ok(),
+            "must work normally again once the hook finishes"
+        );
+    }
+
+    #[test]
+    fn switch_hook_active_refuses_yield_to_ready_and_terminate_current() {
+        // Same guard, the other two switch-staging entry points.
+        let main = 0x1000;
+        let other = 0x2000;
+        let mem = FlatMemory::new(0x4000);
+        let cpu = M68kCpu::new();
+
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(other, zero_snapshot(), 0, 0x1000);
+        tasks.begin_switch_hook();
+        assert!(
+            !tasks.yield_to_ready(&cpu, &mem),
+            "yield_to_ready must refuse while a switch hook is in flight"
+        );
+
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(other, zero_snapshot(), 0, 0x1000);
+        tasks.begin_switch_hook();
+        assert_eq!(
+            tasks.terminate_current(&mem),
+            Err(Deadlock),
+            "terminate_current must refuse while a switch hook is in flight"
+        );
     }
 }

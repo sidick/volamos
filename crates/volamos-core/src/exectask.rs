@@ -1060,6 +1060,11 @@ pub(crate) fn task_exit_stub_handler<C: Cpu>(
                 .close(ctx.heap, crate::guestmem::addr_from_bptr(bptr));
         }
     }
+    // Abandon this task's own still-pending TR_ADDREQUESTs rather than
+    // letting them fire later against an ioreq address this task's own
+    // exit may leave free for the heap to hand out again -- see
+    // PendingTimer::owner_task's doc.
+    ctx.timers.remove_owned_by(task);
     loop {
         if ctx.tasks.terminate_current(ctx.mem).is_ok() {
             return Ok(());
@@ -1763,6 +1768,14 @@ pub struct PendingTimers {
 struct PendingTimer {
     ioreq: u32,
     deadline: std::time::Instant,
+    /// The task that `SendIO`'d this request -- used to drop it
+    /// without completing it if that task exits (falls off its
+    /// `NP_Entry`) while it's still pending, matching real
+    /// `timer.device` abandoning in-flight requests when their owning
+    /// process dies. Without this, a since-removed, possibly-reused
+    /// `ioreq` address would otherwise still fire and write through it
+    /// (see [`complete_timer_request`]'s callers).
+    owner_task: u32,
 }
 
 impl Default for PendingTimers {
@@ -1779,9 +1792,29 @@ impl PendingTimers {
     }
 
     /// Registers `ioreq` (a `TR_ADDREQUEST` request already past
-    /// `SendIO`'s normal validation) as due at `deadline`.
-    fn push(&mut self, ioreq: u32, deadline: std::time::Instant) {
-        self.entries.push(PendingTimer { ioreq, deadline });
+    /// `SendIO`'s normal validation) as due at `deadline`, owned by
+    /// `owner_task`. Replaces (not duplicates) any still-pending entry
+    /// for the same `ioreq`: a guest re-`SendIO`ing a request it never
+    /// `WaitIO`/`CheckIO`/`AbortIO`'d is a guest bug, but shouldn't
+    /// leave two entries that would otherwise both complete and
+    /// double-link the same message `Node` onto its reply port
+    /// (`put_msg_impl`'s `AddTail`, called twice on one node, corrupts
+    /// that list).
+    fn push(&mut self, ioreq: u32, deadline: std::time::Instant, owner_task: u32) {
+        self.remove(ioreq);
+        self.entries.push(PendingTimer {
+            ioreq,
+            deadline,
+            owner_task,
+        });
+    }
+
+    /// Removes (without completing) every entry owned by `task` --
+    /// real `timer.device` abandons a process's in-flight requests
+    /// when it dies rather than delivering them into memory it no
+    /// longer owns. Called from [`task_exit_stub_handler`].
+    fn remove_owned_by(&mut self, task: u32) {
+        self.entries.retain(|e| e.owner_task != task);
     }
 
     /// Whether `ioreq` is still pending (not yet completed) -- used by
@@ -1792,8 +1825,11 @@ impl PendingTimers {
 
     /// Removes `ioreq` without completing it (real `AbortIO`'s
     /// contract: cancel, don't deliver). Returns whether it was
-    /// actually still pending.
-    fn remove(&mut self, ioreq: u32) -> bool {
+    /// actually still pending. `pub(crate)` rather than private: also
+    /// called from `execmem::free_mem_handler` to drop a still-pending
+    /// request whose backing memory is being freed out from under it
+    /// (see that call site's doc).
+    pub(crate) fn remove(&mut self, ioreq: u32) -> bool {
         let before = self.entries.len();
         self.entries.retain(|e| e.ioreq != ioreq);
         self.entries.len() != before
@@ -1981,6 +2017,7 @@ fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
         ctx.timers.push(
             ioreq,
             std::time::Instant::now() + std::time::Duration::from_millis(millis),
+            ctx.current_task,
         );
         return Ok(());
     }
@@ -4044,6 +4081,61 @@ mod tests {
             "should resolve well within a couple of seconds for a 50ms request -- \
              took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn pending_timers_push_replaces_a_duplicate_ioreq_without_double_linking() {
+        // Code review finding: SendIO on an ioreq that's still pending
+        // (never WaitIO/CheckIO/AbortIO'd) used to add a second
+        // PendingTimer entry for the same address. Both would
+        // eventually fire and double-link the same message Node onto
+        // its reply port. push must replace, not duplicate.
+        let mut timers = PendingTimers::new();
+        let deadline1 = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        timers.push(0x1500, deadline1, 0x1000);
+        timers.push(0x1500, deadline2, 0x1000);
+        assert_eq!(
+            timers.entries.len(),
+            1,
+            "push must replace, not duplicate, a still-pending ioreq"
+        );
+    }
+
+    #[test]
+    fn pending_timers_remove_owned_by_drops_only_the_exiting_tasks_entries() {
+        // Code review finding: a task falling off its NP_Entry while
+        // it still had a pending SendIO left that entry dangling,
+        // tracked only by the raw ioreq address -- liable to fire
+        // later against whatever a future allocation reuses that
+        // address for. task_exit_stub_handler now drops its own
+        // task's entries without completing them; a different task's
+        // entries must be left alone.
+        let mut timers = PendingTimers::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        timers.push(0x1500, deadline, 0x1000);
+        timers.push(0x1600, deadline, 0x2000);
+        timers.remove_owned_by(0x1000);
+        assert!(
+            !timers.contains(0x1500),
+            "the exiting task's own entry must be dropped"
+        );
+        assert!(
+            timers.contains(0x1600),
+            "a different task's entry must be untouched"
+        );
+    }
+
+    #[test]
+    fn pending_timers_remove_drops_a_still_pending_entry_by_exact_address() {
+        // The same primitive FreeMem now calls (execmem::
+        // free_mem_handler) so a still-pending SendIO's backing memory
+        // being freed doesn't leave a dangling PendingTimers entry.
+        let mut timers = PendingTimers::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        timers.push(0x1500, deadline, 0x1000);
+        assert!(timers.remove(0x1500));
+        assert!(!timers.contains(0x1500));
     }
 
     #[test]

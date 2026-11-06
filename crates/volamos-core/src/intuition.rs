@@ -380,11 +380,19 @@ fn open_window_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let requested_screen = ctx.mem.read_u32(new_window + NW_SCREEN);
 
     let default_screen = ensure_default_screen(ctx.intuition, ctx.heap, ctx.mem);
-    let wscreen = if requested_screen == 0 {
-        default_screen
-    } else {
-        requested_screen
-    };
+    // This runtime only ever has the one real screen -- see this
+    // function's own doc ("must be the default screen -- there is no
+    // other"). A non-zero NewWindow.Screen that isn't *that* address
+    // is necessarily a stray/uninitialized pointer, not a second real
+    // screen: trusting it blindly would compute RastPort.BitMap as
+    // garbage_pointer + SCR_BITMAP and hand back a Window built on it.
+    // Fail the same clean way every other allocation failure in this
+    // handler already does, rather than silently misusing it.
+    if requested_screen != 0 && requested_screen != default_screen {
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+    let wscreen = default_screen;
 
     let Ok(window) = ctx.heap.alloc(&mut *ctx.mem, WINDOW_SIZE) else {
         ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -780,6 +788,53 @@ mod tests {
         assert_ne!(user_port, 0);
         assert_eq!(rt.memory().read_u16(window + WIN_WIDTH), 100);
         assert_eq!(rt.memory().read_u16(window + WIN_HEIGHT), 50);
+    }
+
+    #[test]
+    fn end_to_end_open_window_rejects_a_stray_screen_pointer() {
+        // Code review finding: NewWindow.Screen used to be trusted
+        // blindly whenever non-zero. This runtime only ever has the
+        // one real default screen (see open_window_handler's own
+        // doc), so a non-zero value that isn't that exact address is
+        // necessarily a stray/uninitialized guest pointer, not a
+        // second real screen -- OpenWindow must fail cleanly (D0 = 0),
+        // not compute RastPort.BitMap from garbage.
+        let nw_addr: u32 = 0x1_8000;
+        let words = [
+            move_imm_to_a(0), // A0 = &NewWindow
+            (nw_addr >> 16) as u16,
+            nw_addr as u16,
+        ];
+        let mut full = movea_intuition_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        full.extend_from_slice(&jsr_disp16_a6(-204)); // OpenWindow -> D0
+        full.push(RTS);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &full);
+        mem.write_u16(nw_addr + NW_WIDTH, 100);
+        mem.write_u16(nw_addr + NW_HEIGHT, 50);
+        // A plausible-looking but entirely stray guest address -- not
+        // the real default screen, not NULL.
+        mem.write_u32(nw_addr + NW_SCREEN, 0xDEAD_BEEF);
+        let load_end = entry + 0x400;
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0,
+            "OpenWindow must reject a Screen pointer that isn't the real default screen"
+        );
     }
 
     #[test]

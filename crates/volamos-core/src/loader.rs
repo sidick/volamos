@@ -963,6 +963,18 @@ impl<'a> Reader<'a> {
         Self { bytes, pos: 0 }
     }
 
+    /// Bytes left unread -- used to validate a count read from the file
+    /// (a hunk-size-table length, an overlay-table length, ...) against
+    /// what could possibly still be present, *before* sizing a `Vec`
+    /// from it. Without this, a single crafted header field near
+    /// `u32::MAX` can request tens of gigabytes via `Vec::with_capacity`
+    /// and abort the host process on allocation failure, long before
+    /// the actual per-entry reads below would otherwise fail cleanly
+    /// with `UnexpectedEof`.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
     fn read_u32(&mut self) -> Result<u32, LoadError> {
         let end = self.pos.checked_add(4).ok_or(LoadError::UnexpectedEof)?;
         let slice = self
@@ -1139,6 +1151,15 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
     // one entry for its one hunk despite `table_size` naming the whole
     // tree's hunk count.
     let n_sizes = last_hunk - first_hunk + 1;
+    // Each entry is a 4-byte size word -- reject up front if the file
+    // couldn't possibly still hold `n_sizes` of them, rather than
+    // reserving `Vec::with_capacity(n_sizes)` first (see `Reader::
+    // remaining`'s doc for why that matters: `table_size` is an
+    // unvalidated file field that can be far larger than this file
+    // actually is).
+    if n_sizes > r.remaining() / 4 {
+        return Err(LoadError::UnexpectedEof);
+    }
     let mut declared_sizes = Vec::with_capacity(n_sizes);
     for _ in 0..n_sizes {
         let raw = r.read_u32()?;
@@ -1406,6 +1427,12 @@ pub fn parse(bytes: &[u8]) -> Result<HunkFile, LoadError> {
         // on-disk convention (see the module docs), confirmed against a
         // real overlay executable's raw bytes.
         let l = r.read_u32()? as usize;
+        // Same reasoning as the hunk-size-table check above: validate
+        // against what's actually left in the file before reserving
+        // capacity for it.
+        if l.checked_add(1).is_none_or(|n| n > r.remaining() / 4) {
+            return Err(LoadError::UnexpectedEof);
+        }
         let mut raw = Vec::with_capacity(l + 1);
         for _ in 0..=l {
             raw.push(r.read_u32()?);
@@ -2253,6 +2280,27 @@ mod tests {
         push_u32(&mut buf, 0);
         push_u32(&mut buf, 0);
         // Missing the size table entry and everything after it.
+        let err = parse(&buf).unwrap_err();
+        assert_eq!(err, LoadError::UnexpectedEof);
+    }
+
+    #[test]
+    fn rejects_a_huge_table_size_instead_of_reserving_a_huge_vec() {
+        // Code review finding: table_size (and so the hunk-size-table
+        // length derived from it) comes straight from this file field,
+        // unvalidated against the file's actual length. A tiny file
+        // declaring a huge table_size used to reserve a multi-gigabyte
+        // Vec::with_capacity before ever reading a single size entry --
+        // this must fail cleanly as UnexpectedEof instead, well before
+        // that allocation.
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0x3FFF_FFFF); // table_size: huge
+        push_u32(&mut buf, 0); // first_hunk
+        push_u32(&mut buf, 0x3FFF_FFFE); // last_hunk: also huge, but < table_size
+        // File ends here -- nowhere near enough bytes for that many
+        // size-table entries.
         let err = parse(&buf).unwrap_err();
         assert_eq!(err, LoadError::UnexpectedEof);
     }

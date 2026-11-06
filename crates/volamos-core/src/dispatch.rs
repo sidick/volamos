@@ -2448,7 +2448,13 @@ fn commit_task_switch<C: Cpu + 'static>(
     if incoming_flags & exectask::TF_LAUNCH != 0 {
         let tc_launch = mem.read_u32(next + exectask::TC_LAUNCH_OFFSET);
         if tc_launch != 0 {
+            // See `TaskScheduler::switch_hook_active`'s doc: guarded for
+            // the same reason as `tc_Switch`'s own trampoline below,
+            // just for the incoming task's hook instead of the
+            // outgoing one's.
+            tasks.begin_switch_hook();
             continuations.trampoline_now(cpu, mem, tc_launch, move |ctx| {
+                ctx.tasks.end_switch_hook();
                 crate::cpu::restore(ctx.cpu, &snapshot);
                 Ok(())
             });
@@ -3450,11 +3456,19 @@ impl<C: Cpu + 'static> Runtime<C> {
         if outgoing_flags & exectask::TF_SWITCH != 0 {
             let tc_switch = self.mem.read_u32(outgoing + exectask::TC_SWITCH_OFFSET);
             if tc_switch != 0 {
+                // See `TaskScheduler::switch_hook_active`'s doc: without
+                // this, the outgoing task's `tc_Switch` itself calling
+                // something that blocks/yields (`Wait`, or `Permit`
+                // after `Forbid`+`SFB_SAR`) would re-read this same
+                // still-set `TF_SWITCH` and re-enter `tc_Switch` a
+                // second time, mid-flight.
+                self.tasks.begin_switch_hook();
                 self.continuations.trampoline_now(
                     &mut self.cpu,
                     &mut self.mem,
                     tc_switch,
                     move |ctx| {
+                        ctx.tasks.end_switch_hook();
                         commit_task_switch(ctx.cpu, ctx.mem, ctx.tasks, ctx.continuations, pending);
                         Ok(())
                     },

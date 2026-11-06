@@ -257,8 +257,26 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Bounds how long a pattern this module will even attempt to parse.
+/// Both the recursive-descent parser (one stack frame per nesting
+/// level of `(...)`/`[...]`) and the continuation-passing matcher
+/// (`match_seq` recurses once per node in a flat sequence, so even a
+/// *flat*, unnested pattern recurses proportionally to its own length)
+/// have recursion depth bounded by the source length, with no other
+/// limit -- a guest-supplied pattern string (read via `read_c_string`,
+/// itself uncapped) could otherwise drive either one to a host stack
+/// overflow well before any real Amiga filename-length pattern would
+/// ever need to be this long. Generous on purpose (no real pattern
+/// comes remotely close): matches `MAX_DPATH`, UAE's own established
+/// "clearly larger than any real path/pattern, small enough to bound
+/// recursion" convention (see `crate::uaedebug::MAX_DPATH`'s doc).
+const MAX_PATTERN_LEN: usize = 4096;
+
 /// Parses `source` into a [`Node`] tree, returning `(node, has_wildcard)`.
 pub(crate) fn parse(source: &[u8]) -> Result<(Node, bool), i32> {
+    if source.len() > MAX_PATTERN_LEN {
+        return Err(ERROR_LINE_TOO_LONG);
+    }
     let mut parser = Parser::new(source);
     let node = parser.parse_top()?;
     Ok((node, parser.has_wildcard))
@@ -857,6 +875,24 @@ mod tests {
         assert_eq!(parse(b"a)").unwrap_err(), ERROR_BAD_TEMPLATE);
         assert_eq!(parse(b"a|b").unwrap_err(), ERROR_BAD_TEMPLATE);
         assert_eq!(parse(b"[a-").unwrap_err(), ERROR_BAD_TEMPLATE);
+    }
+
+    #[test]
+    fn rejects_a_pattern_longer_than_max_pattern_len() {
+        // Code review finding: both the recursive-descent parser and
+        // the continuation-passing matcher (match_seq especially --
+        // one recursion level per node, even in a flat, unnested
+        // pattern) have recursion depth proportional to the pattern's
+        // own length, with no other limit. A guest-supplied pattern
+        // far longer than any real Amiga filename/pattern could
+        // otherwise drive a host stack overflow.
+        let too_long = vec![b'a'; MAX_PATTERN_LEN + 1];
+        assert_eq!(parse(&too_long).unwrap_err(), ERROR_LINE_TOO_LONG);
+
+        // Exactly at the limit must still parse fine -- this is a
+        // length cap, not a tighter-than-documented one.
+        let at_limit = vec![b'a'; MAX_PATTERN_LEN];
+        assert!(parse(&at_limit).is_ok());
     }
 
     #[test]
