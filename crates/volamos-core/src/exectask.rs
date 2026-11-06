@@ -1833,23 +1833,39 @@ impl PendingTimers {
         }
     }
 
-    /// Fires the single earliest-due pending request regardless of
-    /// whether its deadline has actually passed -- [`wait_handler`]'s
+    /// Fires the single earliest-due pending request -- [`wait_handler`]'s
     /// last resort when every task is blocked and a pending timer is
     /// the only event left that could ever unblock anything: in a
-    /// single-process cooperative model, refusing to fire it early
+    /// single-process cooperative model, refusing to fire it eventually
     /// doesn't make the wait any more "real", it only turns an elapsed
     /// timer into a permanent deadlock. Returns whether anything was
     /// fired.
+    ///
+    /// Sleeps for real, synchronously, until the deadline first if it
+    /// hasn't actually passed yet -- found missing by codewiz while
+    /// testing #237's fixes: firing instantly regardless of the real
+    /// deadline made a 0.3s timed wait measure 0.00s elapsed whenever
+    /// nothing else was ever going to be `Ready` (the common case for
+    /// a single pthread using a timed wait as a plain delay). This is
+    /// safe here specifically *because* this is the last-resort path:
+    /// by construction, nothing else could possibly make progress
+    /// while this sleeps anyway (every other task is blocked, or there
+    /// never was another task) -- the same reasoning that already
+    /// makes [`do_io_handler`]'s synchronous sleep correct for `DoIO`.
     fn fire_earliest<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) -> bool {
-        let Some((idx, _)) = self
+        let Some((idx, deadline)) = self
             .entries
             .iter()
             .enumerate()
-            .min_by_key(|(_, e)| e.deadline)
+            .map(|(i, e)| (i, e.deadline))
+            .min_by_key(|&(_, deadline)| deadline)
         else {
             return false;
         };
+        let now = std::time::Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        }
         let entry = self.entries.remove(idx);
         complete_timer_request(mem, tasks, entry.ioreq);
         true
@@ -2285,7 +2301,7 @@ pub fn register_exectask_handlers<C: Cpu + 'static>(
 mod tests {
     use super::*;
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
-    use crate::dispatch::{EXIT_STUB_ADDR, Runtime, StartConfig};
+    use crate::dispatch::{EXIT_STUB_ADDR, Runtime, StartConfig, TraceEvent};
     use crate::memory::FlatMemory;
     use std::sync::Mutex;
 
@@ -3893,17 +3909,164 @@ mod tests {
     }
 
     #[test]
+    fn task_exit_wakes_a_task_blocked_only_on_a_pending_timer() {
+        // Issue #237, sub-problem #2 follow-up, found by codewiz: a
+        // CreateNewProc child falling off the end (task_exit_stub_
+        // handler -> terminate_current) used to fail outright if the
+        // only other task was blocked in Wait purely on a still-
+        // pending TR_ADDREQUEST's signal -- `pick_ready` only ever
+        // looks for `Ready` tasks, and a timer's wake is never that
+        // until it actually fires. The parent genuinely isn't
+        // deadlocked here (the timer would wake it on its own even if
+        // the child never exited), so the child falling off first
+        // must not report one either -- same "fire the only future
+        // event left" fix as wait_handler's own retry loop, just on
+        // the other side of the exact same race. (The fix itself
+        // landed in #241; this is the dedicated regression test for
+        // it #241 didn't add.)
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = movea_dos_base_to_a6().to_vec();
+        let tags_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        let name_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        let ioreq_idx1 = words.len();
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+
+        let ioreq_idx2 = words.len();
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-462)); // SendIO
+
+        words.push(move_imm_to_d(0)); // D0 = the reply port's signal bit
+        words.push(0);
+        words.push(0x0010); // bit 4 -> 0x10
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(0)); // *marker = D0 (Wait's result)
+        words.push(RTS);
+
+        // --- child: immediately falls off into the task-exit stub,
+        // without ever signalling the parent -- only the timer is left.
+        let child_entry = entry + (words.len() as u32) * 2;
+        words.push(RTS);
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let name_addr = code_end + 16;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        let reply_port_addr = ioreq_addr + 64;
+        let marker_addr = reply_port_addr + 64;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_idx + 2] = tags_addr as u16;
+        words[name_idx + 1] = (name_addr >> 16) as u16;
+        words[name_idx + 2] = name_addr as u16;
+        words[ioreq_idx1 + 1] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx1 + 2] = ioreq_addr as u16;
+        words[ioreq_idx2 + 1] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx2 + 2] = ioreq_addr as u16;
+        words[marker_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_idx + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..64 {
+            mem.write_u8(ioreq_addr + i, 0);
+            mem.write_u8(reply_port_addr + i, 0);
+        }
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        crate::execlist::init_list_header(&mut mem, reply_port_addr + crate::execlist::MP_MSGLIST);
+        mem.write_u8(reply_port_addr + crate::execlist::MP_SIGBIT, 4);
+        mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_ADDREQUEST);
+        mem.write_u32(ioreq_addr + crate::execlist::MN_REPLYPORT, reply_port_addr);
+        // Short but real -- PendingTimers::fire_earliest genuinely
+        // sleeps out the remaining duration now (see the previous
+        // test's doc), so this doesn't need to be long to prove
+        // anything; it just needs to actually complete.
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 0);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 50_000);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(reply_port_addr + crate::execlist::MP_SIGTASK, parent_task);
+
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = rt
+            .run(&mut out, None)
+            .expect("the parent must resume once the child exits, not deadlock");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            code, 0x10,
+            "the parent's Wait should resume with the timer's own bit satisfied"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should resolve well within a couple of seconds for a 50ms request -- \
+             took {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn send_io_add_request_completes_via_wait_without_blocking_the_host() {
         // Issue #237, sub-problem #2: SendIO(TR_ADDREQUEST) must return
         // immediately (not block this whole single-threaded runtime in
         // a host sleep -- that would defeat the entire point of racing
-        // a timer against some other signal in a later Wait), and the
-        // later Wait() on the reply port's own signal bit must actually
-        // see it complete -- fired eagerly here (nothing else is
-        // runnable) via PendingTimers::fire_earliest rather than really
-        // waiting out a long deadline. A long requested duration
-        // (10 real seconds) with a fast test (checked via elapsed time)
-        // is exactly what proves this isn't secretly still sleeping.
+        // a timer against some other signal in a later Wait). The
+        // later Wait() on the reply port's own signal bit must then
+        // actually see it complete, which (nothing else is runnable
+        // here) goes through PendingTimers::fire_earliest's own real
+        // sleep until the deadline -- found missing by codewiz: firing
+        // instantly regardless of the real deadline made a timed wait
+        // measure ~0ms elapsed whenever nothing else was ever going to
+        // be Ready (the common case for a single pthread using a timed
+        // wait as a plain delay). So this asserts two different things
+        // about elapsed time, via the trace callback's per-dispatch
+        // timestamps: SendIO's own dispatch returns near-instantly
+        // (proving it isn't the one blocking), while Wait's dispatch
+        // -- whose entire sleep happens before it returns, hence before
+        // its own trace event fires -- takes roughly the full requested
+        // duration (proving the sleep happened there, for real, and
+        // wasn't skipped).
         let _guard = lock_host_break();
         let entry = TRAP_TABLE_END;
         let name = b"timer.device\0";
@@ -3976,10 +4139,16 @@ mod tests {
         let io_command_addr = ioreq_addr + IO_COMMAND_OFFSET;
         mem.write_u16(io_command_addr, TR_ADDREQUEST);
         mem.write_u32(ioreq_addr + crate::execlist::MN_REPLYPORT, reply_port_addr);
-        // 10 real seconds -- would make this test obviously too slow
-        // if SendIO still blocked on it synchronously.
-        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 10);
-        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 0);
+        // A short-but-measurable real duration: long enough that an
+        // instantly-fired timer (0ms elapsed) and a genuinely-slept
+        // one (~this long) are unambiguously distinguishable, short
+        // enough not to slow the test suite down noticeably.
+        const REQUESTED_MS: u64 = 200;
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 0);
+        mem.write_u32(
+            ioreq_addr + TR_TIME_MICRO_OFFSET,
+            (REQUESTED_MS * 1000) as u32,
+        );
 
         let mut rt = Runtime::new(
             M68kCpu::new(),
@@ -3996,9 +4165,22 @@ mod tests {
             .write_u32(reply_port_addr + crate::execlist::MP_SIGTASK, parent_task);
 
         let started = std::time::Instant::now();
+        let mut send_io_elapsed = None;
+        let mut wait_elapsed = None;
         let mut out = Vec::new();
-        let code = rt.run(&mut out, None).expect("run should succeed");
-        let elapsed = started.elapsed();
+        let code = rt
+            .run(
+                &mut out,
+                Some(&mut |ev: &TraceEvent| match ev.handler_name.as_str() {
+                    "SendIO" => send_io_elapsed = Some(started.elapsed()),
+                    "Wait" => wait_elapsed = Some(started.elapsed()),
+                    _ => {}
+                }),
+            )
+            .expect("run should succeed");
+
+        let send_io_elapsed = send_io_elapsed.expect("SendIO should have been dispatched");
+        let wait_elapsed = wait_elapsed.expect("Wait should have been dispatched");
 
         assert_eq!(
             code, 0x10,
@@ -4011,9 +4193,16 @@ mod tests {
             "Wait(0x10) should return with the timer's own signal bit satisfied"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "SendIO(TR_ADDREQUEST) must not block the host for anywhere close to the \
-             requested 10s duration -- took {elapsed:?}"
+            send_io_elapsed < std::time::Duration::from_millis(50),
+            "SendIO(TR_ADDREQUEST) must return near-instantly, not block the host for \
+             anywhere close to the requested {REQUESTED_MS}ms -- took {send_io_elapsed:?}"
+        );
+        assert!(
+            wait_elapsed >= std::time::Duration::from_millis(REQUESTED_MS)
+                && wait_elapsed < std::time::Duration::from_secs(2),
+            "Wait's pending-timer fallback must actually sleep for the real remaining \
+             duration once nothing else is runnable, not fire the timer instantly -- \
+             took {wait_elapsed:?} for a {REQUESTED_MS}ms request"
         );
     }
 
