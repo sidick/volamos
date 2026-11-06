@@ -337,14 +337,20 @@ struct Options {
     /// what a `--clock-mhz` benchmark number *means*, which a stale
     /// `~/.volamos`/`.volamos` shouldn't be able to silently flip on.
     cache: bool,
-    /// `--fpsp-emulate` (issue #129): software-emulate the real-68060
-    /// "unimplemented instruction" set (most FPU transcendentals plus
-    /// MOVEP/CHK2/CMP2/misaligned-CAS2/64-bit-MUL-DIV) instead of
-    /// trapping -- see
-    /// [`volamos_core::backend::M68kCpu::set_emulate_unimplemented_060`]'s
-    /// doc for the full mechanism. Only meaningful with `--cpu 68060`;
-    /// a no-op for every other `--cpu` model, since the `m68k` crate's
-    /// `trap_unimpl_060` gate itself only fires for `CpuType::M68060`.
+    /// `--fpsp-emulate` (issue #129, extended to `--cpu 68040` by issue
+    /// #217): software-emulate the real-68060 "unimplemented
+    /// instruction" set (most FPU transcendentals plus MOVEP/CHK2/CMP2/
+    /// misaligned-CAS2/64-bit-MUL-DIV) or the real-68040 one (a smaller,
+    /// differently composed set -- FINT/FINTRZ/FSCALE plus the
+    /// transcendentals, but no integer ops; FABS/FNEG/FSQRT stay native
+    /// unlike on the 060) instead of trapping -- see
+    /// [`volamos_core::backend::M68kCpu::set_emulate_unimplemented_060`]/
+    /// [`volamos_core::backend::M68kCpu::set_emulate_unimplemented_040`]'s
+    /// docs for the full mechanism, including why the 040 one needs an
+    /// unconditional call regardless of this flag's value. Only
+    /// meaningful with `--cpu 68060`/`68040`; a no-op for every other
+    /// `--cpu` model, since the `m68k` crate's own trap gates are each
+    /// keyed on their own exact `CpuType`.
     ///
     /// `false` (real-hardware-faithful trapping, matching every other
     /// `--cpu` model's default behavior) by default; CLI-only, like
@@ -657,23 +663,26 @@ struct Cli {
     )]
     no_fpu: bool,
 
-    /// Software-emulate 68060-unimplemented instructions instead of trapping (off by default)
+    /// Software-emulate 68040/68060-unimplemented instructions instead of trapping (off by default)
     #[arg(
         long = "fpsp-emulate",
         action = ArgAction::SetTrue,
         help_heading = "Machine",
-        long_help = "Software-emulate the instructions a real 68060 removed from silicon --\
-                      most FPU transcendentals (FSIN/FCOS/FATAN/FETOX/FLOGN/FMOD/FSCALE/\
-                      FGETEXP/FGETMAN/FSINCOS/...) plus a handful of integer ops (MOVEP, \
-                      CHK2/CMP2, misaligned CAS/CAS2, 64-bit MUL/DIV) -- instead of taking an \
-                      \"unimplemented instruction\" exception, the way real hardware does \
-                      (that trap is what lets AmigaOS's 68060.library install FPSP/ISP \
-                      software-emulation handlers at boot; volamos has no equivalent of that \
-                      persistent, cross-process boot state, so this flag gets you the same \
-                      effect for a single run instead). Only meaningful with --cpu 68060; a \
-                      no-op for every other --cpu model. Off by default -- matching real \
-                      68060 hardware fidelity -- so a 68040-FP-targeted binary traps under \
-                      --cpu 68060 unless this is given."
+        long_help = "Software-emulate the instructions a real 68040/68060 removed from silicon \
+                      -- on the 68060, most FPU transcendentals (FSIN/FCOS/FATAN/FETOX/FLOGN/\
+                      FMOD/FSCALE/FGETEXP/FGETMAN/FSINCOS/...) plus a handful of integer ops \
+                      (MOVEP, CHK2/CMP2, misaligned CAS/CAS2, 64-bit MUL/DIV); on the 68040, a \
+                      smaller, differently composed set (the same transcendentals plus FINT/\
+                      FINTRZ/FSCALE, but no integer ops -- FABS/FNEG/FSQRT stay native, unlike \
+                      on the 060) -- instead of taking an \"unimplemented instruction\" \
+                      exception, the way real hardware does (that trap is what lets AmigaOS's \
+                      68040.library/68060.library install FPSP/ISP software-emulation handlers \
+                      at boot; volamos has no equivalent of that persistent, cross-process boot \
+                      state, so this flag gets you the same effect for a single run instead). \
+                      Only meaningful with --cpu 68040/68060; a no-op for every other --cpu \
+                      model. Off by default -- matching real hardware fidelity -- so a \
+                      68040-FP-targeted binary traps under --cpu 68040/68060 unless this is \
+                      given."
     )]
     fpsp_emulate: bool,
 
@@ -1917,9 +1926,13 @@ fn build_nested_runtime(
     // Execute() run gets its own fresh cycle counter, starting at `0`
     // again, same as its own fresh CPU.
     cpu.set_clock_mhz(clock_mhz);
-    // --fpsp-emulate (issue #129): a nested System()/Execute() run shares
-    // the parent's --fpsp-emulate setting, same as it shares --cpu/--fpu.
+    // --fpsp-emulate (issue #129, extended to --cpu 68040 by issue #217):
+    // a nested System()/Execute() run shares the parent's --fpsp-emulate
+    // setting, same as it shares --cpu/--fpu. Both calls are needed --
+    // see M68kCpu::set_emulate_unimplemented_040's doc for why the 040
+    // one can't be skipped just because fpsp_emulate is false here.
     cpu.set_emulate_unimplemented_060(fpsp_emulate);
+    cpu.set_emulate_unimplemented_040(fpsp_emulate);
     let mut runtime = Runtime::new(cpu, mem, config);
     // issue #167 (second half): a nested System()/Execute() run builds
     // its own independent CpuCore/FlatMemory, so it needs this pre-seed
@@ -2110,10 +2123,15 @@ fn run(opts: &Options) -> Result<i32, String> {
     // M68kCpu::set_clock_mhz's doc for how the two would conflict if it
     // weren't.
     cpu.set_clock_mhz(opts.clock_mhz);
-    // --fpsp-emulate (issue #129): only meaningful with --cpu 68060 (the
-    // `m68k` crate's own trap gate is keyed on `CpuType::M68060`), but
-    // harmless to set unconditionally for any other model.
+    // --fpsp-emulate (issue #129, extended to --cpu 68040 by issue #217):
+    // each call is only meaningful for its own `CpuType` (`M68060`/
+    // `M68040` respectively), but harmless to set unconditionally for
+    // any other model. Both calls are needed regardless of
+    // `opts.fpsp_emulate`'s value -- see
+    // M68kCpu::set_emulate_unimplemented_040's doc for why the 040 one
+    // can't be skipped just because it's false.
     cpu.set_emulate_unimplemented_060(opts.fpsp_emulate);
+    cpu.set_emulate_unimplemented_040(opts.fpsp_emulate);
     let program_name = program_name_from_path(std::path::Path::new(&opts.program));
     let vfs_config = vfs_config_from_opts(opts);
 

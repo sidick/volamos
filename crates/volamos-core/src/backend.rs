@@ -368,6 +368,35 @@ impl M68kCpu {
         self.core.emulate_unimplemented_060 = on;
     }
 
+    /// As [`Self::set_emulate_unimplemented_060`], but for the `m68k`
+    /// crate's analogous `CpuCore::emulate_unimplemented_040` gate
+    /// (added in crate v0.16.0, issue #217/upstream #225): the real
+    /// 68040's FPU silicon drops the transcendentals (FSIN/FCOS/FETOX/
+    /// FLOGN/...) plus FINT/FINTRZ/FSCALE -- a smaller, differently
+    /// composed set than the 68060's (e.g. FABS/FNEG/FSQRT *are* 68040
+    /// hardware; FINT/FINTRZ are 68040-trapped but 68060-native) -- and
+    /// `68040.library`'s own FPSP emulates them in software via
+    /// `SetPatch`, exactly paralleling `68060.library`'s role for the
+    /// 060 trap gate above.
+    ///
+    /// **The default polarity is inverted from the 060 gate** -- easy
+    /// to get backwards, so read carefully. Upstream's own
+    /// `CpuCore::emulate_unimplemented_040` defaults to `true` (native
+    /// execution, no trap) for its own backward compatibility: a crate
+    /// consumer already configuring `CpuType::M68040` before this flag
+    /// existed must see no behavior change. Real-hardware-faithful
+    /// trapping is what volamos wants as *its* default regardless
+    /// (matching every other `--cpu` model, 060 included) -- so unlike
+    /// [`Self::set_emulate_unimplemented_060`] (which only needs
+    /// calling to *override* the crate's own already-correct-for-
+    /// volamos `false` default), this one must be called
+    /// unconditionally on every `M68kCpu` construction path that cares
+    /// about `--cpu 68040`, `on` or not, specifically to flip the
+    /// crate's default down to `false` -- never just left alone.
+    pub fn set_emulate_unimplemented_040(&mut self, on: bool) {
+        self.core.emulate_unimplemented_040 = on;
+    }
+
     /// Creates a new core for `cpu_type`, with `fpu_present` controlling
     /// whether F-line (coprocessor ID 1) opcodes execute as real FPU
     /// instructions or trap out to [`Cpu::take_hardware_exception`] --
@@ -1353,6 +1382,100 @@ mod tests {
             0x1256_9ADE,
             "MOVEP.L should have assembled D0 from the high byte of each word at the 2-byte \
              stride"
+        );
+    }
+
+    // --- --fpsp-emulate, extended to --cpu 68040 (issue #217) ---
+    //
+    // FINT is one of the opmodes `trap_unimpl_040` traps for real 68040
+    // fidelity -- unlike MOVEP above, this is a genuine F-line
+    // instruction the `m68k` crate decodes and dispatches internally
+    // (`exec_fpu_op0`), which on the trapping path takes the real
+    // vector-11 (`LINE_1111`) hardware exception directly inside
+    // `step` -- the same "jumps PC to whatever's in the vector table,
+    // which is zero on a fresh FlatMemory" signature the MOVEP tests
+    // above use for vector 61.
+
+    /// `FINT FP0,FP1` (register-to-register form, opmode `0x01`): the
+    /// 68040 drops FINT/FINTRZ from silicon (68040UM table 9-10) even
+    /// though the 68060 keeps them native -- the two models' trap sets
+    /// genuinely differ, not just a subset relationship, which is why
+    /// `fpu_040_traps_opmode` can't just reuse `fpu_060_traps_opmode`
+    /// wholesale (see `M68kCpu::set_emulate_unimplemented_040`'s doc).
+    const FINT_FP0_TO_FP1: [u16; 2] = [0xF200, 0x0081];
+
+    #[test]
+    fn fint_executes_natively_on_bare_m68040_with_config() {
+        // The `m68k` crate's own default for `emulate_unimplemented_040`
+        // is `true` (native execution) -- the *opposite* polarity from
+        // `emulate_unimplemented_060`'s `false` default -- kept that
+        // way upstream for its own backward compatibility. `with_config`
+        // alone, with no `set_emulate_unimplemented_040` call, inherits
+        // that crate default as-is: this test locks that in, precisely
+        // because it's the surprising case that makes the unconditional
+        // `cpu.set_emulate_unimplemented_040(fpsp_emulate)` call in
+        // `main.rs` necessary (not just an override, the way the 060
+        // equivalent is) -- see that method's doc.
+        let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x3000);
+        cpu.set_address_register(AddressRegister(7), 0x3000);
+        load_words(&mut mem, TRAP_TABLE_END, &FINT_FP0_TO_FP1);
+
+        cpu.step(&mut mem);
+
+        assert_eq!(
+            cpu.pc(),
+            TRAP_TABLE_END + 4,
+            "FINT should execute and advance PC past the opcode + extension word, not trap, \
+             matching the m68k crate's own default"
+        );
+    }
+
+    #[test]
+    fn fint_traps_on_m68040_with_emulate_unimplemented_040_false() {
+        // volamos's own real-hardware-faithful default, set explicitly
+        // by `main.rs` on every `--cpu 68040` run (see
+        // `M68kCpu::set_emulate_unimplemented_040`'s doc for why this
+        // can't be left at the crate's own default).
+        let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
+        cpu.set_emulate_unimplemented_040(false);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x3000);
+        cpu.set_address_register(AddressRegister(7), 0x3000);
+        load_words(&mut mem, TRAP_TABLE_END, &FINT_FP0_TO_FP1);
+
+        cpu.step(&mut mem);
+
+        // `jump_vector` sets PC to whatever vector 11's slot holds in
+        // guest memory; a fresh, zero-filled `FlatMemory` reads back
+        // exactly 0 there -- the real-hardware-exception signature, the
+        // same one the MOVEP/vector-61 tests above use.
+        assert_eq!(
+            cpu.pc(),
+            0,
+            "expected the real vector-11 hardware exception to fire (PC jumped to the vector \
+             table's -- empty -- contents), but FINT executed instead"
+        );
+    }
+
+    #[test]
+    fn fint_executes_natively_on_m68040_with_emulate_unimplemented_040_true() {
+        // Opt-in `--fpsp-emulate`: the same instruction now executes
+        // for real instead of trapping.
+        let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
+        cpu.set_emulate_unimplemented_040(true);
+        cpu.set_pc(TRAP_TABLE_END);
+        let mut mem = FlatMemory::new(0x3000);
+        cpu.set_address_register(AddressRegister(7), 0x3000);
+        load_words(&mut mem, TRAP_TABLE_END, &FINT_FP0_TO_FP1);
+
+        cpu.step(&mut mem);
+
+        assert_eq!(
+            cpu.pc(),
+            TRAP_TABLE_END + 4,
+            "FINT should execute and advance PC past the opcode + extension word, not trap"
         );
     }
 
