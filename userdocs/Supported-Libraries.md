@@ -77,6 +77,20 @@ Changelog.
   `SystemTagList`/`System`/`Execute` for tools that shell out to
   another guest program.
 - `CheckSignal`.
+- `CreateNewProc` — a real second task, cooperatively scheduled
+  alongside the main one (see `exec.library`'s "Tasks and signals"
+  below); unblocks both the libpthread and native-toolchain thread
+  models under `m68k-amigaos-gcc`. `NP_Entry` (required)/`NP_StackSize`/
+  `NP_Name`/`NP_Priority`/`NP_Input`/`NP_Output`/`NP_Error` (and their
+  `NP_Close*` flags)/`NP_ConsoleTask`/`NP_WindowPtr`/`NP_Arguments` are
+  honored, with the defaults `<dos/dostags.h>` documents; the standard
+  handles are stored exactly as given, unchecked, matching real DOS
+  (AmigaPorts' libpthread passes a thread's slot number through
+  `NP_Input`, not a real filehandle, and reads it straight back out of
+  `pr_CIS`). `NP_Seglist` (loading a seglist rather than a bare entry
+  point) isn't supported — every known caller always supplies
+  `NP_Entry` — and `NP_CurrentDir`/`NP_HomeDir` aren't read, since this
+  runtime has one current directory for the whole run.
 
 ## exec.library
 
@@ -99,7 +113,17 @@ Changelog.
 - Tasks and signals: `FindTask`/`SetSignal`/`SetExcept`/`Wait`/
   `Signal`/`AllocSignal`/`FreeSignal`/`Forbid`/`Permit`/`SetTaskPri`,
   including host `SIGINT`/`SIGTERM` delivered to the guest as
-  `SIGBREAKF_CTRL_C`.
+  `SIGBREAKF_CTRL_C`. Real cooperative multi-tasking once
+  `dos.library`'s `CreateNewProc` has started a second task: `Wait`
+  genuinely blocks and switches to another runnable task instead of
+  always failing loudly, `Signal` wakes a blocked task, and `Permit`
+  (after `Forbid`+`SysFlags |= SFB_SAR`)/same-priority `SetTaskPri`
+  voluntarily yield — no preemption, a switch only ever happens at one
+  of those explicit points. The outgoing task's `tc_Switch` and the
+  incoming task's `tc_Launch` (`tc_Flags`' `TF_SWITCH`/`TF_LAUNCH`) are
+  called on every switch, as real guest subroutines, matching real
+  `exec.library` — real thread-local storage and newlib's per-task
+  `errno` rely on this.
 - The full `SignalSemaphore` API: `InitSemaphore`/`ObtainSemaphore`/
   `ReleaseSemaphore`/`AttemptSemaphore`/`FindSemaphore`/`AddSemaphore`/
   `RemSemaphore`/`ObtainSemaphoreList`/`ReleaseSemaphoreList`/
@@ -181,12 +205,16 @@ translated catalogs), matching `vamos`'s own scope for this library.
 
 ## intuition.library
 
-A thin stub — `DisplayAlert`, `AutoRequest`, `EasyRequestArgs`,
-`CurrentTime` — just enough that a console tool's stray Intuition call
-doesn't crash. **No real windowing or GUI**: `AutoRequest`/
-`EasyRequestArgs` (which report which button a real user pressed)
-return a fixed default rather than trying to guess, since there's no
-display to show anything on in the first place.
+Headless: real, inspectable `Screen`/`Window`/`RastPort` structures,
+but no actual rendering or user input. `OpenWindow`/`CloseWindow`
+attach a window to a single, lazily-created default public screen
+(always `WBENCHSCREEN`-typed); `LockPubScreen`/`UnlockPubScreen`/
+`GetScreenData` work against it; custom screens aren't supported.
+`DisplayAlert` follows real `exec.library` alert semantics, and
+`CurrentTime` reads the host clock. `AutoRequest`/`EasyRequestArgs`
+(which report which button a real user pressed) return a fixed
+default (`TRUE`/`0` respectively) rather than trying to guess, since
+there's no display to show anything on in the first place.
 
 ## Math libraries
 
@@ -208,6 +236,18 @@ pointing here too, for callers (e.g. libnix's `clock()`) that read it
 directly instead of going through `OpenDevice`. Without `--clock-mhz`,
 `GetSysTime`/`ReadEClock` (and Intuition's `CurrentTime`) resolve real
 host microseconds, not 1/50 s ticks.
+
+`SendIO(TR_ADDREQUEST)` is genuinely asynchronous: it registers the
+request and returns immediately rather than blocking, so a timed
+`Wait()` can race a condition variable's signal against the timer
+exactly like real pthread/newlib `cond_timedwait` code expects.
+Completion delivers through the request's own reply-port signal,
+either when its real deadline passes (checked at `Wait`/`CheckSignal`)
+or — once every task is blocked and nothing else could possibly make
+progress first — fired early by actually sleeping out the real
+remaining duration first, so a timed wait still measures its real
+requested duration rather than resolving instantly.
+`WaitIO`/`CheckIO`/`AbortIO` all recognize a still-pending request.
 
 ## Deliberately out of scope
 

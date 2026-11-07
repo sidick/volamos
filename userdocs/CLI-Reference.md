@@ -322,30 +322,40 @@ the pre-seeded stub like any other guest memory write.
 
 ## `--fpsp-emulate`
 
-Software-emulates the instructions a real 68060 removed from silicon
-— most FPU transcendentals (`FSIN`/`FCOS`/`FATAN`/`FETOX`/`FLOGN`/
-`FMOD`/`FSCALE`/`FGETEXP`/`FGETMAN`/`FSINCOS`/...) plus a
-handful of integer ops (`MOVEP`, `CHK2`/`CMP2`, misaligned `CAS`/
-`CAS2`, 64-bit `MUL`/`DIV`) — instead of taking the real "unimplemented
-instruction" exception a genuine 68060 does for them. Only meaningful
-with `--cpu 68060`; a no-op for every other `--cpu` model. Default:
-off — real 68060 hardware fidelity, matching every other `--cpu`
-model's default behavior.
+Software-emulates the instructions a real 68040 or 68060 removed from
+silicon, instead of taking the real "unimplemented instruction"
+exception a genuine chip does for them:
+
+- On `--cpu 68060`: most FPU transcendentals (`FSIN`/`FCOS`/`FATAN`/
+  `FETOX`/`FLOGN`/`FMOD`/`FSCALE`/`FGETEXP`/`FGETMAN`/`FSINCOS`/...)
+  plus a handful of integer ops (`MOVEP`, `CHK2`/`CMP2`, misaligned
+  `CAS`/`CAS2`, 64-bit `MUL`/`DIV`).
+- On `--cpu 68040`: a smaller, differently composed set — the same
+  transcendentals plus `FINT`/`FINTRZ`/`FSCALE`, but none of the
+  integer ops above (`FABS`/`FNEG`/`FSQRT` stay native, unlike on the
+  68060).
+
+Only meaningful with `--cpu 68040`/`68060`; a no-op for every other
+`--cpu` model. Default: off — real hardware fidelity, matching every
+other `--cpu` model's default behavior, so a 68040-FP-targeted binary
+traps under either `--cpu 68040` or `--cpu 68060` unless this is given.
 
 ```sh
 volamos --cpu 68060 --fpu --fpsp-emulate a-68040-fp-binary
+volamos --cpu 68040 --fpsp-emulate a-68040-fp-binary
 ```
 
 On real hardware, that trap is exactly what lets AmigaOS's
-`68060.library` install FPSP/ISP software-emulation handlers at boot
-(via `SetPatch`) — which is how a 68040-FP-targeted binary keeps
-working on a real 68060 machine without ever being recompiled.
-volamos has no equivalent of that persistent, cross-process boot
-state (every invocation is a single, fresh guest process, with no
-"patch once at boot, every later process inherits it" mechanism), so
-loading a real `68060.library` isn't a viable substitute here — this
-flag gets you the same practical effect for a single run instead,
-without needing any real `68060.library`/`fpsp.library` file at all.
+`68040.library`/`68060.library` install FPSP/ISP software-emulation
+handlers at boot (via `SetPatch`) — which is how an FP-targeted binary
+keeps working on hardware that dropped some of the instructions it
+uses, without ever being recompiled. volamos has no equivalent of that
+persistent, cross-process boot state (every invocation is a single,
+fresh guest process, with no "patch once at boot, every later process
+inherits it" mechanism), so loading a real `68040.library`/
+`68060.library` isn't a viable substitute here — this flag gets you
+the same practical effect for a single run instead, without needing
+any real `68040.library`/`68060.library`/`fpsp.library` file at all.
 
 CLI-only: unlike most flags on this page, `--fpsp-emulate` can't be
 set in `~/.volamos`/`.volamos` — silently swapping real hardware
