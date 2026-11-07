@@ -1875,11 +1875,29 @@ pub struct PendingTimers {
     entries: Vec<PendingTimer>,
 }
 
+/// What firing a [`PendingTimer`] actually does -- a real guest
+/// `TR_ADDREQUEST` (completed via `ReplyMsg`, [`complete_timer_request`]),
+/// or (issue #254) a `Delay`-blocked task's own deadline, which has no
+/// guest-visible I/O struct to complete -- just a task to wake
+/// (`TaskScheduler::wake_task`). Sharing one `Vec` sorted by deadline
+/// means `fire_due`/`fire_earliest` naturally interleave both kinds
+/// correctly relative to each other, which is the whole point: a real
+/// pending timer request must still complete on time even while some
+/// *other* task is blocked in `Delay`, and a `Delay`'s own deadline
+/// must still be considered by another task's `Wait`-driven
+/// `fire_due`/`fire_earliest` call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimerCompletion {
+    Request(u32),
+    Delay(u32),
+}
+
 struct PendingTimer {
-    ioreq: u32,
+    completion: TimerCompletion,
     deadline: std::time::Instant,
-    /// The task that `SendIO`'d this request -- used to drop it
-    /// without completing it if that task exits (falls off its
+    /// The task that owns this entry -- `SendIO`'s caller for a
+    /// `Request`, or the delaying task itself for a `Delay` -- used to
+    /// drop it without completing it if that task exits (falls off its
     /// `NP_Entry`) while it's still pending, matching real
     /// `timer.device` abandoning in-flight requests when their owning
     /// process dies. Without this, a since-removed, possibly-reused
@@ -1913,16 +1931,55 @@ impl PendingTimers {
     fn push(&mut self, ioreq: u32, deadline: std::time::Instant, owner_task: u32) {
         self.remove(ioreq);
         self.entries.push(PendingTimer {
-            ioreq,
+            completion: TimerCompletion::Request(ioreq),
             deadline,
             owner_task,
         });
     }
 
+    /// Returns `task`'s already-registered `Delay` deadline, or
+    /// registers a fresh one (`now + duration`) and returns that.
+    /// [`delay_handler`]'s first entry for a given `Delay` call must
+    /// compute the deadline once and every subsequent re-trap (after
+    /// blocking) must reuse that exact same deadline rather than
+    /// restarting the clock -- the re-trap model re-enters
+    /// `delay_handler` from scratch each time, with `D1` still holding
+    /// the original tick count, so there is nothing else durable to
+    /// recognize "this is a re-entry, not a fresh call" by.
+    pub(crate) fn delay_deadline(
+        &mut self,
+        task: u32,
+        duration: std::time::Duration,
+    ) -> std::time::Instant {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.completion == TimerCompletion::Delay(task))
+        {
+            return entry.deadline;
+        }
+        let deadline = std::time::Instant::now() + duration;
+        self.entries.push(PendingTimer {
+            completion: TimerCompletion::Delay(task),
+            deadline,
+            owner_task: task,
+        });
+        deadline
+    }
+
+    /// Removes `task`'s own `Delay` entry, if any, once its `Delay`
+    /// call has genuinely finished (so a later, unrelated `Delay` call
+    /// from the same task starts with a clean slate).
+    pub(crate) fn remove_delay(&mut self, task: u32) {
+        self.entries
+            .retain(|e| e.completion != TimerCompletion::Delay(task));
+    }
+
     /// Removes (without completing) every entry owned by `task` --
     /// real `timer.device` abandons a process's in-flight requests
     /// when it dies rather than delivering them into memory it no
-    /// longer owns. Called from [`task_exit_stub_handler`].
+    /// longer owns; a `Delay` entry is dropped the same way (nothing
+    /// left to wake). Called from [`task_exit_stub_handler`].
     fn remove_owned_by(&mut self, task: u32) {
         self.entries.retain(|e| e.owner_task != task);
     }
@@ -1930,7 +1987,9 @@ impl PendingTimers {
     /// Whether `ioreq` is still pending (not yet completed) -- used by
     /// [`check_io_handler`]'s "still queued" answer.
     fn contains(&self, ioreq: u32) -> bool {
-        self.entries.iter().any(|e| e.ioreq == ioreq)
+        self.entries
+            .iter()
+            .any(|e| e.completion == TimerCompletion::Request(ioreq))
     }
 
     /// Removes `ioreq` without completing it (real `AbortIO`'s
@@ -1941,7 +2000,8 @@ impl PendingTimers {
     /// (see that call site's doc).
     pub(crate) fn remove(&mut self, ioreq: u32) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|e| e.ioreq != ioreq);
+        self.entries
+            .retain(|e| e.completion != TimerCompletion::Request(ioreq));
         self.entries.len() != before
     }
 
@@ -1963,23 +2023,24 @@ impl PendingTimers {
 
     /// Completes and removes every entry whose deadline has already
     /// passed. Called at the same two points [`fold_pending_host_break`]
-    /// already is (`Wait`, `CheckSignal`) -- the ordinary path for a
-    /// timer that genuinely elapsed while other guest code ran.
-    fn fire_due<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) {
+    /// already is (`Wait`, `CheckSignal`), and from [`delay_handler`]'s
+    /// own loop -- the ordinary path for a timer (or another task's
+    /// `Delay`) that genuinely elapsed while other guest code ran.
+    pub(crate) fn fire_due<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) {
         let now = std::time::Instant::now();
-        let due: Vec<u32> = self
+        let due: Vec<TimerCompletion> = self
             .entries
             .iter()
             .filter(|e| e.deadline <= now)
-            .map(|e| e.ioreq)
+            .map(|e| e.completion)
             .collect();
         self.entries.retain(|e| e.deadline > now);
-        for ioreq in due {
-            complete_timer_request(mem, tasks, ioreq);
+        for completion in due {
+            Self::complete(mem, tasks, completion);
         }
     }
 
-    /// Fires the single earliest-due pending request -- [`wait_handler`]'s
+    /// Fires the single earliest-due pending entry -- [`wait_handler`]'s
     /// last resort when every task is blocked and a pending timer is
     /// the only event left that could ever unblock anything: in a
     /// single-process cooperative model, refusing to fire it eventually
@@ -2003,6 +2064,35 @@ impl PendingTimers {
         mem: &mut M,
         tasks: &mut TaskScheduler,
     ) -> bool {
+        self.fire_earliest_impl(mem, tasks, None)
+    }
+
+    /// As [`Self::fire_earliest`], but only fires if the earliest
+    /// pending entry's deadline is at or before `bound` -- [`delay_handler`]'s
+    /// own last-resort case (no other task runnable, but some *other*
+    /// entry -- another task's real timer request, or another task's
+    /// own `Delay` -- might legitimately be due before this task's own
+    /// deadline, and firing it could make a task `Ready` to switch to
+    /// instead of just sleeping blindly for the rest of this `Delay`).
+    /// Returns `false` without sleeping or touching anything if the
+    /// earliest entry is later than `bound` (including when there are
+    /// no entries at all) -- `delay_handler` handles its own deadline
+    /// directly rather than through this path.
+    pub(crate) fn fire_earliest_bounded<M: AddressSpace>(
+        &mut self,
+        mem: &mut M,
+        tasks: &mut TaskScheduler,
+        bound: std::time::Instant,
+    ) -> bool {
+        self.fire_earliest_impl(mem, tasks, Some(bound))
+    }
+
+    fn fire_earliest_impl<M: AddressSpace>(
+        &mut self,
+        mem: &mut M,
+        tasks: &mut TaskScheduler,
+        bound: Option<std::time::Instant>,
+    ) -> bool {
         let Some((idx, deadline)) = self
             .entries
             .iter()
@@ -2012,13 +2102,29 @@ impl PendingTimers {
         else {
             return false;
         };
+        if let Some(bound) = bound
+            && deadline > bound
+        {
+            return false;
+        }
         let now = std::time::Instant::now();
         if deadline > now {
             std::thread::sleep(deadline - now);
         }
         let entry = self.entries.remove(idx);
-        complete_timer_request(mem, tasks, entry.ioreq);
+        Self::complete(mem, tasks, entry.completion);
         true
+    }
+
+    fn complete<M: AddressSpace>(
+        mem: &mut M,
+        tasks: &mut TaskScheduler,
+        completion: TimerCompletion,
+    ) {
+        match completion {
+            TimerCompletion::Request(ioreq) => complete_timer_request(mem, tasks, ioreq),
+            TimerCompletion::Delay(task) => tasks.wake_task(task),
+        }
     }
 }
 
@@ -4548,6 +4654,146 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "should resolve well within a couple of seconds for a 50ms request -- \
              took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_timer_request_completes_on_time_during_another_tasks_delay() {
+        // codewiz's issue #254 "delay-time.c" repro: a real pending
+        // timer request in one task must still complete on its own
+        // schedule even while a *different* task is blocked in
+        // `Delay` for much longer -- before this fix, `Delay` was a
+        // flat host sleep that gave nothing else (including
+        // `PendingTimers`' own bookkeeping) a chance to run, so the
+        // parent's 50ms timer request would only have completed once
+        // the child's much longer Delay finished.
+        //
+        // Parent: OpenDevice+SendIO a short (50ms) real timer request,
+        // spawn a child that immediately Delays for far longer
+        // (500ms), then Wait on the request's own reply-port signal.
+        // With the fix, the parent's Wait resolves around 50ms (the
+        // timer firing wakes it while the child is still deep in its
+        // own Delay); measuring total elapsed time well under the
+        // child's 500ms distinguishes this from the pre-fix behavior.
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let name_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        let ioreq_idx1 = words.len();
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+
+        let ioreq_idx2 = words.len();
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-462)); // SendIO
+
+        words.extend_from_slice(&movea_dos_base_to_a6());
+        let tags_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        words.push(move_imm_to_d(0)); // D0 = the reply port's signal bit
+        words.push(0);
+        words.push(0x0010); // bit 4 -> 0x10
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(0)); // *marker = D0 (Wait's result)
+        words.push(RTS);
+
+        // --- child: Delay(25) [500ms], far longer than the parent's
+        // own 50ms timer request, then fall off the end ---
+        let child_entry = entry + (words.len() as u32) * 2;
+        words.extend_from_slice(&movea_dos_base_to_a6());
+        words.push(move_imm_to_d(1)); // D1 = 25 ticks (500ms)
+        words.push(0);
+        words.push(25);
+        words.extend_from_slice(&jsr_disp16_a6(-198)); // Delay
+        words.push(RTS);
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let name_addr = code_end + 16;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        let reply_port_addr = ioreq_addr + 64;
+        let marker_addr = reply_port_addr + 64;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[name_idx + 1] = (name_addr >> 16) as u16;
+        words[name_idx + 2] = name_addr as u16;
+        words[ioreq_idx1 + 1] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx1 + 2] = ioreq_addr as u16;
+        words[ioreq_idx2 + 1] = (ioreq_addr >> 16) as u16;
+        words[ioreq_idx2 + 2] = ioreq_addr as u16;
+        words[tags_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_idx + 2] = tags_addr as u16;
+        words[marker_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_idx + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..64 {
+            mem.write_u8(ioreq_addr + i, 0);
+            mem.write_u8(reply_port_addr + i, 0);
+        }
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        crate::execlist::init_list_header(&mut mem, reply_port_addr + crate::execlist::MP_MSGLIST);
+        mem.write_u8(reply_port_addr + crate::execlist::MP_SIGBIT, 4);
+        mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_ADDREQUEST);
+        mem.write_u32(ioreq_addr + crate::execlist::MN_REPLYPORT, reply_port_addr);
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 0);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, 50_000); // 50ms
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(reply_port_addr + crate::execlist::MP_SIGTASK, parent_task);
+
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            code, 0x10,
+            "the parent's Wait should resume with the timer's own bit satisfied"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "the 50ms timer request must complete on its own schedule, not wait for the \
+             child's unrelated 500ms Delay to finish first -- took {elapsed:?}"
         );
     }
 

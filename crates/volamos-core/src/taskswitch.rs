@@ -139,6 +139,17 @@ pub enum TaskState {
         /// The semaphore's guest address.
         sem: u32,
     },
+    /// Blocked in `Delay` (issue #254), waiting for its own deadline
+    /// (tracked in [`crate::exectask::PendingTimers`], not here --
+    /// there's nothing guest-visible to key this on the way a
+    /// semaphore's address or a signal mask works). Becomes
+    /// [`TaskState::Ready`] when [`TaskScheduler::wake_task`] is
+    /// called for this task, which [`crate::exectask::PendingTimers`]
+    /// does once that deadline is reached; on resume, `delay_handler`
+    /// re-enters from scratch and re-checks whether its deadline has
+    /// genuinely passed yet (same re-trap model as every other
+    /// `BlockedOn*` state).
+    BlockedOnDelay,
 }
 
 /// Everything known about one non-running task: its suspended registers
@@ -432,9 +443,43 @@ impl TaskScheduler {
         self.block_current(cpu, mem, pc, TaskState::BlockedOnSemaphore { sem })
     }
 
+    /// As [`Self::block_current_on_signal`], but for `Delay` finding
+    /// its own deadline not yet reached (issue #254): blocks the
+    /// currently-running task and switches to the next `Ready` task,
+    /// or fails with [`Deadlock`] if there isn't one. Same resume
+    /// contract -- `pc` must be `ctx.trap_pc`, and the caller skips
+    /// its own generic post-dispatch epilogue on success, since
+    /// resuming re-enters `delay_handler` from scratch rather than
+    /// returning a remembered result.
+    pub fn block_current_on_delay<C: Cpu, M: AddressSpace>(
+        &mut self,
+        cpu: &C,
+        mem: &M,
+        pc: u32,
+    ) -> Result<(), Deadlock> {
+        self.block_current(cpu, mem, pc, TaskState::BlockedOnDelay)
+    }
+
+    /// Marks `target` [`TaskState::Ready`] if it's currently blocked on
+    /// a `Delay` (issue #254) -- called by
+    /// [`crate::exectask::PendingTimers`] once a `Delay`-blocked
+    /// task's own deadline is reached, the same way
+    /// [`Self::wake_blocked_on_semaphore`] reacts to `ReleaseSemaphore`.
+    /// A no-op if `target` isn't currently `BlockedOnDelay` (it may
+    /// already be `Ready`, or blocked on something else entirely, or
+    /// not a known task at all) -- callers don't need to check first.
+    pub fn wake_task(&mut self, target: u32) {
+        if let Some(record) = self.others.get_mut(&target)
+            && record.state == TaskState::BlockedOnDelay
+        {
+            record.state = TaskState::Ready;
+        }
+    }
+
     /// Shared implementation behind [`Self::block_current_on_signal`]/
-    /// [`Self::block_current_on_semaphore`]: the two differ only in
-    /// which [`TaskState`] the blocking task ends up recorded with.
+    /// [`Self::block_current_on_semaphore`]/[`Self::
+    /// block_current_on_delay`]: the three differ only in which
+    /// [`TaskState`] the blocking task ends up recorded with.
     fn block_current<C: Cpu, M: AddressSpace>(
         &mut self,
         cpu: &C,

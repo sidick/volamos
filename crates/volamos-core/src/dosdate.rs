@@ -7,17 +7,38 @@
 //! its own run, or to compare against file dates for `SINCE`/`UPTO`-
 //! style filtering) before it ever gets to printing a single directory
 //! entry. `Delay` found missing while running the real `C:/Wait`
-//! binary -- unlike `exec.library`'s device-I/O primitives
-//! (`crate::exectask`'s `OpenDevice`/`CloseDevice`, always failing
-//! since this runtime models no real device drivers), `Delay` has
-//! simple, fully-specifiable semantics this runtime *can* implement
-//! faithfully: it just blocks the host thread for the requested
-//! duration via `std::thread::sleep`. Real `Delay` is "system-friendly"
-//! (per the RKRM: the process is suspended, not busy-waiting) --
-//! irrelevant here since this runtime is single-threaded and there's
-//! no other guest task that could run in the meantime anyway, but a
-//! real sleep is still the correct, literal behavior a corpus binary
-//! (or a human watching `Wait` actually wait) expects.
+//! binary.
+//!
+//! # `Delay` blocks like `Wait`, not like a host sleep (issue #254)
+//!
+//! Before `CreateNewProc` (issue #121), this runtime was single-
+//! tasking, so `Delay` just blocked the host thread for the requested
+//! duration via `std::thread::sleep`: real `Delay` is "system-
+//! friendly" (per the RKRM: the process is suspended, not busy-
+//! waiting), but with no other guest task that could ever run in the
+//! meantime anyway, a flat host sleep had the same observable effect.
+//! codewiz's issue #254 report showed that reasoning breaks once a
+//! second real task exists: a task spinning on `Delay(1)` waiting for
+//! another one (`pthread_join`'s polling idiom when no signal is
+//! free) hung forever, since the host sleep gave that other task no
+//! chance to run at all; and a pending real timer request
+//! (`SendIO(TR_ADDREQUEST)`) in one task overshot its own deadline
+//! whenever another task happened to be delaying, since nothing ever
+//! checked [`crate::exectask::PendingTimers`] while the sleep blocked
+//! everything.
+//!
+//! [`delay_handler`] now behaves like [`crate::exectask::wait_handler`]:
+//! it registers its own deadline in `PendingTimers` (shared with real
+//! timer requests, so both are considered together, each correctly
+//! able to wake or be woken by the other) and blocks
+//! (`TaskScheduler::block_current_on_delay`), switching to another
+//! runnable task instead of sleeping the host thread, until that
+//! deadline is reached. Only once no other task is runnable either
+//! does it fall back to a real, bounded sleep -- and even then, only
+//! up to whichever is sooner: its own deadline, or some other
+//! pending entry that might wake a task first
+//! (`PendingTimers::fire_earliest_bounded`) and change the picture
+//! before this `Delay` would otherwise have to finish sleeping blind.
 //!
 //! # `struct DateStamp` (`dos/dos.h`)
 //!
@@ -107,8 +128,54 @@ fn datestamp_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 fn delay_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ticks = ctx.cpu.data_register(DataRegister(1));
     let millis = u64::from(ticks) * 1000 / u64::from(TICKS_PER_SECOND);
-    std::thread::sleep(std::time::Duration::from_millis(millis));
-    Ok(())
+    let task = ctx.current_task;
+
+    ctx.timers.fire_due(ctx.mem, ctx.tasks);
+
+    let deadline = ctx
+        .timers
+        .delay_deadline(task, std::time::Duration::from_millis(millis));
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            ctx.timers.remove_delay(task);
+            return Ok(());
+        }
+
+        // Nothing here "remembers" to return once woken -- re-trapping
+        // into this exact call re-checks the deadline fresh, same as
+        // `wait_handler`'s re-trap model (see this module's doc).
+        if ctx
+            .tasks
+            .block_current_on_delay(ctx.cpu, ctx.mem, ctx.trap_pc)
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        // No other task is runnable. Some other pending entry (another
+        // task's real timer request, or another task's own Delay)
+        // might still be due before this one and could make a task
+        // Ready -- give it the chance rather than sleeping blind for
+        // the rest of this Delay's own duration.
+        if !ctx
+            .timers
+            .fire_earliest_bounded(ctx.mem, ctx.tasks, deadline)
+        {
+            // Nothing else pending before our own deadline either:
+            // sleep out the remainder for real, the same reasoning
+            // `fire_earliest`'s own fallback sleep uses -- nothing else
+            // could possibly make progress while this sleeps anyway.
+            let now = std::time::Instant::now();
+            if deadline > now {
+                std::thread::sleep(deadline - now);
+            }
+            ctx.timers.remove_delay(task);
+            return Ok(());
+        }
+        // Something else fired -- possibly waking a task -- loop back
+        // and recheck.
+    }
 }
 
 /// Reads a `struct DateStamp` at `addr` as `(ds_Days, ds_Minute, ds_Tick)`.
@@ -388,6 +455,128 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_millis(30),
             "Delay(2) should block for roughly 40ms, only blocked {elapsed:?}"
+        );
+    }
+
+    /// `move.l #imm32,An`.
+    fn move_imm_to_a(n: u16) -> u16 {
+        0x207C | (n << 9)
+    }
+
+    /// `move.l D0,(An)`.
+    fn move_d0_to_a_indirect(an: u16) -> u16 {
+        0x2080 | (an << 9)
+    }
+
+    /// `move.l (An),D0`.
+    fn move_a_indirect_to_d0(an: u16) -> u16 {
+        0x2010 | an
+    }
+
+    /// `jsr <disp16>(a6)`.
+    fn jsr_disp16_a6(disp: i32) -> [u16; 2] {
+        [0x4EAE, disp as u16]
+    }
+
+    const RTS: u16 = 0x4E75;
+
+    fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
+        let mut offset = addr;
+        for &w in words {
+            mem.write_u16(offset, w);
+            offset += 2;
+        }
+    }
+
+    #[test]
+    fn delay_lets_another_ready_task_run() {
+        // codewiz's issue #254 "delay-switch.c" repro: a task spinning
+        // on Delay(1) waiting for another one to make progress (e.g.
+        // pthread_join's polling idiom when no signal is free) must
+        // actually let that other task run during the Delay, not hang
+        // the whole runtime in a host sleep that starves it. A
+        // CreateNewProc child, spawned right before the parent's own
+        // Delay, writes a marker and exits; if the child got to run
+        // at all during the parent's Delay (this fix), the marker is
+        // already set by the time Delay returns. Before this fix, the
+        // child never got the CPU -- Delay was a flat host sleep that
+        // gave nothing else a chance to run -- so the marker would
+        // still read 0.
+        const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3; // TAG_USER + NP_Dummy + NP_Entry
+
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); Delay(5) [100ms]; read marker ---
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        let tags_imm_idx = words.len();
+        words.push(0x223C); // move.l #imm32,D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+        words.push(0x223C); // move.l #imm32,D1 (ticks)
+        words.push(0);
+        words.push(5); // 5 ticks == 100ms
+        words.extend_from_slice(&jsr_disp16_a6(-198)); // Delay
+
+        let marker_imm_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: write the marker; fall off the end into the
+        // task-exit stub ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7000 | 0x2A); // moveq #0x2A,d0
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR, pre-pushed by CreateNewProc
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x2A,
+            "the child must have run and written the marker during the parent's Delay, not \
+             been starved of the CPU by a flat host sleep"
         );
     }
 }
