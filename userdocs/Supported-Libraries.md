@@ -129,6 +129,12 @@ Changelog.
   `RemSemaphore`/`ObtainSemaphoreList`/`ReleaseSemaphoreList`/
   `ObtainSemaphoreShared`/`AttemptSemaphoreShared` (AROS semantics: a
   free semaphore obtained shared gets `ss_Owner = NULL`).
+  `ObtainSemaphore`/`ObtainSemaphoreShared` genuinely block (and
+  `ReleaseSemaphore` genuinely wakes) when a `CreateNewProc`'d task
+  contends a semaphore another task holds — the exact shape
+  libpthread's mutex/thread-table bookkeeping hits at its first lock.
+  `ObtainSemaphoreList`/`ReleaseSemaphoreList` don't implement that
+  same block-and-retry dance and still fail loudly on contention.
 - I/O requests: `OpenDevice`/`CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/
   `CheckIO`/`AbortIO`, `CreateIORequest`/`DeleteIORequest`.
 - `Alert`, `RawDoFmt`.
