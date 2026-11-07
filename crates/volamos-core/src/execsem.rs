@@ -745,6 +745,11 @@ mod tests {
         0x2010 | an
     }
 
+    /// `move.l (disp,An),D0`.
+    fn move_a_disp_to_d0(an: u16, disp: i16) -> [u16; 2] {
+        [0x2028 | an, disp as u16]
+    }
+
     #[test]
     fn obtain_semaphore_blocks_until_the_holder_releases_it() {
         // Mirrors codewiz's minimal repro on issue #237: a parent task
@@ -758,11 +763,20 @@ mod tests {
         //
         // Since this runtime only switches tasks at an explicit
         // blocking/yielding point (no preemption), the parent must
-        // voluntarily yield (SetTaskPri to its own priority) after
-        // spawning the child and before releasing, so the child
-        // actually gets to run and attempt (and block on) the
-        // contended Obtain before the parent releases it. The order of
-        // operations below is deliberate -- see this test's steps.
+        // voluntarily yield after spawning the child and before
+        // releasing, so the child actually gets to run and attempt
+        // (and block on) the contended Obtain before the parent
+        // releases it. Real exec's `SetTaskPri` only reschedules when
+        // the caller's priority actually drops below a ready task's
+        // (issue #254) -- same priority is a no-op -- so the yield
+        // here is the real "dip and restore" idiom
+        // (`SetTaskPri(self, pri - 1); SetTaskPri(self, pri);`,
+        // `__gthread_yield()`'s own pattern): the dip (to below the
+        // child's priority) is what actually triggers the switch; the
+        // restore afterward runs once the parent is given the CPU back
+        // and is itself a no-op (raising priority never yields). The
+        // order of operations below is deliberate -- see this test's
+        // steps.
         const DOS_LIBRARY_BASE: u32 = crate::dispatch::DOS_LIBRARY_BASE;
         const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3; // TAG_USER + NP_Dummy + NP_Entry
 
@@ -790,18 +804,33 @@ mod tests {
         words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
         words.push((EXEC_LIBRARY_BASE >> 16) as u16);
         words.push(EXEC_LIBRARY_BASE as u16);
-        let parent_task_imm_idx_pri = words.len();
+        let parent_task_imm_idx_pri_dip = words.len();
         words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
         words.push(0);
         words.push(0);
-        words.push(move_imm_to_d(0)); // D0 = 0 (same as the parent's own default priority)
-        words.push(0);
-        words.push(0);
-        words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, same pri): yield to
-        // the child, which attempts ObtainSemaphore and blocks on the
-        // still-parent-held `sem`, switching straight back here.
+        words.push(move_imm_to_d(0)); // D0 = -1 (dip below the child's priority)
+        words.push(0xFFFF);
+        words.push(0xFFFF);
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, -1): drops below
+        // the child's priority, triggering a real reschedule -- the
+        // child attempts ObtainSemaphore and blocks on the still-
+        // parent-held `sem`, switching straight back here.
 
-        words.push(move_imm_to_a(0)); // A0 = SEM_ADDR (SetTaskPri clobbered A0/A1/D0/D1)
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE (SetTaskPri doesn't clobber
+        // A6, but reload for clarity/robustness like every other call site here)
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        let parent_task_imm_idx_pri_restore = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0 (restore the original priority)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, 0): raising priority
+        // never yields, so this is a plain no-op by the time it runs
+
+        words.push(move_imm_to_a(0)); // A0 = SEM_ADDR (SetTaskPri clobbered A0/D0/D1)
         words.push((SEM_ADDR >> 16) as u16);
         words.push(SEM_ADDR as u16);
         words.extend_from_slice(&jsr_disp16_a6(-570)); // ReleaseSemaphore: frees it, waking
@@ -831,6 +860,21 @@ mod tests {
         words.push(move_imm_to_a(0)); // A0 = SEM_ADDR
         words.push((SEM_ADDR >> 16) as u16);
         words.push(SEM_ADDR as u16);
+
+        // Proves this is a genuine contention repro, not a degenerate
+        // one where the parent already released before the child ever
+        // ran (which would still coincidentally pass this test's final
+        // assertions, by a different, uninteresting path): read
+        // ss_Owner directly, the instant the child starts, before
+        // calling anything -- the test below asserts this equals the
+        // parent's own task address.
+        words.extend_from_slice(&move_a_disp_to_d0(0, SS_OWNER as i16));
+        let observed_owner_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = observed_owner_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(1)); // *observed_owner_addr = D0
+
         words.extend_from_slice(&jsr_disp16_a6(-564)); // ObtainSemaphore: contended, blocks
 
         let marker_imm_idx_child = words.len();
@@ -858,7 +902,8 @@ mod tests {
         let entry = TRAP_TABLE_END;
         let code_end = entry + (words.len() as u32) * 2;
         let marker_addr = code_end + 16;
-        let tags_addr = marker_addr + 16;
+        let observed_owner_addr = marker_addr + 16;
+        let tags_addr = observed_owner_addr + 16;
         let load_end = tags_addr + 32;
 
         words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
@@ -867,10 +912,13 @@ mod tests {
         words[marker_imm_idx_parent + 2] = marker_addr as u16;
         words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
         words[marker_imm_idx_child + 2] = marker_addr as u16;
+        words[observed_owner_imm_idx + 1] = (observed_owner_addr >> 16) as u16;
+        words[observed_owner_imm_idx + 2] = observed_owner_addr as u16;
 
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
         mem.write_u32(marker_addr, 0);
+        mem.write_u32(observed_owner_addr, 0);
         // tags: [NP_ENTRY, child_entry], [TAG_DONE(0), 0]
         mem.write_u32(tags_addr, NP_ENTRY);
         mem.write_u32(tags_addr + 4, child_entry);
@@ -888,7 +936,11 @@ mod tests {
             },
         );
         let parent_task = rt.current_task();
-        for idx in [parent_task_imm_idx_pri, parent_task_imm_idx_signal] {
+        for idx in [
+            parent_task_imm_idx_pri_dip,
+            parent_task_imm_idx_pri_restore,
+            parent_task_imm_idx_signal,
+        ] {
             let patch_addr = entry + (idx as u32) * 2 + 2;
             rt.memory_mut().write_u32(patch_addr, parent_task);
         }
@@ -903,6 +955,15 @@ mod tests {
              early, or never waking) fails this assertion"
         );
         let mem = rt.memory();
+        assert_eq!(
+            mem.read_u32(observed_owner_addr),
+            parent_task,
+            "this is the discriminating check: the child must observe ss_Owner still equal \
+             to the parent's task address the instant it starts running, proving the \
+             parent's SetTaskPri dip genuinely switched to it *before* the parent's \
+             Release -- otherwise this test degenerates to a non-contended ObtainSemaphore \
+             that happens to leave the same final state"
+        );
         let owner = mem.read_u32(SEM_ADDR + SS_OWNER);
         assert_ne!(
             owner, 0,

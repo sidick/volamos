@@ -1098,14 +1098,20 @@ fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// `D0` = the old priority, sign-extended. clib2's exit code calls it
 /// to restore the priority its startup saved.
 ///
-/// Issue #121: setting a task's priority to the value it already had
-/// is a documented AmigaOS idiom for voluntarily yielding the CPU to
-/// any other task at the same priority -- requested here exactly like
-/// `Permit`'s `SFB_SAR` case, via `TaskScheduler::request_yield` (see
-/// its doc for why this only requests a yield rather than switching
-/// immediately). Only requested for the *current* task setting its own
-/// priority -- one task changing another's priority (real, if less
-/// common, usage) isn't a yield point for either of them.
+/// Issue #254: an earlier version of this handler treated setting a
+/// task's own priority to the value it already had as a yield point,
+/// based on a mistaken reading of the idiom -- real exec's scheduler
+/// only reschedules out of `SetTaskPri` when the calling task's new
+/// priority actually drops *below* some ready task's, never on a tie
+/// (confirmed against real exec, reported by codewiz: same-priority
+/// `SetTaskPri` keeps the CPU, and it's a lower-then-restore pair --
+/// `SetTaskPri(self, pri - 1); SetTaskPri(self, pri);`, the pattern
+/// AmigaPorts/gcc's `__gthread_yield()` uses -- that hands it to an
+/// equal, during the lowering call only). [`TaskScheduler::
+/// reschedule_if_outranked`] implements that real rule; only called
+/// for the *current* task setting its own priority -- one task
+/// changing another's priority (real, if less common, usage) isn't a
+/// reschedule point for either of them.
 fn set_task_pri_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let task = ctx.cpu.address_register(AddressRegister(1));
     let new_pri = ctx.cpu.data_register(DataRegister(0)) as u8;
@@ -1113,8 +1119,8 @@ fn set_task_pri_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     ctx.mem.write_u8(task + crate::execlist::LN_PRI, new_pri);
     ctx.cpu
         .set_data_register(DataRegister(0), old_pri as i32 as u32);
-    if task == ctx.current_task && new_pri as i8 == old_pri {
-        ctx.tasks.request_yield();
+    if task == ctx.current_task {
+        ctx.tasks.request_reschedule_if_outranked(new_pri as i8);
     }
     Ok(())
 }
@@ -2537,6 +2543,161 @@ mod tests {
             rt.memory()
                 .read_u8(rt.current_task() + crate::execlist::LN_PRI) as i8,
             3
+        );
+    }
+
+    // --- SetTaskPri scheduling (issue #254) ---
+
+    /// Builds a program that spawns a `CreateNewProc` child at the
+    /// parent's own priority (the real `NP_Priority` default), has the
+    /// parent run `pri_program` (free to call `SetTaskPri` on itself
+    /// however it likes -- returning its own words plus the relative
+    /// index of each `move_imm_to_a(1)`'s immediate operand that needs
+    /// the real parent task address patched in), then exits reporting
+    /// whatever marker byte the child wrote (`0x2A` if the child got to
+    /// run before the parent's own exit, `0` if it never did) -- shared
+    /// by the two regression tests below, which differ only in
+    /// `pri_program`.
+    fn run_set_task_pri_scheduling_test(
+        pri_program: impl FnOnce() -> (Vec<u16>, Vec<usize>),
+    ) -> i32 {
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); pri_program; read marker ---
+        words.extend_from_slice(&movea_dos_base_to_a6());
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        let pri_program_base = words.len();
+        let (pri_words, parent_task_patch_offsets) = pri_program();
+        words.extend_from_slice(&pri_words);
+
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: write the marker; fall off the end into the
+        // task-exit stub ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x2A
+        words.push(0);
+        words.push(0x2A);
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR, pre-pushed by CreateNewProc
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        // tags: [NP_ENTRY, child_entry], [TAG_DONE(0), 0] -- no
+        // NP_Priority, so the child inherits the parent's own current
+        // priority, per real CreateNewProc's documented default.
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        for offset in parent_task_patch_offsets {
+            let patch_addr = entry + ((pri_program_base + offset) as u32) * 2;
+            rt.memory_mut().write_u32(patch_addr, parent_task);
+        }
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn set_task_pri_to_the_same_priority_does_not_run_a_ready_task_of_that_priority() {
+        // codewiz's issue #254 "yield-test.c", the "same" case: real
+        // exec never reschedules on a tie, so the child (spawned at the
+        // parent's own priority, CreateNewProc's default) must still
+        // not have run by the time the parent reads the marker.
+        let code = run_set_task_pri_scheduling_test(|| {
+            let mut words = vec![
+                move_imm_to_a(1), // A1 = parent task (patched below)
+                0,
+                0,
+                move_imm_to_d(0), // D0 = 0 (same as the parent's own default priority)
+                0,
+                0,
+            ];
+            words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, same)
+            (words, vec![1])
+        });
+        assert_eq!(
+            code, 0,
+            "same-priority SetTaskPri must not hand the CPU to an equal-priority ready task"
+        );
+    }
+
+    #[test]
+    fn set_task_pri_dip_then_restore_runs_a_ready_task_of_that_priority() {
+        // codewiz's issue #254 "yield-test.c", the "dip and back" case
+        // (`__gthread_yield()`'s real pattern): dropping below the
+        // child's priority, even briefly, must hand it the CPU; the
+        // child runs to completion (writing the marker) before the
+        // parent's restoring second call ever gets to execute, let
+        // alone its own exit.
+        let code = run_set_task_pri_scheduling_test(|| {
+            let mut words = vec![
+                move_imm_to_a(1), // A1 = parent task (patched below)
+                0,
+                0,
+                move_imm_to_d(0), // D0 = -1 (dip below the child's priority)
+                0xFFFF,
+                0xFFFF,
+            ];
+            words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, -1)
+            let restore_patch_offset = words.len() + 1;
+            words.push(move_imm_to_a(1)); // A1 = parent task again (patched below)
+            words.push(0);
+            words.push(0);
+            words.push(move_imm_to_d(0)); // D0 = 0 (restore)
+            words.push(0);
+            words.push(0);
+            words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, 0)
+            (words, vec![1, restore_patch_offset])
+        });
+        assert_eq!(
+            code, 0x2A,
+            "dipping below a ready task's priority and restoring it must let that task run \
+             during the dip"
         );
     }
 

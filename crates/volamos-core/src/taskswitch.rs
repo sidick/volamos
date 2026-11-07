@@ -216,6 +216,14 @@ pub struct TaskScheduler {
     /// epilogue first, *then* checks this flag and calls
     /// [`Self::yield_to_ready`] itself.
     yield_requested: bool,
+    /// Set by [`Self::request_reschedule_if_outranked`] (`SetTaskPri`'s
+    /// handler), taken by [`Self::take_reschedule_request`]. A flag
+    /// (carrying the new priority) for the same reason
+    /// [`Self::yield_requested`] is: the handler runs *before* the
+    /// generic post-dispatch epilogue that actually completes
+    /// `SetTaskPri`'s own call, so it can't yet capture the correct
+    /// post-epilogue registers to save if it switched immediately.
+    reschedule_requested: Option<i8>,
 }
 
 impl TaskScheduler {
@@ -229,6 +237,7 @@ impl TaskScheduler {
             pending_restore: None,
             switch_hook_active: false,
             yield_requested: false,
+            reschedule_requested: None,
         }
     }
 
@@ -236,8 +245,7 @@ impl TaskScheduler {
     /// finishes -- see [`Self::yield_requested`]'s doc for why this is
     /// a flag rather than switching immediately. Called by `Permit`'s
     /// handler when `SysFlags`'s `SFB_SAR` bit was set (real
-    /// `sched_yield()`'s mechanism) and by `SetTaskPri`'s handler when
-    /// the new priority equals the old one.
+    /// `sched_yield()`'s mechanism).
     pub fn request_yield(&mut self) {
         self.yield_requested = true;
     }
@@ -245,6 +253,20 @@ impl TaskScheduler {
     /// Takes (and clears) a pending [`Self::request_yield`] request.
     pub fn take_yield_request(&mut self) -> bool {
         std::mem::take(&mut self.yield_requested)
+    }
+
+    /// Requests [`Self::reschedule_if_outranked`] once the current
+    /// `SetTaskPri` call finishes -- see [`Self::reschedule_requested`]'s
+    /// doc for why this is a flag rather than switching immediately.
+    /// `new_pri` is the priority the task was just set to.
+    pub fn request_reschedule_if_outranked(&mut self, new_pri: i8) {
+        self.reschedule_requested = Some(new_pri);
+    }
+
+    /// Takes (and clears) a pending
+    /// [`Self::request_reschedule_if_outranked`] request.
+    pub fn take_reschedule_request(&mut self) -> Option<i8> {
+        self.reschedule_requested.take()
     }
 
     /// The currently-running task's guest address -- **not** updated
@@ -540,6 +562,54 @@ impl TaskScheduler {
         let Some(next) = self.pick_ready(mem) else {
             return false;
         };
+        self.switch_to_ready(cpu, mem, next);
+        true
+    }
+
+    /// `SetTaskPri` (issue #254): unlike [`Self::yield_to_ready`]
+    /// (`Permit`+`SFB_SAR`'s unconditional "give up the timeslice if
+    /// anything is ready"), real exec's scheduler only reschedules out
+    /// of `SetTaskPri` when the calling task's new priority actually
+    /// drops below some ready task's -- setting the *same* priority a
+    /// task already had is a no-op (it keeps running), and a lower-
+    /// then-restore pair yields only during the lowering call, to
+    /// whichever ready task that lower priority no longer dominates.
+    /// `new_pri` is the just-written priority the caller already
+    /// stored into the task's own `ln_Pri` (read fresh rather than
+    /// cached, in case something else changed it in between).
+    ///
+    /// Same calling convention as `yield_to_ready`: the caller runs its
+    /// own post-dispatch epilogue first, then calls this with `cpu`
+    /// holding that post-epilogue state. Returns whether a switch
+    /// happened.
+    pub fn reschedule_if_outranked<C: Cpu, M: AddressSpace>(
+        &mut self,
+        cpu: &C,
+        mem: &M,
+        new_pri: i8,
+    ) -> bool {
+        if self.switch_hook_active {
+            return false;
+        }
+        let Some(next) = self.pick_ready(mem) else {
+            return false;
+        };
+        let next_pri = mem.read_u8(next + crate::execlist::LN_PRI) as i8;
+        if next_pri <= new_pri {
+            // The lowered task still dominates (or ties) every ready
+            // task's priority -- real exec never switches away on a
+            // tie, so neither does this.
+            return false;
+        }
+        self.switch_to_ready(cpu, mem, next);
+        true
+    }
+
+    /// Shared staging logic behind [`Self::yield_to_ready`] and
+    /// [`Self::reschedule_if_outranked`]: both have already decided
+    /// (via [`Self::pick_ready`] plus their own condition) that `next`
+    /// should run instead of [`Self::current`].
+    fn switch_to_ready<C: Cpu, M: AddressSpace>(&mut self, cpu: &C, mem: &M, next: u32) {
         let yielding = self.current;
         let (sp_lower, sp_upper) = Self::read_stack_bounds(mem, yielding);
         self.others.insert(
@@ -556,14 +626,14 @@ impl TaskScheduler {
             .remove(&next)
             .expect("pick_ready only returns a known task");
         // Not `self.current = next` here either -- see `Self::commit`'s
-        // doc. A voluntary yield has no outgoing `tc_Switch` step (the
-        // yielding task's own library call already fully completed, by
-        // the time this is called -- see this method's doc), but the
-        // caller still commits via the same path as every other switch,
-        // for one reason: the *incoming* task may have `TF_LAUNCH` set,
-        // and `tc_Launch` must see `current()` already updated to it.
+        // doc. A voluntary yield/reschedule has no outgoing `tc_Switch`
+        // step (the yielding task's own library call already fully
+        // completed, by the time this is called -- see the callers'
+        // doc), but the caller still commits via the same path as every
+        // other switch, for one reason: the *incoming* task may have
+        // `TF_LAUNCH` set, and `tc_Launch` must see `current()` already
+        // updated to it.
         self.pending_restore = Some((next, next_record));
-        true
     }
 
     /// The current task ran off the end of its `NP_Entry` (reached the

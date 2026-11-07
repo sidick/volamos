@@ -3681,6 +3681,21 @@ impl<C: Cpu + 'static> Runtime<C> {
                             self.apply_pending_task_switch();
                         }
                     }
+
+                    // Issue #254: `SetTaskPri` requested a reschedule
+                    // check (now that its own call has genuinely
+                    // completed, for the same reason the yield check
+                    // just above has to happen here) -- switch away
+                    // only if the task's new priority no longer
+                    // dominates the best ready task's. See
+                    // `TaskScheduler::reschedule_if_outranked`'s doc.
+                    if let Some(new_pri) = self.tasks.take_reschedule_request() {
+                        self.tasks
+                            .reschedule_if_outranked(&self.cpu, &self.mem, new_pri);
+                        if self.tasks.has_pending_switch() {
+                            self.apply_pending_task_switch();
+                        }
+                    }
                 }
             }
         }
