@@ -1054,6 +1054,28 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 /// `NP_CloseError`) are closed: whatever `pr_CIS`/`pr_COS`/`pr_CES`
 /// hold by now, which is why libpthread clears `pr_CIS` once it has
 /// read its slot number from it.
+///
+/// Issue #254: real `dos.library` frees a process's stack and `struct
+/// Process` when it ends -- this didn't, leaving roughly one stack's
+/// worth of guest heap permanently allocated per `CreateNewProc`'d
+/// task, noticeable after many short-lived ones (codewiz's repro: 50
+/// processes with 64 KB stacks each). Every address needed is
+/// recoverable from the exiting task's own struct, read out *before*
+/// any of it is freed (freeing may poison the block's bytes, e.g.
+/// under `--sanitize`'s quarantine): the stack block (`tc_SPLower`,
+/// the same address [`crate::exectask::create_new_proc_handler`]
+/// originally allocated it at and handed to
+/// [`crate::taskswitch::TaskScheduler::spawn_ready`] -- not whatever
+/// `A7`/`tc_SPLower` happen to read if the task `StackSwap`ped onto a
+/// *different* stack and never swapped back, which stays leaked same
+/// as before), the process-name string (`ln_Name`), and the
+/// `NP_Arguments` copy (`pr_Arguments`, if any -- most callers pass
+/// none). The `struct Process` itself is freed last, once nothing
+/// above still needs to read it. Each address was allocated exactly
+/// once, by this same task's own `CreateNewProc` call, and never
+/// freed anywhere else, so a failed free here would mean a real
+/// double-free/corruption bug in this runtime, not a guest one --
+/// worth failing loudly over rather than silently leaking again.
 pub(crate) fn task_exit_stub_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
@@ -1075,6 +1097,34 @@ pub(crate) fn task_exit_stub_handler<C: Cpu>(
     // exit may leave free for the heap to hand out again -- see
     // PendingTimer::owner_task's doc.
     ctx.timers.remove_owned_by(task);
+
+    let stack_block = ctx.mem.read_u32(task + TC_SPLOWER);
+    let name_addr = ctx.mem.read_u32(task + LN_NAME);
+    let args_addr = ctx.mem.read_u32(task + PR_ARGUMENTS_OFFSET);
+    // Only if `tc_SPLower` still names a live allocation: a task that
+    // `StackSwap`ped onto some other stack and never swapped back
+    // before exiting leaves `tc_SPLower` naming that *other* stack
+    // instead (StackSwap's whole contract is overwriting it) -- not
+    // this runtime's own heap allocation to free, and possibly not a
+    // heap allocation at all. Leaked in that case, same as every
+    // CreateNewProc child's stack was before this fix.
+    if ctx.heap.size_of_live_alloc(stack_block).is_some() {
+        ctx.heap
+            .free(stack_block)
+            .unwrap_or_else(|e| panic!("exiting task's own stack block: {e}"));
+    }
+    ctx.heap
+        .free(name_addr)
+        .unwrap_or_else(|e| panic!("exiting task's own process-name string: {e}"));
+    if args_addr != 0 {
+        ctx.heap
+            .free(args_addr)
+            .unwrap_or_else(|e| panic!("exiting task's own NP_Arguments copy: {e}"));
+    }
+    ctx.heap
+        .free(task)
+        .unwrap_or_else(|e| panic!("exiting task's own struct Process: {e}"));
+
     loop {
         if ctx.tasks.terminate_current(ctx.mem).is_ok() {
             return Ok(());
@@ -3148,6 +3198,109 @@ mod tests {
             code, 0x2A,
             "the parent should read the marker only the child task's own \
              code could have written, proving the child actually ran"
+        );
+    }
+
+    #[test]
+    fn create_new_proc_frees_the_childs_stack_and_process_struct_on_exit() {
+        // codewiz's issue #254 "proc-mem.c" repro, scaled down from 50
+        // processes to 3 (the mechanism is the same regardless of
+        // count -- this just needs to prove a child's heap allocations
+        // come back, not survive a long-running fuzz test): three
+        // CreateNewProc children, one after another, each immediately
+        // Signal-ing the parent and exiting. If their stack/`struct
+        // Process`/name string are freed on exit (this fix), the
+        // host-measured free heap space is identical before the first
+        // spawn and after the last child's exit; before this fix, each
+        // iteration leaked a stack's worth permanently.
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+
+        // --- parent: [CreateNewProc(tags); Wait(SIGNAL)] x3; exit ---
+        let mut tags_imm_idxs = Vec::new();
+        for _ in 0..3 {
+            words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+            words.push((DOS_LIBRARY_BASE >> 16) as u16);
+            words.push(DOS_LIBRARY_BASE as u16);
+            tags_imm_idxs.push(words.len());
+            words.push(move_imm_to_d(1)); // D1 = tags (patched below, same
+            words.push(0); // tags block reused for every iteration --
+            words.push(0); // nothing here mutates it)
+            words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+            words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+            words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+            words.push(EXEC_LIBRARY_BASE as u16);
+            words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+            words.push(0x0001);
+            words.push(0x0000);
+            words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+        }
+        words.push(RTS); // -> EXIT_STUB_ADDR
+
+        // --- child (one shared entry point, reused by all three spawns):
+        // Signal(parent, join signal); fall off the end into the
+        // task-exit stub ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        let parent_task_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR, pre-pushed on each
+        // child's own stack by CreateNewProc.
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let tags_addr = code_end + 16;
+        let load_end = tags_addr + 32;
+
+        // One tags block, reused by all three (structurally identical)
+        // CreateNewProc call sites.
+        for idx in tags_imm_idxs {
+            words[idx + 1] = (tags_addr >> 16) as u16;
+            words[idx + 2] = tags_addr as u16;
+        }
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        // tags: [NP_ENTRY, child_entry], [TAG_DONE(0), 0]
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        let parent_task_patch_addr = entry + (parent_task_imm_idx as u32) * 2 + 2;
+        rt.memory_mut()
+            .write_u32(parent_task_patch_addr, parent_task);
+
+        let free_before = rt.heap_mut().free_bytes();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let free_after = rt.heap_mut().free_bytes();
+        assert_eq!(
+            free_before, free_after,
+            "each CreateNewProc child's stack, struct Process, and name string must be \
+             fully freed by the time it exits -- any difference here is exactly the leak \
+             issue #254 reported (64 KB per process, in the real repro)"
         );
     }
 

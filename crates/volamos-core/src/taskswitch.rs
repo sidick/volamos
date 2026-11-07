@@ -573,15 +573,16 @@ impl TaskScheduler {
     /// [`Deadlock`] if there isn't one (an orphaned task left with
     /// nothing able to wake it).
     ///
-    /// Deliberately leaks the exited task's `struct Process`/stack
-    /// back in the guest heap rather than freeing them: this module
-    /// never recorded their addresses for the *running* task (only
-    /// non-running tasks are tracked in [`Self::others`]), and
-    /// recovering them would mean plumbing the allocation sizes back
-    /// in from `crate::exectask::create_task`/`CreateNewProc`'s
-    /// handler for what is, for every program this runtime targets (one
-    /// short-lived CLI run, not a long-lived server spawning threads
-    /// indefinitely), a harmless one-time leak.
+    /// Doesn't free the exited task's `struct Process`/stack/name
+    /// string itself -- this module never recorded their addresses
+    /// for the *running* task (only non-running tasks are tracked in
+    /// [`Self::others`]), so it has nothing to free them with. Issue
+    /// #254 found this mattered after all (many `CreateNewProc`'d
+    /// short-lived processes, not the one-time leak this used to
+    /// assume): [`crate::exectask::task_exit_stub_handler`], the sole
+    /// caller, frees them itself before calling this, since it still
+    /// has the exiting task's own struct to read every address back
+    /// out of.
     pub fn terminate_current<M: AddressSpace>(&mut self, mem: &M) -> Result<(), Deadlock> {
         // See `switch_hook_active`'s doc -- same reasoning as
         // `block_current_on_signal`'s matching check.
