@@ -128,6 +128,16 @@
 //! fresh return address always means "decrement by 4 from a
 //! nothing-pending pointer, whichever stack it names."
 //!
+//! [`stack_swap_handler`] sanity-checks `stk_Lower`/`stk_Upper`/
+//! `stk_Pointer` before touching anything, and fails loudly right at
+//! the call site on a corrupted or never-initialized
+//! `StackSwapStruct` -- found worth adding after a separate tool built
+//! on this runtime hit exactly that confusion: a bad struct otherwise
+//! runs on silently (A7 lands on garbage, the generic post-dispatch
+//! `rts` pops whatever happens to be there) until the failure surfaces
+//! as something far removed from this call site, most often
+//! [`crate::dispatch::DispatchError::EmptyContinuationStack`].
+//!
 //! # Stack-overflow detection
 //!
 //! [`check_stack_bounds`] is `Runtime::run`'s guard against the "stack-
@@ -1467,6 +1477,50 @@ fn stack_swap_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     let new_lower = ctx.mem.read_u32(struct_ptr + STK_LOWER);
     let new_upper = ctx.mem.read_u32(struct_ptr + STK_UPPER);
     let new_pointer = ctx.mem.read_u32(struct_ptr + STK_POINTER);
+
+    // A corrupted or never-initialized StackSwapStruct (a guest bug,
+    // not this runtime's) would otherwise run on silently -- A7 lands
+    // on garbage, the generic post-dispatch `rts` above pops whatever
+    // happens to be there, and the failure that eventually surfaces
+    // (an UnknownCall at a nonsense pc, or EmptyContinuationStack) is
+    // far removed from this call site and much more confusing to
+    // debug than the actual cause. Fail loudly here instead, the same
+    // posture every other malformed-input check in this module takes.
+    if new_lower > new_upper {
+        return Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -732,
+            handler_name: "StackSwap".to_string(),
+            message: format!(
+                "StackSwap({struct_ptr:#010x}): stk_Lower {new_lower:#010x} > stk_Upper \
+                 {new_upper:#010x} -- an invalid or uninitialized StackSwapStruct"
+            ),
+        });
+    }
+    if new_pointer < new_lower || new_pointer > new_upper {
+        return Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -732,
+            handler_name: "StackSwap".to_string(),
+            message: format!(
+                "StackSwap({struct_ptr:#010x}): stk_Pointer {new_pointer:#010x} is outside \
+                 [stk_Lower {new_lower:#010x}, stk_Upper {new_upper:#010x}] -- an invalid or \
+                 uninitialized StackSwapStruct"
+            ),
+        });
+    }
+    if new_pointer - new_lower < 4 {
+        return Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -732,
+            handler_name: "StackSwap".to_string(),
+            message: format!(
+                "StackSwap({struct_ptr:#010x}): stk_Pointer {new_pointer:#010x} leaves no room \
+                 above stk_Lower {new_lower:#010x} for the return address this call needs to \
+                 push -- the new stack is already full"
+            ),
+        });
+    }
 
     let old_lower = ctx.mem.read_u32(task + TC_SPLOWER);
     let old_upper = ctx.mem.read_u32(task + TC_SPUPPER);
@@ -3748,6 +3802,105 @@ mod tests {
         let task = rt.current_task();
         assert_eq!(rt.memory().read_u32(task + TC_SPLOWER), new_stack_block);
         assert_eq!(rt.memory().read_u32(task + TC_SPUPPER), new_stack_top);
+    }
+
+    /// Builds a program that calls `StackSwap` once on a `StackSwapStruct`
+    /// at a fixed address, with `init_struct` free to fill in a
+    /// deliberately invalid `stk_Lower`/`stk_Upper`/`stk_Pointer` before
+    /// the run -- for the sanity-check regression tests below. Feedback
+    /// from a separate tool built on this runtime: a corrupted or
+    /// never-initialized `StackSwapStruct` otherwise runs on silently
+    /// until the failure surfaces as something far removed from this call
+    /// site (most often `EmptyContinuationStack`), rather than failing
+    /// loudly right here.
+    fn run_stack_swap_with_struct(
+        init_struct: impl FnOnce(&mut FlatMemory, u32),
+    ) -> crate::dispatch::RuntimeError {
+        let _guard = lock_host_break();
+        let entry = TRAP_TABLE_END;
+
+        let mut words = Vec::new();
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        words.push(move_imm_to_a(0)); // A0 = struct_addr (patched below)
+        let a0_patch = words.len();
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-732)); // StackSwap
+        words.push(RTS);
+
+        let code_len = words.len() as u32 * 2;
+        let struct_addr = entry + code_len;
+        let load_end = struct_addr + 32;
+
+        words[a0_patch] = (struct_addr >> 16) as u16;
+        words[a0_patch + 1] = struct_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        init_struct(&mut mem, struct_addr);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None)
+            .expect_err("StackSwap with an invalid StackSwapStruct should fail loudly")
+    }
+
+    fn assert_stack_swap_failed(err: crate::dispatch::RuntimeError) {
+        match err {
+            crate::dispatch::RuntimeError::Dispatch(DispatchError::HandlerFailed {
+                library,
+                lvo,
+                handler_name,
+                ..
+            }) => {
+                assert_eq!(library, "exec.library");
+                assert_eq!(lvo, -732);
+                assert_eq!(handler_name, "StackSwap");
+            }
+            other => panic!("expected HandlerFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stack_swap_rejects_inverted_bounds() {
+        let err = run_stack_swap_with_struct(|mem, struct_addr| {
+            // stk_Lower > stk_Upper: never produced by a correctly
+            // initialized struct.
+            mem.write_u32(struct_addr, 0x5000); // stk_Lower
+            mem.write_u32(struct_addr + 4, 0x4000); // stk_Upper
+            mem.write_u32(struct_addr + 8, 0x4800); // stk_Pointer
+        });
+        assert_stack_swap_failed(err);
+    }
+
+    #[test]
+    fn stack_swap_rejects_pointer_outside_its_own_bounds() {
+        let err = run_stack_swap_with_struct(|mem, struct_addr| {
+            mem.write_u32(struct_addr, 0x4000); // stk_Lower
+            mem.write_u32(struct_addr + 4, 0x5000); // stk_Upper
+            mem.write_u32(struct_addr + 8, 0x6000); // stk_Pointer, past stk_Upper
+        });
+        assert_stack_swap_failed(err);
+    }
+
+    #[test]
+    fn stack_swap_rejects_a_pointer_with_no_room_for_the_return_address() {
+        let err = run_stack_swap_with_struct(|mem, struct_addr| {
+            mem.write_u32(struct_addr, 0x4000); // stk_Lower
+            mem.write_u32(struct_addr + 4, 0x5000); // stk_Upper
+            mem.write_u32(struct_addr + 8, 0x4000); // stk_Pointer == stk_Lower: no room to push
+        });
+        assert_stack_swap_failed(err);
     }
 
     // --- Forbid/Permit ---
