@@ -4,7 +4,7 @@
 //! running the real `AmiSnap` binary (`~/src/amisnap`), which uses a
 //! semaphore somewhere in its libnix-provided runtime support.
 //!
-//! # Design: single-tasking means "contention" is always a guest bug
+//! # Design: real blocking since `CreateNewProc` (issue #121/#237)
 //!
 //! Real semaphore semantics (traced against AROS's `rom/exec/
 //! semaphores.c`/`obtainsemaphore.c`/`releasesemaphore.c`/
@@ -14,24 +14,36 @@
 //! `ObtainSemaphore` blocks (via `Wait`) if some other task already
 //! holds it, and `ReleaseSemaphore` wakes the next waiter.
 //!
-//! This runtime only ever has one task ([`crate::exectask::TASK_STRUCT_SIZE`]'s
-//! module docs -- see [`crate::dispatch::HandlerContext::current_task`]),
-//! so the "some other task holds it" branch can never legitimately be
-//! reached: the only way `ss_Owner` could differ from
-//! [`crate::dispatch::HandlerContext::current_task`] while the
-//! semaphore is held is guest memory corruption or an uninitialized/
-//! garbage `SignalSemaphore*` -- a real bug worth surfacing loudly
-//! (same philosophy as `exectask.rs`'s `Signal`-to-unknown-task and
-//! `Wait`-with-nothing-pending checks), *except* for `AttemptSemaphore`,
-//! whose whole documented contract is "never blocks, just tells you
-//! whether it worked" -- callers are required to handle a `FALSE`
-//! result, so returning `FALSE` there instead of erroring stays
-//! faithful to the real function's contract.
+//! Before `CreateNewProc` (issue #121) this runtime only ever had one
+//! task, so that branch could never legitimately be reached and any
+//! contention meant guest memory corruption or an uninitialized/garbage
+//! `SignalSemaphore*`. A second real task changes that: codewiz's issue
+//! #237 report (a `CreateNewProc`'d child contending a parent's held
+//! semaphore -- the exact shape libpthread's mutex/thread-table
+//! bookkeeping hits at its very first lock) showed contention is now a
+//! completely ordinary, correct program's behavior. `obtain_semaphore_
+//! handler`/`obtain_semaphore_shared_handler` now block the caller
+//! (`TaskScheduler::block_current_on_semaphore`) and switch to another
+//! runnable task, the same re-trap pattern `exectask::wait_handler`
+//! uses for `Wait`; `release_semaphore_handler` wakes every blocked
+//! waiter (`TaskScheduler::wake_blocked_on_semaphore`) once a release
+//! fully frees the semaphore. It's still a real bug -- surfaced loudly,
+//! same philosophy as `exectask.rs`'s `Signal`-to-unknown-task and
+//! `Wait`-with-nothing-pending checks -- if contention happens with no
+//! other task runnable and no pending timer that could ever change
+//! that either (a genuine deadlock, not just "no scheduler").
+//! `AttemptSemaphore`'s whole documented contract is "never blocks,
+//! just tells you whether it worked" -- callers are required to handle
+//! a `FALSE` result, so returning `FALSE` there instead of blocking or
+//! erroring stays faithful to the real function's contract.
 //!
 //! The waiter-queue side of the real algorithm (`ss_WaitQueue`,
-//! `ss_MultipleLink`, queued `SM_SHARED` requests) is consequently
-//! never exercised in this runtime and isn't implemented -- only the
-//! nesting/ownership bookkeeping a single task can actually observe.
+//! `ss_MultipleLink`, queued `SM_SHARED` requests) still isn't
+//! implemented as a real walkable list -- blocked waiters are tracked
+//! in [`crate::taskswitch::TaskState::BlockedOnSemaphore`] instead, and
+//! woken all at once rather than in real FIFO order; see that variant's
+//! own doc for why that stays behaviorally correct under cooperative
+//! scheduling.
 //!
 //! # Shared locks
 //!
@@ -187,59 +199,105 @@ fn release_semaphore_impl<M: AddressSpace>(mem: &mut M, sem: u32, task: u32) -> 
 
 /// `ObtainSemaphore` (LVO -564): `A0` = `struct SignalSemaphore*`. No
 /// return value (real `ObtainSemaphore` preserves every register).
+///
+/// On contention (issue #237's semaphore-contention follow-up, reported
+/// by codewiz with a minimal `CreateNewProc` repro): blocks the current
+/// task on `sem` and switches to another runnable one, the same
+/// `block_current_on_signal`/re-trap pattern `exectask::wait_handler`
+/// already uses for `Wait` -- see this module's docs for why that's now
+/// reachable at all now that a second real task can exist. Only fails
+/// loudly if no other task is runnable and no pending timer could ever
+/// change that either, exactly `wait_handler`'s own deadlock posture.
 fn obtain_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
 
-    obtain_semaphore_impl(ctx.mem, sem, task, task).map_err(|owner| DispatchError::HandlerFailed {
-        library: "exec.library".to_string(),
-        lvo: -564,
-        handler_name: "ObtainSemaphore".to_string(),
-        message: if owner == 0 {
-            format!(
-                "ObtainSemaphore({sem:#010x}) would block forever: the current task \
-                     {task:#010x} holds it shared, and an exclusive lock waits for every \
-                     shared one to be released"
-            )
-        } else {
-            format!(
-                "ObtainSemaphore({sem:#010x}) would block forever: already held by task \
-                     {owner:#010x}, not the current task {task:#010x} -- this is a \
-                     single-tasking runtime with no other task that could plausibly own it, \
-                     so the semaphore is either uninitialized or corrupt"
-            )
-        },
-    })
+    loop {
+        let Err(owner) = obtain_semaphore_impl(ctx.mem, sem, task, task) else {
+            return Ok(());
+        };
+
+        if ctx
+            .tasks
+            .block_current_on_semaphore(ctx.cpu, ctx.mem, ctx.trap_pc, sem)
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            return Err(DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -564,
+                handler_name: "ObtainSemaphore".to_string(),
+                message: if owner == 0 {
+                    format!(
+                        "ObtainSemaphore({sem:#010x}) would deadlock: the current task \
+                             {task:#010x} holds it shared, and an exclusive lock waits for \
+                             every shared one to be released, but no other task is runnable \
+                             and no pending timer could ever release it"
+                    )
+                } else {
+                    format!(
+                        "ObtainSemaphore({sem:#010x}) would deadlock: already held by task \
+                             {owner:#010x}, not the current task {task:#010x}, but no other \
+                             task is runnable and no pending timer could ever release it"
+                    )
+                },
+            });
+        }
+    }
 }
 
 /// `ObtainSemaphoreShared` (LVO -678): `A0` = `struct SignalSemaphore*`.
 /// No return value. A free semaphore becomes shared (`ss_Owner` = NULL);
-/// a shared one, or one the current task holds exclusively, nests.
+/// a shared one, or one the current task holds exclusively, nests. On
+/// contention, blocks exactly as [`obtain_semaphore_handler`] does.
 fn obtain_semaphore_shared_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
 
-    obtain_semaphore_impl(ctx.mem, sem, task, 0).map_err(|owner| DispatchError::HandlerFailed {
-        library: "exec.library".to_string(),
-        lvo: -678,
-        handler_name: "ObtainSemaphoreShared".to_string(),
-        message: format!(
-            "ObtainSemaphoreShared({sem:#010x}) would block forever: held exclusively by \
-                 task {owner:#010x}, not the current task {task:#010x} -- this is a \
-                 single-tasking runtime with no other task that could plausibly own it, so \
-                 the semaphore is either uninitialized or corrupt"
-        ),
-    })
+    loop {
+        let Err(owner) = obtain_semaphore_impl(ctx.mem, sem, task, 0) else {
+            return Ok(());
+        };
+
+        if ctx
+            .tasks
+            .block_current_on_semaphore(ctx.cpu, ctx.mem, ctx.trap_pc, sem)
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            return Err(DispatchError::HandlerFailed {
+                library: "exec.library".to_string(),
+                lvo: -678,
+                handler_name: "ObtainSemaphoreShared".to_string(),
+                message: format!(
+                    "ObtainSemaphoreShared({sem:#010x}) would deadlock: held exclusively by \
+                         task {owner:#010x}, not the current task {task:#010x}, but no other \
+                         task is runnable and no pending timer could ever release it"
+                ),
+            });
+        }
+    }
 }
 
 /// `ReleaseSemaphore` (LVO -570): `A0` = `struct SignalSemaphore*`. No
-/// return value.
+/// return value. If this fully frees `sem` (nest count reaches zero),
+/// wakes every task blocked on it in `ObtainSemaphore`/
+/// `ObtainSemaphoreShared` (issue #237's semaphore-contention follow-up)
+/// -- they re-attempt their original call from scratch on resume, so
+/// whichever loses the race to actually obtain it just blocks again.
 fn release_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
 
+    let nest_before = ctx.mem.read_u16(sem + SS_NEST_COUNT);
     release_semaphore_impl(ctx.mem, sem, task).map_err(|owner| DispatchError::HandlerFailed {
         library: "exec.library".to_string(),
         lvo: -570,
@@ -249,7 +307,12 @@ fn release_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
              {task:#010x} -- an unmatched Release (never Obtained, or already fully released) \
              or a corrupt semaphore"
         ),
-    })
+    })?;
+
+    if nest_before == 1 {
+        ctx.tasks.wake_blocked_on_semaphore(sem);
+    }
+    Ok(())
 }
 
 /// `AttemptSemaphore` (LVO -576): `A0` = `struct SignalSemaphore*`.
@@ -339,12 +402,14 @@ fn rem_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// Autodoc's `EXAMPLE`). No return value. Real `ObtainSemaphoreList`
 /// (traced against AROS's `rom/exec/obtainsemaphorelist.c`) obtains
 /// every semaphore on the list, queuing a wait for any it can't get
-/// immediately and coming back to it later; this single-tasking
-/// runtime's "contention is always a bug" stance ([`obtain_semaphore_impl`],
-/// this module's own docs) applies per-semaphore here too -- the first
-/// one that can't be obtained fails the whole call loudly rather than
-/// partially unwinding, since a real waiting-then-retrying loop can't
-/// happen without another task to eventually release it.
+/// immediately, releasing what it already holds, and retrying the
+/// whole list once that one frees up. Unlike [`obtain_semaphore_handler`]/
+/// [`obtain_semaphore_shared_handler`], this handler deliberately
+/// doesn't implement that partial-obtain/release/retry dance -- nothing
+/// in this runtime's corpus has needed it yet -- so contention here
+/// still fails the whole call loudly at the first semaphore that can't
+/// be obtained immediately, same posture this module used everywhere
+/// before issue #237's semaphore-contention follow-up.
 fn obtain_semaphore_list_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
@@ -363,8 +428,9 @@ fn obtain_semaphore_list_handler<C: Cpu>(
                 handler_name: "ObtainSemaphoreList".to_string(),
                 message: format!(
                     "ObtainSemaphoreList({list:#010x}): semaphore {node:#010x} already held \
-                     by task {owner:#010x}, not the current task {task:#010x} -- this is a \
-                     single-tasking runtime with no other task that could plausibly own it"
+                     by task {owner:#010x}, not the current task {task:#010x} -- \
+                     ObtainSemaphoreList doesn't block-and-retry on contention in this \
+                     runtime, unlike ObtainSemaphore/ObtainSemaphoreShared"
                 ),
             }
         })?;
@@ -659,6 +725,195 @@ mod tests {
             }
             other => panic!("expected HandlerFailed, got {other:?}"),
         }
+    }
+
+    // --- Two-task semaphore contention (issue #237's semaphore-
+    // contention follow-up, reported by codewiz) ---
+
+    /// `move.l #imm32,Dn`.
+    fn move_imm_to_d(n: u16) -> u16 {
+        0x203C | (n << 9)
+    }
+
+    /// `move.l D0,(An)`.
+    fn move_d0_to_a_indirect(an: u16) -> u16 {
+        0x2080 | (an << 9)
+    }
+
+    /// `move.l (An),D0`.
+    fn move_a_indirect_to_d0(an: u16) -> u16 {
+        0x2010 | an
+    }
+
+    #[test]
+    fn obtain_semaphore_blocks_until_the_holder_releases_it() {
+        // Mirrors codewiz's minimal repro on issue #237: a parent task
+        // holds `sem`; a child, spawned via CreateNewProc, tries to
+        // obtain the same semaphore while the parent still holds it.
+        // Real hardware blocks the child until the parent releases it;
+        // before this fix, this runtime instead failed loudly with
+        // "would block forever ... single-tasking runtime", since a
+        // second real task couldn't exist yet when this module's
+        // original design was written.
+        //
+        // Since this runtime only switches tasks at an explicit
+        // blocking/yielding point (no preemption), the parent must
+        // voluntarily yield (SetTaskPri to its own priority) after
+        // spawning the child and before releasing, so the child
+        // actually gets to run and attempt (and block on) the
+        // contended Obtain before the parent releases it. The order of
+        // operations below is deliberate -- see this test's steps.
+        const DOS_LIBRARY_BASE: u32 = crate::dispatch::DOS_LIBRARY_BASE;
+        const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3; // TAG_USER + NP_Dummy + NP_Entry
+
+        // --- parent ---
+        let mut words = vec![
+            move_imm_to_a(6), // A6 = EXEC_LIBRARY_BASE
+            (EXEC_LIBRARY_BASE >> 16) as u16,
+            EXEC_LIBRARY_BASE as u16,
+        ];
+        words.push(move_imm_to_a(0)); // A0 = SEM_ADDR
+        words.push((SEM_ADDR >> 16) as u16);
+        words.push(SEM_ADDR as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-558)); // InitSemaphore
+        words.extend_from_slice(&jsr_disp16_a6(-564)); // ObtainSemaphore: parent now owns it
+
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc: spawn child
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        let parent_task_imm_idx_pri = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0 (same as the parent's own default priority)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, same pri): yield to
+        // the child, which attempts ObtainSemaphore and blocks on the
+        // still-parent-held `sem`, switching straight back here.
+
+        words.push(move_imm_to_a(0)); // A0 = SEM_ADDR (SetTaskPri clobbered A0/A1/D0/D1)
+        words.push((SEM_ADDR >> 16) as u16);
+        words.push(SEM_ADDR as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-570)); // ReleaseSemaphore: frees it, waking
+        // the child (still blocked on its original ObtainSemaphore call)
+
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait: nothing satisfied yet (the
+        // child hasn't obtained+signaled), switches to the child
+
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: ObtainSemaphore(sem) [blocks, then succeeds once
+        // woken]; write the marker; Signal(parent, join signal); fall
+        // off the end into the task-exit stub ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        words.push(move_imm_to_a(0)); // A0 = SEM_ADDR
+        words.push((SEM_ADDR >> 16) as u16);
+        words.push(SEM_ADDR as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-564)); // ObtainSemaphore: contended, blocks
+
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x2A
+        words.push(0);
+        words.push(0x2A);
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        let parent_task_imm_idx_signal = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR, pre-pushed by CreateNewProc
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        // tags: [NP_ENTRY, child_entry], [TAG_DONE(0), 0]
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        for idx in [parent_task_imm_idx_pri, parent_task_imm_idx_signal] {
+            let patch_addr = entry + (idx as u32) * 2 + 2;
+            rt.memory_mut().write_u32(patch_addr, parent_task);
+        }
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x2A,
+            "the child must actually block on the contended semaphore, get woken by the \
+             parent's Release, and successfully obtain it before writing the marker -- a \
+             wrong value anywhere in that chain (the child never blocking, obtaining it \
+             early, or never waking) fails this assertion"
+        );
+        let mem = rt.memory();
+        let owner = mem.read_u32(SEM_ADDR + SS_OWNER);
+        assert_ne!(
+            owner, 0,
+            "the child obtained it exclusively, so it must have a non-NULL owner"
+        );
+        assert_ne!(
+            owner, parent_task,
+            "the parent released it before the child obtained it, so the owner must now be \
+             the child task, not the parent"
+        );
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_NEST_COUNT), 1);
     }
 
     // --- ObtainSemaphoreShared/AttemptSemaphoreShared ---

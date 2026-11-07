@@ -121,6 +121,24 @@ pub enum TaskState {
         /// The signal set this task is waiting for.
         wait_mask: u32,
     },
+    /// Blocked in `ObtainSemaphore`/`ObtainSemaphoreShared` (issue
+    /// #237's semaphore-contention follow-up), waiting for `sem` to
+    /// become available. Becomes [`TaskState::Ready`] when
+    /// [`TaskScheduler::wake_blocked_on_semaphore`] sees `ReleaseSemaphore`
+    /// fully free that same semaphore -- not handed ownership directly;
+    /// on resume it just re-enters the original `Obtain*` call from
+    /// scratch (same re-trap model as [`TaskState::BlockedOnSignal`]),
+    /// so a woken task that loses a race to another one simply blocks
+    /// again. `wake_blocked_on_semaphore` wakes every task blocked on a
+    /// given semaphore at once rather than tracking real FIFO queue
+    /// order (`ss_WaitQueue` stays the empty, unused `MinList` it
+    /// already was) -- correct either way, since cooperative scheduling
+    /// means they still only re-attempt one at a time, just not
+    /// necessarily in arrival order.
+    BlockedOnSemaphore {
+        /// The semaphore's guest address.
+        sem: u32,
+    },
 }
 
 /// Everything known about one non-running task: its suspended registers
@@ -370,10 +388,43 @@ impl TaskScheduler {
         pc: u32,
         wait_mask: u32,
     ) -> Result<(), Deadlock> {
+        self.block_current(cpu, mem, pc, TaskState::BlockedOnSignal { wait_mask })
+    }
+
+    /// As [`Self::block_current_on_signal`], but for `ObtainSemaphore`/
+    /// `ObtainSemaphoreShared` finding `sem` already held (issue #237's
+    /// semaphore-contention follow-up): blocks the currently-running
+    /// task on `sem` and switches to the next `Ready` task, or fails
+    /// with [`Deadlock`] if there isn't one. Same resume contract as
+    /// `block_current_on_signal` -- `pc` must be `ctx.trap_pc`, and the
+    /// caller skips its own generic post-dispatch epilogue on success,
+    /// since resuming re-enters the original `Obtain*` call from
+    /// scratch rather than returning a remembered result.
+    pub fn block_current_on_semaphore<C: Cpu, M: AddressSpace>(
+        &mut self,
+        cpu: &C,
+        mem: &M,
+        pc: u32,
+        sem: u32,
+    ) -> Result<(), Deadlock> {
+        self.block_current(cpu, mem, pc, TaskState::BlockedOnSemaphore { sem })
+    }
+
+    /// Shared implementation behind [`Self::block_current_on_signal`]/
+    /// [`Self::block_current_on_semaphore`]: the two differ only in
+    /// which [`TaskState`] the blocking task ends up recorded with.
+    fn block_current<C: Cpu, M: AddressSpace>(
+        &mut self,
+        cpu: &C,
+        mem: &M,
+        pc: u32,
+        state: TaskState,
+    ) -> Result<(), Deadlock> {
         // See `switch_hook_active`'s doc: a `tc_Switch`/`tc_Launch`
-        // hook calling `Wait` and blocking here would re-enter the
-        // trampoline mid-flight for the same outgoing task. Refuse
-        // exactly like "nothing else is ready" rather than risk that.
+        // hook calling `Wait`/`ObtainSemaphore` and blocking here would
+        // re-enter the trampoline mid-flight for the same outgoing
+        // task. Refuse exactly like "nothing else is ready" rather
+        // than risk that.
         if self.switch_hook_active {
             return Err(Deadlock);
         }
@@ -388,7 +439,7 @@ impl TaskScheduler {
             blocking,
             TaskRecord {
                 snapshot,
-                state: TaskState::BlockedOnSignal { wait_mask },
+                state,
                 sp_lower: blocking_sp_lower,
                 sp_upper: blocking_sp_upper,
             },
@@ -442,6 +493,28 @@ impl TaskScheduler {
             && recvd & wait_mask != 0
         {
             record.state = TaskState::Ready;
+        }
+    }
+
+    /// Marks every task [`TaskState::Ready`] that's currently
+    /// [`TaskState::BlockedOnSemaphore`] on `sem` (issue #237's
+    /// semaphore-contention follow-up) -- called once `ReleaseSemaphore`
+    /// sees `sem` fully freed (nest count reached zero). Wakes *all*
+    /// matching waiters at once rather than tracking real FIFO queue
+    /// order through `ss_WaitQueue` (which stays the empty, unused
+    /// `MinList` it already was); this stays behaviourally correct
+    /// under cooperative scheduling, since the woken tasks still only
+    /// re-attempt their original `Obtain*` call one at a time, just not
+    /// necessarily in arrival order, and whichever loses the race to
+    /// obtain `sem` first simply blocks again. Never switches, matching
+    /// `wake_if_signal_matches`.
+    pub fn wake_blocked_on_semaphore(&mut self, sem: u32) {
+        for record in self.others.values_mut() {
+            if let TaskState::BlockedOnSemaphore { sem: blocked_on } = record.state
+                && blocked_on == sem
+            {
+                record.state = TaskState::Ready;
+            }
         }
     }
 

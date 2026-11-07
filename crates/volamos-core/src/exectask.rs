@@ -1888,7 +1888,11 @@ impl PendingTimers {
     /// while this sleeps anyway (every other task is blocked, or there
     /// never was another task) -- the same reasoning that already
     /// makes [`do_io_handler`]'s synchronous sleep correct for `DoIO`.
-    fn fire_earliest<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) -> bool {
+    pub(crate) fn fire_earliest<M: AddressSpace>(
+        &mut self,
+        mem: &mut M,
+        tasks: &mut TaskScheduler,
+    ) -> bool {
         let Some((idx, deadline)) = self
             .entries
             .iter()
