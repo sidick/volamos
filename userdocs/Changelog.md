@@ -3,6 +3,35 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.17
+
+- **`exec.library` semaphores now block on real contention** —
+  `ObtainSemaphore` and `ObtainSemaphoreShared` suspend the current task
+  until a held semaphore is released, then retry the acquisition. This
+  supports the lock contention used by libpthread and other multi-task
+  programs.
+
+- **Task scheduling and cleanup now match AmigaOS more closely** —
+  `SetTaskPri` reschedules only when the priority change lets a ready
+  task outrank the caller, and a `CreateNewProc` child releases its
+  process resources when it exits.
+
+- **`Delay` now cooperates with tasks and timers** — waiting tasks can
+  run while another task is delayed, and pending `timer.device`
+  requests complete against their deadlines instead of being held up
+  by a host sleep.
+
+- **`StackSwap` validates its stack structure before switching** —
+  invalid bounds or pointers now fail at the call site with a clear
+  error.
+
+- **`AddTime` and `SubTime` handle multi-second carry and borrow** —
+  microsecond normalization now works when the adjustment spans more
+  than one second.
+
+- Updated the CLI and supported-library documentation, and refreshed
+  the documentation dependency lock.
+
 ## 0.16
 
 - **`dos.library`'s `CreateNewProc` implemented, with cooperative
