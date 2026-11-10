@@ -3,6 +3,25 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.18.1](https://github.com/sidick/volamos/compare/volamos-v0.18.0...volamos-v0.18.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* 10: CurrentDir must accept a lock on a file ([8efb2bd](https://github.com/sidick/volamos/commit/8efb2bd087f0085c1889ae330c99750ebf024d40))
+* 12 (VFWritef used C-printf grammar, not real BCPL Writef) and [#13](https://github.com/sidick/volamos/issues/13) (Search: cli_StandardInput unpopulated, Cli() not BADDR-converted, dospattern used invented not real dosasl.h tokens) ([e8aae46](https://github.com/sidick/volamos/commit/e8aae4684621e935d4af2f00edccecd17f5b8581))
+* 14 (AnchorPath's ap_Buf wrongly included the device-name prefix) and add Delete/MakeDir to the corpus ([948f28a](https://github.com/sidick/volamos/commit/948f28a54e25bb9ba6174e9e909b796cba49a44a))
+* 15: OpenLibrary ignored full-path library names, always prefixed LIBS: ([87f6a40](https://github.com/sidick/volamos/commit/87f6a40943ea825023ae4d3d5bc6f6d7710628fd))
+* 167 (68060 half): pre-seed vector 11 to decline cleanly without an FPU ([#169](https://github.com/sidick/volamos/issues/169)) ([a4f6989](https://github.com/sidick/volamos/commit/a4f69890374ace77c0d62bb41de8d825e20bba6b))
+* 17: implement PROGDIR: pseudo-assign ([475656f](https://github.com/sidick/volamos/commit/475656f0b758b08f5a45b8ac30361312942edd84))
+* 18: enable the m68k crate's trace JIT via a --jit runtime flag ([c3d3b56](https://github.com/sidick/volamos/commit/c3d3b56feffa4cb0c2921672fd599a7e2a9ce5f1))
+* 19: multi-arch static container image (linux/amd64, linux/arm64) ([a6e8512](https://github.com/sidick/volamos/commit/a6e85123be183096238df1cad113aade6bbc150b))
+* 22: Open("*")/Open("CONSOLE:") now return a real interactive handle ([ad9b039](https://github.com/sidick/volamos/commit/ad9b03917f17372ba0183f048de7152d02e41830))
+* 24: packet-level file I/O -- fh_Type + a host-serviced handler port ([d8165bf](https://github.com/sidick/volamos/commit/d8165bf20066d6caf6d3bb4c4feab957750f7869))
+* 25: standalone per-arch binary zips on release tags ([12486aa](https://github.com/sidick/volamos/commit/12486aa788e1e13fc218658a9f3232a45dee61ec))
+* 6: exectest.s had a real A6 calling-convention bug ([c98e436](https://github.com/sidick/volamos/commit/c98e43632211835dba7778be68a9cd8b8002e0b2))
+* address 11 code-review findings across dispatch/exec/dos/bsdsocket ([#247](https://github.com/sidick/volamos/issues/247)) ([412262f](https://github.com/sidick/volamos/commit/412262f3a4e86c90037f7f14c5908edb4b985398))
+
 ## 0.18
 
 - **`PIPE:` channels implemented** — named pipe channels with blocking
