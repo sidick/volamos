@@ -291,15 +291,22 @@ pub fn handle_fs_packet<C: Cpu>(
         // RKRM packet-documentation.md, ACTION_READ (82): Arg1 =
         // fh_Arg1, Arg2 = buffer (APTR), Arg3 = length; Res1 = bytes
         // read (0 legal at EOF) or -1 + Res2 on error.
-        ACTION_READ => match ctx.dos.read(arg1, arg3 as usize) {
-            Ok(data) => {
-                for (i, b) in data.iter().enumerate() {
-                    ctx.mem.write_u8(arg2.wrapping_add(i as u32), *b);
+        ACTION_READ => {
+            match match crate::dospipe::read(ctx, arg1, arg3 as usize, -1, "ACTION_READ")? {
+                crate::dospipe::Outcome::Done(result) => result,
+                // A PIPE: with nothing to read: the task is blocked and
+                // PutMsg runs again, packet and all, once there is.
+                crate::dospipe::Outcome::Switched => return Ok(()),
+            } {
+                Ok(data) => {
+                    for (i, b) in data.iter().enumerate() {
+                        ctx.mem.write_u8(arg2.wrapping_add(i as u32), *b);
+                    }
+                    (data.len() as u32, 0)
                 }
-                (data.len() as u32, 0)
+                Err(code) => (RESULT_ERROR, code as u32),
             }
-            Err(code) => (RESULT_ERROR, code as u32),
-        },
+        }
         // ACTION_WRITE (87): same shape; Res1 = bytes written or -1.
         // The Output() default handle write goes through ctx.out, same
         // as the Write LVO handler (see HostHandle::Stdout's doc).
@@ -314,9 +321,10 @@ pub fn handle_fs_packet<C: Cpu>(
                     Err(e) => (RESULT_ERROR, crate::dosfile::map_io_error(&e) as u32),
                 }
             } else {
-                match ctx.dos.write(arg1, &buf) {
-                    Ok(n) => (n as u32, 0),
-                    Err(code) => (RESULT_ERROR, code as u32),
+                match crate::dospipe::write(ctx, arg1, &buf, -1, "ACTION_WRITE")? {
+                    crate::dospipe::Outcome::Done(Ok(n)) => (n as u32, 0),
+                    crate::dospipe::Outcome::Done(Err(code)) => (RESULT_ERROR, code as u32),
+                    crate::dospipe::Outcome::Switched => return Ok(()),
                 }
             }
         }
@@ -330,7 +338,7 @@ pub fn handle_fs_packet<C: Cpu>(
         // Input()/Output() defaults is the same documented no-op
         // success as the Close LVO's.
         ACTION_END => {
-            if ctx.dos.close(ctx.heap, arg1) {
+            if crate::dospipe::close(ctx, arg1) {
                 (DOSTRUE, 0)
             } else {
                 (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32)

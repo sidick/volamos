@@ -141,6 +141,16 @@ pub enum TaskState {
         /// The semaphore's guest address.
         sem: u32,
     },
+    /// Blocked in `Read`/`Write` on a `PIPE:` channel (issue #264) that
+    /// has nothing to read or no room to write. Becomes
+    /// [`TaskState::Ready`] when [`TaskScheduler::wake_pipe`] reports
+    /// the pipe changed (data arrived or was drained, or the other end
+    /// closed); the call is then re-entered from scratch, like every
+    /// blocking call here, and blocks again if it still can't proceed.
+    BlockedOnPipe {
+        /// [`crate::dospipe`]'s id for the channel.
+        pipe: u32,
+    },
     /// Blocked in `Delay` (issue #254), waiting for its own deadline
     /// (tracked in [`crate::exectask::PendingTimers`], not here --
     /// there's nothing guest-visible to key this on the way a
@@ -699,6 +709,34 @@ impl TaskScheduler {
             && recvd & wait_mask != 0
         {
             self.mark_ready_if(target, TaskState::BlockedOnSignal { wait_mask });
+        }
+    }
+
+    /// As [`Self::block_current_on_signal`], but for a `PIPE:`
+    /// `Read`/`Write` that can't proceed yet (issue #264). Same resume
+    /// contract: `pc` must be `ctx.trap_pc`, and the caller skips its own
+    /// post-dispatch epilogue on success.
+    pub fn block_current_on_pipe<C: Cpu, M: AddressSpace>(
+        &mut self,
+        cpu: &C,
+        mem: &M,
+        pc: u32,
+        pipe: u32,
+    ) -> Result<(), Deadlock> {
+        self.block_current(cpu, mem, pc, TaskState::BlockedOnPipe { pipe })
+    }
+
+    /// Makes every task blocked on `pipe` [`TaskState::Ready`] (it
+    /// changed: whoever waited can retry). Never switches.
+    pub fn wake_pipe(&mut self, pipe: u32) {
+        let waiters: Vec<u32> = self
+            .others
+            .iter()
+            .filter(|(_, record)| record.state == TaskState::BlockedOnPipe { pipe })
+            .map(|(&addr, _)| addr)
+            .collect();
+        for waiter in waiters {
+            self.mark_ready_if(waiter, TaskState::BlockedOnPipe { pipe });
         }
     }
 

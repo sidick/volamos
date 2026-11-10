@@ -314,6 +314,13 @@ pub(crate) enum HostHandle {
     /// enum; this variant exists so `Close`/`Read`/lookup-by-address
     /// still see a consistent entry for it.
     Stdout,
+    /// One end of a `PIPE:` channel (issue #264) -- see
+    /// [`crate::dospipe`]. `channel` is the case-folded name keying
+    /// [`DosState::pipes`].
+    Pipe {
+        channel: String,
+        end: crate::dospipe::PipeEnd,
+    },
     /// `Open("NIL:", ...)`'s handle -- the real AmigaOS null device:
     /// `Write` always succeeds, discarding the data (real hardware's
     /// `NIL:` handler is a genuine, silent bit-bucket); `Read` always
@@ -525,6 +532,17 @@ pub struct DosState {
     /// packet, then calls `FreeDosObject` itself -- see `dospkt.rs`'s
     /// `handle_fs_packet` doc for the packet sequence).
     pub(crate) dos_object_filehandles: HashSet<u32>,
+
+    // --- `PIPE:` (issue #264). Methods live in `crate::dospipe`.
+    /// Open channels, by case-folded name.
+    pub(crate) pipes: HashMap<String, crate::dospipe::PipeChannel>,
+    /// The id the next channel created gets.
+    pub(crate) next_pipe_id: u32,
+    /// How many bytes of its data a blocked `Write` on a pipe has
+    /// already put in the buffer, keyed by `(task, handle address)` --
+    /// the call is re-entered from scratch when it wakes, and must carry
+    /// on rather than write the front of its data again.
+    pub(crate) pipe_write_progress: HashMap<(u32, u32), usize>,
 }
 
 impl DosState {
@@ -561,6 +579,9 @@ impl DosState {
             volume_task_ids: HashMap::new(),
             fs_buffers: 30,
             dos_object_filehandles: HashSet::new(),
+            pipes: HashMap::new(),
+            next_pipe_id: 0,
+            pipe_write_progress: HashMap::new(),
         }
     }
 
@@ -615,7 +636,7 @@ impl DosState {
     /// doc), and -- unless `nil` -- `fh_Type` = the filesystem handler
     /// port (see [`FH_TYPE_OFFSET`]'s doc; `NIL:` handles keep the real
     /// AmigaOS `fh_Type = 0`, "no handler process").
-    fn alloc_file_handle(
+    pub(crate) fn alloc_file_handle(
         &mut self,
         heap: &mut GuestHeap,
         mem: &mut dyn AddressSpace,
@@ -687,6 +708,9 @@ impl DosState {
         // machinery.
         if name == "*" || name.eq_ignore_ascii_case("CONSOLE:") {
             return self.output_addr(heap, mem).map(bptr_from_addr);
+        }
+        if let Some(key) = crate::dospipe::pipe_key(name) {
+            return self.open_pipe(heap, mem, key, access_mode);
         }
         if name.eq_ignore_ascii_case("NIL:") {
             let addr = self.alloc_file_handle(heap, mem, true)?;
@@ -957,7 +981,10 @@ impl DosState {
         if self.input_handle == Some(addr) || self.output_handle == Some(addr) {
             return true;
         }
-        if self.handles.remove(&addr).is_some() {
+        if let Some(handle) = self.handles.remove(&addr) {
+            if let HostHandle::Pipe { channel, end } = handle {
+                self.close_pipe(&channel, end);
+            }
             if !self.dos_object_filehandles.contains(&addr) {
                 let _ = heap.free(addr);
             }
@@ -984,7 +1011,11 @@ impl DosState {
     /// including empty at EOF -- matching real `Read`'s "actual count"
     /// contract) or an `IoErr()` code.
     pub fn read(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, i32> {
+        if matches!(self.handles.get(&addr), Some(HostHandle::Pipe { .. })) {
+            return self.pipe_read_nonblocking(addr, len);
+        }
         match self.handles.get_mut(&addr) {
+            Some(HostHandle::Pipe { .. }) => unreachable!("handled above"),
             Some(HostHandle::HostFile(f, _, _)) => {
                 let mut buf = vec![0u8; len];
                 let n = f.read(&mut buf).map_err(|e| map_io_error(&e))?;
@@ -1013,7 +1044,11 @@ impl DosState {
     /// [`HandlerContext::out`] rather than here). Returns the number of
     /// bytes actually written, or an `IoErr()` code.
     pub fn write(&mut self, addr: u32, data: &[u8]) -> Result<usize, i32> {
+        if matches!(self.handles.get(&addr), Some(HostHandle::Pipe { .. })) {
+            return self.pipe_write_nonblocking(0, addr, data);
+        }
         match self.handles.get_mut(&addr) {
+            Some(HostHandle::Pipe { .. }) => unreachable!("handled above"),
             Some(HostHandle::HostFile(f, _, _)) => f.write(data).map_err(|e| map_io_error(&e)),
             Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
             // NIL: discards the data but reports success, as if every
@@ -1174,9 +1209,10 @@ impl DosState {
     pub fn name_from_fh(&self, addr: u32) -> Result<String, i32> {
         match self.handles.get(&addr) {
             Some(HostHandle::HostFile(_, amiga_path, _)) => Ok(amiga_path.clone()),
-            Some(HostHandle::Stdin) | Some(HostHandle::Stdout) | Some(HostHandle::Null) => {
-                Err(ERROR_ACTION_NOT_KNOWN)
-            }
+            Some(HostHandle::Stdin)
+            | Some(HostHandle::Stdout)
+            | Some(HostHandle::Null)
+            | Some(HostHandle::Pipe { .. }) => Err(ERROR_ACTION_NOT_KNOWN),
             None => Err(ERROR_INVALID_LOCK),
         }
     }
@@ -1310,7 +1346,7 @@ fn open_from_lock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
 fn close_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let addr = addr_from_bptr(bptr);
-    let ok = ctx.dos.close(ctx.heap, addr);
+    let ok = crate::dospipe::close(ctx, addr);
     if !ok {
         ctx.dos.set_io_err(ERROR_INVALID_LOCK);
     }
@@ -1357,7 +1393,11 @@ fn read_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     let buf_addr = ctx.cpu.data_register(DataRegister(2));
     let len = ctx.cpu.data_register(DataRegister(3)) as usize;
     let addr = addr_from_bptr(bptr);
-    match ctx.dos.read(addr, len) {
+    let result = match crate::dospipe::read(ctx, addr, len, -42, "Read")? {
+        crate::dospipe::Outcome::Done(result) => result,
+        crate::dospipe::Outcome::Switched => return Ok(()),
+    };
+    match result {
         Ok(bytes) => {
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.mem.write_u8(buf_addr.wrapping_add(i as u32), b);
@@ -1398,7 +1438,11 @@ fn write_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
         return Ok(());
     }
 
-    match ctx.dos.write(addr, &buf) {
+    let result = match crate::dospipe::write(ctx, addr, &buf, -48, "Write")? {
+        crate::dospipe::Outcome::Done(result) => result,
+        crate::dospipe::Outcome::Switched => return Ok(()),
+    };
+    match result {
         Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
         Err(code) => {
             ctx.dos.set_io_err(code);

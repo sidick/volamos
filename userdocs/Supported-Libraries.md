@@ -20,6 +20,16 @@ Changelog.
 
 - File I/O: `Open`/`Read`/`Write`/`Seek`/`Close`/`SetFileSize`,
   `Input`/`Output`, `IoErr`/`SetIoErr`.
+- `PIPE:` — named in-memory channels, as libnix's `pipe()` needs:
+  `Open("PIPE:name", MODE_NEWFILE)` opens the write end and
+  `MODE_OLDFILE` the read end (either may come first). A `Read` waits
+  for data and returns 0 once every writer has closed; a `Write` waits
+  while the 4096-byte buffer is full; both ends work from different
+  tasks. There are no buffer-size/flag suffixes on the name, no
+  `MODE_READWRITE`, and the buffered `FGetC`/`FGets`/`FRead` calls fail
+  on an empty pipe instead of waiting. `popen()` still needs
+  `SystemTagList`'s `SYS_Input`/`SYS_Output` redirection, which isn't
+  implemented.
 - Locks and directory traversal: `Lock`/`UnLock`/`DupLock`/
   `DupLockFromFH`/`OpenFromLock`/`Examine`/`ExamineFH`/`ExNext`/`ExAll`/
   `ExAllEnd`/`CurrentDir`/`ParentDir`/`ParentOfFH`/`SameLock`/

@@ -31,6 +31,7 @@ pub mod dosnote;
 pub mod dosnotify;
 pub mod dospath;
 pub mod dospattern;
+pub mod dospipe;
 pub mod dospkt;
 pub mod dosprintf;
 pub mod dosprotect;
