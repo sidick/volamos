@@ -5,6 +5,7 @@
     "helpers:pinGitHubActionDigests",
     "docker:pinDigests"
   ],
+  "semanticCommits": "enabled",
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 6am on monday"]
