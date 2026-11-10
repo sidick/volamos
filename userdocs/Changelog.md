@@ -3,6 +3,34 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## 0.18
+
+- **`PIPE:` channels implemented** — named pipe channels with blocking
+  reads and writes, supporting libnix's `pipe()` and `popen()`. The
+  buffered stdio calls (`FGets`, `FRead`, `FPuts`, and friends) now
+  block on a full or empty pipe instead of failing.
+
+- **`SystemTagList(SYS_Asynch)` runs commands as real in-process
+  processes** — the launched command gets its own CLI structure,
+  `SYS_Input`/`SYS_Output` redirection, and exit-code delivery, which
+  together with `PIPE:` makes `popen()` work end to end.
+
+- **Semaphore waiters now queue on `ss_WaitQueue`** — contended
+  `ObtainSemaphore` callers are linked onto the real wait queue and
+  handed the semaphore over in FIFO order, so `ss_QueueCount` and the
+  queue contents are visible to guest code.
+
+- **`Forbid()` defers voluntary task switches** — switch requests made
+  inside a Forbid section are held until the outermost `Permit()`,
+  matching real exec nesting semantics.
+
+- **Two scheduling fixes** — a `Delay()` no longer restarts its wait
+  when another task polls `Delay(1)`, and three or more equal-priority
+  yielding tasks now round-robin instead of starving one of them.
+
+- **New `--stack-report` flag** — tracks and prints per-stack
+  high-water-mark usage at exit, for sizing `--stack`.
+
 ## 0.17
 
 - **`exec.library` semaphores now block on real contention** —
