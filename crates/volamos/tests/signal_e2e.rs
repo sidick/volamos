@@ -42,6 +42,9 @@ const LOOPER_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/l
 /// See the module docs.
 const STARTUP_GRACE: Duration = Duration::from_millis(1500);
 
+/// How long to leave between two signals that must be seen separately.
+const SIGNAL_GAP: Duration = Duration::from_millis(200);
+
 /// Starts `fixtures/looper` and waits out [`STARTUP_GRACE`] before
 /// returning, so callers can send a signal immediately.
 fn spawn_looper() -> Child {
@@ -108,6 +111,12 @@ fn sigterm_force_exits_a_guest_that_never_calls_a_library() {
 fn second_sigint_force_exits_a_guest_that_never_calls_a_library() {
     let child = spawn_looper();
     kill(&child, "INT");
+    // Standard signals aren't queued: a second one that arrives while the
+    // first is still pending merges into it, and a single SIGINT is
+    // deliberately cooperative. On a loaded CI runner the process can be
+    // slow enough to be scheduled that the two `kill`s land together, so
+    // give the handler time to run before the second.
+    std::thread::sleep(SIGNAL_GAP);
     kill(&child, "INT");
     let status = wait_with_timeout(child, Duration::from_secs(5));
     assert_eq!(
