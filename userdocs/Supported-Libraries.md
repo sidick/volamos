@@ -25,9 +25,10 @@ Changelog.
   `MODE_OLDFILE` the read end (either may come first). A `Read` waits
   for data and returns 0 once every writer has closed; a `Write` waits
   while the 4096-byte buffer is full; both ends work from different
-  tasks. There are no buffer-size/flag suffixes on the name, no
-  `MODE_READWRITE`, and the buffered `FGetC`/`FGets`/`FRead` calls fail
-  on an empty pipe instead of waiting.
+  tasks, through `Read`/`Write` and the buffered-stdio calls
+  (`FGetC`/`FGets`/`FRead`/`FPutC`/`FWrite`/`FPuts`/`PutStr`/`Printf`/...)
+  alike. There are no buffer-size/flag suffixes on the name and no
+  `MODE_READWRITE`.
 - `SystemTagList` with `SYS_Asynch`, as libnix's `popen()` uses it:
   the command runs as a process of its own *inside* the same run, so it
   can share `PIPE:` channels with the caller. It gets `SYS_Input`/

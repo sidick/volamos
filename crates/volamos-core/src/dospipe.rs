@@ -31,11 +31,14 @@
 //! re-entered call carries on from there instead of writing the front
 //! of its data twice.
 //!
-//! The buffered-stdio calls (`FGetC`, `FGets`, `FRead`, ...) are not
-//! blocking-aware: on a pipe with nothing to read they fail with
-//! `ERROR_OBJECT_IN_USE` rather than wait, since `FRead` and `FGets`
-//! consume bytes before they could block. libnix's stdio goes through
-//! `Read`/`Write`, which is what this exists for.
+//! The buffered-stdio calls block the same way (issue #268):
+//! `FGetC`, `FGets`, `FRead`, `FPutC`, `FWrite`, `FPuts`, `WriteChars`,
+//! `PutStr` and the `Printf` family. `FGets` and `FRead` consume bytes
+//! before they could block, so what they took is carried across the
+//! re-entry in [`DosState::stdio_progress`] (and only written to the
+//! guest's buffer when the call completes). Callers that can't block at
+//! all get `ERROR_OBJECT_IN_USE` from [`DosState::read`]/[`DosState::
+//! write`] instead of a hang.
 //!
 //! [`TaskState::BlockedOnPipe`]: crate::taskswitch::TaskState::BlockedOnPipe
 
@@ -268,6 +271,12 @@ impl DosState {
             IoStep::Block(_) => unreachable!("it fits, so it cannot block"),
         }
     }
+}
+
+/// A `dos.library` function's LVO by name, for [`park_on_pipe`]'s
+/// deadlock message (`0` if the name isn't in the table).
+pub(crate) fn dos_lvo(name: &str) -> i32 {
+    crate::lvos::find_by_name(crate::lvos::dos::DOS_LVOS, name).map_or(0, |entry| entry.lvo)
 }
 
 /// What parking a task on a pipe came to.
@@ -769,5 +778,327 @@ mod tests {
         let mem = rt.memory();
         assert_eq!(mem.read_u8(buf), b'A');
         assert_eq!(mem.read_u8(buf + 1), b'B');
+    }
+
+    // --- end to end: the buffered-stdio calls block on a pipe too (issue #268) ---
+
+    const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3;
+    const NP_OUTPUT: u32 = 0x8000_0000 + 1000 + 5;
+    const NP_CLOSEOUTPUT: u32 = 0x8000_0000 + 1000 + 7;
+    const JOIN: u32 = 0x0001_0000;
+    /// Fixed addresses for the stdio cases' data, above the code and
+    /// below the heap.
+    const NAME: u32 = 0x4000;
+    const HELLO: u32 = 0x4010;
+    const RSLOT: u32 = 0x4020;
+    const WSLOT: u32 = 0x4024;
+    const RES: u32 = 0x4028;
+    const TAGS: u32 = 0x4040;
+    const CHUNKS: u32 = 0x4080;
+    const BUF: u32 = 0x4100;
+    const BIG: u32 = 0x6000;
+
+    /// A call to a `dos.library` function (A6 = dos.library).
+    fn call(words: &mut Vec<u16>, name: &str) {
+        words.extend_from_slice(&jsr_disp16_a6(dos_lvo(name)));
+    }
+
+    /// A call to an `exec.library` function (A6 = exec.library).
+    fn ecall(words: &mut Vec<u16>, name: &str) {
+        let lvo = crate::lvos::find_by_name(crate::lvos::exec::EXEC_LVOS, name)
+            .unwrap_or_else(|| panic!("{name} is in the exec table"))
+            .lvo;
+        words.extend_from_slice(&jsr_disp16_a6(lvo));
+    }
+
+    fn d_imm(words: &mut Vec<u16>, n: u16, value: u32) {
+        words.extend_from_slice(&[move_imm_to_d(n), (value >> 16) as u16, value as u16]);
+    }
+
+    /// `move.l <abs32>,Dn` of `addr`.
+    fn d_from(words: &mut Vec<u16>, n: u16, addr: u32) {
+        let at = load_d_from(words, n);
+        patch(words, at, addr);
+    }
+
+    fn store_d0(words: &mut Vec<u16>, addr: u32) {
+        let at = store_d0_to(words);
+        patch(words, at, addr);
+    }
+
+    /// `Write(w, data, len)` from the guest, A6 = dos.library.
+    fn guest_write(words: &mut Vec<u16>, data: u32, len: u32) {
+        d_from(words, 1, WSLOT);
+        d_imm(words, 2, data);
+        d_imm(words, 3, len);
+        call(words, "Write");
+    }
+
+    /// `Read(r, buf, len)` from the guest, A6 = dos.library.
+    fn guest_read(words: &mut Vec<u16>, buf: u32, len: u32) {
+        d_from(words, 1, RSLOT);
+        d_imm(words, 2, buf);
+        d_imm(words, 3, len);
+        call(words, "Read");
+    }
+
+    /// Lets the child run until it blocks: the parent drops below its
+    /// priority and back. Leaves A6 = dos.library. Returns the indices
+    /// of the two `A1 = parent task` immediates to patch.
+    fn guest_yield(words: &mut Vec<u16>) -> [usize; 2] {
+        set_a6(words, EXEC_LIBRARY_BASE);
+        let dip = load_a(words, 1);
+        words.extend_from_slice(&[move_imm_to_d(0), 0xFFFF, 0xFFFF]);
+        ecall(words, "SetTaskPri");
+        let restore = load_a(words, 1);
+        words.extend_from_slice(&[move_imm_to_d(0), 0, 0]);
+        ecall(words, "SetTaskPri");
+        set_a6(words, DOS_LIBRARY_BASE);
+        [dip, restore]
+    }
+
+    /// What a stdio case runs, and when.
+    struct StdioCase {
+        /// Run by the parent before the child starts (A6 = dos).
+        setup: Vec<u16>,
+        /// The child's code (A6 = dos); its `D0` is stored in `RES`.
+        child: Vec<u16>,
+        /// Run by the parent once the child has started and blocked
+        /// (A6 = dos); it ends by doing whatever unblocks the child.
+        after: Vec<u16>,
+        /// Indices into `after` of `A1 = parent task` immediates.
+        after_patches: Vec<usize>,
+        /// Initial memory beyond the common data: `(address, bytes)`.
+        data: Vec<(u32, Vec<u8>)>,
+    }
+
+    /// Runs `case`: the parent opens both ends of a `PIPE:`, runs
+    /// `setup`, starts the child with the write end as its `Output()`,
+    /// lets it run and block, runs `after`, and waits for the child to
+    /// finish.
+    fn run_stdio_case(case: StdioCase) -> Runtime<M68kCpu> {
+        let mut words = Vec::new();
+        let mut parent_patches = Vec::new();
+
+        set_a6(&mut words, DOS_LIBRARY_BASE);
+        d_imm(&mut words, 1, NAME);
+        d_imm(&mut words, 2, 1006); // MODE_NEWFILE
+        call(&mut words, "Open");
+        store_d0(&mut words, WSLOT);
+        d_imm(&mut words, 1, NAME);
+        d_imm(&mut words, 2, 1005); // MODE_OLDFILE
+        call(&mut words, "Open");
+        store_d0(&mut words, RSLOT);
+        // The child's NP_Output is the write end.
+        d_from(&mut words, 0, WSLOT);
+        store_d0(&mut words, TAGS + 8 + 4);
+
+        words.extend_from_slice(&case.setup);
+        d_imm(&mut words, 1, TAGS);
+        call(&mut words, "CreateNewProc");
+        parent_patches.extend(guest_yield(&mut words));
+        let after_base = words.len();
+        words.extend_from_slice(&case.after);
+        parent_patches.extend(case.after_patches.iter().map(|i| after_base + i));
+        set_a6(&mut words, EXEC_LIBRARY_BASE);
+        d_imm(&mut words, 0, JOIN);
+        ecall(&mut words, "Wait");
+        words.extend_from_slice(&[0x7000, 0x4E75]); // moveq #0,D0 ; rts
+
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+        set_a6(&mut words, DOS_LIBRARY_BASE);
+        words.extend_from_slice(&case.child);
+        store_d0(&mut words, RES);
+        set_a6(&mut words, EXEC_LIBRARY_BASE);
+        parent_patches.push(load_a(&mut words, 1));
+        d_imm(&mut words, 0, JOIN);
+        ecall(&mut words, "Signal");
+        words.push(0x4E75);
+
+        let mut mem = FlatMemory::new(0x4_0000);
+        for (i, &w) in words.iter().enumerate() {
+            mem.write_u16(TRAP_TABLE_END + (i as u32) * 2, w);
+        }
+        crate::guestmem::write_c_string(&mut mem, NAME, b"PIPE:stdio");
+        crate::guestmem::write_c_string(&mut mem, HELLO, b"hello");
+        let tags = [
+            (NP_ENTRY, child_entry),
+            (NP_OUTPUT, 0), // patched at run time: the write end
+            (NP_CLOSEOUTPUT, 0),
+            (0, 0),
+        ];
+        for (i, (id, value)) in tags.into_iter().enumerate() {
+            mem.write_u32(TAGS + i as u32 * 8, id);
+            mem.write_u32(TAGS + i as u32 * 8 + 4, value);
+        }
+        for i in 0..4096 {
+            mem.write_u8(BIG + i, b'x');
+        }
+        for (addr, bytes) in &case.data {
+            for (i, &b) in bytes.iter().enumerate() {
+                mem.write_u8(addr + i as u32, b);
+            }
+        }
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: BIG + 0x1100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        for at in parent_patches {
+            rt.memory_mut()
+                .write_u32(TRAP_TABLE_END + (at as u32) * 2 + 2, parent_task);
+        }
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        rt
+    }
+
+    fn bytes_at(rt: &Runtime<M68kCpu>, addr: u32, len: u32) -> Vec<u8> {
+        (0..len).map(|i| rt.memory().read_u8(addr + i)).collect()
+    }
+
+    /// A child blocked reading the empty pipe with `child`'s call, and
+    /// the writes that unblock it, one `chunks` entry at a time (the
+    /// parent lets the child consume each and block again before the
+    /// next).
+    fn run_read_case(child: Vec<u16>, chunks: &[&[u8]]) -> Runtime<M68kCpu> {
+        let mut after = Vec::new();
+        let mut patches = Vec::new();
+        let mut data = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let at = CHUNKS + i as u32 * 0x10;
+            data.push((at, chunk.to_vec()));
+            if i > 0 {
+                patches.extend(guest_yield(&mut after));
+            }
+            guest_write(&mut after, at, chunk.len() as u32);
+        }
+        run_stdio_case(StdioCase {
+            setup: Vec::new(),
+            child,
+            after,
+            after_patches: patches,
+            data,
+        })
+    }
+
+    #[test]
+    fn fgetc_on_an_empty_pipe_blocks_until_a_byte_arrives() {
+        let mut child = Vec::new();
+        d_from(&mut child, 1, RSLOT);
+        call(&mut child, "FGetC");
+        let rt = run_read_case(child, &[b"A"]);
+        assert_eq!(rt.memory().read_u32(RES), u32::from(b'A'));
+    }
+
+    #[test]
+    fn fgets_carries_a_partial_line_across_a_block() {
+        // "ab" arrives first: FGets takes it, finds no newline, and has
+        // to wait for the rest. The two bytes already taken must not be
+        // lost when the call is re-entered.
+        let mut child = Vec::new();
+        d_from(&mut child, 1, RSLOT);
+        d_imm(&mut child, 2, BUF);
+        d_imm(&mut child, 3, 16);
+        call(&mut child, "FGets");
+        let rt = run_read_case(child, &[b"ab", b"c\n"]);
+        assert_eq!(rt.memory().read_u32(RES), BUF, "FGets returns its buffer");
+        assert_eq!(bytes_at(&rt, BUF, 5), b"abc\n\0");
+    }
+
+    #[test]
+    fn fread_carries_what_it_has_read_across_a_block() {
+        let mut child = Vec::new();
+        d_from(&mut child, 1, RSLOT);
+        d_imm(&mut child, 2, BUF);
+        d_imm(&mut child, 3, 1); // record size
+        d_imm(&mut child, 4, 5); // records
+        call(&mut child, "FRead");
+        let rt = run_read_case(child, &[b"ab", b"cde"]);
+        assert_eq!(rt.memory().read_u32(RES), 5, "five complete records");
+        assert_eq!(bytes_at(&rt, BUF, 5), b"abcde");
+    }
+
+    /// A child whose write blocks on a full pipe, unblocked when the
+    /// parent drains it; returns what the child wrote (what the pipe
+    /// held after the parent's drain).
+    fn run_write_case(child: Vec<u16>, expected: &[u8]) -> Vec<u8> {
+        // Fill the pipe exactly, so the child's write has no room.
+        let mut setup = Vec::new();
+        guest_write(&mut setup, BIG, BUFFER_SIZE as u32);
+        let mut after = Vec::new();
+        guest_read(&mut after, BIG, BUFFER_SIZE as u32); // drains: room for the child
+        guest_read(&mut after, BUF, 64); // then waits for what the child writes
+        store_d0(&mut after, RES + 4);
+        let rt = run_stdio_case(StdioCase {
+            setup,
+            child,
+            after,
+            after_patches: Vec::new(),
+            data: Vec::new(),
+        });
+        let n = rt.memory().read_u32(RES + 4);
+        assert_eq!(n as usize, expected.len(), "bytes the parent read back");
+        bytes_at(&rt, BUF, n)
+    }
+
+    #[test]
+    fn the_buffered_write_calls_block_on_a_full_pipe_and_finish_once_it_drains() {
+        type Setup = fn(&mut Vec<u16>);
+        let cases: [(&str, &[u8], Setup); 7] = [
+            ("FPutC", b"Z", |c| {
+                d_from(c, 1, WSLOT);
+                d_imm(c, 2, u32::from(b'Z'));
+                call(c, "FPutC");
+            }),
+            ("FWrite", b"hello", |c| {
+                d_from(c, 1, WSLOT);
+                d_imm(c, 2, HELLO);
+                d_imm(c, 3, 1);
+                d_imm(c, 4, 5);
+                call(c, "FWrite");
+            }),
+            ("FPuts", b"hello", |c| {
+                d_from(c, 1, WSLOT);
+                d_imm(c, 2, HELLO);
+                call(c, "FPuts");
+            }),
+            ("WriteChars", b"hello", |c| {
+                d_imm(c, 1, HELLO);
+                d_imm(c, 2, 5);
+                call(c, "WriteChars");
+            }),
+            ("PutStr", b"hello", |c| {
+                d_imm(c, 1, HELLO);
+                call(c, "PutStr");
+            }),
+            ("VPrintf", b"hello", |c| {
+                d_imm(c, 1, HELLO);
+                d_imm(c, 2, 0);
+                call(c, "VPrintf");
+            }),
+            ("VFPrintf", b"hello", |c| {
+                d_from(c, 1, WSLOT);
+                d_imm(c, 2, HELLO);
+                d_imm(c, 3, 0);
+                call(c, "VFPrintf");
+            }),
+        ];
+        for (name, expected, build) in cases {
+            let mut child = Vec::new();
+            build(&mut child);
+            assert_eq!(
+                run_write_case(child, expected),
+                expected,
+                "{name}: the call must block on the full pipe, then deliver all of its data"
+            );
+        }
     }
 }

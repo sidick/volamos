@@ -547,6 +547,13 @@ pub struct DosState {
     /// freed when it ends. Only processes `SystemTagList` loaded the
     /// program for; see [`crate::dosseg`].
     pub(crate) process_seglists: HashMap<u32, u32>,
+    /// The bytes a blocked `FGets`/`FRead` has already taken from a
+    /// pipe, keyed by `(task, handle address)`. Those calls consume as
+    /// they go, and are re-entered from scratch when the pipe has more,
+    /// so what they took must be carried over rather than lost; the
+    /// guest's buffer is only written once the call completes. See
+    /// [`crate::dosbuf`].
+    pub(crate) stdio_progress: HashMap<(u32, u32), Vec<u8>>,
 }
 
 impl DosState {
@@ -587,6 +594,7 @@ impl DosState {
             next_pipe_id: 0,
             pipe_write_progress: HashMap::new(),
             process_seglists: HashMap::new(),
+            stdio_progress: HashMap::new(),
         }
     }
 
@@ -1004,11 +1012,21 @@ impl DosState {
     /// current `Input()`, then the handle itself. Plain `Read` bypasses
     /// the buffer, as it does on AmigaOS, so it uses [`Self::read`].
     pub fn read_buffered_byte(&mut self, addr: u32) -> Result<Option<u8>, i32> {
-        if self.current_input == Some(addr) && self.input_pos < self.input_buf.len() {
-            self.input_pos += 1;
-            return Ok(Some(self.input_buf[self.input_pos - 1]));
+        if let Some(byte) = self.buffered_input_byte(addr) {
+            return Ok(Some(byte));
         }
         Ok(self.read(addr, 1)?.first().copied())
+    }
+
+    /// The next byte of [`Self::input_buf`], if `addr` is the current
+    /// `Input()` and any is left -- the part of [`Self::read_buffered_byte`]
+    /// that doesn't touch the handle itself.
+    pub(crate) fn buffered_input_byte(&mut self, addr: u32) -> Option<u8> {
+        if self.current_input == Some(addr) && self.input_pos < self.input_buf.len() {
+            self.input_pos += 1;
+            return Some(self.input_buf[self.input_pos - 1]);
+        }
+        None
     }
 
     /// `Read`: reads up to `len` bytes from the handle at `addr`,
@@ -2275,12 +2293,13 @@ fn putstr_via_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<
             return Ok(());
         }
     };
-    match crate::dosbuf::write_bytes(ctx, out_addr, &bytes) {
-        Ok(_) => ctx.cpu.set_data_register(DataRegister(0), 0),
-        Err(code) => {
+    match crate::dosbuf::write_bytes(ctx, out_addr, &bytes, "PutStr")? {
+        crate::dosbuf::Written::Done(Ok(_)) => ctx.cpu.set_data_register(DataRegister(0), 0),
+        crate::dosbuf::Written::Done(Err(code)) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
+        crate::dosbuf::Written::Switched => return Ok(()),
     }
     Ok(())
 }

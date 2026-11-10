@@ -24,7 +24,7 @@
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::dosbuf::write_bytes;
+use crate::dosbuf::{Written, write_bytes};
 use crate::execfmt::render_format;
 use crate::guestmem::{addr_from_bptr, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
@@ -51,12 +51,13 @@ fn vprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
             return Ok(());
         }
     };
-    match write_bytes(ctx, out_addr, &rendered) {
-        Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
-        Err(code) => {
+    match write_bytes(ctx, out_addr, &rendered, "VPrintf")? {
+        Written::Done(Ok(n)) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
+        Written::Done(Err(code)) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
+        Written::Switched => return Ok(()),
     }
     Ok(())
 }
@@ -73,12 +74,13 @@ fn vfprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let fmt = read_c_string(ctx.mem, fmt_ptr);
     let (rendered, _) = render_format(ctx.mem, &fmt, data_ptr);
 
-    match write_bytes(ctx, addr, &rendered) {
-        Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
-        Err(code) => {
+    match write_bytes(ctx, addr, &rendered, "VFPrintf")? {
+        Written::Done(Ok(n)) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
+        Written::Done(Err(code)) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
+        Written::Switched => return Ok(()),
     }
     Ok(())
 }
@@ -207,12 +209,13 @@ fn vfwritef_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let fmt = read_c_string(ctx.mem, fmt_ptr);
     let rendered = render_writef_format(ctx.mem, &fmt, data_ptr);
 
-    match write_bytes(ctx, addr, &rendered) {
-        Ok(n) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
-        Err(code) => {
+    match write_bytes(ctx, addr, &rendered, "VFWritef")? {
+        Written::Done(Ok(n)) => ctx.cpu.set_data_register(DataRegister(0), n as u32),
+        Written::Done(Err(code)) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
         }
+        Written::Switched => return Ok(()),
     }
     Ok(())
 }

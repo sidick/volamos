@@ -15,7 +15,7 @@
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::dosbuf::write_bytes;
+use crate::dosbuf::{Written, write_bytes};
 use crate::guestmem::{read_c_string, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 
@@ -161,7 +161,12 @@ fn print_fault_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             return Ok(());
         }
     };
-    let _ = write_bytes(ctx, out_addr, &rendered);
+    if matches!(
+        write_bytes(ctx, out_addr, &rendered, "PrintFault")?,
+        Written::Switched
+    ) {
+        return Ok(());
+    }
     ctx.cpu
         .set_data_register(DataRegister(0), if found { DOSTRUE } else { DOSFALSE });
     Ok(())
