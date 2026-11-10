@@ -133,6 +133,9 @@ Changelog.
   `ReleaseSemaphore` genuinely wakes) when a `CreateNewProc`'d task
   contends a semaphore another task holds — the exact shape
   libpthread's mutex/thread-table bookkeeping hits at its first lock.
+  A blocked waiter is visible in the semaphore as on exec — a
+  `SemaphoreRequest` on `ss_WaitQueue`, counted in `ss_QueueCount` —
+  and a release hands the semaphore to waiters in arrival order.
   `ObtainSemaphoreList`/`ReleaseSemaphoreList` don't implement that
   same block-and-retry dance and still fail loudly on contention.
 - I/O requests: `OpenDevice`/`CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/

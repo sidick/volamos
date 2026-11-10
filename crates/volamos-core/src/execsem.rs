@@ -25,25 +25,38 @@
 //! handler`/`obtain_semaphore_shared_handler` now block the caller
 //! (`TaskScheduler::block_current_on_semaphore`) and switch to another
 //! runnable task, the same re-trap pattern `exectask::wait_handler`
-//! uses for `Wait`; `release_semaphore_handler` wakes every blocked
-//! waiter (`TaskScheduler::wake_blocked_on_semaphore`) once a release
-//! fully frees the semaphore. It's still a real bug -- surfaced loudly,
-//! same philosophy as `exectask.rs`'s `Signal`-to-unknown-task and
-//! `Wait`-with-nothing-pending checks -- if contention happens with no
-//! other task runnable and no pending timer that could ever change
-//! that either (a genuine deadlock, not just "no scheduler").
-//! `AttemptSemaphore`'s whole documented contract is "never blocks,
-//! just tells you whether it worked" -- callers are required to handle
-//! a `FALSE` result, so returning `FALSE` there instead of blocking or
-//! erroring stays faithful to the real function's contract.
+//! uses for `Wait`.
 //!
-//! The waiter-queue side of the real algorithm (`ss_WaitQueue`,
-//! `ss_MultipleLink`, queued `SM_SHARED` requests) still isn't
-//! implemented as a real walkable list -- blocked waiters are tracked
-//! in [`crate::taskswitch::TaskState::BlockedOnSemaphore`] instead, and
-//! woken all at once rather than in real FIFO order; see that variant's
-//! own doc for why that stays behaviorally correct under cooperative
-//! scheduling.
+//! A waiter is queued the way real exec queues it (issue #263): a
+//! `struct SemaphoreRequest` linked on `ss_WaitQueue`, naming the
+//! waiting task, with its `ss_QueueCount` increment kept. Code that
+//! checks whether a task is queued before it goes on -- libpthread's
+//! `tlskeys-1`/`tlskeys-2` do -- sees what it would on exec. Real exec
+//! builds that request on the waiter's own stack, which the re-trap
+//! model has no frame for, so it lives in a guest-heap block instead,
+//! freed once the request is granted.
+//!
+//! `release_semaphore_handler` hands a fully released semaphore
+//! straight to the first queued waiter (or, for a run of shared
+//! requests at the head, all of them), in arrival order, as real exec
+//! does -- ownership passes at the release, so nothing can slip in
+//! between the release and the waiter running
+//! (`TaskScheduler::grant_semaphore`). The woken task re-enters its
+//! `Obtain*` call from scratch and is told it already owns the
+//! semaphore (`TaskScheduler::take_semaphore_grant`). Contention is
+//! still surfaced loudly -- same philosophy as `exectask.rs`'s
+//! `Signal`-to-unknown-task and `Wait`-with-nothing-pending checks --
+//! if it happens with no other task runnable and no pending timer that
+//! could ever change that either (a genuine deadlock, not just "no
+//! scheduler"). `AttemptSemaphore`'s whole documented contract is
+//! "never blocks, just tells you whether it worked" -- callers are
+//! required to handle a `FALSE` result, so returning `FALSE` there
+//! instead of blocking or erroring stays faithful to the real
+//! function's contract.
+//!
+//! `ss_MultipleLink` (used by `ObtainSemaphoreList`'s own partial-
+//! obtain dance, which this runtime still doesn't implement) is never
+//! populated.
 //!
 //! # Shared locks
 //!
@@ -69,17 +82,23 @@ const SS_LINK_TYPE: u32 = 8; // ln_Type, per crate::execlist::LN_TYPE
 /// `ss_NestCount`: `WORD`, offset 14.
 const SS_NEST_COUNT: u32 = 14;
 /// `ss_WaitQueue`: `struct MinList` (`mlh_Head`/`mlh_Tail`/
-/// `mlh_TailPred`, 4 bytes each = 12), offset 16. Only initialized to a
-/// real empty list by `InitSemaphore` -- see this module's docs for why
-/// nothing ever queues on it in this runtime.
+/// `mlh_TailPred`, 4 bytes each = 12), offset 16. Initialized to a real
+/// empty list by `InitSemaphore`; a contended `Obtain*` links a
+/// [`SemaphoreRequest`](SR_WAITER) on it.
 const SS_WAIT_QUEUE: u32 = 16;
 const SS_WAIT_QUEUE_HEAD: u32 = SS_WAIT_QUEUE;
 const SS_WAIT_QUEUE_TAIL: u32 = SS_WAIT_QUEUE + 4;
 const SS_WAIT_QUEUE_TAILPRED: u32 = SS_WAIT_QUEUE + 8;
-/// `ss_MultipleLink`: `struct SemaphoreRequest` (`sr_Link` `struct
-/// MinNode` 8 bytes + `sr_Waiter` `struct Task*` 4 bytes = 12), offset
-/// 28. Never populated -- part of the waiter-queue machinery this
-/// module's docs explain is unreachable here.
+/// `struct SemaphoreRequest`: `sr_Link` (`struct MinNode`, 8 bytes) +
+/// `sr_Waiter` (`struct Task*`) = 12 bytes. One of these is what a
+/// queued waiter links on `ss_WaitQueue`; `ss_MultipleLink`, the one
+/// embedded in the semaphore itself at offset 28, is never populated.
+const SR_WAITER: u32 = 8;
+const SR_SIZE: u32 = 12;
+/// A shared request is told apart from an exclusive one by this bit
+/// ORed into `sr_Waiter` (tasks are word-aligned, so it is free);
+/// `SM_SHARED` in `<exec/semaphores.h>`.
+const SM_SHARED: u32 = 1;
 /// `ss_Owner`: `struct Task*`, offset 40 (16 + 12 + 12).
 const SS_OWNER: u32 = 40;
 /// `ss_QueueCount`: `WORD`, offset 44. `-1` means "free"; `AROS`'s
@@ -197,122 +216,200 @@ fn release_semaphore_impl<M: AddressSpace>(mem: &mut M, sem: u32, task: u32) -> 
     Ok(())
 }
 
-/// `ObtainSemaphore` (LVO -564): `A0` = `struct SignalSemaphore*`. No
-/// return value (real `ObtainSemaphore` preserves every register).
+/// Obtains `sem` for the current task, queuing and blocking on
+/// contention -- the shared body of [`obtain_semaphore_handler`] and
+/// [`obtain_semaphore_shared_handler`] (`shared` says which).
 ///
-/// On contention (issue #237's semaphore-contention follow-up, reported
-/// by codewiz with a minimal `CreateNewProc` repro): blocks the current
-/// task on `sem` and switches to another runnable one, the same
-/// `block_current_on_signal`/re-trap pattern `exectask::wait_handler`
-/// already uses for `Wait` -- see this module's docs for why that's now
-/// reachable at all now that a second real task can exist. Only fails
-/// loudly if no other task is runnable and no pending timer could ever
-/// change that either, exactly `wait_handler`'s own deadlock posture.
-fn obtain_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// If `ReleaseSemaphore` handed the semaphore to this task while it
+/// slept (this is then the re-trap into the original call), there is
+/// nothing left to do. Otherwise, on contention a `SemaphoreRequest`
+/// is allocated and the task blocked on `sem`; the request is linked,
+/// and the speculative `ss_QueueCount` increment [`obtain_semaphore_impl`]
+/// undid is reinstated, only once the block has actually succeeded -- a
+/// failed block (nothing else runnable) leaves the semaphore exactly as
+/// it found it.
+fn obtain_or_block<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    shared: bool,
+) -> Result<(), DispatchError> {
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
+    let (lvo, handler_name) = if shared {
+        (-678, "ObtainSemaphoreShared")
+    } else {
+        (-564, "ObtainSemaphore")
+    };
+
+    if ctx.tasks.take_semaphore_grant(task, sem) {
+        return Ok(());
+    }
 
     loop {
-        let Err(owner) = obtain_semaphore_impl(ctx.mem, sem, task, task) else {
+        let Err(owner) = obtain_semaphore_impl(ctx.mem, sem, task, if shared { 0 } else { task })
+        else {
             return Ok(());
         };
+
+        let request =
+            ctx.heap
+                .alloc(ctx.mem, SR_SIZE)
+                .map_err(|e| DispatchError::HandlerFailed {
+                    library: "exec.library".to_string(),
+                    lvo,
+                    handler_name: handler_name.to_string(),
+                    message: format!(
+                        "{handler_name}({sem:#010x}): no memory for the SemaphoreRequest to queue \
+                     on: {e}"
+                    ),
+                })?;
 
         if ctx
             .tasks
             .block_current_on_semaphore(ctx.cpu, ctx.mem, ctx.trap_pc, sem)
             .is_ok()
         {
+            ctx.mem.write_u32(
+                request + SR_WAITER,
+                task | if shared { SM_SHARED } else { 0 },
+            );
+            crate::execlist::add_tail_impl(ctx.mem, sem + SS_WAIT_QUEUE, request);
+            let queue_count = ctx.mem.read_u16(sem + SS_QUEUE_COUNT);
+            ctx.mem
+                .write_u16(sem + SS_QUEUE_COUNT, queue_count.wrapping_add(1));
             return Ok(());
         }
+        ctx.heap
+            .free(request)
+            .expect("the SemaphoreRequest was just allocated");
 
         if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
             return Err(DispatchError::HandlerFailed {
                 library: "exec.library".to_string(),
-                lvo: -564,
-                handler_name: "ObtainSemaphore".to_string(),
-                message: if owner == 0 {
-                    format!(
+                lvo,
+                handler_name: handler_name.to_string(),
+                message: match (shared, owner) {
+                    (false, 0) => format!(
                         "ObtainSemaphore({sem:#010x}) would deadlock: the current task \
-                             {task:#010x} holds it shared, and an exclusive lock waits for \
-                             every shared one to be released, but no other task is runnable \
-                             and no pending timer could ever release it"
-                    )
-                } else {
-                    format!(
+                         {task:#010x} holds it shared, and an exclusive lock waits for \
+                         every shared one to be released, but no other task is runnable \
+                         and no pending timer could ever release it"
+                    ),
+                    (false, _) => format!(
                         "ObtainSemaphore({sem:#010x}) would deadlock: already held by task \
-                             {owner:#010x}, not the current task {task:#010x}, but no other \
-                             task is runnable and no pending timer could ever release it"
-                    )
+                         {owner:#010x}, not the current task {task:#010x}, but no other \
+                         task is runnable and no pending timer could ever release it"
+                    ),
+                    (true, _) => format!(
+                        "ObtainSemaphoreShared({sem:#010x}) would deadlock: held exclusively \
+                         by task {owner:#010x}, not the current task {task:#010x}, but no \
+                         other task is runnable and no pending timer could ever release it"
+                    ),
                 },
             });
         }
     }
 }
 
+/// `ObtainSemaphore` (LVO -564): `A0` = `struct SignalSemaphore*`. No
+/// return value (real `ObtainSemaphore` preserves every register).
+///
+/// On contention (issue #237's semaphore-contention follow-up, reported
+/// by codewiz with a minimal `CreateNewProc` repro): queues on `sem`'s
+/// `ss_WaitQueue` and blocks the current task, switching to another
+/// runnable one, the same `block_current_on_signal`/re-trap pattern
+/// `exectask::wait_handler` already uses for `Wait` -- see
+/// [`obtain_or_block`] and this module's docs. Only fails loudly if no
+/// other task is runnable and no pending timer could ever change that
+/// either, exactly `wait_handler`'s own deadlock posture.
+fn obtain_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    obtain_or_block(ctx, false)
+}
+
 /// `ObtainSemaphoreShared` (LVO -678): `A0` = `struct SignalSemaphore*`.
 /// No return value. A free semaphore becomes shared (`ss_Owner` = NULL);
 /// a shared one, or one the current task holds exclusively, nests. On
-/// contention, blocks exactly as [`obtain_semaphore_handler`] does.
+/// contention, queues and blocks exactly as [`obtain_semaphore_handler`]
+/// does.
 fn obtain_semaphore_shared_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
-    let sem = ctx.cpu.address_register(AddressRegister(0));
-    let task = ctx.current_task;
+    obtain_or_block(ctx, true)
+}
 
-    loop {
-        let Err(owner) = obtain_semaphore_impl(ctx.mem, sem, task, 0) else {
-            return Ok(());
-        };
-
-        if ctx
-            .tasks
-            .block_current_on_semaphore(ctx.cpu, ctx.mem, ctx.trap_pc, sem)
-            .is_ok()
-        {
-            return Ok(());
-        }
-
-        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
-            return Err(DispatchError::HandlerFailed {
-                library: "exec.library".to_string(),
-                lvo: -678,
-                handler_name: "ObtainSemaphoreShared".to_string(),
-                message: format!(
-                    "ObtainSemaphoreShared({sem:#010x}) would deadlock: held exclusively by \
-                         task {owner:#010x}, not the current task {task:#010x}, but no other \
-                         task is runnable and no pending timer could ever release it"
-                ),
-            });
-        }
+/// Releases `sem` for `task` and, if that fully frees it with waiters
+/// queued, hands it to them -- the shared body of
+/// [`release_semaphore_handler`] and [`release_semaphore_list_handler`].
+/// Returns `Err(owner)` for an unmatched release, as
+/// [`release_semaphore_impl`] does.
+///
+/// Handing over mirrors real exec: the first waiter takes the semaphore
+/// (exclusive: it becomes `ss_Owner` with nest count 1; shared: owner
+/// NULL, and every shared request in an unbroken run at the head joins
+/// it), is unlinked from `ss_WaitQueue`, and is made runnable. Its
+/// `ss_QueueCount` increment, kept while it waited, now stands for the
+/// lock it holds -- so the count needs no further adjustment.
+fn release_and_hand_over<M: AddressSpace>(
+    mem: &mut M,
+    heap: &mut crate::guestmem::GuestHeap,
+    tasks: &mut crate::taskswitch::TaskScheduler,
+    sem: u32,
+    task: u32,
+) -> Result<(), u32> {
+    release_semaphore_impl(mem, sem, task)?;
+    if mem.read_u16(sem + SS_NEST_COUNT) != 0 {
+        return Ok(());
     }
+
+    let mut granted_shared = false;
+    loop {
+        let request = mem.read_u32(sem + SS_WAIT_QUEUE_HEAD);
+        if mem.read_u32(request + crate::execlist::LN_SUCC) == 0 {
+            break; // empty
+        }
+        let waiter_bits = mem.read_u32(request + SR_WAITER);
+        let shared = waiter_bits & SM_SHARED != 0;
+        let waiter = waiter_bits & !SM_SHARED;
+        if granted_shared && !shared {
+            break;
+        }
+
+        crate::execlist::remove_impl(mem, request);
+        heap.free(request)
+            .expect("a queued SemaphoreRequest is a live heap block");
+        mem.write_u32(sem + SS_OWNER, if shared { 0 } else { waiter });
+        let nest = mem.read_u16(sem + SS_NEST_COUNT);
+        mem.write_u16(sem + SS_NEST_COUNT, nest.wrapping_add(1));
+        tasks.grant_semaphore(waiter, sem);
+
+        if !shared {
+            break;
+        }
+        granted_shared = true;
+    }
+    Ok(())
 }
 
 /// `ReleaseSemaphore` (LVO -570): `A0` = `struct SignalSemaphore*`. No
-/// return value. If this fully frees `sem` (nest count reaches zero),
-/// wakes every task blocked on it in `ObtainSemaphore`/
-/// `ObtainSemaphoreShared` (issue #237's semaphore-contention follow-up)
-/// -- they re-attempt their original call from scratch on resume, so
-/// whichever loses the race to actually obtain it just blocks again.
+/// return value. If this fully frees `sem` (nest count reaches zero)
+/// and tasks are queued on it, hands it to the first of them -- see
+/// [`release_and_hand_over`]. They resume inside their original
+/// `ObtainSemaphore`/`ObtainSemaphoreShared` call already owning it.
 fn release_semaphore_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let sem = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
 
-    let nest_before = ctx.mem.read_u16(sem + SS_NEST_COUNT);
-    release_semaphore_impl(ctx.mem, sem, task).map_err(|owner| DispatchError::HandlerFailed {
-        library: "exec.library".to_string(),
-        lvo: -570,
-        handler_name: "ReleaseSemaphore".to_string(),
-        message: format!(
-            "ReleaseSemaphore({sem:#010x}): owned by task {owner:#010x}, not the current task \
-             {task:#010x} -- an unmatched Release (never Obtained, or already fully released) \
-             or a corrupt semaphore"
-        ),
-    })?;
-
-    if nest_before == 1 {
-        ctx.tasks.wake_blocked_on_semaphore(sem);
-    }
-    Ok(())
+    release_and_hand_over(ctx.mem, ctx.heap, ctx.tasks, sem, task).map_err(|owner| {
+        DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -570,
+            handler_name: "ReleaseSemaphore".to_string(),
+            message: format!(
+                "ReleaseSemaphore({sem:#010x}): owned by task {owner:#010x}, not the current \
+                 task {task:#010x} -- an unmatched Release (never Obtained, or already fully \
+                 released) or a corrupt semaphore"
+            ),
+        }
+    })
 }
 
 /// `AttemptSemaphore` (LVO -576): `A0` = `struct SignalSemaphore*`.
@@ -457,7 +554,7 @@ fn release_semaphore_list_handler<C: Cpu>(
         if succ == 0 {
             return Ok(());
         }
-        release_semaphore_impl(ctx.mem, node, task).map_err(|owner| {
+        release_and_hand_over(ctx.mem, ctx.heap, ctx.tasks, node, task).map_err(|owner| {
             DispatchError::HandlerFailed {
                 library: "exec.library".to_string(),
                 lvo: -588,
@@ -830,6 +927,34 @@ mod tests {
         words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, 0): raising priority
         // never yields, so this is a plain no-op by the time it runs
 
+        // Issue #263: the child is now blocked in ObtainSemaphore, and
+        // must be visible in the semaphore the way it is on exec: its
+        // request on ss_WaitQueue (naming it) and counted in
+        // ss_QueueCount. Record all three for the assertions below.
+        words.push(move_imm_to_a(0)); // A0 = SEM_ADDR
+        words.push((SEM_ADDR >> 16) as u16);
+        words.push(SEM_ADDR as u16);
+        words.push(0x7000); // moveq #0,D0
+        words.extend_from_slice(&[0x3028, SS_QUEUE_COUNT as u16]); // move.w ss_QueueCount(A0),D0
+        let observed_qc_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = observed_qc_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(1));
+        words.extend_from_slice(&move_a_disp_to_d0(0, SS_WAIT_QUEUE_HEAD as i16)); // D0 = mlh_Head
+        let observed_head_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = observed_head_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(1));
+        words.push(0x2440); // movea.l D0,A2
+        words.extend_from_slice(&[0x202A, SR_WAITER as u16]); // move.l sr_Waiter(A2),D0
+        let observed_waiter_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = observed_waiter_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(1));
+
         words.push(move_imm_to_a(0)); // A0 = SEM_ADDR (SetTaskPri clobbered A0/D0/D1)
         words.push((SEM_ADDR >> 16) as u16);
         words.push(SEM_ADDR as u16);
@@ -903,7 +1028,10 @@ mod tests {
         let code_end = entry + (words.len() as u32) * 2;
         let marker_addr = code_end + 16;
         let observed_owner_addr = marker_addr + 16;
-        let tags_addr = observed_owner_addr + 16;
+        let observed_qc_addr = observed_owner_addr + 16;
+        let observed_head_addr = observed_qc_addr + 16;
+        let observed_waiter_addr = observed_head_addr + 16;
+        let tags_addr = observed_waiter_addr + 16;
         let load_end = tags_addr + 32;
 
         words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
@@ -914,6 +1042,14 @@ mod tests {
         words[marker_imm_idx_child + 2] = marker_addr as u16;
         words[observed_owner_imm_idx + 1] = (observed_owner_addr >> 16) as u16;
         words[observed_owner_imm_idx + 2] = observed_owner_addr as u16;
+        for (idx, addr) in [
+            (observed_qc_imm_idx, observed_qc_addr),
+            (observed_head_imm_idx, observed_head_addr),
+            (observed_waiter_imm_idx, observed_waiter_addr),
+        ] {
+            words[idx + 1] = (addr >> 16) as u16;
+            words[idx + 2] = addr as u16;
+        }
 
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
@@ -975,6 +1111,175 @@ mod tests {
              the child task, not the parent"
         );
         assert_eq!(mem.read_u16(SEM_ADDR + SS_NEST_COUNT), 1);
+
+        // Issue #263: while the child waited it was in the queue, and
+        // counted.
+        assert_eq!(
+            mem.read_u16(observed_qc_addr + 2),
+            1,
+            "the owner's lock plus one waiter: ss_QueueCount = 1 (it was 0 with the owner alone)"
+        );
+        assert_ne!(
+            mem.read_u32(observed_head_addr),
+            SEM_ADDR + SS_WAIT_QUEUE_TAIL,
+            "ss_WaitQueue must not be empty while the child waits"
+        );
+        assert_eq!(
+            mem.read_u32(observed_waiter_addr),
+            owner,
+            "the queued SemaphoreRequest must name the waiting task (the one that went on to \
+             own the semaphore)"
+        );
+        // ...and once it was handed the semaphore, it left the queue
+        // and the count stands for the lock it now holds.
+        assert_eq!(
+            mem.read_u32(SEM_ADDR + SS_WAIT_QUEUE_HEAD),
+            SEM_ADDR + SS_WAIT_QUEUE_TAIL,
+            "the granted request must be unlinked"
+        );
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT), 0);
+    }
+
+    /// A heap-allocated `SemaphoreRequest` linked on `sem`'s
+    /// `ss_WaitQueue` the way [`obtain_or_block`] leaves one, for the
+    /// hand-over tests below.
+    fn queue_waiter(
+        mem: &mut FlatMemory,
+        heap: &mut crate::guestmem::GuestHeap,
+        sem: u32,
+        task: u32,
+        shared: bool,
+    ) {
+        let request = heap.alloc(mem, SR_SIZE).expect("heap has room");
+        mem.write_u32(
+            request + SR_WAITER,
+            task | if shared { SM_SHARED } else { 0 },
+        );
+        crate::execlist::add_tail_impl(mem, sem + SS_WAIT_QUEUE, request);
+        let qc = mem.read_u16(sem + SS_QUEUE_COUNT);
+        mem.write_u16(sem + SS_QUEUE_COUNT, qc.wrapping_add(1));
+    }
+
+    fn handover_fixture() -> (FlatMemory, crate::guestmem::GuestHeap) {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let heap = crate::guestmem::GuestHeap::new(0x1_4000, 0x1_c000);
+        init_semaphore_impl(&mut mem, SEM_ADDR);
+        (mem, heap)
+    }
+
+    fn queue_len(mem: &FlatMemory, sem: u32) -> usize {
+        let mut n = 0;
+        let mut node = mem.read_u32(sem + SS_WAIT_QUEUE_HEAD);
+        while mem.read_u32(node + crate::execlist::LN_SUCC) != 0 {
+            n += 1;
+            node = mem.read_u32(node + crate::execlist::LN_SUCC);
+        }
+        n
+    }
+
+    #[test]
+    fn release_hands_the_semaphore_to_waiters_in_arrival_order() {
+        // Issue #263: ownership passes straight to the first queued
+        // waiter, not to whichever woken task happens to run first.
+        let (mut mem, mut heap) = handover_fixture();
+        let mut tasks = crate::taskswitch::TaskScheduler::new(0x1000);
+        let (owner, first, second) = (0x1000, 0x2000, 0x3000);
+
+        obtain_semaphore_impl(&mut mem, SEM_ADDR, owner, owner).unwrap();
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, first, false);
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, second, false);
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT), 2);
+
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, owner).unwrap();
+        assert_eq!(
+            mem.read_u32(SEM_ADDR + SS_OWNER),
+            first,
+            "first in, first served"
+        );
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_NEST_COUNT), 1);
+        assert_eq!(
+            mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT),
+            1,
+            "the new owner's lock plus the one still waiting, minus one"
+        );
+        assert_eq!(queue_len(&mem, SEM_ADDR), 1);
+        assert!(tasks.take_semaphore_grant(first, SEM_ADDR));
+        assert!(
+            !tasks.take_semaphore_grant(second, SEM_ADDR),
+            "the second waiter must keep waiting"
+        );
+
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, first).unwrap();
+        assert_eq!(mem.read_u32(SEM_ADDR + SS_OWNER), second);
+        assert_eq!(queue_len(&mem, SEM_ADDR), 0);
+        assert_eq!(mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT), 0);
+
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, second).unwrap();
+        assert_eq!(
+            mem.read_u16(SEM_ADDR + SS_QUEUE_COUNT) as i16,
+            -1,
+            "nobody left: the semaphore is free again"
+        );
+        assert_eq!(mem.read_u32(SEM_ADDR + SS_OWNER), 0);
+    }
+
+    #[test]
+    fn a_nested_release_does_not_hand_over() {
+        let (mut mem, mut heap) = handover_fixture();
+        let mut tasks = crate::taskswitch::TaskScheduler::new(0x1000);
+        let owner = 0x1000;
+        obtain_semaphore_impl(&mut mem, SEM_ADDR, owner, owner).unwrap();
+        obtain_semaphore_impl(&mut mem, SEM_ADDR, owner, owner).unwrap(); // nested
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, 0x2000, false);
+
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, owner).unwrap();
+        assert_eq!(
+            mem.read_u32(SEM_ADDR + SS_OWNER),
+            owner,
+            "still the owner's"
+        );
+        assert_eq!(queue_len(&mem, SEM_ADDR), 1, "the waiter is still queued");
+        assert!(!tasks.take_semaphore_grant(0x2000, SEM_ADDR));
+
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, owner).unwrap();
+        assert_eq!(mem.read_u32(SEM_ADDR + SS_OWNER), 0x2000);
+    }
+
+    #[test]
+    fn release_hands_a_run_of_shared_waiters_the_semaphore_together() {
+        // Shared requests at the head of the queue all get in at once;
+        // an exclusive one behind them keeps waiting.
+        let (mut mem, mut heap) = handover_fixture();
+        let mut tasks = crate::taskswitch::TaskScheduler::new(0x1000);
+        let owner = 0x1000;
+        obtain_semaphore_impl(&mut mem, SEM_ADDR, owner, owner).unwrap();
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, 0x2000, true);
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, 0x3000, true);
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, 0x4000, false);
+        queue_waiter(&mut mem, &mut heap, SEM_ADDR, 0x5000, true);
+
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, owner).unwrap();
+        assert_eq!(mem.read_u32(SEM_ADDR + SS_OWNER), 0, "held shared");
+        assert_eq!(
+            mem.read_u16(SEM_ADDR + SS_NEST_COUNT),
+            2,
+            "two shared locks"
+        );
+        assert!(tasks.take_semaphore_grant(0x2000, SEM_ADDR));
+        assert!(tasks.take_semaphore_grant(0x3000, SEM_ADDR));
+        assert!(!tasks.take_semaphore_grant(0x4000, SEM_ADDR));
+        assert!(
+            !tasks.take_semaphore_grant(0x5000, SEM_ADDR),
+            "a shared request behind an exclusive one must not jump it"
+        );
+        assert_eq!(queue_len(&mem, SEM_ADDR), 2);
+
+        // Both shared holders release; the exclusive waiter is next.
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, 0x2000).unwrap();
+        assert_eq!(queue_len(&mem, SEM_ADDR), 2, "one shared lock still out");
+        release_and_hand_over(&mut mem, &mut heap, &mut tasks, SEM_ADDR, 0x3000).unwrap();
+        assert_eq!(mem.read_u32(SEM_ADDR + SS_OWNER), 0x4000);
+        assert!(tasks.take_semaphore_grant(0x4000, SEM_ADDR));
     }
 
     // --- ObtainSemaphoreShared/AttemptSemaphoreShared ---

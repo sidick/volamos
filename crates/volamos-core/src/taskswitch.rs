@@ -128,19 +128,15 @@ pub enum TaskState {
         wait_mask: u32,
     },
     /// Blocked in `ObtainSemaphore`/`ObtainSemaphoreShared` (issue
-    /// #237's semaphore-contention follow-up), waiting for `sem` to
-    /// become available. Becomes [`TaskState::Ready`] when
-    /// [`TaskScheduler::wake_blocked_on_semaphore`] sees `ReleaseSemaphore`
-    /// fully free that same semaphore -- not handed ownership directly;
-    /// on resume it just re-enters the original `Obtain*` call from
-    /// scratch (same re-trap model as [`TaskState::BlockedOnSignal`]),
-    /// so a woken task that loses a race to another one simply blocks
-    /// again. `wake_blocked_on_semaphore` wakes every task blocked on a
-    /// given semaphore at once rather than tracking real FIFO queue
-    /// order (`ss_WaitQueue` stays the empty, unused `MinList` it
-    /// already was) -- correct either way, since cooperative scheduling
-    /// means they still only re-attempt one at a time, just not
-    /// necessarily in arrival order.
+    /// #237's semaphore-contention follow-up), queued on `sem`'s
+    /// `ss_WaitQueue`. Becomes [`TaskState::Ready`] when
+    /// [`TaskScheduler::grant_semaphore`] records that `ReleaseSemaphore`
+    /// handed it the semaphore -- ownership passes directly, in queue
+    /// order, as in real exec. On resume the task re-enters the original
+    /// `Obtain*` call from scratch (same re-trap model as
+    /// [`TaskState::BlockedOnSignal`]), where
+    /// [`TaskScheduler::take_semaphore_grant`] tells it it already owns
+    /// the semaphore.
     BlockedOnSemaphore {
         /// The semaphore's guest address.
         sem: u32,
@@ -285,6 +281,13 @@ pub struct TaskScheduler {
     /// outgoing task's `tc_Switch` hook (issue #237) still runs as that
     /// task, and must see *its* count, not the incoming task's.
     incoming_forbid_nest: u32,
+    /// `(task, semaphore)` pairs `ReleaseSemaphore` has handed a
+    /// semaphore to while the task was still asleep in its
+    /// `Obtain*` call -- see [`Self::grant_semaphore`]. Needed because
+    /// that call is re-entered from scratch on resume (see
+    /// [`TaskState::BlockedOnSemaphore`]) and must be able to tell
+    /// "I was handed it" from "this is a fresh, contended obtain".
+    semaphore_grants: std::collections::BTreeSet<(u32, u32)>,
 }
 
 impl TaskScheduler {
@@ -302,6 +305,7 @@ impl TaskScheduler {
             ready_seq: 0,
             forbid_nest: 0,
             incoming_forbid_nest: 0,
+            semaphore_grants: std::collections::BTreeSet::new(),
         }
     }
 
@@ -592,7 +596,7 @@ impl TaskScheduler {
     /// a `Delay` (issue #254) -- called by
     /// [`crate::exectask::PendingTimers`] once a `Delay`-blocked
     /// task's own deadline is reached, the same way
-    /// [`Self::wake_blocked_on_semaphore`] reacts to `ReleaseSemaphore`.
+    /// [`Self::grant_semaphore`] reacts to `ReleaseSemaphore`.
     /// A no-op if `target` isn't currently `BlockedOnDelay` (it may
     /// already be `Ready`, or blocked on something else entirely, or
     /// not a known task at all) -- callers don't need to check first.
@@ -698,28 +702,25 @@ impl TaskScheduler {
         }
     }
 
-    /// Marks every task [`TaskState::Ready`] that's currently
-    /// [`TaskState::BlockedOnSemaphore`] on `sem` (issue #237's
-    /// semaphore-contention follow-up) -- called once `ReleaseSemaphore`
-    /// sees `sem` fully freed (nest count reached zero). Wakes *all*
-    /// matching waiters at once rather than tracking real FIFO queue
-    /// order through `ss_WaitQueue` (which stays the empty, unused
-    /// `MinList` it already was); this stays behaviourally correct
-    /// under cooperative scheduling, since the woken tasks still only
-    /// re-attempt their original `Obtain*` call one at a time, just not
-    /// necessarily in arrival order, and whichever loses the race to
-    /// obtain `sem` first simply blocks again. Never switches, matching
-    /// `wake_if_signal_matches`.
-    pub fn wake_blocked_on_semaphore(&mut self, sem: u32) {
-        let waiters: Vec<u32> = self
-            .others
-            .iter()
-            .filter(|(_, record)| record.state == TaskState::BlockedOnSemaphore { sem })
-            .map(|(&addr, _)| addr)
-            .collect();
-        for waiter in waiters {
-            self.mark_ready_if(waiter, TaskState::BlockedOnSemaphore { sem });
-        }
+    /// Records that `ReleaseSemaphore` handed `sem` to `task` (issue
+    /// #263: real exec passes ownership straight to the first queued
+    /// waiter rather than waking everyone to race for it), and makes it
+    /// [`TaskState::Ready`] if it is asleep on `sem`. Never switches,
+    /// matching [`Self::wake_if_signal_matches`].
+    ///
+    /// The semaphore's own bookkeeping (`ss_Owner`, `ss_NestCount`) is
+    /// the caller's to do; this only carries the fact across the
+    /// task's resume, for [`Self::take_semaphore_grant`].
+    pub fn grant_semaphore(&mut self, task: u32, sem: u32) {
+        self.semaphore_grants.insert((task, sem));
+        self.mark_ready_if(task, TaskState::BlockedOnSemaphore { sem });
+    }
+
+    /// Whether `task` was handed `sem` while it slept in `Obtain*`
+    /// (consumes the grant). `true` means the caller already owns the
+    /// semaphore and must return without touching it again.
+    pub fn take_semaphore_grant(&mut self, task: u32, sem: u32) -> bool {
+        self.semaphore_grants.remove(&(task, sem))
     }
 
     /// Voluntary yield (`Permit` after `Forbid`+`SysFlags |= SFB_SAR`,
