@@ -64,7 +64,7 @@ use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTa
 use crate::dosfile::{
     ERROR_ACTION_NOT_KNOWN, ERROR_OBJECT_NOT_FOUND, MODE_NEWFILE, MODE_OLDFILE, MODE_READWRITE,
 };
-use crate::guestmem::{addr_from_bptr, read_bstr, read_c_string};
+use crate::guestmem::{addr_from_bptr, clamp_guest_len, read_bstr, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 
@@ -291,7 +291,7 @@ pub fn handle_fs_packet<C: Cpu>(
         // RKRM packet-documentation.md, ACTION_READ (82): Arg1 =
         // fh_Arg1, Arg2 = buffer (APTR), Arg3 = length; Res1 = bytes
         // read (0 legal at EOF) or -1 + Res2 on error.
-        ACTION_READ => match ctx.dos.read(arg1, arg3 as usize) {
+        ACTION_READ => match ctx.dos.read(arg1, clamp_guest_len(ctx.mem, arg3)) {
             Ok(data) => {
                 for (i, b) in data.iter().enumerate() {
                     ctx.mem.write_u8(arg2.wrapping_add(i as u32), *b);
@@ -304,7 +304,8 @@ pub fn handle_fs_packet<C: Cpu>(
         // The Output() default handle write goes through ctx.out, same
         // as the Write LVO handler (see HostHandle::Stdout's doc).
         ACTION_WRITE => {
-            let mut buf = vec![0u8; arg3 as usize];
+            let buf_len = clamp_guest_len(ctx.mem, arg3);
+            let mut buf = vec![0u8; buf_len];
             for (i, b) in buf.iter_mut().enumerate() {
                 *b = ctx.mem.read_u8(arg2.wrapping_add(i as u32));
             }

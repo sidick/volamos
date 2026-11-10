@@ -45,6 +45,7 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, HandlerContext, LibraryTable};
 use crate::exectask;
+use crate::guestmem::clamp_guest_len;
 use crate::lvos::bsdsocket::BSDSOCKET_LVOS;
 use crate::memory::AddressSpace;
 
@@ -740,20 +741,6 @@ fn is_connect_in_progress(e: &std::io::Error) -> bool {
         Some(10035) | Some(10036) => true,
         _ => false,
     }
-}
-
-/// Clamps a guest-supplied byte length to the guest's own address
-/// space size: no real guest buffer can ever be larger than all of
-/// guest memory, so anything above that is necessarily a bogus or
-/// hostile length register, not a legitimately huge real buffer.
-/// `Send`/`Recv`/`SendTo`/`RecvFrom`/`SendMsg`/`RecvMsg` all take a
-/// raw, unchecked 32-bit length straight from a guest register or
-/// `struct iovec`; without this, a single call with `len` near
-/// `u32::MAX` would try to allocate up to 4 GiB in one `vec![0u8; n]`,
-/// which aborts the whole host process on allocation failure (not a
-/// catchable panic).
-fn clamp_guest_len(mem: &dyn AddressSpace, len: u32) -> usize {
-    (len as usize).min(mem.len())
 }
 
 /// `send(sock, buf, len, flags)`. `D0` = bytes sent, or `-1` with
@@ -2954,24 +2941,6 @@ mod tests {
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
     use crate::dispatch::{BSDSOCKET_LIBRARY_BASE, Runtime, StartConfig};
     use crate::memory::FlatMemory;
-
-    #[test]
-    fn clamp_guest_len_caps_at_the_address_space_size() {
-        // Code review finding: Send/Recv/SendTo/RecvFrom/SendMsg/
-        // RecvMsg all took a raw, unchecked guest length and allocated
-        // a Vec sized directly from it -- a length near u32::MAX would
-        // try to allocate up to 4 GiB in one call, aborting the host
-        // process on allocation failure. No real guest buffer can be
-        // larger than all of guest memory, so that's the natural cap.
-        let mem = FlatMemory::new(0x1_0000);
-        assert_eq!(clamp_guest_len(&mem, 100), 100);
-        assert_eq!(clamp_guest_len(&mem, 0x1_0000), 0x1_0000);
-        assert_eq!(
-            clamp_guest_len(&mem, u32::MAX),
-            0x1_0000,
-            "must clamp to the address space's own size, not try to allocate ~4 GiB"
-        );
-    }
 
     fn load_words<M: AddressSpace>(mem: &mut M, addr: u32, words: &[u16]) {
         let mut offset = addr;

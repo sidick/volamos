@@ -69,7 +69,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
-use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr, read_c_string, write_c_string};
+use crate::guestmem::{
+    GuestHeap, addr_from_bptr, bptr_from_addr, clamp_guest_len, read_c_string, write_c_string,
+};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 use crate::vfs::{ResolveMode, Vfs, VfsError};
@@ -1355,7 +1357,7 @@ fn name_from_fh_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 fn read_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let buf_addr = ctx.cpu.data_register(DataRegister(2));
-    let len = ctx.cpu.data_register(DataRegister(3)) as usize;
+    let len = clamp_guest_len(ctx.mem, ctx.cpu.data_register(DataRegister(3)));
     let addr = addr_from_bptr(bptr);
     match ctx.dos.read(addr, len) {
         Ok(bytes) => {
@@ -1379,7 +1381,7 @@ fn read_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
 fn write_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let buf_addr = ctx.cpu.data_register(DataRegister(2));
-    let len = ctx.cpu.data_register(DataRegister(3)) as usize;
+    let len = clamp_guest_len(ctx.mem, ctx.cpu.data_register(DataRegister(3)));
     let addr = addr_from_bptr(bptr);
 
     let mut buf = vec![0u8; len];

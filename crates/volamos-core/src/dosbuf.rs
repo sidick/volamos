@@ -37,7 +37,7 @@
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::map_io_error;
-use crate::guestmem::{addr_from_bptr, read_c_string};
+use crate::guestmem::{addr_from_bptr, clamp_guest_len, read_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 
@@ -182,12 +182,12 @@ fn fread_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
 fn fwrite_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let buf_addr = ctx.cpu.data_register(DataRegister(2));
-    let block_len = ctx.cpu.data_register(DataRegister(3));
-    let block_count = ctx.cpu.data_register(DataRegister(4));
+    let block_len = clamp_guest_len(ctx.mem, ctx.cpu.data_register(DataRegister(3)));
+    let block_count = clamp_guest_len(ctx.mem, ctx.cpu.data_register(DataRegister(4)));
     let addr = addr_from_bptr(bptr);
 
-    let total = (block_len as u64) * (block_count as u64);
-    let mut buf = Vec::with_capacity(total as usize);
+    let total = usize::saturating_mul(block_len, block_count).min(ctx.mem.len());
+    let mut buf = Vec::with_capacity(total);
     for i in 0..total {
         buf.push(ctx.mem.read_u8(buf_addr.wrapping_add(i as u32)));
     }
@@ -201,7 +201,7 @@ fn fwrite_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let complete_records = if block_len == 0 {
         0
     } else {
-        (written / u64::from(block_len)) as u32
+        (written / (block_len as u64)) as u32
     };
     ctx.cpu.set_data_register(DataRegister(0), complete_records);
     Ok(())
@@ -263,7 +263,7 @@ fn fputs_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
 /// Equivalent to `FWrite(Output(),buf,1,buflen)`.
 fn write_chars_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let buf_addr = ctx.cpu.data_register(DataRegister(1));
-    let len = ctx.cpu.data_register(DataRegister(2));
+    let len = clamp_guest_len(ctx.mem, ctx.cpu.data_register(DataRegister(2)));
     let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
         Ok(addr) => addr,
         Err(code) => {
@@ -272,9 +272,9 @@ fn write_chars_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             return Ok(());
         }
     };
-    let mut buf = Vec::with_capacity(len as usize);
+    let mut buf = Vec::with_capacity(len);
     for i in 0..len {
-        buf.push(ctx.mem.read_u8(buf_addr.wrapping_add(i)));
+        buf.push(ctx.mem.read_u8(buf_addr.wrapping_add(i as u32)));
     }
     let written = match write_bytes(ctx, out_addr, &buf) {
         Ok(n) => n as u32,

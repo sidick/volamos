@@ -934,6 +934,60 @@ pub fn write_bstr(mem: &mut dyn AddressSpace, addr: u32, bytes: &[u8]) -> u8 {
     len
 }
 
+/// Clamps a guest-supplied byte length to the guest's own address
+/// space size: no real guest buffer can ever be larger than all of
+/// guest memory, so anything above that is necessarily a bogus or
+/// hostile length register, not a legitimately huge real buffer.
+///
+/// Many guest-facing APIs (dos.library `Read`/`Write`, exec.library
+/// `CopyMem`, `bsdsocket.library` `Send`/`Recv`, etc.) take a raw,
+/// unchecked 32-bit length from guest registers or guest memory.
+/// Without clamping, a single call with `len` near `u32::MAX` would
+/// try to allocate up to 4 GiB in one `vec![0u8; n]`, which aborts
+/// the whole host process on allocation failure (not a catchable
+/// panic).  This is the canonical guard for all such functions.
+pub fn clamp_guest_len(mem: &dyn AddressSpace, len: u32) -> usize {
+    (len as usize).min(mem.len())
+}
+
+#[cfg(test)]
+mod clamp_guest_len_tests {
+    use super::*;
+    use crate::memory::FlatMemory;
+
+    #[test]
+    fn clamp_guest_len_returns_zero_for_zero() {
+        let mem = FlatMemory::new(0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, 0), 0);
+    }
+
+    #[test]
+    fn clamp_guest_len_passes_through_small_values() {
+        let mem = FlatMemory::new(0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, 512), 512);
+        assert_eq!(clamp_guest_len(&mem, 0x1_0000), 0x1_0000);
+    }
+
+    #[test]
+    fn clamp_guest_len_returns_exact_mem_size_when_equal() {
+        let mem = FlatMemory::new(0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, 0x1_0000), 0x1_0000);
+    }
+
+    #[test]
+    fn clamp_guest_len_clamps_u32_max_to_mem_size() {
+        let mem = FlatMemory::new(0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, u32::MAX), 0x1_0000);
+    }
+
+    #[test]
+    fn clamp_guest_len_clamps_any_value_above_mem_size() {
+        let mem = FlatMemory::new(0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, 0x1_0001), 0x1_0000);
+        assert_eq!(clamp_guest_len(&mem, 0xFFFF_FFFF), 0x1_0000);
+    }
+}
+
 /// Test-only shorthands for [`GuestHeap::alloc`]/
 /// [`GuestHeap::alloc_with_requested`] without an address space.
 ///

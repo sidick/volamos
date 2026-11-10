@@ -105,9 +105,11 @@
 //! single source of truth, exactly as it already is for `FreeMem` above.
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
+
 use crate::dispatch::{
     CACHE_BITS_ADDR, DispatchError, EXEC_LIBRARY_BASE, HandlerContext, LibraryTable,
 };
+use crate::guestmem::clamp_guest_len;
 use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
 use crate::sanitize::PoisonReason;
@@ -589,6 +591,7 @@ fn alloc_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         ctx.mem
             .read_u16(template.wrapping_add(ML_NUMENTRIES_OFFSET)),
     );
+    let num_entries = num_entries.min(ctx.mem.len() as u32 / MEMENTRY_SIZE);
 
     // The new MemList, sized for `num_entries` entries. Note
     // `sizeof(struct MemList)` already includes ml_ME[1] (memory.h's
@@ -973,17 +976,17 @@ fn free_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let source = ctx.cpu.address_register(AddressRegister(0));
     let dest = ctx.cpu.address_register(AddressRegister(1));
-    let size = ctx.cpu.data_register(DataRegister(0));
+    let size = clamp_guest_len(ctx.mem, ctx.cpu.data_register(DataRegister(0)));
 
-    let mut buf = Vec::with_capacity(size as usize);
+    let mut buf = Vec::with_capacity(size);
     for i in 0..size {
-        buf.push(ctx.mem.peek_u8(source.wrapping_add(i)));
+        buf.push(ctx.mem.peek_u8(source.wrapping_add(i as u32)));
     }
     for (i, b) in buf.into_iter().enumerate() {
         ctx.mem.poke_u8(dest.wrapping_add(i as u32), b);
     }
     if let Some(shadow) = ctx.mem.shadow_mut() {
-        shadow.copy_range(source, dest, size);
+        shadow.copy_range(source, dest, size as u32);
     }
     Ok(())
 }
