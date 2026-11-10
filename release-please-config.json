@@ -5,6 +5,7 @@
     ".": {
       "release-type": "simple",
       "package-name": "volamos",
+      "include-component-in-tag": false,
       "changelog-path": "userdocs/Changelog.md",
       "extra-files": [
         {
