@@ -1895,6 +1895,33 @@ enum TimerCompletion {
 struct PendingTimer {
     completion: TimerCompletion,
     deadline: std::time::Instant,
+    /// Only ever set for a [`TimerCompletion::Delay`] entry: its
+    /// deadline has passed and the delaying task has already been
+    /// woken, but the entry itself is deliberately kept until that
+    /// task's own `delay_handler` re-trap retires it with
+    /// [`PendingTimers::remove_delay`].
+    ///
+    /// A `Delay` entry does two jobs at once -- it's the wake event
+    /// *and* the deadline memo [`PendingTimers::delay_deadline`] hands
+    /// back on every re-trap (see its doc for why the re-trap model
+    /// has nothing else durable to recognize a re-entry by). Removing
+    /// it at the moment it fires, the way a completed
+    /// [`TimerCompletion::Request`] is removed, destroys the memo too:
+    /// the woken task re-enters `delay_handler`, finds no entry, and
+    /// registers `now + the full original duration` all over again --
+    /// so its `Delay` never returns as long as anything keeps waking
+    /// it (issue #262: a child's `Delay(10)` restarted forever while
+    /// the main task polled with `Delay(1)`, because each of the main
+    /// task's own blocking waits fired the child's elapsed entry).
+    ///
+    /// Keeping the entry fixes that, but it must then be invisible to
+    /// every later scan -- [`PendingTimers::fire_due`] would otherwise
+    /// re-wake the same task on every call, and
+    /// [`PendingTimers::fire_earliest_impl`] would pick this
+    /// already-elapsed entry as "the earliest thing that could still
+    /// make progress" forever, reporting progress to its callers'
+    /// retry loops without any being made.
+    elapsed: bool,
     /// The task that owns this entry -- `SendIO`'s caller for a
     /// `Request`, or the delaying task itself for a `Delay` -- used to
     /// drop it without completing it if that task exits (falls off its
@@ -1934,6 +1961,7 @@ impl PendingTimers {
             completion: TimerCompletion::Request(ioreq),
             deadline,
             owner_task,
+            elapsed: false,
         });
     }
 
@@ -1963,6 +1991,7 @@ impl PendingTimers {
             completion: TimerCompletion::Delay(task),
             deadline,
             owner_task: task,
+            elapsed: false,
         });
         deadline
     }
@@ -2028,13 +2057,17 @@ impl PendingTimers {
     /// `Delay`) that genuinely elapsed while other guest code ran.
     pub(crate) fn fire_due<M: AddressSpace>(&mut self, mem: &mut M, tasks: &mut TaskScheduler) {
         let now = std::time::Instant::now();
-        let due: Vec<TimerCompletion> = self
-            .entries
-            .iter()
-            .filter(|e| e.deadline <= now)
-            .map(|e| e.completion)
-            .collect();
-        self.entries.retain(|e| e.deadline > now);
+        let mut due = Vec::new();
+        for entry in &mut self.entries {
+            if !entry.elapsed && entry.deadline <= now {
+                entry.elapsed = true;
+                due.push(entry.completion);
+            }
+        }
+        // A fired `Delay` entry stays, flagged -- see [`PendingTimer::
+        // elapsed`]'s doc. A completed `Request` goes, as always.
+        self.entries
+            .retain(|e| matches!(e.completion, TimerCompletion::Delay(_)) || !e.elapsed);
         for completion in due {
             Self::complete(mem, tasks, completion);
         }
@@ -2097,6 +2130,7 @@ impl PendingTimers {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, e)| !e.elapsed)
             .map(|(i, e)| (i, e.deadline))
             .min_by_key(|&(_, deadline)| deadline)
         else {
@@ -2111,8 +2145,19 @@ impl PendingTimers {
         if deadline > now {
             std::thread::sleep(deadline - now);
         }
-        let entry = self.entries.remove(idx);
-        Self::complete(mem, tasks, entry.completion);
+        // A fired `Delay` entry stays, flagged -- see [`PendingTimer::
+        // elapsed`]'s doc. A completed `Request` goes, as always.
+        let completion = match self.entries[idx].completion {
+            completion @ TimerCompletion::Delay(_) => {
+                self.entries[idx].elapsed = true;
+                completion
+            }
+            completion @ TimerCompletion::Request(_) => {
+                self.entries.remove(idx);
+                completion
+            }
+        };
+        Self::complete(mem, tasks, completion);
         true
     }
 

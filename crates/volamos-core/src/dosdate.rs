@@ -579,4 +579,132 @@ mod tests {
              been starved of the CPU by a flat host sleep"
         );
     }
+
+    #[test]
+    fn a_delay_still_ends_while_another_task_polls_with_its_own_delay() {
+        // codewiz's issue #262 "delay-delay.c" repro: a child's
+        // Delay(3) must genuinely end while the main task polls with
+        // Delay(1) -- libpthread's pthread_join() does exactly this
+        // when no signal is free.
+        //
+        // What used to go wrong is the re-trap model meeting
+        // `PendingTimers`' bookkeeping: a `Delay` entry is both the
+        // wake event *and* the deadline memo `delay_deadline` hands
+        // back on re-entry, and firing it used to remove it. So every
+        // time the main task's own blocking wait fired the child's
+        // elapsed entry, the woken child re-entered `delay_handler`,
+        // found no memo, and started its full 3 ticks over again --
+        // forever, for as long as anything kept waking it. The child's
+        // Delay must now return after roughly its own duration, not
+        // after the main task gives up polling.
+        //
+        // Parent: spawn the child, then poll Delay(1) up to 50 times
+        // (a second, far longer than the child's 60ms) for the child's
+        // marker, and exit with whatever the marker holds -- 0 if the
+        // child's Delay never returned.
+        const NP_ENTRY: u32 = 0x8000_0000 + 1000 + 3; // TAG_USER + NP_Dummy + NP_Entry
+        const POLLS: u16 = 50;
+
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+
+        // --- parent ---
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        let tags_imm_idx = words.len();
+        words.push(0x223C); // move.l #imm32,D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+        words.push(0x7400 | POLLS); // moveq #POLLS,D2 -- the poll budget
+
+        // poll: Delay(1); D0 = *marker; stop as soon as it's non-zero,
+        // or once the budget runs out.
+        let poll_idx = words.len();
+        words.push(0x223C); // move.l #imm32,D1
+        words.push(0);
+        words.push(1); // 1 tick == 20ms
+        words.extend_from_slice(&jsr_disp16_a6(-198)); // Delay
+        let marker_imm_idx = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr, sets Z
+        words.push(0x6600 | 8); // bne.s done (4 words further on)
+        words.push(0x5382); // subq.l #1,D2
+        let back = (poll_idx as i32 - (words.len() as i32 + 1)) * 2;
+        words.push(0x6600 | (back as u8 as u16)); // bne.s poll
+        words.push(0x7000); // moveq #0,D0 -- budget exhausted
+        words.push(RTS); // -> EXIT_STUB_ADDR
+        // done: exit with the *unused* poll budget, so the assertion
+        // can tell "ended promptly" from "ended on the last poll".
+        words.push(0x2002); // move.l D2,D0
+        words.push(RTS); // -> EXIT_STUB_ADDR
+
+        // --- child: Delay(3) [60ms], then write the marker ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        words.push(0x223C); // move.l #imm32,D1
+        words.push(0);
+        words.push(3); // 3 ticks == 60ms
+        words.extend_from_slice(&jsr_disp16_a6(-198)); // Delay
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(0x7000 | 0x2A); // moveq #0x2A,d0
+        words.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR
+
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+
+        let mut out = Vec::new();
+        // The exit code is the parent's unused poll budget: 0 means it
+        // polled all 50 times (a second) and the child's Delay(3)
+        // never returned at all.
+        let polls_left = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            polls_left, 0,
+            "the child's own Delay must have ended during the parent's Delay(1) polling \
+             rather than restarting its full duration every time the parent's wait woke it"
+        );
+        let polls_used = i32::from(POLLS) - polls_left;
+        assert!(
+            polls_used <= 10,
+            "the child's Delay(3) should end within a handful of the parent's 20ms polls; \
+             it took {polls_used} of {POLLS}"
+        );
+    }
 }
