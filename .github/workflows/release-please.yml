@@ -68,6 +68,32 @@ jobs:
           cache-key: ${{ runner.os }}
           components: clippy, rustfmt
 
+      # The release PR bumps the crate versions via generic TOML updaters
+      # (see release-please-config.json); if one of their paths stops
+      # matching, release-please leaves the file untouched with only a
+      # log warning. Fail loudly here instead: every published artifact
+      # must come from a commit whose crate versions match the tag.
+      - name: Crate versions match the release tag
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          want="${TAG#v}"
+          for crate in crates/volamos crates/volamos-core; do
+            got=$(cargo read-manifest --manifest-path "$crate/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+            if [ "$got" != "$want" ]; then
+              echo "::error::$crate is at $got but the release tag is $TAG"
+              exit 1
+            fi
+          done
+          python3 - "$want" <<'PY'
+          import sys, tomllib
+          want = sys.argv[1]
+          lock = {p["name"]: p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"]}
+          bad = {n: lock[n] for n in ("volamos", "volamos-core") if lock[n] != want}
+          if bad:
+              sys.exit(f"::error::Cargo.lock disagrees with the release tag v{want}: {bad}")
+          PY
+
       - name: Check formatting
         run: cargo fmt --all --check
 
