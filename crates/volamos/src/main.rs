@@ -360,6 +360,14 @@ struct Options {
     /// kind of thing a stale `~/.volamos`/`.volamos` shouldn't be able
     /// to turn on for every future run in that directory.
     fpsp_emulate: bool,
+    /// `--stack-report`: track and print each distinct stack region's
+    /// high-water-mark usage at exit -- see
+    /// [`volamos_core::dispatch::Runtime::enable_stack_report`]'s doc for
+    /// the mechanism. `false` by default; CLI-only, like
+    /// `sanitize`/`clock_mhz`/`cache`/`fpsp_emulate` above, for the same
+    /// reason: diagnostic instrumentation, not something a stale
+    /// `~/.volamos`/`.volamos` should be able to silently turn on.
+    stack_report: bool,
     net: bool,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
@@ -854,6 +862,25 @@ struct Cli {
     )]
     emu68_debug: bool,
 
+    /// Report each stack region's high-water-mark usage at exit (off by default)
+    #[arg(
+        long = "stack-report",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Track the lowest A7 ever reached on each distinct stack region the guest \
+                      runs on, and print bytes-used-of-total for each at exit. A guest that \
+                      StackSwaps onto a second stack gets a separate line for it, since usage \
+                      on one stack says nothing about the other. Checked at the same \
+                      trap-dispatch-boundary granularity as the stack-overflow check: a tight \
+                      loop that recurses deep without ever making a library call won't have its \
+                      true deepest point observed until its next trap, if any -- so this can \
+                      under-report, never over-report, how close a run came to overflowing. \
+                      Off by default and CLI-only (not settable via ~/.volamos/.volamos), since \
+                      this is diagnostic instrumentation like --sanitize, not something a \
+                      stale config file should silently keep turning on."
+    )]
+    stack_report: bool,
+
     /// Enable bsdsocket.library: real host network access for the guest
     #[arg(
         long = "net",
@@ -1058,6 +1085,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         cli.clock_mhz,
         cli.cache,
         cli.fpsp_emulate,
+        cli.stack_report,
         cli.libs_dir,
         cli.program,
         cli.guest_args,
@@ -1349,12 +1377,14 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// (issue #102), threaded alongside `InstrumentationOptions` for the
 /// same reason (see `Options::clock_mhz`'s doc). The first `bool` is
 /// `--cache` (issue #148, see `Options::cache`'s doc); the second is
-/// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc) --
-/// both CLI-only for the same reason.
+/// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc); the
+/// third is `--stack-report` (see `Options::stack_report`'s doc) --
+/// all CLI-only for the same reason.
 type RawParsedArgs = (
     config::Overrides,
     InstrumentationOptions,
     Option<f64>,
+    bool,
     bool,
     bool,
     Option<PathBuf>,
@@ -1433,6 +1463,7 @@ fn resolve(
     clock_mhz: Option<f64>,
     cache: bool,
     fpsp_emulate: bool,
+    stack_report: bool,
     libs_dir: Option<PathBuf>,
     cli_jit: Option<bool>,
     program: String,
@@ -1477,6 +1508,7 @@ fn resolve(
         clock_mhz,
         cache,
         fpsp_emulate,
+        stack_report,
         net: overrides.net.unwrap_or(false),
         // Only ever non-empty when `overrides` already includes
         // `config::built_in_defaults`'s own layer -- `main` merges that
@@ -1496,8 +1528,17 @@ fn resolve(
 /// module wants instead.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let (overrides, sanitize, clock_mhz, cache, fpsp_emulate, libs_dir, program, guest_args) =
-        parse_args_raw(args)?;
+    let (
+        overrides,
+        sanitize,
+        clock_mhz,
+        cache,
+        fpsp_emulate,
+        stack_report,
+        libs_dir,
+        program,
+        guest_args,
+    ) = parse_args_raw(args)?;
     let cli_jit = overrides.jit;
     Ok(resolve(
         overrides,
@@ -1505,6 +1546,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         clock_mhz,
         cache,
         fpsp_emulate,
+        stack_report,
         libs_dir,
         cli_jit,
         program,
@@ -1875,6 +1917,7 @@ fn build_nested_runtime(
     clock_mhz: Option<f64>,
     cache: bool,
     fpsp_emulate: bool,
+    stack_report: bool,
     net: bool,
     libs_dir_override: bool,
 ) -> Option<Runtime<M68kCpu>> {
@@ -1944,6 +1987,14 @@ fn build_nested_runtime(
     // A nested System()/Execute() run is still the real CLI process --
     // see Runtime::enable_host_break_folding's doc (issue #210).
     runtime.enable_host_break_folding();
+    // --stack-report: a nested System()/Execute() run shares the
+    // parent's --stack-report setting, same as --cache/--fpsp-emulate
+    // above -- its own report just isn't surfaced anywhere yet (nothing
+    // calls stack_usage_report() on a nested Runtime), matching
+    // --clock-mhz's own cycle count for a nested run today.
+    if stack_report {
+        runtime.enable_stack_report();
+    }
     sanitize.reserve_debug_ports(&mut runtime).ok()?;
     if sanitize.dirty_heap {
         runtime.enable_dirty_heap();
@@ -1986,6 +2037,7 @@ fn run_nested_program(
     clock_mhz: Option<f64>,
     cache: bool,
     fpsp_emulate: bool,
+    stack_report: bool,
     net: bool,
     libs_dir_override: bool,
 ) -> i32 {
@@ -2002,6 +2054,7 @@ fn run_nested_program(
         clock_mhz,
         cache,
         fpsp_emulate,
+        stack_report,
         net,
         libs_dir_override,
     ) else {
@@ -2043,6 +2096,9 @@ fn build_runtime_with_vfs(
     // Runtime::enable_host_break_folding's doc for why this is opt-in
     // rather than Runtime::new's default.
     runtime.enable_host_break_folding();
+    if opts.stack_report {
+        runtime.enable_stack_report();
+    }
     opts.sanitize.reserve_debug_ports(&mut runtime)?;
     if let Some(vfs_config) = vfs_config {
         let vfs =
@@ -2231,6 +2287,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_clock_mhz = opts.clock_mhz;
     let nested_cache = opts.cache;
     let nested_fpsp_emulate = opts.fpsp_emulate;
+    let nested_stack_report = opts.stack_report;
 
     let nested_net = opts.net;
     let nested_libs_dir_override = opts.libs_dir.is_some();
@@ -2248,6 +2305,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_clock_mhz,
             nested_cache,
             nested_fpsp_emulate,
+            nested_stack_report,
             nested_net,
             nested_libs_dir_override,
         )
@@ -2272,9 +2330,53 @@ fn run(opts: &Options) -> Result<i32, String> {
     let violated =
         report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
     report_emulated_cycles(&runtime);
+    report_stack_usage(&runtime);
     match result {
         Ok(_) if violated => Ok(SANITIZER_EXIT_CODE),
         other => other,
+    }
+}
+
+/// Prints `--stack-report`'s per-stack-region high-water-mark usage at
+/// exit, once -- a no-op for every run without the flag (see
+/// [`volamos_core::dispatch::Runtime::stack_usage_report`], which
+/// returns `None` unless `--stack-report` was passed).
+///
+/// To stderr, like [`report_emulated_cycles`] and for the same reason
+/// (the guest's own output is on stdout). Reported even when the run
+/// ended in an error -- a guest that overflowed its stack is exactly
+/// the case this report exists to explain, and the error alone doesn't
+/// say how close every *other* stack region came.
+///
+/// One line per distinct stack region (plural for a program that
+/// `StackSwap`ped), sorted by `sp_lower` (the order
+/// [`volamos_core::dispatch::Runtime::stack_usage_report`] already
+/// returns them in): `"stack at 0xADDR (task 0xADDR): N/M bytes used
+/// (P%)"`. A run with no stack regions recorded at all (the guest made
+/// no library call, so [`volamos_core::exectask::check_stack_bounds`]
+/// never ran) prints nothing beyond a one-line "(no library call was
+/// ever dispatched)" note, rather than silently looking identical to
+/// `--stack-report` not having been passed.
+fn report_stack_usage<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime<C>) {
+    let Some(entries) = runtime.stack_usage_report() else {
+        return;
+    };
+    if entries.is_empty() {
+        eprintln!("volamos: --stack-report: no library call was ever dispatched");
+        return;
+    }
+    for entry in entries {
+        let used = entry.bytes_used();
+        let total = entry.bytes_total();
+        let percent = if total == 0 {
+            0.0
+        } else {
+            100.0 * f64::from(used) / f64::from(total)
+        };
+        eprintln!(
+            "volamos: stack at {:#010x} (task {:#010x}): {used}/{total} bytes used ({percent:.1}%)",
+            entry.sp_lower, entry.task
+        );
     }
 }
 
@@ -2460,8 +2562,17 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     cli.guest_args = guest_args;
-    let (cli_overrides, sanitize, clock_mhz, cache, fpsp_emulate, libs_dir, program, guest_args) =
-        cli_to_raw(cli);
+    let (
+        cli_overrides,
+        sanitize,
+        clock_mhz,
+        cache,
+        fpsp_emulate,
+        stack_report,
+        libs_dir,
+        program,
+        guest_args,
+    ) = cli_to_raw(cli);
 
     let file_overrides = match config::load_all(&program) {
         Ok(overrides) => overrides,
@@ -2500,6 +2611,7 @@ fn main() -> ExitCode {
         clock_mhz,
         cache,
         fpsp_emulate,
+        stack_report,
         libs_dir,
         cli_jit,
         program,
@@ -3637,7 +3749,7 @@ mod tests {
         // literal has no field for it at all, so this documents the
         // invariant: the flag's value flows out of `cli_to_raw` as a
         // plain `bool` alongside (not inside) `overrides`.
-        let (overrides, _, _, cache, _, _, _, _) =
+        let (overrides, _, _, cache, _, _, _, _, _) =
             parse_args_raw(args(&["--cache", "prog"])).unwrap();
         assert!(cache);
         let _ = overrides;
@@ -3695,12 +3807,39 @@ mod tests {
         // it at all, so this is really just documenting the invariant:
         // the flag's value flows out of `cli_to_raw` as a plain `bool`
         // alongside (not inside) `overrides`.
-        let (overrides, _, _, _, fpsp_emulate, _, _, _) =
+        let (overrides, _, _, _, fpsp_emulate, _, _, _, _) =
             parse_args_raw(args(&["--fpsp-emulate", "prog"])).unwrap();
         assert!(fpsp_emulate);
         // `Overrides` has no `fpsp_emulate` field to assert on by name;
         // the absence of one is exactly the point -- a stray
         // `FPSP_EMULATE=` key in a config file has no field to land in.
+        let _ = overrides;
+    }
+
+    #[test]
+    fn stack_report_flag_turns_it_on() {
+        let opts = parse_args(args(&["--stack-report", "prog"])).unwrap();
+        assert!(opts.stack_report);
+    }
+
+    #[test]
+    fn stack_report_is_off_by_default() {
+        let opts = parse_args(args(&["prog"])).unwrap();
+        assert!(!opts.stack_report);
+    }
+
+    #[test]
+    fn stack_report_is_cli_only_not_a_config_override() {
+        // Like --sanitize/--net/--clock-mhz/--fpsp-emulate, this must
+        // never be settable via ~/.volamos/.volamos -- see
+        // `Options::stack_report`'s doc. `cli_to_raw`'s
+        // `config::Overrides` literal has no field for it at all, so
+        // this is really just documenting the invariant: the flag's
+        // value flows out of `cli_to_raw` as a plain `bool` alongside
+        // (not inside) `overrides`.
+        let (overrides, _, _, _, _, stack_report, _, _, _) =
+            parse_args_raw(args(&["--stack-report", "prog"])).unwrap();
+        assert!(stack_report);
         let _ = overrides;
     }
 
@@ -3798,14 +3937,14 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
@@ -3816,13 +3955,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }
@@ -4032,10 +4171,11 @@ mod tests {
             false,
             &InstrumentationOptions::default(),
             None,
-            false,
-            false,
-            false,
-            false,
+            false, // cache
+            false, // fpsp_emulate
+            false, // stack_report
+            false, // net
+            false, // libs_dir_override
         );
         let mut runtime = runtime.expect("build_nested_runtime should succeed");
 

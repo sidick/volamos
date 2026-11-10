@@ -6,7 +6,7 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
-        [--emu68-debug] [--net] <program> [args...]
+        [--emu68-debug] [--stack-report] [--net] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself, and
@@ -1112,6 +1112,35 @@ or in assembly:
 
 run with `volamos --emu68-debug --cpu 68020 prog`. Use `volatile` so the
 compiler cannot merge or drop the stores.
+
+## `--stack-report`
+
+Tracks the lowest `A7` ever reached on each distinct stack region the
+guest runs on, and prints bytes-used-of-total for each at exit. Default:
+off.
+
+```sh
+volamos --stack-report fixtures/hello
+```
+```
+Hello from volamos
+volamos: stack at 0x00ff0000 (task 0x00002ca4): 8/65536 bytes used (0.0%)
+```
+
+Checked at the same trap-dispatch-boundary granularity as the
+stack-overflow check (volamos fails loudly on `--stack NNN` being too
+small — see [`--stack SIZE`](#-stack-size)): a tight loop that recurses
+deep without ever making a library call won't have its true deepest
+point observed until its next trap, if any. This means `--stack-report`
+can under-report how close a run came to overflowing, but never
+over-report it.
+
+A `CreateNewProc`'d task gets its own line, and a task that `StackSwap`s
+onto a second stack gets a separate line for that stack too — usage on
+one stack says nothing about usage on another, so they're never summed
+together. Printed to stderr, like every other instrumentation flag's
+exit report, so it never mixes into the guest program's own stdout
+output.
 
 ## No flags at all
 

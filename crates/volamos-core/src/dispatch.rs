@@ -55,7 +55,7 @@
 //! code and stops, without trying to dispatch or perform a synthetic RTS
 //! (there's nothing to return to).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Write;
 
@@ -2360,6 +2360,70 @@ pub struct Runtime<C: Cpu> {
     /// `Ctrl-C` to reach the guest as `SIGBREAKF_CTRL_C`) should call
     /// `enable_host_break_folding`.
     host_break_folding: bool,
+    /// Opt-in (see [`Self::enable_stack_report`]) for whether [`Self::run`]'s
+    /// dispatch loop updates [`Self::stack_usage`] on every trap. Off by
+    /// default: it costs a `BTreeMap` lookup per dispatched library call,
+    /// which every run that doesn't want the report shouldn't pay for.
+    stack_report_enabled: bool,
+    /// Per-stack-region high-water-mark tracking for `--stack-report`
+    /// (issue #(TBD)), keyed by `sp_lower` -- a stack's own heap
+    /// allocation address, not the owning task -- because a single task
+    /// can run on more than one distinct stack over its lifetime
+    /// (`StackSwap`); keying by task would conflate usage across
+    /// unrelated stacks into one misleading number. Updated at the exact
+    /// point [`exectask::check_stack_bounds`] already reads `A7` and the
+    /// current task's `tc_SPLower`/`tc_SPUpper` fresh from guest memory,
+    /// so this sees the same real-time picture that check does (including
+    /// after a `StackSwap`). Empty unless [`Self::enable_stack_report`]
+    /// was called. See [`Self::stack_usage_report`].
+    stack_usage: BTreeMap<u32, StackUsageEntry>,
+}
+
+/// One distinct stack region's high-water mark, as reported by
+/// [`Runtime::stack_usage_report`]. "Distinct" means a unique `sp_lower`
+/// -- the stack's own heap-allocation address -- not a task: see
+/// [`Runtime::stack_usage`]'s doc for why a `StackSwap`-using task can
+/// own more than one of these over its lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackUsageEntry {
+    /// The stack region's lower bound (`tc_SPLower`/`stk_Lower`) -- also
+    /// this entry's own key, and the address `GuestHeap` originally
+    /// allocated the stack block at.
+    pub sp_lower: u32,
+    /// The stack region's upper bound (`tc_SPUpper`/`stk_Upper`), as most
+    /// recently observed -- real AmigaOS never moves a stack's bounds
+    /// without a `StackSwap` registering a different region entirely, so
+    /// this is constant for the life of this entry in practice.
+    pub sp_upper: u32,
+    /// The lowest `A7` ever observed on this stack region, at the
+    /// trap-dispatch-boundary granularity [`exectask::check_stack_bounds`]'s
+    /// own doc already describes (a guest that recurses deep without
+    /// ever making a library call won't have its true minimum seen until
+    /// its next trap, if any) -- so this is a lower bound on how far the
+    /// guest's own stack pointer *could* have gone unobserved, not a
+    /// guarantee it didn't go further.
+    pub min_a7_seen: u32,
+    /// The most recent task address observed running on this stack
+    /// region -- display-only (e.g. to tell a `CreateNewProc` child's
+    /// stack apart from the main task's in a multi-task report), not
+    /// part of this entry's identity.
+    pub task: u32,
+}
+
+impl StackUsageEntry {
+    /// Bytes used at this stack region's deepest observed point --
+    /// `sp_upper - min_a7_seen`, since a descending stack's "used" bytes
+    /// are everything above the lowest `A7` it ever reached.
+    pub fn bytes_used(&self) -> u32 {
+        self.sp_upper - self.min_a7_seen
+    }
+
+    /// This stack region's total size -- `sp_upper - sp_lower`, the same
+    /// size `GuestHeap::alloc`/`CreateNewProc`/a guest's own
+    /// `StackSwap`-provided region was given.
+    pub fn bytes_total(&self) -> u32 {
+        self.sp_upper - self.sp_lower
+    }
 }
 
 /// A single trapped library call, reported to an optional trace callback
@@ -3030,6 +3094,8 @@ impl<C: Cpu + 'static> Runtime<C> {
             intuition: crate::intuition::IntuitionState::new(),
             timers: exectask::PendingTimers::new(),
             host_break_folding: false,
+            stack_report_enabled: false,
+            stack_usage: BTreeMap::new(),
         }
     }
 
@@ -3109,6 +3175,47 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// leave it unset.
     pub fn enable_host_break_folding(&mut self) {
         self.host_break_folding = true;
+    }
+
+    /// Opts into `--stack-report`-style tracking: from this call on,
+    /// [`Self::run`]'s dispatch loop records the lowest `A7` ever seen on
+    /// each distinct stack region the current task runs on, retrievable
+    /// afterward via [`Self::stack_usage_report`]. Off by default --
+    /// see [`Self::stack_report_enabled`]'s doc for the cost this avoids
+    /// when unset.
+    pub fn enable_stack_report(&mut self) {
+        self.stack_report_enabled = true;
+    }
+
+    /// Updates [`Self::stack_usage`] for the stack region `task` is
+    /// currently on, given its freshly-observed `a7`, `sp_lower`, and
+    /// `sp_upper` (the caller already read these for
+    /// [`exectask::check_stack_bounds`], so this takes them rather than
+    /// re-reading guest memory itself).
+    fn record_stack_usage(&mut self, task: u32, a7: u32, sp_lower: u32, sp_upper: u32) {
+        let entry = self.stack_usage.entry(sp_lower).or_insert(StackUsageEntry {
+            sp_lower,
+            sp_upper,
+            min_a7_seen: a7,
+            task,
+        });
+        entry.sp_upper = sp_upper;
+        entry.task = task;
+        entry.min_a7_seen = entry.min_a7_seen.min(a7);
+    }
+
+    /// This run's per-stack-region high-water marks, sorted by `sp_lower`
+    /// -- `None` unless [`Self::enable_stack_report`] was called (the
+    /// same "opt-in instrumentation reports `None` when off" convention
+    /// [`Self::emulated_cycles`] already uses). `Some(&[])` (as opposed
+    /// to `None`) is possible for a program that made no library calls
+    /// at all -- `--stack-report`'s own granularity limit, same as
+    /// [`exectask::check_stack_bounds`]'s.
+    pub fn stack_usage_report(&self) -> Option<Vec<StackUsageEntry>> {
+        if !self.stack_report_enabled {
+            return None;
+        }
+        Some(self.stack_usage.values().copied().collect())
     }
 
     /// Populates `PROGDIR:` (issue #17): if `host_dir` (the launched
@@ -3580,6 +3687,16 @@ impl<C: Cpu + 'static> Runtime<C> {
                     let a7 = self.cpu.address_register(AddressRegister(7));
                     exectask::check_stack_bounds(&self.mem, self.task, a7)?;
 
+                    // --stack-report (opt-in, see Self::enable_stack_report):
+                    // same checkpoint as the overflow check just above, so
+                    // this sees the same real-time tc_SPLower/tc_SPUpper
+                    // (StackSwap-aware) picture that check already read.
+                    if self.stack_report_enabled {
+                        let sp_lower = self.mem.read_u32(self.task + exectask::TC_SPLOWER);
+                        let sp_upper = self.mem.read_u32(self.task + exectask::TC_SPUPPER);
+                        self.record_stack_usage(self.task, a7, sp_lower, sp_upper);
+                    }
+
                     let mut call_detail = None;
                     let mut ctx = HandlerContext {
                         cpu: &mut self.cpu,
@@ -3763,6 +3880,91 @@ mod tests {
             .expect("a clock rate was configured, so a count must be reported");
         assert_eq!(clock_hz, 25_000_000.0, "the configured rate, in Hz");
         assert_eq!(cycles, 0, "nothing has run yet");
+    }
+
+    /// Test: `Runtime::stack_usage_report` reports `None` unless
+    /// `--stack-report`-style tracking was enabled, and `Some` with the
+    /// current task's real stack region's high-water mark once it is --
+    /// the same `None`-unless-opted-in convention
+    /// `emulated_cycles_is_none_without_a_clock_rate_and_some_with_one`
+    /// already covers for `--clock-mhz`.
+    #[test]
+    fn stack_usage_report_is_none_unless_enabled_and_some_with_an_entry_once_it_is() {
+        let entry = crate::backend::TRAP_TABLE_END;
+        // move.l #EXEC_LIBRARY_BASE,a6; jsr -294(a6) [FindTask]; rts --
+        // one real library call is enough to reach the trap-dispatch
+        // checkpoint stack tracking hooks into; FindTask with A1 left at
+        // its default 0 (NULL) is a harmless, side-effect-free choice.
+        let words = [
+            0x2C7Cu16,
+            (EXEC_LIBRARY_BASE >> 16) as u16,
+            EXEC_LIBRARY_BASE as u16,
+            0x4EAE,
+            (-294i16) as u16,
+            0x4E75,
+        ];
+        let load_end = entry + (words.len() as u32) * 2 + 64;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let task = rt.current_task();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            rt.stack_usage_report(),
+            None,
+            "a run without enable_stack_report has no tracking to report"
+        );
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.enable_stack_report();
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let entries = rt
+            .stack_usage_report()
+            .expect("enable_stack_report was called, so a report must exist");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the main task only ever runs on its one stack region here"
+        );
+        let usage = entries[0];
+        assert_eq!(usage.task, task);
+        let sp_lower = rt.memory().read_u32(task + exectask::TC_SPLOWER);
+        let sp_upper = rt.memory().read_u32(task + exectask::TC_SPUPPER);
+        assert_eq!(usage.sp_lower, sp_lower);
+        assert_eq!(usage.sp_upper, sp_upper);
+        assert!(
+            usage.min_a7_seen <= sp_upper && usage.min_a7_seen >= sp_lower,
+            "the lowest A7 seen must still be within the stack's own bounds"
+        );
+        assert!(
+            usage.bytes_used() > 0,
+            "the JSR/RTS pair alone pushes a return address, so some stack must be in use \
+             by the time the library call traps"
+        );
+        assert_eq!(usage.bytes_total(), sp_upper - sp_lower);
     }
 
     struct TempDir {
