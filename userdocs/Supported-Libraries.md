@@ -27,9 +27,18 @@ Changelog.
   while the 4096-byte buffer is full; both ends work from different
   tasks. There are no buffer-size/flag suffixes on the name, no
   `MODE_READWRITE`, and the buffered `FGetC`/`FGets`/`FRead` calls fail
-  on an empty pipe instead of waiting. `popen()` still needs
-  `SystemTagList`'s `SYS_Input`/`SYS_Output` redirection, which isn't
-  implemented.
+  on an empty pipe instead of waiting.
+- `SystemTagList` with `SYS_Asynch`, as libnix's `popen()` uses it:
+  the command runs as a process of its own *inside* the same run, so it
+  can share `PIPE:` channels with the caller. It gets `SYS_Input`/
+  `SYS_Output`/`SYS_Error` as its standard handles (and closes them when
+  it ends), a real CLI so `GetProgramName` and `argv[0]` work, and
+  `NP_ExitCode`/`NP_ExitData` are honored, with the command's return
+  code in `cli_ReturnCode`. The command is looked up in the current
+  directory, then `C:`, so run from the program's own directory (e.g.
+  `-V WORK:. --cwd WORK:`) if the command is the program itself. A
+  synchronous `SystemTagList` still runs the command in a separate
+  nested run, with `SYS_Input`/`SYS_Output` read but not acted on.
 - Locks and directory traversal: `Lock`/`UnLock`/`DupLock`/
   `DupLockFromFH`/`OpenFromLock`/`Examine`/`ExamineFH`/`ExNext`/`ExAll`/
   `ExAllEnd`/`CurrentDir`/`ParentDir`/`ParentOfFH`/`SameLock`/

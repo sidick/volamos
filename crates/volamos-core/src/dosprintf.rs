@@ -43,7 +43,7 @@ fn vprintf_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let fmt = read_c_string(ctx.mem, fmt_ptr);
     let (rendered, _) = render_format(ctx.mem, &fmt, data_ptr);
 
-    let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
+    let out_addr = match crate::dosfile::current_output_addr(ctx) {
         Ok(addr) => addr,
         Err(code) => {
             ctx.dos.set_io_err(code);

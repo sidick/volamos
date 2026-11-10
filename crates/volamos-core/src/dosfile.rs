@@ -543,6 +543,10 @@ pub struct DosState {
     /// the call is re-entered from scratch when it wakes, and must carry
     /// on rather than write the front of its data again.
     pub(crate) pipe_write_progress: HashMap<(u32, u32), usize>,
+    /// Process (struct address) -> the seglist it was started from,
+    /// freed when it ends. Only processes `SystemTagList` loaded the
+    /// program for; see [`crate::dosseg`].
+    pub(crate) process_seglists: HashMap<u32, u32>,
 }
 
 impl DosState {
@@ -582,6 +586,7 @@ impl DosState {
             pipes: HashMap::new(),
             next_pipe_id: 0,
             pipe_write_progress: HashMap::new(),
+            process_seglists: HashMap::new(),
         }
     }
 
@@ -1561,6 +1566,26 @@ fn input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     Ok(())
 }
 
+/// The current process's output handle, as a `FileHandle` address --
+/// what `Output()` returns, for the calls that write to it directly
+/// (`PutStr`, `Printf`, `WriteChars`, `PrintFault`). The main task's is
+/// the default output; any other process's is its own `pr_COS`, which
+/// `CreateNewProc`/`SystemTagList` set (an asynchronous command's pipe,
+/// say) -- using the default there would send its output to the
+/// caller's stdout instead.
+pub(crate) fn current_output_addr<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<u32, i32> {
+    if ctx.tasks.is_main(ctx.current_task) {
+        return ctx.dos.output_addr(ctx.heap, ctx.mem);
+    }
+    let bptr = ctx
+        .mem
+        .read_u32(ctx.current_task + crate::exectask::PR_COS_OFFSET);
+    if bptr == 0 {
+        return Err(ERROR_INVALID_LOCK);
+    }
+    Ok(addr_from_bptr(bptr))
+}
+
 /// `Output()`. As [`input_handler`], for the default output handle and
 /// `pr_COS`.
 fn output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -2242,7 +2267,7 @@ fn setioerr_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 fn putstr_via_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ptr = ctx.cpu.data_register(DataRegister(1));
     let bytes = read_c_string(ctx.mem, ptr);
-    let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
+    let out_addr = match current_output_addr(ctx) {
         Ok(addr) => addr,
         Err(code) => {
             ctx.dos.set_io_err(code);

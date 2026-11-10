@@ -264,7 +264,7 @@ fn fputs_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
 fn write_chars_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let buf_addr = ctx.cpu.data_register(DataRegister(1));
     let len = ctx.cpu.data_register(DataRegister(2));
-    let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
+    let out_addr = match crate::dosfile::current_output_addr(ctx) {
         Ok(addr) => addr,
         Err(code) => {
             ctx.dos.set_io_err(code);

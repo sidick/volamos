@@ -426,6 +426,18 @@ pub const PRF_CLOSEINPUT: u32 = 1 << 3;
 pub const PRF_CLOSEOUTPUT: u32 = 1 << 4;
 /// `PRF_CLOSEERROR`: close `pr_CES` at exit.
 pub const PRF_CLOSEERROR: u32 = 1 << 6;
+/// `pr_ExitCode`: `APTR`, offset 196 (`pr_Flags` 192 + 4): code DOS calls
+/// when the process ends (`NP_ExitCode`), with the process's return code
+/// in `D0` and `pr_ExitData` in `D1`.
+pub const PR_EXITCODE_OFFSET: u32 = 196;
+/// `pr_ExitData`: `ULONG`, offset 200: the `NP_ExitData` argument for
+/// [`PR_EXITCODE_OFFSET`]'s routine.
+pub const PR_EXITDATA_OFFSET: u32 = 200;
+/// `cli_ReturnCode`: `LONG`, offset 12 within `struct
+/// CommandLineInterface` (`cli_Result2` 0, `cli_SetName` 4,
+/// `cli_CommandDir` 8): the return code of the last command the CLI ran.
+/// A process with its own CLI has it set to its return code as it ends.
+pub(crate) const CLI_RETURN_CODE_OFFSET: u32 = 12;
 /// `pr_Arguments`: `STRPTR`, offset 204 (`pr_HomeDir` 188 + 4, `pr_Flags`
 /// 192, `pr_ExitCode` 196, `pr_ExitData` 200, `pr_Arguments` 204). Per
 /// `<dos/dosextens.h>`: "Arguments passed to the process at start".
@@ -812,6 +824,10 @@ const NP_CONSOLETASK: u32 = NP_DUMMY + 14;
 /// `NP_WindowPtr` (`NP_Dummy + 15`): `pr_WindowPtr`. Default: the
 /// parent's.
 const NP_WINDOWPTR: u32 = NP_DUMMY + 15;
+/// `NP_ExitCode` (`NP_Dummy + 24`): code to call as the process ends.
+pub(crate) const NP_EXITCODE: u32 = NP_DUMMY + 24;
+/// `NP_ExitData` (`NP_Dummy + 25`): its argument, passed in `D1`.
+pub(crate) const NP_EXITDATA: u32 = NP_DUMMY + 25;
 /// `NP_Arguments` (`NP_Dummy + 21`): a C string, copied, that the entry
 /// point gets in `A0` with its length in `D0`, and `pr_Arguments`.
 const NP_ARGUMENTS: u32 = NP_DUMMY + 21;
@@ -865,7 +881,7 @@ fn create_task<M: AddressSpace>(
 }
 
 /// The `ti_Data` of tag `id` in the tag list at `tags`, if it is there.
-fn tag_data<M: AddressSpace>(mem: &M, tags: u32, id: u32) -> Option<u32> {
+pub(crate) fn tag_data<M: AddressSpace>(mem: &M, tags: u32, id: u32) -> Option<u32> {
     let item = crate::utility::find_tag_item_impl(mem, id, tags);
     (item != 0).then(|| mem.read_u32(item + 4))
 }
@@ -883,7 +899,8 @@ fn open_nil<C: Cpu>(ctx: &mut HandlerContext<'_, C>, mode: i32) -> u32 {
 /// Scope: `NP_Entry` (required), `NP_StackSize`, `NP_Name`,
 /// `NP_Priority`, the standard handles (`NP_Input`/`NP_Output`/
 /// `NP_Error` and their `NP_Close*` flags, which [`task_exit_stub_handler`]
-/// acts on), `NP_ConsoleTask`, `NP_WindowPtr` and `NP_Arguments`, with
+/// acts on), `NP_ConsoleTask`, `NP_WindowPtr`, `NP_Arguments` and
+/// `NP_ExitCode`/`NP_ExitData` (see [`task_exit_stub_handler`]), with
 /// the defaults `<dos/dostags.h>` documents. The handles are stored as
 /// given, unchecked, as real DOS does: libpthread passes a thread's
 /// slot number in `NP_Input` and reads it back from `pr_CIS`.
@@ -921,74 +938,27 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     }
     let entry = ctx.mem.read_u32(entry_item + 4);
 
-    let stack_size = {
-        let item = crate::utility::find_tag_item_impl(ctx.mem, NP_STACKSIZE, tags);
-        if item != 0 {
-            ctx.mem.read_u32(item + 4)
-        } else {
-            DEFAULT_NP_STACKSIZE
-        }
-    }
-    .max(crate::guestmem::MIN_STACK_SIZE);
+    let stack_size = tag_data(ctx.mem, tags, NP_STACKSIZE).unwrap_or(DEFAULT_NP_STACKSIZE);
 
-    let name = {
-        let item = crate::utility::find_tag_item_impl(ctx.mem, NP_NAME, tags);
-        if item != 0 {
-            let ptr = ctx.mem.read_u32(item + 4);
+    let name = match tag_data(ctx.mem, tags, NP_NAME) {
+        Some(ptr) => {
             String::from_utf8_lossy(&crate::guestmem::read_c_string(ctx.mem, ptr)).into_owned()
-        } else {
-            DEFAULT_NP_NAME.to_string()
         }
+        None => DEFAULT_NP_NAME.to_string(),
     };
 
-    let priority = {
-        let item = crate::utility::find_tag_item_impl(ctx.mem, NP_PRIORITY, tags);
-        if item != 0 {
-            ctx.mem.read_u32(item + 4) as i8
-        } else {
-            ctx.mem.read_u8(ctx.current_task + crate::execlist::LN_PRI) as i8
-        }
+    let priority = match tag_data(ctx.mem, tags, NP_PRIORITY) {
+        Some(pri) => pri as i8,
+        None => ctx.mem.read_u8(ctx.current_task + crate::execlist::LN_PRI) as i8,
     };
 
     // NP_Arguments: copied, as real DOS does, and then the caller's own
     // string may go away.
-    let (args, args_len) = match tag_data(ctx.mem, tags, NP_ARGUMENTS) {
-        Some(ptr) if ptr != 0 => {
-            let bytes = crate::guestmem::read_c_string(ctx.mem, ptr);
-            let Ok(copy) = ctx.heap.alloc(ctx.mem, bytes.len() as u32 + 1) else {
-                ctx.cpu.set_data_register(DataRegister(0), 0);
-                return Ok(());
-            };
-            write_c_string(ctx.mem, copy, &bytes);
-            (copy, bytes.len() as u32)
-        }
-        _ => (0, 0),
+    let args = match tag_data(ctx.mem, tags, NP_ARGUMENTS) {
+        Some(ptr) if ptr != 0 => Some(crate::guestmem::read_c_string(ctx.mem, ptr)),
+        _ => None,
     };
 
-    let Ok(stack_block) = ctx.heap.alloc(ctx.mem, stack_size) else {
-        ctx.cpu.set_data_register(DataRegister(0), 0);
-        return Ok(());
-    };
-    let sp_upper = stack_block.wrapping_add(stack_size) & !3;
-    let sp = sp_upper.wrapping_sub(4);
-    ctx.mem.write_u32(sp, crate::dispatch::TASK_EXIT_STUB_ADDR);
-
-    let Some(task) = create_task(ctx.mem, ctx.heap, &name, priority, stack_block, sp_upper) else {
-        ctx.cpu.set_data_register(DataRegister(0), 0);
-        return Ok(());
-    };
-
-    // The standard handles, as given or a NIL: of the child's own, and
-    // which of them DOS closes at exit (see task_exit_stub_handler).
-    let input = match tag_data(ctx.mem, tags, NP_INPUT) {
-        Some(bptr) => bptr,
-        None => open_nil(ctx, crate::dosfile::MODE_OLDFILE),
-    };
-    let output = match tag_data(ctx.mem, tags, NP_OUTPUT) {
-        Some(bptr) => bptr,
-        None => open_nil(ctx, crate::dosfile::MODE_NEWFILE),
-    };
-    let error = tag_data(ctx.mem, tags, NP_ERROR).unwrap_or(0);
     let mut flags = 0;
     if tag_data(ctx.mem, tags, NP_CLOSEINPUT).is_none_or(|v| v != 0) {
         flags |= PRF_CLOSEINPUT;
@@ -999,18 +969,150 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     if tag_data(ctx.mem, tags, NP_CLOSEERROR).is_some_and(|v| v != 0) {
         flags |= PRF_CLOSEERROR;
     }
+
+    let spec = SpawnSpec {
+        entry,
+        stack_size,
+        name,
+        priority,
+        args,
+        input: tag_data(ctx.mem, tags, NP_INPUT),
+        output: tag_data(ctx.mem, tags, NP_OUTPUT),
+        error: tag_data(ctx.mem, tags, NP_ERROR).unwrap_or(0),
+        flags,
+        console: tag_data(ctx.mem, tags, NP_CONSOLETASK),
+        window: tag_data(ctx.mem, tags, NP_WINDOWPTR),
+        exit_code: tag_data(ctx.mem, tags, NP_EXITCODE).unwrap_or(0),
+        exit_data: tag_data(ctx.mem, tags, NP_EXITDATA).unwrap_or(0),
+        cli_command_name: None,
+        seglist: 0,
+    };
+    let task = spawn_process(ctx, spec).unwrap_or(0);
+    ctx.cpu.set_data_register(DataRegister(0), task);
+    Ok(())
+}
+
+/// What [`spawn_process`] needs to start a process: everything
+/// `CreateNewProc`'s tags can say, resolved to values, plus what only
+/// `SystemTagList` needs.
+pub(crate) struct SpawnSpec {
+    pub entry: u32,
+    pub stack_size: u32,
+    pub name: String,
+    pub priority: i8,
+    /// `NP_Arguments`: the bytes DOS copies and hands the entry in
+    /// `A0`/`D0`. `None` means none (`A0`/`D0` = 0).
+    pub args: Option<Vec<u8>>,
+    /// The standard handles, as BPTRs; `None` for input/output means a
+    /// `NIL:` of the child's own.
+    pub input: Option<u32>,
+    pub output: Option<u32>,
+    pub error: u32,
+    /// `pr_Flags`' `PRF_CLOSE*` bits.
+    pub flags: u32,
+    /// `None` inherits the parent's.
+    pub console: Option<u32>,
+    pub window: Option<u32>,
+    /// `NP_ExitCode`/`NP_ExitData`; `0` for no exit routine.
+    pub exit_code: u32,
+    pub exit_data: u32,
+    /// `Some(name)` gives the process a real `CommandLineInterface`
+    /// whose `cli_CommandName` is `name`, as a process started by a shell
+    /// has -- startup code treats a process without one as launched from
+    /// Workbench and waits for a `WBStartup` message that never comes.
+    pub cli_command_name: Option<String>,
+    /// A seglist (from `LoadSeg`) holding the code at `entry`, to
+    /// `UnLoadSeg` when the process ends; `0` for none.
+    pub seglist: u32,
+}
+
+/// Creates a process from `spec` and makes it ready to run (it doesn't
+/// run until some later switch point picks it, as `CreateNewProc` never
+/// yields). Returns its `struct Process*`, or `None` if the guest heap
+/// has no room.
+///
+/// The child's initial registers: `A7` = the top of its own freshly
+/// allocated stack (with [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
+/// pre-pushed as the return address for its outermost `rts`, exactly
+/// the way [`crate::dispatch::Runtime::new`] pre-pushes `EXIT_STUB_ADDR`
+/// for the main task's own outermost `rts`), `PC` = `entry`, `A0`/`D0`
+/// = the argument copy and its length (`0`/`0` without one), every
+/// other register zeroed.
+pub(crate) fn spawn_process<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    spec: SpawnSpec,
+) -> Option<u32> {
+    let stack_size = spec.stack_size.max(crate::guestmem::MIN_STACK_SIZE);
+
+    let (args, args_len) = match &spec.args {
+        Some(bytes) => {
+            let copy = ctx.heap.alloc(ctx.mem, bytes.len() as u32 + 1).ok()?;
+            write_c_string(ctx.mem, copy, bytes);
+            (copy, bytes.len() as u32)
+        }
+        None => (0, 0),
+    };
+
+    let stack_block = ctx.heap.alloc(ctx.mem, stack_size).ok()?;
+    let sp_upper = stack_block.wrapping_add(stack_size) & !3;
+    let sp = sp_upper.wrapping_sub(4);
+    ctx.mem.write_u32(sp, crate::dispatch::TASK_EXIT_STUB_ADDR);
+
+    let task = create_task(
+        ctx.mem,
+        ctx.heap,
+        &spec.name,
+        spec.priority,
+        stack_block,
+        sp_upper,
+    )?;
+
+    let input = match spec.input {
+        Some(bptr) => bptr,
+        None => open_nil(ctx, crate::dosfile::MODE_OLDFILE),
+    };
+    let output = match spec.output {
+        Some(bptr) => bptr,
+        None => open_nil(ctx, crate::dosfile::MODE_NEWFILE),
+    };
     let parent = ctx.current_task;
-    let console = tag_data(ctx.mem, tags, NP_CONSOLETASK)
+    let console = spec
+        .console
         .unwrap_or_else(|| ctx.mem.read_u32(parent + PR_CONSOLE_TASK_OFFSET));
-    let window = tag_data(ctx.mem, tags, NP_WINDOWPTR)
+    let window = spec
+        .window
         .unwrap_or_else(|| ctx.mem.read_u32(parent + PR_WINDOW_PTR_OFFSET));
     ctx.mem.write_u32(task + PR_CIS_OFFSET, input);
     ctx.mem.write_u32(task + PR_COS_OFFSET, output);
-    ctx.mem.write_u32(task + PR_CES_OFFSET, error);
-    ctx.mem.write_u32(task + PR_FLAGS_OFFSET, flags);
+    ctx.mem.write_u32(task + PR_CES_OFFSET, spec.error);
+    ctx.mem.write_u32(task + PR_FLAGS_OFFSET, spec.flags);
     ctx.mem.write_u32(task + PR_CONSOLE_TASK_OFFSET, console);
     ctx.mem.write_u32(task + PR_WINDOW_PTR_OFFSET, window);
     ctx.mem.write_u32(task + PR_ARGUMENTS_OFFSET, args);
+    ctx.mem.write_u32(task + PR_EXITCODE_OFFSET, spec.exit_code);
+    ctx.mem.write_u32(task + PR_EXITDATA_OFFSET, spec.exit_data);
+
+    if let Some(command_name) = &spec.cli_command_name {
+        let cli = ctx.heap.alloc(ctx.mem, CLI_STRUCT_SIZE).ok()?;
+        for i in 0..CLI_STRUCT_SIZE {
+            ctx.mem.write_u8(cli.wrapping_add(i), 0);
+        }
+        let name_bytes = command_name.as_bytes();
+        let name_bstr = ctx
+            .heap
+            .alloc(ctx.mem, 1 + name_bytes.len().min(255) as u32)
+            .ok()?;
+        write_bstr(ctx.mem, name_bstr, name_bytes);
+        ctx.mem
+            .write_u32(cli + CLI_COMMAND_NAME_OFFSET, bptr_from_addr(name_bstr));
+        ctx.mem.write_u32(cli + CLI_STANDARD_INPUT_OFFSET, input);
+        ctx.mem
+            .write_u32(cli + CLI_DEFAULT_STACK_OFFSET, stack_size / 4);
+        ctx.mem.write_u32(task + PR_CLI_OFFSET, bptr_from_addr(cli));
+    }
+    if spec.seglist != 0 {
+        ctx.dos.process_seglists.insert(task, spec.seglist);
+    }
 
     let mut a = [0u32; 8];
     a[0] = args;
@@ -1020,7 +1122,7 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     let snapshot = crate::cpu::RegisterSnapshot {
         d,
         a,
-        pc: entry,
+        pc: spec.entry,
         // The parent's own current SR, not a hardcoded value: this
         // runtime never models the user/supervisor distinction
         // itself (every task just inherits whatever `CpuCore`'s own
@@ -1032,8 +1134,7 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         sr: ctx.cpu.sr(),
     };
     ctx.tasks.spawn_ready(task, snapshot, stack_block, sp_upper);
-    ctx.cpu.set_data_register(DataRegister(0), task);
-    Ok(())
+    Some(task)
 }
 
 /// The stub handler bound to [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
@@ -1076,9 +1177,41 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 /// freed anywhere else, so a failed free here would mean a real
 /// double-free/corruption bug in this runtime, not a guest one --
 /// worth failing loudly over rather than silently leaking again.
-pub(crate) fn task_exit_stub_handler<C: Cpu>(
+pub(crate) fn task_exit_stub_handler<C: Cpu + 'static>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
+    let task = ctx.current_task;
+    // The program's own `rts` left its return code in D0. A process
+    // that has a CLI reports it there, which is where a command's
+    // return code lives (`cli_ReturnCode`).
+    let rc = ctx.cpu.data_register(DataRegister(0));
+    let cli = crate::guestmem::addr_from_bptr(ctx.mem.read_u32(task + PR_CLI_OFFSET));
+    if cli != 0 {
+        ctx.mem.write_u32(cli + CLI_RETURN_CODE_OFFSET, rc);
+    }
+
+    // NP_ExitCode: DOS calls it as the process ends, in the process's
+    // own context, `D0` = return code, `D1` = NP_ExitData -- libnix's
+    // popen() signals the parent that way. It is guest code, so it runs
+    // through the trampoline and the rest of the exit follows in the
+    // continuation.
+    let hook = ctx.mem.read_u32(task + PR_EXITCODE_OFFSET);
+    if hook != 0 {
+        let data = ctx.mem.read_u32(task + PR_EXITDATA_OFFSET);
+        ctx.mem.write_u32(task + PR_EXITCODE_OFFSET, 0);
+        ctx.cpu.set_data_register(DataRegister(0), rc);
+        ctx.cpu.set_data_register(DataRegister(1), data);
+        ctx.continuations
+            .trampoline(ctx.cpu, ctx.mem, hook, finish_task_exit::<C>);
+        return Ok(());
+    }
+    finish_task_exit(ctx)
+}
+
+/// The rest of [`task_exit_stub_handler`], once any `NP_ExitCode`
+/// routine has returned: close the handles, free what the process owned
+/// and switch to the next task.
+fn finish_task_exit<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let task = ctx.current_task;
     let flags = ctx.mem.read_u32(task + PR_FLAGS_OFFSET);
     for (flag, offset) in [
@@ -1088,8 +1221,7 @@ pub(crate) fn task_exit_stub_handler<C: Cpu>(
     ] {
         let bptr = ctx.mem.read_u32(task + offset);
         if flags & flag != 0 && bptr != 0 {
-            ctx.dos
-                .close(ctx.heap, crate::guestmem::addr_from_bptr(bptr));
+            crate::dospipe::close(ctx, crate::guestmem::addr_from_bptr(bptr));
         }
     }
     // Abandon this task's own still-pending TR_ADDREQUESTs rather than
@@ -1120,6 +1252,25 @@ pub(crate) fn task_exit_stub_handler<C: Cpu>(
         ctx.heap
             .free(args_addr)
             .unwrap_or_else(|e| panic!("exiting task's own NP_Arguments copy: {e}"));
+    }
+    // A process started with its own CLI (`SystemTagList`) owns that
+    // struct and its command-name BSTR; one loaded from a seglist owns
+    // that too.
+    let cli = crate::guestmem::addr_from_bptr(ctx.mem.read_u32(task + PR_CLI_OFFSET));
+    if cli != 0 {
+        let name_bstr =
+            crate::guestmem::addr_from_bptr(ctx.mem.read_u32(cli + CLI_COMMAND_NAME_OFFSET));
+        ctx.heap
+            .free(name_bstr)
+            .unwrap_or_else(|e| panic!("exiting task's own cli_CommandName: {e}"));
+        ctx.heap
+            .free(cli)
+            .unwrap_or_else(|e| panic!("exiting task's own CommandLineInterface: {e}"));
+    }
+    if let Some(seglist) = ctx.dos.process_seglists.remove(&task) {
+        ctx.dos
+            .unload_seg(ctx.heap, seglist)
+            .unwrap_or_else(|e| panic!("exiting task's own seglist: {e}"));
     }
     ctx.heap
         .free(task)

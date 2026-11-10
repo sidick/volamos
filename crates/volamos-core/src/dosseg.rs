@@ -187,6 +187,12 @@
 //!
 //! # Scope cuts (documented, not silent)
 //!
+//! - **`SYS_Asynch` is the exception** (issue #264): it starts the
+//!   command as a process inside the *calling* runtime instead, with real
+//!   `SYS_Input`/`SYS_Output`/`SYS_Error` redirection and `NP_ExitCode`
+//!   -- see [`start_system_child`]. The two paths differ because a pipe
+//!   shared with the command must live in one address space. The scope
+//!   cut below still holds for the synchronous path.
 //! - **Input/output redirection**: `Execute`'s `D2`/`D3` (input/output
 //!   `BPTR`s) and `SystemTagList`'s tag list (`D2`, e.g. `SYS_Input`/
 //!   `SYS_Output`) are read off the guest registers (so a well-behaved
@@ -892,6 +898,22 @@ impl DosState {
         Ok(())
     }
 
+    /// Finds the program a command line names, the way the shell does: a
+    /// bare name is looked up in the current directory first, then in
+    /// C:. (The CLI's Path list sits between the two on real AmigaOS;
+    /// this runtime has none.) SAS/C, for one, runs its linker as
+    /// "slink WITH ...".
+    fn resolve_command(&self, program: &str) -> Result<std::path::PathBuf, i32> {
+        let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        match vfs.resolve(program, ResolveMode::MustExist) {
+            Ok(path) => Ok(path),
+            Err(e) if program.contains(':') => Err(map_vfs_error(&e)),
+            Err(e) => vfs
+                .resolve(&format!("C:{program}"), ResolveMode::MustExist)
+                .map_err(|_| map_vfs_error(&e)),
+        }
+    }
+
     /// Shared `System()`/`Execute()` resolution + invocation: splits
     /// `command_line` on whitespace (first token = program, rest =
     /// args -- no quoting support, see the module docs), resolves the
@@ -908,18 +930,7 @@ impl DosState {
         let program = parts.next().ok_or(ERROR_OBJECT_NOT_FOUND)?;
         let args: Vec<String> = parts.map(str::to_string).collect();
 
-        let vfs = self.vfs.as_ref().ok_or(ERROR_OBJECT_NOT_FOUND)?;
-        // A bare command name is looked up the way the shell does: in the
-        // current directory first, then in C:. (The CLI's Path list sits
-        // between the two on real AmigaOS; this runtime has none.) SAS/C,
-        // for one, runs its linker as "slink WITH ...".
-        let host_path = match vfs.resolve(program, ResolveMode::MustExist) {
-            Ok(path) => path,
-            Err(e) if program.contains(':') => return Err(map_vfs_error(&e)),
-            Err(e) => vfs
-                .resolve(&format!("C:{program}"), ResolveMode::MustExist)
-                .map_err(|_| map_vfs_error(&e))?,
-        };
+        let host_path = self.resolve_command(program)?;
 
         let runner = self.system_runner.as_mut().ok_or(ERROR_OBJECT_NOT_FOUND)?;
         let request = SystemRequest {
@@ -1006,16 +1017,121 @@ fn unloadseg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     }
 }
 
+/// `SYS_Dummy`, per `<dos/dostags.h>`: `TAG_USER + 32`.
+const SYS_DUMMY: u32 = 0x8000_0000 + 32;
+/// `SYS_Input`: the command's standard input, a `BPTR`.
+const SYS_INPUT: u32 = SYS_DUMMY + 1;
+/// `SYS_Output`: its standard output.
+const SYS_OUTPUT: u32 = SYS_DUMMY + 2;
+/// `SYS_Asynch`: don't wait for the command to finish.
+const SYS_ASYNCH: u32 = SYS_DUMMY + 3;
+/// `SYS_Error`: its error stream.
+const SYS_ERROR: u32 = SYS_DUMMY + 6;
+
 /// `SystemTagList` (`D1` = command `CString*`, `D2` = `struct TagItem*`
-/// tag list -- read for calling-convention fidelity, never acted on; see
-/// the module docs' scope cuts). `D0` = the command's exit code, or `-1`
-/// with `IoErr()` set.
-fn system_tag_list_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// tag list). `D0` = the command's exit code, or `-1` with `IoErr()`
+/// set; for `SYS_Asynch`, `0` once it has started.
+///
+/// `SYS_Asynch` starts the command as a new process in this same
+/// runtime, concurrent with the caller ([`start_system_child`]).
+/// Everything else still takes the synchronous nested-runtime path the
+/// module docs describe, with the tag list read but not acted on --
+/// including a synchronous `SYS_Input`/`SYS_Output`.
+fn system_tag_list_handler<C: Cpu + 'static>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
     let cmd_ptr = ctx.cpu.data_register(DataRegister(1));
-    let _tags = ctx.cpu.data_register(DataRegister(2)); // unused: see module docs
+    let tags = ctx.cpu.data_register(DataRegister(2));
     let command_line = String::from_utf8_lossy(&read_c_string(ctx.mem, cmd_ptr)).into_owned();
-    let code = ctx.dos.system(&command_line);
+
+    let asynch =
+        crate::exectask::tag_data(ctx.mem, tags, SYS_ASYNCH).is_some_and(|value| value != 0);
+    let code = if asynch {
+        match start_system_child(ctx, &command_line, tags) {
+            Ok(()) => 0,
+            Err(io_err) => {
+                ctx.dos.set_io_err(io_err);
+                -1
+            }
+        }
+    } else {
+        ctx.dos.system(&command_line)
+    };
     ctx.cpu.set_data_register(DataRegister(0), code as u32);
+    Ok(())
+}
+
+/// `SystemTagList(.., SYS_Asynch, TRUE, ..)`: loads the command's
+/// program and starts it as a process of its own, in this runtime, so it
+/// runs alongside the caller and can share its pipes (`popen()`'s
+/// `PIPE:` channel) -- the nested-runtime route can't, being a separate
+/// address space.
+///
+/// The process gets what a shell would give a command: a real CLI (with
+/// the command name as typed, for `GetProgramName`/`argv[0]`), the
+/// arguments as `A0`/`D0` with the trailing newline a shell's command
+/// line has, and `SYS_Input`/`SYS_Output`/`SYS_Error` as its standard
+/// handles -- which it closes when it ends, as for any asynchronous
+/// command. A handle not given is the caller's own, left open. The
+/// tag list also reaches `CreateNewProc`: `NP_ExitCode`/`NP_ExitData`
+/// are honored, so the caller learns when the command ends and how
+/// (`cli_ReturnCode`).
+///
+/// On failure nothing the caller passed in is closed: it still owns the
+/// handles.
+fn start_system_child<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    command_line: &str,
+    tags: u32,
+) -> Result<(), i32> {
+    let trimmed = command_line.trim_start();
+    let program = trimmed
+        .split_whitespace()
+        .next()
+        .ok_or(ERROR_OBJECT_NOT_FOUND)?;
+    let rest = trimmed[program.len()..].trim();
+    let host_path = ctx.dos.resolve_command(program)?;
+
+    let seglist = ctx
+        .dos
+        .load_seg_from_host_path(ctx.heap, ctx.mem, &host_path)?;
+    let entry = ctx.dos.seglists[&seglist][0].wrapping_add(SEG_HEADER_SIZE);
+
+    let parent = ctx.current_task;
+    let tag = |id| crate::exectask::tag_data(ctx.mem, tags, id);
+    let (input, output, error) = (tag(SYS_INPUT), tag(SYS_OUTPUT), tag(SYS_ERROR));
+    let mut flags = 0;
+    if input.is_some() {
+        flags |= crate::exectask::PRF_CLOSEINPUT;
+    }
+    if output.is_some() {
+        flags |= crate::exectask::PRF_CLOSEOUTPUT;
+    }
+    if error.is_some_and(|bptr| bptr != 0) {
+        flags |= crate::exectask::PRF_CLOSEERROR;
+    }
+    let inherit = |ctx: &HandlerContext<'_, C>, offset| ctx.mem.read_u32(parent + offset);
+    let spec = crate::exectask::SpawnSpec {
+        entry,
+        stack_size: ctx.mem.read_u32(parent + TC_SPUPPER) - ctx.mem.read_u32(parent + TC_SPLOWER),
+        name: program.to_string(),
+        priority: ctx.mem.read_u8(parent + crate::execlist::LN_PRI) as i8,
+        args: Some(format!("{rest}\n").into_bytes()),
+        input: Some(input.unwrap_or_else(|| inherit(ctx, crate::exectask::PR_CIS_OFFSET))),
+        output: Some(output.unwrap_or_else(|| inherit(ctx, crate::exectask::PR_COS_OFFSET))),
+        error: error.unwrap_or_else(|| inherit(ctx, crate::exectask::PR_CES_OFFSET)),
+        flags,
+        console: None,
+        window: None,
+        exit_code: tag(crate::exectask::NP_EXITCODE).unwrap_or(0),
+        exit_data: tag(crate::exectask::NP_EXITDATA).unwrap_or(0),
+        cli_command_name: Some(program.to_string()),
+        seglist,
+    };
+    if crate::exectask::spawn_process(ctx, spec).is_none() {
+        let _ = ctx.dos.unload_seg(ctx.heap, seglist);
+        return Err(ERROR_NO_FREE_STORE);
+    }
     Ok(())
 }
 
@@ -2266,5 +2382,197 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, ERROR_OBJECT_NOT_FOUND);
+    }
+
+    // --- SystemTagList(SYS_Asynch): the command runs in-process (issue #264) ---
+
+    /// `move.l D0,<abs32>`.
+    fn store_d0_abs(words: &mut Vec<u16>, addr: u32) {
+        words.extend_from_slice(&[0x23C0, (addr >> 16) as u16, addr as u16]);
+    }
+
+    /// `move.l <abs32>,Dn`.
+    fn load_d_abs(words: &mut Vec<u16>, n: u16, addr: u32) {
+        words.extend_from_slice(&[0x2039 | (n << 9), (addr >> 16) as u16, addr as u16]);
+    }
+
+    /// `move.l #imm32,Dn`.
+    fn load_d_imm(words: &mut Vec<u16>, n: u16, value: u32) {
+        words.extend_from_slice(&[move_imm_to_d(n), (value >> 16) as u16, value as u16]);
+    }
+
+    #[test]
+    fn system_tag_list_asynch_runs_the_command_as_a_process_sharing_the_callers_pipe() {
+        // What libnix's popen() does, minus libnix: open both ends of a
+        // PIPE:, start a command asynchronously with the write end as
+        // its output and an NP_ExitCode routine, then read the pipe.
+        // The command is a second program in the *same* runtime (it has
+        // to be: the pipe lives in this runtime's dos state), so its
+        // PutStr has to reach the pipe -- its own Output(), not the
+        // caller's -- and its exit has to close the write end (EOF for
+        // the reader), report its return code to the NP_ExitCode
+        // routine, and free what it loaded.
+        const SYS_DUMMY: u32 = 0x8000_0000 + 32;
+        const NP_DUMMY: u32 = 0x8000_0000 + 1000;
+        let tmp = TempDir::new("asynch");
+
+        let extra_addr = TRAP_TABLE_END + 0x300;
+        let (pipe_name, nil_name, cmd) = (extra_addr, extra_addr + 16, extra_addr + 24);
+        let tags = extra_addr + 48;
+        let (rslot, hook_slot, n1_slot, n2_slot) = (
+            extra_addr + 96,
+            extra_addr + 100,
+            extra_addr + 104,
+            extra_addr + 108,
+        );
+        let buf = extra_addr + 112;
+        let (dos_name, msg) = (extra_addr + 176, extra_addr + 192);
+        let sys_slot = extra_addr + 240;
+
+        // The command: OpenLibrary("dos.library"), PutStr("from child\n"),
+        // exit code 7. A processes starts with nothing in A6.
+        let mut child = vec![0x2C78, 0x0004]; // movea.l 4.w,A6 (SysBase)
+        child.extend_from_slice(&[0x227C, (dos_name >> 16) as u16, dos_name as u16]);
+        child.push(0x7000); // moveq #0,D0
+        push_jsr(&mut child, 6, -552); // OpenLibrary
+        child.push(0x2C40); // movea.l D0,A6
+        load_d_imm(&mut child, 1, msg);
+        push_jsr(&mut child, 6, -948); // PutStr -> this process's Output()
+        child.push(0x7007); // moveq #7,D0
+        child.push(RTS);
+        fs::write(tmp.path().join("child"), hunk_file_from_words(&child)).unwrap();
+
+        // The caller (A6 = dos.library at start).
+        let mut words = Vec::new();
+        load_d_imm(&mut words, 1, pipe_name);
+        load_d_imm(&mut words, 2, 1006); // MODE_NEWFILE: the write end
+        push_jsr(&mut words, 6, -30);
+        store_d0_abs(&mut words, tags + 8 + 4); // SYS_Output's value
+        load_d_imm(&mut words, 1, pipe_name);
+        load_d_imm(&mut words, 2, 1005); // MODE_OLDFILE: the read end
+        push_jsr(&mut words, 6, -30);
+        store_d0_abs(&mut words, rslot);
+        load_d_imm(&mut words, 1, nil_name);
+        load_d_imm(&mut words, 2, 1005);
+        push_jsr(&mut words, 6, -30);
+        store_d0_abs(&mut words, tags + 4); // SYS_Input's value
+        load_d_imm(&mut words, 1, cmd);
+        load_d_imm(&mut words, 2, tags);
+        push_jsr(&mut words, 6, -606); // SystemTagList(cmd, tags)
+        store_d0_abs(&mut words, sys_slot);
+        for slot in [n1_slot, n2_slot] {
+            load_d_abs(&mut words, 1, rslot);
+            load_d_imm(&mut words, 2, buf);
+            load_d_imm(&mut words, 3, 63);
+            push_jsr(&mut words, 6, -42); // Read: blocks until the command writes / exits
+            store_d0_abs(&mut words, slot);
+        }
+        words.push(0x7000); // moveq #0,D0
+        words.push(RTS);
+        // NP_ExitCode routine: D0 = return code, D1 = NP_ExitData (a slot).
+        let hook = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words.extend_from_slice(&[0x2041, 0x2080, RTS]); // movea.l D1,A0 ; move.l D0,(A0) ; rts
+
+        let mut extra = vec![0u8; 256];
+        let mut put = |at: u32, bytes: &[u8]| {
+            let o = (at - extra_addr) as usize;
+            extra[o..o + bytes.len()].copy_from_slice(bytes);
+        };
+        put(pipe_name, b"PIPE:sys\0");
+        put(nil_name, b"NIL:\0");
+        put(cmd, b"SYS:child hi there\0");
+        put(dos_name, b"dos.library\0");
+        put(msg, b"from child\n\0");
+        for (i, (id, value)) in [
+            (SYS_DUMMY + 1, 0), // SYS_Input: patched at run time
+            (SYS_DUMMY + 2, 0), // SYS_Output: patched at run time
+            (SYS_DUMMY + 3, 1), // SYS_Asynch
+            (NP_DUMMY + 24, hook),
+            (NP_DUMMY + 25, hook_slot),
+            (0, 0), // TAG_DONE
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(tags + i as u32 * 8, &id.to_be_bytes());
+            put(tags + i as u32 * 8 + 4, &value.to_be_bytes());
+        }
+
+        // A small stack: the command gets one of the caller's size, and
+        // this test's memory is only 128 KiB.
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        for (i, &b) in extra.iter().enumerate() {
+            mem.write_u8(extra_addr + i as u32, b);
+        }
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + 0x400,
+                args: Vec::new(),
+                stack_size: 8192,
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs_over(tmp.path()));
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+        assert_eq!(
+            rt.memory().read_u32(sys_slot),
+            0,
+            "SystemTagList(SYS_Asynch) reports 0 once the command has started (run: {result:?})"
+        );
+        result.expect("run should succeed");
+
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u32(n1_slot),
+            11,
+            "the command's PutStr must have reached the pipe, via its own Output()"
+        );
+        let got: Vec<u8> = (0..11).map(|i| mem.read_u8(buf + i)).collect();
+        assert_eq!(got, b"from child\n");
+        assert_eq!(
+            mem.read_u32(n2_slot),
+            0,
+            "the command's exit must close its end of the pipe: EOF"
+        );
+        assert_eq!(
+            mem.read_u32(hook_slot),
+            7,
+            "NP_ExitCode's routine must get the command's return code, and NP_ExitData"
+        );
+        assert!(
+            out.is_empty(),
+            "the command's output belongs to the pipe, not the caller's stdout: {out:?}"
+        );
+    }
+
+    #[test]
+    fn system_tag_list_asynch_fails_cleanly_for_a_command_that_does_not_exist() {
+        // -1 and IoErr(), with nothing left half-started; the caller
+        // still owns the handles it passed in.
+        const SYS_ASYNCH: u32 = 0x8000_0000 + 32 + 3;
+        let tmp = TempDir::new("asynch-missing");
+        let extra_addr = TRAP_TABLE_END + 0x300;
+        let (cmd, tags) = (extra_addr, extra_addr + 16);
+
+        let mut words = Vec::new();
+        load_d_imm(&mut words, 1, cmd);
+        load_d_imm(&mut words, 2, tags);
+        push_jsr(&mut words, 6, -606); // SystemTagList
+        words.push(RTS); // exit code = D0
+
+        let mut extra = vec![0u8; 64];
+        extra[..12].copy_from_slice(b"SYS:nothere\0");
+        extra[16..20].copy_from_slice(&SYS_ASYNCH.to_be_bytes());
+        extra[20..24].copy_from_slice(&1u32.to_be_bytes());
+
+        let mut rt = runtime_with_program_and_extra(&words, extra_addr, &extra, Some(tmp.path()));
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, -1);
     }
 }

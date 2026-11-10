@@ -153,7 +153,7 @@ fn print_fault_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let (mut rendered, found) = render_fault(code, &header);
     rendered.push(b'\n');
 
-    let out_addr = match ctx.dos.output_addr(ctx.heap, ctx.mem) {
+    let out_addr = match crate::dosfile::current_output_addr(ctx) {
         Ok(addr) => addr,
         Err(io_code) => {
             ctx.dos.set_io_err(io_code);
