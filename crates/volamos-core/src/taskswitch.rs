@@ -165,6 +165,14 @@ struct TaskRecord {
     state: TaskState,
     sp_lower: u32,
     sp_upper: u32,
+    /// When this task last *became* [`TaskState::Ready`], as a ticket
+    /// from [`TaskScheduler::ready_seq`] -- the ready queue's FIFO
+    /// position within its priority (see [`TaskScheduler::pick_ready`]).
+    /// Meaningless while the task is blocked; restamped the moment it
+    /// becomes `Ready` again, so a just-woken or just-yielded task goes
+    /// to the *back* of its priority's queue the way real exec's
+    /// `AddTail` onto `TaskReady` puts it there.
+    ready_since: u64,
 }
 
 /// A task is blocked and no other task can be woken to replace it --
@@ -180,15 +188,23 @@ pub struct Deadlock;
 /// [`Cpu`] -- there would be nothing meaningful to store here for it
 /// that isn't instantly stale).
 ///
-/// Ready/blocked candidates are chosen by scanning in task-address
-/// order (a [`BTreeMap`], not a `HashMap`, specifically so this is
-/// deterministic): among every [`TaskState::Ready`] entry, the highest
-/// `ln_Pri` wins; ties break by lowest address. This is a simplified
-/// stand-in for real AmigaOS's round-robin-among-equal-priority
-/// scheduling (good enough for the handful of tasks any program this
-/// runtime targets actually creates; a real round-robin would need to
-/// remember *which* equal-priority task ran last, which nothing here
-/// currently needs).
+/// Among every [`TaskState::Ready`] entry, the highest `ln_Pri` wins;
+/// equal priorities round-robin in the order they became `Ready`
+/// ([`TaskRecord::ready_since`]), matching real AmigaOS's FIFO
+/// `TaskReady` list. Tasks are stored in a [`BTreeMap`], not a
+/// `HashMap`, so everything here (including the ticket order two tasks
+/// woken by one call end up with) stays deterministic.
+///
+/// This used to break ties by lowest task address instead, on the
+/// reasoning that the handful of tasks this runtime's programs create
+/// didn't need a real round-robin. Issue #262 found they do: with
+/// three or more equal-priority tasks all yielding
+/// (`std::this_thread::yield()`, i.e. `Forbid()`+`SFB_SAR`+`Permit()`,
+/// as gcc's `__gthread_yield()` compiles to), an address-ordered pick
+/// is a *fixed function of the candidate set*, so the two
+/// lowest-addressed tasks ping-pong between themselves forever and
+/// every other ready task -- including the main task polling for them
+/// to finish -- starves.
 pub struct TaskScheduler {
     /// The program's own task, the one [`Self::new`] started with.
     main: u32,
@@ -235,6 +251,10 @@ pub struct TaskScheduler {
     /// `SetTaskPri`'s own call, so it can't yet capture the correct
     /// post-epilogue registers to save if it switched immediately.
     reschedule_requested: Option<i8>,
+    /// Hands out [`TaskRecord::ready_since`] tickets: bumped once per
+    /// became-`Ready` transition, so a larger ticket means "joined the
+    /// ready queue later".
+    ready_seq: u64,
 }
 
 impl TaskScheduler {
@@ -249,6 +269,32 @@ impl TaskScheduler {
             switch_hook_active: false,
             yield_requested: false,
             reschedule_requested: None,
+            ready_seq: 0,
+        }
+    }
+
+    /// The next [`TaskRecord::ready_since`] ticket -- one per
+    /// became-`Ready` transition.
+    fn next_ready_ticket(&mut self) -> u64 {
+        self.ready_seq += 1;
+        self.ready_seq
+    }
+
+    /// Marks `task` [`TaskState::Ready`] and puts it at the back of its
+    /// priority's ready queue, if it's a known non-running task
+    /// currently in `blocked_in`. Returns whether it actually changed
+    /// state, so callers that only wake one task can stop looking.
+    /// Every became-`Ready` transition goes through here, so none can
+    /// forget to take a fresh ticket.
+    fn mark_ready_if(&mut self, task: u32, blocked_in: TaskState) -> bool {
+        let ticket = self.next_ready_ticket();
+        match self.others.get_mut(&task) {
+            Some(record) if record.state == blocked_in => {
+                record.state = TaskState::Ready;
+                record.ready_since = ticket;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -357,6 +403,7 @@ impl TaskScheduler {
         sp_lower: u32,
         sp_upper: u32,
     ) {
+        let ready_since = self.next_ready_ticket();
         self.others.insert(
             task,
             TaskRecord {
@@ -364,6 +411,7 @@ impl TaskScheduler {
                 state: TaskState::Ready,
                 sp_lower,
                 sp_upper,
+                ready_since,
             },
         );
     }
@@ -385,20 +433,23 @@ impl TaskScheduler {
         self.others.get(&task).map(|r| (r.sp_lower, r.sp_upper))
     }
 
-    /// Picks the highest-priority [`TaskState::Ready`] entry (lowest
-    /// address breaking a tie), reading each candidate's `ln_Pri`
-    /// fresh from guest memory (a task's priority can change at any
-    /// time via `SetTaskPri`, so nothing here caches it).
+    /// Picks the highest-priority [`TaskState::Ready`] entry, the
+    /// longest-waiting one ([`TaskRecord::ready_since`]) breaking a
+    /// tie, reading each candidate's `ln_Pri` fresh from guest memory
+    /// (a task's priority can change at any time via `SetTaskPri`, so
+    /// nothing here caches it). See [`Self`]'s own doc for why the tie
+    /// break has to be queue order rather than anything derived from
+    /// the candidate set itself.
     fn pick_ready<M: AddressSpace>(&self, mem: &M) -> Option<u32> {
         self.others
             .iter()
             .filter(|(_, record)| record.state == TaskState::Ready)
-            .map(|(&addr, _)| {
+            .map(|(&addr, record)| {
                 let pri = mem.read_u8(addr + crate::execlist::LN_PRI) as i8;
-                (pri, addr)
+                (pri, record.ready_since, addr)
             })
-            .max_by_key(|&(pri, addr)| (pri, std::cmp::Reverse(addr)))
-            .map(|(_, addr)| addr)
+            .max_by_key(|&(pri, ready_since, _)| (pri, std::cmp::Reverse(ready_since)))
+            .map(|(_, _, addr)| addr)
     }
 
     /// Blocks the currently-running task on `wait_mask` (`Wait` with
@@ -469,11 +520,7 @@ impl TaskScheduler {
     /// already be `Ready`, or blocked on something else entirely, or
     /// not a known task at all) -- callers don't need to check first.
     pub fn wake_task(&mut self, target: u32) {
-        if let Some(record) = self.others.get_mut(&target)
-            && record.state == TaskState::BlockedOnDelay
-        {
-            record.state = TaskState::Ready;
-        }
+        self.mark_ready_if(target, TaskState::BlockedOnDelay);
     }
 
     /// Shared implementation behind [`Self::block_current_on_signal`]/
@@ -509,6 +556,10 @@ impl TaskScheduler {
                 state,
                 sp_lower: blocking_sp_lower,
                 sp_upper: blocking_sp_upper,
+                // Blocked, so it holds no ready-queue position at all;
+                // whichever `mark_ready_if` eventually wakes it stamps
+                // the ticket that places it then.
+                ready_since: 0,
             },
         );
         let next_record = self
@@ -555,11 +606,13 @@ impl TaskScheduler {
     /// it's `Ready` already, or `Signal`'s own "unknown task" check
     /// already rejected it before this is ever called).
     pub fn wake_if_signal_matches(&mut self, target: u32, recvd: u32) {
-        if let Some(record) = self.others.get_mut(&target)
-            && let TaskState::BlockedOnSignal { wait_mask } = record.state
+        let Some(record) = self.others.get(&target) else {
+            return;
+        };
+        if let TaskState::BlockedOnSignal { wait_mask } = record.state
             && recvd & wait_mask != 0
         {
-            record.state = TaskState::Ready;
+            self.mark_ready_if(target, TaskState::BlockedOnSignal { wait_mask });
         }
     }
 
@@ -576,12 +629,14 @@ impl TaskScheduler {
     /// obtain `sem` first simply blocks again. Never switches, matching
     /// `wake_if_signal_matches`.
     pub fn wake_blocked_on_semaphore(&mut self, sem: u32) {
-        for record in self.others.values_mut() {
-            if let TaskState::BlockedOnSemaphore { sem: blocked_on } = record.state
-                && blocked_on == sem
-            {
-                record.state = TaskState::Ready;
-            }
+        let waiters: Vec<u32> = self
+            .others
+            .iter()
+            .filter(|(_, record)| record.state == TaskState::BlockedOnSemaphore { sem })
+            .map(|(&addr, _)| addr)
+            .collect();
+        for waiter in waiters {
+            self.mark_ready_if(waiter, TaskState::BlockedOnSemaphore { sem });
         }
     }
 
@@ -657,6 +712,11 @@ impl TaskScheduler {
     fn switch_to_ready<C: Cpu, M: AddressSpace>(&mut self, cpu: &C, mem: &M, next: u32) {
         let yielding = self.current;
         let (sp_lower, sp_upper) = Self::read_stack_bounds(mem, yielding);
+        // A fresh ticket: the yielding task rejoins its priority's
+        // ready queue at the *back*, which is what makes repeated
+        // yields rotate through every equal-priority task instead of
+        // bouncing between the same two (issue #262).
+        let ready_since = self.next_ready_ticket();
         self.others.insert(
             yielding,
             TaskRecord {
@@ -664,6 +724,7 @@ impl TaskScheduler {
                 state: TaskState::Ready,
                 sp_lower,
                 sp_upper,
+                ready_since,
             },
         );
         let next_record = self
@@ -800,6 +861,104 @@ mod tests {
             tasks.terminate_current(&mem),
             Err(Deadlock),
             "terminate_current must refuse while a switch hook is in flight"
+        );
+    }
+
+    #[test]
+    fn repeated_yields_rotate_through_every_equal_priority_task() {
+        // codewiz's issue #262 "yield-n.c" repro, at the scheduler
+        // level: N equal-priority tasks that each yield must every one
+        // of them get the CPU. `pick_ready` used to break a priority
+        // tie by lowest task address -- a fixed function of the
+        // candidate set, with no memory of who ran last -- so the two
+        // lowest-addressed tasks ping-ponged between themselves and
+        // every other ready task starved forever. Three tasks is the
+        // smallest set that shows it (with two there's never a choice
+        // to make).
+        let main = 0x1000;
+        let others = [0x2000, 0x3000, 0x4000];
+        let mut mem = FlatMemory::new(0x8000);
+        let cpu = M68kCpu::new();
+
+        let mut tasks = TaskScheduler::new(main);
+        for task in others {
+            // Equal priority: `ln_Pri` 0 for all four, main included.
+            mem.write_u8(task + crate::execlist::LN_PRI, 0);
+            tasks.spawn_ready(task, zero_snapshot(), 0, 0x1000);
+        }
+        mem.write_u8(main + crate::execlist::LN_PRI, 0);
+
+        // Yield round-robin style, committing each switch the way
+        // `crate::dispatch` does, and record who ran.
+        let mut ran = Vec::new();
+        for _ in 0..8 {
+            assert!(
+                tasks.yield_to_ready(&cpu, &mem),
+                "something is always Ready here, so every yield must switch"
+            );
+            let (next, ..) = tasks
+                .take_pending_restore()
+                .expect("a switch was just staged");
+            tasks.commit(next);
+            ran.push(tasks.current());
+        }
+
+        for task in others.iter().chain(std::iter::once(&main)) {
+            assert!(
+                ran.contains(task),
+                "{task:#x} never ran across 8 yields among 4 equal-priority tasks: {ran:#x?}"
+            );
+        }
+        // And it's a real rotation, not just eventual coverage: the
+        // same task must not run twice before every other one has.
+        assert_eq!(
+            ran[..4]
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4,
+            "the first four yields must visit four distinct tasks: {ran:#x?}"
+        );
+    }
+
+    #[test]
+    fn a_woken_task_joins_the_back_of_its_priority_queue() {
+        // The other half of issue #262's fix: becoming `Ready` again
+        // takes a *fresh* ready-queue ticket, so a task that was
+        // blocked and has just been woken doesn't jump ahead of tasks
+        // that have been waiting their turn all along.
+        let main = 0x1000;
+        let early = 0x2000;
+        let late = 0x4000;
+        let mut mem = FlatMemory::new(0x8000);
+        for task in [main, early, late] {
+            mem.write_u8(task + crate::execlist::LN_PRI, 0);
+        }
+
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(late, zero_snapshot(), 0, 0x1000);
+        tasks.spawn_ready(early, zero_snapshot(), 0, 0x1000);
+
+        // `late` was spawned first, so it holds the older ticket and
+        // must be picked first even though `early` has the lower
+        // address (which the old tie break would have preferred).
+        assert_eq!(tasks.pick_ready(&mem), Some(late));
+
+        // Block `late` on a signal, then wake it: it now holds the
+        // newest ticket, so `early` -- which has been Ready the whole
+        // time -- goes first.
+        tasks.others.get_mut(&late).expect("spawned above").state =
+            TaskState::BlockedOnSignal { wait_mask: 1 };
+        tasks.wake_if_signal_matches(late, 1);
+        assert_eq!(
+            tasks.others[&late].state,
+            TaskState::Ready,
+            "the signal matched its mask, so it must be Ready again"
+        );
+        assert_eq!(
+            tasks.pick_ready(&mem),
+            Some(early),
+            "a just-woken task must rejoin at the back of its priority's queue"
         );
     }
 }
