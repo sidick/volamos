@@ -1656,27 +1656,47 @@ const SFB_SAR: u16 = 1 << 15;
 /// `exec.library`'s `Forbid` (LVO -132, no args, no return value): real
 /// `Forbid` disables task switching until a matching `Permit`,
 /// protecting a critical section (e.g. walking a shared list) from
-/// being preempted mid-scan. Still a true no-op even after issue #121:
-/// this runtime has no preemption at all (switches only ever happen at
-/// a handler's own request -- see `crate::taskswitch`'s module doc), so
-/// there's nothing a critical section could be preempted by regardless
-/// of whether `Forbid` is in effect. Found missing running the real
-/// Workbench 3.1.4 `C:/Avail` binary, which calls `Forbid` before
-/// walking exec's memory-pool list and `Permit` after.
-fn forbid_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+/// being preempted mid-scan. Found missing running the real Workbench
+/// 3.1.4 `C:/Avail` binary, which calls `Forbid` before walking exec's
+/// memory-pool list and `Permit` after.
+///
+/// This runtime has no preemption (switches only ever happen at a
+/// handler's own request -- see `crate::taskswitch`'s module doc), so
+/// nothing can interrupt a critical section regardless. Issue #262 found
+/// `Forbid` still matters for the *voluntary* switch points, though: it
+/// now keeps a real per-task nest count
+/// ([`crate::taskswitch::TaskScheduler::enter_forbid`]) so that a
+/// `SetTaskPri`-triggered reschedule, and `Permit`'s own `SFB_SAR`
+/// yield, wait for the outermost `Permit` the way real exec's do.
+///
+/// The count is deliberately *not* mirrored into the guest-visible
+/// `ExecBase.TDNestCnt`/`Task.tc_TDNestCnt` bytes (nor is `Disable`'s
+/// `IDNestCnt`, see [`disable_handler`]): a guest that reads those
+/// directly rather than calling `Forbid`/`Permit` is relying on more
+/// than this API-level runtime promises.
+fn forbid_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    ctx.tasks.enter_forbid();
     Ok(())
 }
 
 /// `exec.library`'s `Permit` (LVO -138, no args, no return value). See
-/// [`forbid_handler`] for why ending a critical section is otherwise a
-/// no-op. Issue #121 adds the one thing it's not a no-op for: real
-/// `sched_yield()`'s `SFB_SAR` trick (see [`SFB_SAR`]'s doc). If the
-/// guest has set that bit in `ExecBase->SysFlags`, this clears it
-/// (real hardware consumes the request, it doesn't stay set) and
-/// requests a yield -- see `crate::taskswitch::TaskScheduler::
-/// request_yield`'s doc for why this only *requests* one rather than
-/// switching immediately.
+/// [`forbid_handler`] for the nest count this unwinds.
+///
+/// Only the *outermost* `Permit` acts on anything, as in real exec.
+/// Issue #121's one use of it is real `sched_yield()`'s `SFB_SAR` trick
+/// (see [`SFB_SAR`]'s doc): if the guest has set that bit in
+/// `ExecBase->SysFlags`, this clears it (real hardware consumes the
+/// request, it doesn't stay set) and requests a yield -- see
+/// `crate::taskswitch::TaskScheduler::request_yield`'s doc for why this
+/// only *requests* one rather than switching immediately. Inside a
+/// nested `Forbid` the bit is left set for the outermost `Permit` to
+/// find. A deferred `SetTaskPri` reschedule (issue #262) needs no
+/// action here: it is picked up by the generic post-dispatch epilogue
+/// right after this handler, now that the count is back to zero.
 fn permit_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    if !ctx.tasks.leave_forbid() {
+        return Ok(());
+    }
     let sys_flags_addr =
         crate::dispatch::EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_SYSFLAGS_OFFSET;
     let sys_flags = ctx.mem.read_u16(sys_flags_addr);
@@ -1709,16 +1729,16 @@ fn permit_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 /// walk). The tempting argument for maintaining it is that a guest
 /// reading `SysBase->IDNestCnt` directly (rather than calling `Disable`/
 /// `Enable`) would see something coherent instead of a stuck `0`.
-/// Rejected: `Forbid`/`Permit` already don't maintain the exactly
-/// parallel `TDNestCnt`, and giving `Disable`/`Enable` a real counter
-/// while their sibling pair stays a no-op would be an inconsistency
-/// with no real payoff -- nothing in this runtime ever branches on
-/// either nest count (there's no scheduler and no interrupt delivery to
-/// gate), so a maintained counter would only be a guest-visible number,
-/// not an actual guarantee. A guest that inspects the field directly
-/// instead of trusting `Disable`/`Enable`'s return contract is already
-/// relying on behavior this API-level runtime doesn't promise; matching
-/// `Forbid`/`Permit`'s existing precedent is the more defensible answer.
+/// Rejected: `Forbid`/`Permit` don't mirror their own nest count into
+/// the exactly parallel `TDNestCnt` either (see [`forbid_handler`]), and
+/// giving `Disable`/`Enable` a guest-visible counter while their sibling
+/// pair keeps its count host-side would be an inconsistency with no
+/// real payoff. Unlike `Forbid`'s count, nothing here branches on this
+/// one at all (there's no interrupt delivery to gate), so a maintained
+/// counter would only be a guest-visible number, not an actual
+/// guarantee. A guest that inspects the field directly instead of
+/// trusting `Disable`/`Enable`'s return contract is already relying on
+/// behavior this API-level runtime doesn't promise.
 fn disable_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     Ok(())
 }
@@ -2899,6 +2919,77 @@ mod tests {
             code, 0x2A,
             "dipping below a ready task's priority and restoring it must let that task run \
              during the dip"
+        );
+    }
+
+    #[test]
+    fn set_task_pri_dip_and_restore_inside_a_forbid_does_not_run_an_equal_priority_task() {
+        // Issue #262: a reschedule that comes due inside `Forbid()` is
+        // decided at the outermost `Permit()`, not at the
+        // `SetTaskPri()`. Same dip-and-restore as above, but the whole
+        // thing sits in a Forbid: by the Permit the parent is back at
+        // the child's priority, and exec never preempts on a tie. (The
+        // un-Forbidden version above hands the child the CPU during the
+        // dip; deciding at the dip here would too.)
+        let code = run_set_task_pri_scheduling_test(|| {
+            let mut words = Vec::new();
+            words.extend_from_slice(&jsr_disp16_a6(-132)); // Forbid
+            let dip_patch_offset = words.len() + 1;
+            words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+            words.push(0);
+            words.push(0);
+            words.push(move_imm_to_d(0)); // D0 = -1
+            words.push(0xFFFF);
+            words.push(0xFFFF);
+            words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, -1)
+            let restore_patch_offset = words.len() + 1;
+            words.push(move_imm_to_a(1)); // A1 = parent task again (patched below)
+            words.push(0);
+            words.push(0);
+            words.push(move_imm_to_d(0)); // D0 = 0
+            words.push(0);
+            words.push(0);
+            words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, 0)
+            words.extend_from_slice(&jsr_disp16_a6(-138)); // Permit
+            (words, vec![dip_patch_offset, restore_patch_offset])
+        });
+        assert_eq!(
+            code, 0,
+            "the parent was back at the child's priority by the Permit, so the child must \
+             not have run"
+        );
+    }
+
+    #[test]
+    fn a_priority_drop_inside_a_forbid_takes_effect_at_the_outermost_permit() {
+        // The other half of issue #262: deferring must not mean
+        // dropping. The parent lowers itself below the ready child
+        // inside *nested* Forbids and stays lowered, so the child must
+        // run by the outermost Permit. This pins down the dispatch
+        // wiring -- the request survives `SetTaskPri`'s epilogue and is
+        // acted on at `Permit`'s; that nothing runs *before* the
+        // outermost Permit is pinned down by the scheduler-level tests
+        // in `crate::taskswitch`.
+        let code = run_set_task_pri_scheduling_test(|| {
+            let mut words = Vec::new();
+            words.extend_from_slice(&jsr_disp16_a6(-132)); // Forbid
+            words.extend_from_slice(&jsr_disp16_a6(-132)); // Forbid (nested)
+            let dip_patch_offset = words.len() + 1;
+            words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+            words.push(0);
+            words.push(0);
+            words.push(move_imm_to_d(0)); // D0 = -1
+            words.push(0xFFFF);
+            words.push(0xFFFF);
+            words.extend_from_slice(&jsr_disp16_a6(-300)); // SetTaskPri(self, -1)
+            words.extend_from_slice(&jsr_disp16_a6(-138)); // Permit (inner: nothing yet)
+            words.extend_from_slice(&jsr_disp16_a6(-138)); // Permit (outermost: child runs)
+            (words, vec![dip_patch_offset])
+        });
+        assert_eq!(
+            code, 0x2A,
+            "the deferred reschedule must fire at the outermost Permit, with the parent still \
+             below the child"
         );
     }
 

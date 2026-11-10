@@ -19,6 +19,12 @@
 //!   and `SetTaskPri` to a task's own current priority). A task that
 //!   makes no such call and never returns runs forever, exactly as
 //!   today.
+//! - **`Forbid()` defers the voluntary ones** (issue #262). A per-task
+//!   nest count ([`TaskScheduler::enter_forbid`]) holds back a
+//!   `SetTaskPri` reschedule and `Permit`'s `SFB_SAR` yield until the
+//!   outermost `Permit`, and `Wait`/`ObtainSemaphore`/`Delay` break the
+//!   `Forbid()` while they sleep -- saved with the blocked task and
+//!   restored when it resumes.
 //! - **`Signal` never itself switches** -- it only marks a blocked
 //!   target `Ready`. The next switch point (on either task) is what
 //!   actually hands it the CPU.
@@ -173,6 +179,10 @@ struct TaskRecord {
     /// to the *back* of its priority's queue the way real exec's
     /// `AddTail` onto `TaskReady` puts it there.
     ready_since: u64,
+    /// The task's `Forbid()` nest count at the moment it stopped
+    /// running -- see [`TaskScheduler::forbid_nest`]. Restored by
+    /// [`TaskScheduler::commit`] when it runs again.
+    forbid_nest: u32,
 }
 
 /// A task is blocked and no other task can be woken to replace it --
@@ -255,6 +265,26 @@ pub struct TaskScheduler {
     /// became-`Ready` transition, so a larger ticket means "joined the
     /// ready queue later".
     ready_seq: u64,
+    /// The running task's `Forbid()` nest count: bumped by [`Self::
+    /// enter_forbid`], dropped by [`Self::leave_forbid`]. Per-task, like
+    /// real exec's `TDNestCnt`/`tc_TDNestCnt` pair: saved into the
+    /// outgoing task's [`TaskRecord`] at every switch and restored from
+    /// the incoming one's by [`Self::commit`], so a task that blocks in
+    /// `Wait` inside a `Forbid()` gets that `Forbid()` back when it
+    /// resumes, and one that exits inside one leaves no stray count
+    /// behind for whoever runs next.
+    ///
+    /// While non-zero, [`Self::take_reschedule_request`] holds back a
+    /// pending `SetTaskPri` reschedule, and `Permit` only acts on
+    /// `SFB_SAR` once the count is back to zero -- see their docs.
+    forbid_nest: u32,
+    /// The incoming task's saved [`TaskRecord::forbid_nest`], parked by
+    /// [`Self::take_pending_restore`] until [`Self::commit`] makes it
+    /// the running task's. Kept separate from [`Self::forbid_nest`] for
+    /// the same reason [`Self::current`] lags the switch decision: an
+    /// outgoing task's `tc_Switch` hook (issue #237) still runs as that
+    /// task, and must see *its* count, not the incoming task's.
+    incoming_forbid_nest: u32,
 }
 
 impl TaskScheduler {
@@ -270,6 +300,8 @@ impl TaskScheduler {
             yield_requested: false,
             reschedule_requested: None,
             ready_seq: 0,
+            forbid_nest: 0,
+            incoming_forbid_nest: 0,
         }
     }
 
@@ -321,9 +353,47 @@ impl TaskScheduler {
     }
 
     /// Takes (and clears) a pending
-    /// [`Self::request_reschedule_if_outranked`] request.
+    /// [`Self::request_reschedule_if_outranked`] request -- unless a
+    /// `Forbid()` is in effect, in which case it stays pending and this
+    /// returns `None`.
+    ///
+    /// Real exec doesn't reschedule while task switching is forbidden;
+    /// it notes that one is due and does it at the outermost `Permit()`
+    /// (issue #262). That matters to code that changes the running
+    /// task's priority and then readies a higher-priority task inside
+    /// the *same* `Forbid()` -- gcc's `<benaphore.h>` does exactly this
+    /// when it releases a lock: restore the owner's priority, then
+    /// signal the waiter. Deciding at the `SetTaskPri()` picks among
+    /// whoever is ready *then*, and hands the CPU to a middle-priority
+    /// task over the waiter that was about to become ready.
+    ///
+    /// The request is re-examined at `Permit()`'s own epilogue (the
+    /// handler is where [`Self::leave_forbid`] drops the count to
+    /// zero), so what it compares against is whoever is `Ready` *then*.
     pub fn take_reschedule_request(&mut self) -> Option<i8> {
+        if self.forbid_nest > 0 {
+            return None;
+        }
         self.reschedule_requested.take()
+    }
+
+    /// `Forbid()`: one more level of task-switching prohibition for the
+    /// running task.
+    pub fn enter_forbid(&mut self) {
+        self.forbid_nest += 1;
+    }
+
+    /// `Permit()`: one fewer level. Returns whether task switching is
+    /// now permitted again (the outermost `Permit()`), which is the only
+    /// point real exec acts on a reschedule that came due meanwhile.
+    ///
+    /// A `Permit()` with no `Forbid()` to match (a guest bug, or a
+    /// count lost to a guest that inlines `TDNestCnt`) counts as
+    /// outermost rather than underflowing -- the behavior every
+    /// `Permit()` had before this count existed.
+    pub fn leave_forbid(&mut self) -> bool {
+        self.forbid_nest = self.forbid_nest.saturating_sub(1);
+        self.forbid_nest == 0
     }
 
     /// The currently-running task's guest address -- **not** updated
@@ -366,6 +436,12 @@ impl TaskScheduler {
     /// must stay correct for its whole duration).
     pub fn commit(&mut self, next: u32) {
         self.current = next;
+        self.forbid_nest = self.incoming_forbid_nest;
+        // Whatever reschedule the outgoing task had pending was just
+        // answered by this very switch. Left set, it would carry that
+        // task's `SetTaskPri` value over to whoever runs next and be
+        // judged against *their* priority.
+        self.reschedule_requested = None;
     }
 
     /// Marks a `tc_Switch`/`tc_Launch` trampoline as in flight -- see
@@ -412,6 +488,7 @@ impl TaskScheduler {
                 sp_lower,
                 sp_upper,
                 ready_since,
+                forbid_nest: 0,
             },
         );
     }
@@ -560,6 +637,10 @@ impl TaskScheduler {
                 // whichever `mark_ready_if` eventually wakes it stamps
                 // the ticket that places it then.
                 ready_since: 0,
+                // `Wait` breaks `Forbid()` while it sleeps -- the next
+                // task runs with its own count -- and the count comes
+                // back when this task does, via `commit`.
+                forbid_nest: self.forbid_nest,
             },
         );
         let next_record = self
@@ -584,9 +665,10 @@ impl TaskScheduler {
     /// may need to run the outgoing task's `tc_Switch` first (issue
     /// #237). `None` if the last call didn't switch.
     pub fn take_pending_restore(&mut self) -> Option<(u32, RegisterSnapshot, u32, u32)> {
-        self.pending_restore
-            .take()
-            .map(|(next, r)| (next, r.snapshot, r.sp_lower, r.sp_upper))
+        self.pending_restore.take().map(|(next, r)| {
+            self.incoming_forbid_nest = r.forbid_nest;
+            (next, r.snapshot, r.sp_lower, r.sp_upper)
+        })
     }
 
     fn read_stack_bounds<M: AddressSpace>(mem: &M, task: u32) -> (u32, u32) {
@@ -725,6 +807,7 @@ impl TaskScheduler {
                 sp_lower,
                 sp_upper,
                 ready_since,
+                forbid_nest: self.forbid_nest,
             },
         );
         let next_record = self
@@ -960,5 +1043,135 @@ mod tests {
             Some(early),
             "a just-woken task must rejoin at the back of its priority's queue"
         );
+    }
+
+    /// Stages and commits a switch away from the current task the way
+    /// `crate::dispatch` does, for tests that only care about the
+    /// scheduler's bookkeeping.
+    fn switch_now(tasks: &mut TaskScheduler) {
+        let (next, ..) = tasks
+            .take_pending_restore()
+            .expect("a switch was just staged");
+        tasks.commit(next);
+    }
+
+    #[test]
+    fn a_reschedule_request_waits_for_the_outermost_permit() {
+        // Issue #262: inside Forbid() a SetTaskPri reschedule stays
+        // pending, and is handed back only once every Forbid() has had
+        // its Permit().
+        let mut tasks = TaskScheduler::new(0x1000);
+        tasks.enter_forbid();
+        tasks.enter_forbid();
+        tasks.request_reschedule_if_outranked(-1);
+
+        assert_eq!(tasks.take_reschedule_request(), None, "two levels deep");
+        assert!(!tasks.leave_forbid(), "inner Permit is not the outermost");
+        assert_eq!(tasks.take_reschedule_request(), None, "one level deep");
+        assert!(tasks.leave_forbid(), "outermost Permit");
+        assert_eq!(
+            tasks.take_reschedule_request(),
+            Some(-1),
+            "the request must survive the whole Forbid, not be dropped"
+        );
+        assert_eq!(tasks.take_reschedule_request(), None, "and is taken once");
+    }
+
+    #[test]
+    fn an_unbalanced_permit_counts_as_outermost_instead_of_underflowing() {
+        let mut tasks = TaskScheduler::new(0x1000);
+        assert!(tasks.leave_forbid());
+        tasks.enter_forbid();
+        assert!(
+            tasks.leave_forbid(),
+            "a stray Permit must not leave a debt that swallows the next Forbid"
+        );
+    }
+
+    #[test]
+    fn wait_breaks_a_forbid_and_gets_it_back_on_resume() {
+        // Real exec: a task that Wait()s inside Forbid() lets others
+        // run, and finds its Forbid() back when it wakes. The nest
+        // count is per task.
+        let main = 0x1000;
+        let other = 0x2000;
+        let mut mem = FlatMemory::new(0x4000);
+        let cpu = M68kCpu::new();
+        for task in [main, other] {
+            mem.write_u8(task + crate::execlist::LN_PRI, 0);
+        }
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(other, zero_snapshot(), 0, 0x1000);
+
+        tasks.enter_forbid();
+        tasks.enter_forbid();
+        tasks
+            .block_current_on_signal(&cpu, &mem, 0, 1)
+            .expect("`other` is ready");
+        switch_now(&mut tasks);
+        assert_eq!(tasks.current(), other);
+
+        // `other` is not Forbidden: a reschedule request is live.
+        tasks.request_reschedule_if_outranked(0);
+        assert_eq!(
+            tasks.take_reschedule_request(),
+            Some(0),
+            "the incoming task must not inherit the blocked task's Forbid"
+        );
+
+        // Wake `main` and switch back to it.
+        tasks.wake_if_signal_matches(main, 1);
+        assert!(tasks.yield_to_ready(&cpu, &mem));
+        switch_now(&mut tasks);
+        assert_eq!(tasks.current(), main);
+
+        assert!(!tasks.leave_forbid(), "first Permit: still one level in");
+        assert!(tasks.leave_forbid(), "second Permit: now permitted");
+    }
+
+    #[test]
+    fn a_task_that_exits_inside_a_forbid_leaves_no_count_for_the_next_task() {
+        let main = 0x1000;
+        let other = 0x2000;
+        let mut mem = FlatMemory::new(0x4000);
+        mem.write_u8(other + crate::execlist::LN_PRI, 0);
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(other, zero_snapshot(), 0, 0x1000);
+
+        tasks.enter_forbid();
+        tasks.terminate_current(&mem).expect("`other` is ready");
+        switch_now(&mut tasks);
+
+        tasks.request_reschedule_if_outranked(0);
+        assert_eq!(
+            tasks.take_reschedule_request(),
+            Some(0),
+            "the exited task's Forbid must not outlive it"
+        );
+    }
+
+    #[test]
+    fn a_pending_reschedule_does_not_carry_over_to_the_next_task() {
+        // `Wait` inside a Forbid, after a SetTaskPri: the switch away
+        // answers the pending reschedule. Left set, it would be judged
+        // against whoever runs next, using the blocked task's priority.
+        let main = 0x1000;
+        let other = 0x2000;
+        let mut mem = FlatMemory::new(0x4000);
+        let cpu = M68kCpu::new();
+        for task in [main, other] {
+            mem.write_u8(task + crate::execlist::LN_PRI, 0);
+        }
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(other, zero_snapshot(), 0, 0x1000);
+
+        tasks.enter_forbid();
+        tasks.request_reschedule_if_outranked(-1);
+        tasks
+            .block_current_on_signal(&cpu, &mem, 0, 1)
+            .expect("`other` is ready");
+        switch_now(&mut tasks);
+
+        assert_eq!(tasks.take_reschedule_request(), None);
     }
 }
