@@ -47,14 +47,22 @@
 //! `ReadBattClock` reports the same host wall clock
 //! [`crate::exectask::host_time_secs_micro`] gives `GetSysTime` and
 //! [`crate::dosdate::now_as_datestamp`] gives `DateStamp`, in the same
-//! AmigaOS epoch (1978-01-01) those already use -- so the RTC and the
-//! system clock agree, which is the whole point of the pair for a
-//! program like `SetClock`: `SetClock SAVE` then `SetClock LOAD` must
-//! not shift the time. (That also means it reports what the host
-//! reports, which on a host configured for UTC is UTC, not local time
-//! -- volamos's existing `DateStamp`/`GetSysTime` already behave that
+//! AmigaOS epoch (1978-01-01) those already use -- so an unwritten
+//! chip and the system clock read the same time, which is what makes a
+//! `SetClock SAVE` / `SetClock LOAD` round trip a no-op rather than a
+//! time shift. (That also means it reports what the host reports,
+//! which on a host configured for UTC is UTC, not local time --
+//! volamos's existing `DateStamp`/`GetSysTime` already behave that
 //! way, and matching them matters more here than matching a real
 //! Amiga's local-time-only world view.)
+//!
+//! The agreement is one-directional, though, and only until something
+//! writes the chip: `timer.device`'s `TR_SETSYSTIME` is a no-op in
+//! this runtime (there is no virtual clock to set -- see
+//! [`crate::exectask`]'s `do_io_handler`), so `SetClock LOAD` cannot
+//! push a written RTC value back into the system clock. After a
+//! `WriteBattClock(t)` with `t` far from now, `ReadBattClock` and
+//! `DateStamp` genuinely disagree, by design, for the rest of the run.
 //!
 //! A real clock chip can be *set*, though, and then keeps ticking from
 //! there. Rather than carry a second clock, this keeps one signed
@@ -108,6 +116,24 @@ const BC_OFFSET_FIELD: u32 = 34;
 /// just past [`BC_OFFSET_FIELD`]'s longword. 19 bytes including the
 /// terminator, well inside the chunk's positive-offset room.
 const BC_NAME_FIELD: u32 = BC_OFFSET_FIELD + 4;
+
+/// The private fields above have to stay inside the positive-offset
+/// room this base's chunk reserves -- past it sit
+/// [`crate::dispatch::EXIT_STUB_ADDR`] and
+/// [`crate::dispatch::FPU_DISABLED_060_DECLINE_STUB_ADDR`], the two
+/// end-anchored A-line stub words, and overwriting the first of those
+/// would stop the guest's outermost `rts` trapping at all, i.e. break
+/// program termination with no compile- or test-time signal. Adding a
+/// field (or a longer name string) past the chunk's end is therefore a
+/// compile error rather than a silent clobber.
+///
+/// First byte past the last private field (the name string's `NUL`
+/// included) -- split out so the bound below reads as one comparison.
+const BC_FIELDS_END: u32 = BC_NAME_FIELD + BATTCLOCK_NAME.len() as u32 + 1;
+const _: () = assert!(
+    BC_FIELDS_END <= crate::dispatch::EXIT_STUB_ADDR - BATTCLOCK_RESOURCE_BASE,
+    "battclock.resource's private fields must fit below EXIT_STUB_ADDR"
+);
 
 /// `ResetBattClock`'s LVO, per `include_i/lvo/battclock_lib.i`.
 const LVO_RESET_BATT_CLOCK: i32 = -6;
@@ -369,11 +395,24 @@ mod tests {
             skew <= 2,
             "ReadBattClock ({chip}) should match GetSysTime/DateStamp's clock ({sys_secs})"
         );
-        // Sanity-check the epoch itself: anything plausible is decades
-        // past 1978, so a Unix-epoch value would stand out immediately.
+
+        // Pin the epoch independently. Comparing against
+        // host_time_secs_micro alone can't: both sides would move
+        // together if the epoch offset were ever dropped. So derive
+        // the expected value straight from the host's Unix clock, with
+        // the 1970 -> 1978 day count (8 years, 1972 and 1976 leap)
+        // spelled out here rather than taken from
+        // dosdate::UNIX_TO_AMIGA_EPOCH_DAYS -- an error in that
+        // constant should fail this test, not be inherited by it.
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host clock is past the Unix epoch")
+            .as_secs();
+        let expected = unix_secs - (8 * 365 + 2) * 86_400;
         assert!(
-            chip > 1_300_000_000,
-            "{chip} seconds past 1978-01-01 is not a plausible current time"
+            u64::from(chip).abs_diff(expected) <= 2,
+            "ReadBattClock ({chip}) should be seconds since 1978-01-01, i.e. about \
+             {expected} -- a Unix-epoch value would be {unix_secs}"
         );
     }
 

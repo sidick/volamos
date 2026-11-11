@@ -285,12 +285,18 @@ system *resource* on `ExecBase`'s resource list from startup, so
 `OpenResource("battclock.resource")` returns a real base:
 
 - `ReadBattClock()` — seconds since 1978-01-01, the same host clock
-  (and the same epoch) `DateStamp`/`GetSysTime` report, so the RTC and
-  the system clock never disagree.
+  (and the same epoch) `DateStamp`/`GetSysTime` report, so an unwritten
+  chip reads the same time as the system clock, and a `SetClock SAVE` /
+  `SetClock LOAD` round trip doesn't shift the time.
 - `WriteBattClock(secs)` — sets the chip, which then keeps ticking from
   there for the rest of the run. Like `SetClock SAVE` on real AmigaOS,
   it doesn't change the system time, and nothing persists past the
-  invocation (volamos is one process per run, with no boot state).
+  invocation (volamos is one process per run, with no boot state). Note
+  that the reverse direction isn't available either: `timer.device`'s
+  `TR_SETSYSTIME` is a no-op here (there's no virtual clock to set), so
+  `SetClock LOAD` can't push a written chip value back into the system
+  clock — after writing the chip to some distant time, `ReadBattClock`
+  and `DateStamp` will disagree for the rest of the run.
 - `ResetBattClock()` — puts the chip back to 1978-01-01, per the NDK
   autodoc.
 
