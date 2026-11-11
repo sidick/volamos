@@ -381,21 +381,43 @@ pub const PR_CONSOLE_TASK_OFFSET: u32 = 164;
 /// `RunCommand`/`CreateNewProc` convention real AmigaOS uses (and
 /// `ixemul.library`'s startup code, `ix_init.c`, relies on): it points
 /// at a longword holding the process's reserved stack size in bytes,
-/// immediately followed (at `pr_ReturnAddr + 4`) by the return address
-/// the process's outermost `rts` lands on -- the layout this runtime
-/// already builds at the top of the guest stack region (the exit-stub
-/// return address `Runtime::new` writes at its initial `sp`, see
-/// [`crate::dispatch::EXIT_STUB_ADDR`]), one longword earlier. A reader
-/// derives the process's stack bounds as `upper = pr_ReturnAddr + 8`,
-/// `lower = pr_ReturnAddr + 8 - size`. Left at `0`, ixemul's
-/// `get_stack_size()`/stack-extension code computed both bounds from
-/// address `0` instead and its `CopyMem` of the live frame onto the
-/// "extended" stack overwrote the real one. Written once, at creation,
-/// by [`crate::dispatch::Runtime::new`] (not this function -- it's
-/// part of the stack region's own layout, not the fake task struct's
-/// static fields, so it's naturally set alongside the exit-stub
-/// write). Found needed running a real `ixemul.library` 80.1-linked
-/// program (issue #178).
+/// which sits **above** the return address the process's outermost
+/// `rts` lands on -- that return address is at `pr_ReturnAddr - 4`,
+/// which is also the process's initial `sp`:
+///
+/// ```text
+/// pr_ReturnAddr - 4   [return address]            <- sp at entry
+/// pr_ReturnAddr       [reserved stack size]
+/// pr_ReturnAddr + 4   [caller's stack pointer]
+/// ```
+///
+/// Readers derive the process's stack bounds from it two ways:
+/// `lower = pr_ReturnAddr - size` exactly (libnix's `__init_stk`,
+/// `sources/stack/init_stk.c`), or `upper = pr_ReturnAddr + 8`,
+/// `lower = upper - size` -- 8 bytes conservative, as on real AmigaOS,
+/// where those two longwords above the size are part of the stack
+/// allocation too. Left at `0`, ixemul's `get_stack_size()`/
+/// stack-extension code computed both bounds from address `0` instead
+/// and its `CopyMem` of the live frame onto the "extended" stack
+/// overwrote the real one.
+///
+/// The ordering is load-bearing in the other direction too: vbcc's
+/// resident startup (`minres.o`) stashes its data block at entry
+/// `sp - 4` and reads it back from `pr_ReturnAddr - 8` on exit (and
+/// `_geta4` finds it the same way), so the inverted layout this
+/// runtime built before issue #279 -- size below the return address --
+/// made it `FreeMem` an address 8 bytes off. AROS's m68k
+/// `AOS_CallEntry` (`arch/m68k-all/dos/callentry.S`) builds the frame
+/// documented above; the same program runs clean on real AmigaOS 3.x
+/// under MuForce.
+///
+/// Written once, at creation, by [`crate::dispatch::Runtime::new`]
+/// (not this function -- it's part of the stack region's own layout,
+/// not the fake task struct's static fields, so it's naturally set
+/// alongside the exit-stub write, see
+/// [`crate::dispatch::EXIT_STUB_ADDR`]). Found needed running a real
+/// `ixemul.library` 80.1-linked program (issue #178); frame order
+/// fixed for vbcc `minres.o` (issue #279).
 pub const PR_RETURNADDR_OFFSET: u32 = 176;
 /// `pr_HomeDir`: `BPTR`, offset 188 (`pr_CLI` 172 + 4, `pr_ReturnAddr`
 /// 176, `pr_PktWait` 180, `pr_WindowPtr` 184, `pr_HomeDir` 188). A lock
@@ -674,11 +696,11 @@ pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, task: u32) {
 /// `input_addr`/`output_addr` are the guest addresses of the handles
 /// `Input()`/`Output()` return, stored in `pr_CIS`/`pr_COS` as BPTRs.
 ///
-/// `return_addr_footer` is the guest address of the `[stack size,
-/// return address]` longword pair [`crate::dispatch::Runtime::new`]
-/// already wrote just below the stack's initial `sp` (per
-/// [`PR_RETURNADDR_OFFSET`]'s doc), written here into `pr_ReturnAddr`
-/// unchanged; `cli_DefaultStack` (see
+/// `return_addr_footer` is the guest address of the reserved-stack-size
+/// longword in the entry frame [`crate::dispatch::Runtime::new`]
+/// already wrote at the top of the stack region, one longword above
+/// the initial `sp` (per [`PR_RETURNADDR_OFFSET`]'s doc), written here
+/// into `pr_ReturnAddr` unchanged; `cli_DefaultStack` (see
 /// [`CLI_DEFAULT_STACK_OFFSET`]) is derived from the same `[sp_lower,
 /// sp_upper)` region as `tc_SPLower`/`tc_SPUpper` below, so both
 /// fields describe one consistent reserved-stack size.
@@ -1032,10 +1054,11 @@ pub(crate) struct SpawnSpec {
 /// has no room.
 ///
 /// The child's initial registers: `A7` = the top of its own freshly
-/// allocated stack (with [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
-/// pre-pushed as the return address for its outermost `rts`, exactly
-/// the way [`crate::dispatch::Runtime::new`] pre-pushes `EXIT_STUB_ADDR`
-/// for the main task's own outermost `rts`), `PC` = `entry`, `A0`/`D0`
+/// allocated stack, below the `pr_ReturnAddr` entry frame (with
+/// [`crate::dispatch::TASK_EXIT_STUB_ADDR`] as the return address for
+/// its outermost `rts`, exactly the way
+/// [`crate::dispatch::Runtime::new`] builds the same frame with
+/// `EXIT_STUB_ADDR` for the main task), `PC` = `entry`, `A0`/`D0`
 /// = the argument copy and its length (`0`/`0` without one), every
 /// other register zeroed.
 pub(crate) fn spawn_process<C: Cpu>(
@@ -1055,7 +1078,21 @@ pub(crate) fn spawn_process<C: Cpu>(
 
     let stack_block = ctx.heap.alloc(ctx.mem, stack_size).ok()?;
     let sp_upper = stack_block.wrapping_add(stack_size) & !3;
-    let sp = sp_upper.wrapping_sub(4);
+    // The child's entry frame, in the same `RunCommand`/`CallEntry`
+    // layout `Runtime::new` builds for the main task (see
+    // [`PR_RETURNADDR_OFFSET`]'s doc): the caller's-stack-pointer slot
+    // (`0` -- the child's outermost `rts` lands on the task exit stub,
+    // there is no guest-side caller), then the reserved stack size
+    // with `pr_ReturnAddr` pointing at it, then the return address at
+    // the child's initial `sp`, one longword below. Startup code that
+    // keys off `pr_ReturnAddr` -- vbcc's `minres.o`, ixemul's stack
+    // extension -- needs this on a `CreateNewProc` child exactly as
+    // much as on the main task (issue #279).
+    ctx.mem.write_u32(sp_upper.wrapping_sub(4), 0);
+    let return_addr_footer = sp_upper.wrapping_sub(8);
+    ctx.mem
+        .write_u32(return_addr_footer, return_addr_footer - stack_block);
+    let sp = return_addr_footer.wrapping_sub(4);
     ctx.mem.write_u32(sp, crate::dispatch::TASK_EXIT_STUB_ADDR);
 
     let task = create_task(
@@ -1089,6 +1126,8 @@ pub(crate) fn spawn_process<C: Cpu>(
     ctx.mem.write_u32(task + PR_CONSOLE_TASK_OFFSET, console);
     ctx.mem.write_u32(task + PR_WINDOW_PTR_OFFSET, window);
     ctx.mem.write_u32(task + PR_ARGUMENTS_OFFSET, args);
+    ctx.mem
+        .write_u32(task + PR_RETURNADDR_OFFSET, return_addr_footer);
     ctx.mem.write_u32(task + PR_EXITCODE_OFFSET, spec.exit_code);
     ctx.mem.write_u32(task + PR_EXITDATA_OFFSET, spec.exit_data);
 
@@ -3174,11 +3213,14 @@ mod tests {
 
     #[test]
     fn pr_return_addr_and_cli_default_stack_match_the_runcommand_convention() {
-        // Issue #178: ixemul.library's startup code computes its stack
-        // bounds from pr_ReturnAddr and decides whether to extend from
-        // cli_DefaultStack. FlatMemory::new(0x2_0000) with the default
-        // 64 KiB stack (DEFAULT_STACK_SIZE) gives top = 0x20000,
-        // stack_base = 0x10000, sp = 0x1FFFC.
+        // Issues #178 and #279: ixemul.library's startup code computes
+        // its stack bounds from pr_ReturnAddr and decides whether to
+        // extend from cli_DefaultStack; vbcc's minres.o startup reads
+        // its own saved data block at pr_ReturnAddr - 8, i.e. relative
+        // to an initial sp of pr_ReturnAddr - 4.
+        // FlatMemory::new(0x2_0000) with the default 64 KiB stack
+        // (DEFAULT_STACK_SIZE) gives top = 0x20000, stack_base =
+        // 0x10000, pr_ReturnAddr = 0x1FFF8, sp = 0x1FFF4.
         let rt = runtime_with_program(&[RTS]);
         let mem = rt.memory();
         let task = rt.current_task();
@@ -3186,23 +3228,26 @@ mod tests {
         let pr_return_addr = mem.read_u32(task + PR_RETURNADDR_OFFSET);
         assert_eq!(
             pr_return_addr, 0x1FFF8,
-            "pr_ReturnAddr should point 4 bytes below the initial sp (0x1FFFC)"
+            "pr_ReturnAddr should point 4 bytes *above* the initial sp (0x1FFF4)"
         );
-        // [pr_ReturnAddr]: the reserved stack size, in bytes.
-        assert_eq!(mem.read_u32(pr_return_addr), 0x10000);
-        // [pr_ReturnAddr + 4]: the return address, the same exit-stub
-        // longword already at the initial sp.
-        assert_eq!(
-            mem.read_u32(pr_return_addr + 4),
-            mem.read_u32(0x1FFFC),
-            "pr_ReturnAddr + 4 should be the same return-address slot as the initial sp"
-        );
-        // upper = pr_ReturnAddr + 8, lower = upper - size: should
-        // reproduce this run's real [stack_base, top) bounds.
+        // [pr_ReturnAddr]: the reserved stack size, in bytes -- the
+        // distance from this longword down to the stack's lower bound,
+        // as on real AmigaOS, so `lower = pr_ReturnAddr - size` is
+        // exact (libnix's __init_stk does precisely that).
         let size = mem.read_u32(pr_return_addr);
-        let upper = pr_return_addr + 8;
-        let lower = upper - size;
-        assert_eq!((lower, upper), (0x10000, 0x20000));
+        assert_eq!(size, 0x1FFF8 - 0x10000);
+        assert_eq!(pr_return_addr - size, 0x10000);
+        // [pr_ReturnAddr - 4]: the return address the outermost rts
+        // lands on, which is also the initial sp.
+        assert_eq!(
+            mem.read_u32(pr_return_addr - 4),
+            crate::dispatch::EXIT_STUB_ADDR,
+            "pr_ReturnAddr - 4 is the exit-stub return address at the initial sp"
+        );
+        // upper = pr_ReturnAddr + 8: the stack region's top, the other
+        // derivation ixemul uses (lower from it is 8 bytes
+        // conservative, exactly as on real AmigaOS).
+        assert_eq!(pr_return_addr + 8, 0x20000);
 
         let cli_bptr = mem.read_u32(task + PR_CLI_OFFSET);
         let cli_addr = crate::guestmem::addr_from_bptr(cli_bptr);
@@ -3629,6 +3674,160 @@ mod tests {
     /// [`move_d0_to_a_indirect`].
     fn move_a_indirect_to_d0(an: u16) -> u16 {
         0x2010 | an
+    }
+
+    /// The vbcc `minres.o` idiom, as a word sequence: stash `marker`
+    /// at entry `sp - 4` (the startup's own data block), then recover
+    /// it the way `_exit`/`_geta4` do -- through
+    /// `ExecBase->ThisTask->pr_ReturnAddr - 8` -- leaving it in `D0`
+    /// and the stack pointer where it started. See
+    /// [`PR_RETURNADDR_OFFSET`]'s doc (issue #279).
+    fn minres_stash_and_recover(marker: u16) -> Vec<u16> {
+        vec![
+            0x2F3C, 0, marker, // move.l #marker,-(sp)
+            0x2C78, 0x0004, // movea.l (4).w,a6         ; ExecBase
+            0x206E, 0x0114, // movea.l 276(a6),a0       ; ThisTask
+            0x2068, 0x00B0, // movea.l 176(a0),a0       ; pr_ReturnAddr
+            0x2028, 0xFFF8, // move.l -8(a0),d0         ; the stashed block
+            0x588F, // addq.l #4,sp             ; drop the stash
+        ]
+    }
+
+    #[test]
+    fn minres_style_startup_recovers_its_block_through_pr_return_addr() {
+        // Issue #279: vbcc's resident startup (`minres.o`) saves the
+        // block it AllocMem'd at entry `sp - 4` and reads it back at
+        // `pr_ReturnAddr - 8` to FreeMem it, which only works when the
+        // entry frame has the stack size *above* the return address
+        // (`sp == pr_ReturnAddr - 4`). volamos built that frame the
+        // other way round, so an empty `vc +aos68kr` program died at
+        // exit with a bogus FreeMem. The exit code here is the
+        // recovered marker: a frame off by so much as a longword
+        // reports something else.
+        let _guard = lock_host_break();
+        let mut words = minres_stash_and_recover(0x2A2A);
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        let entry = TRAP_TABLE_END;
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + (words.len() as u32) * 2 + 16,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x2A2A,
+            "a minres.o-style startup must read back its own block at \
+             pr_ReturnAddr - 8"
+        );
+    }
+
+    #[test]
+    fn create_new_proc_child_gets_its_own_pr_return_addr_frame() {
+        // Issue #279, the CreateNewProc side: a child's stack gets the
+        // same entry frame as the main task's, with pr_ReturnAddr
+        // pointing into the child's own stack -- before this it was
+        // left at 0 (and the child would have read the *parent's*
+        // frame had it inherited one). The child runs the minres.o
+        // idiom and leaves what it recovered in the marker the parent
+        // reports, so a missing or misplaced frame reports something
+        // other than the marker it stashed.
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+
+        // --- parent: CreateNewProc(tags); Wait(join signal); read marker ---
+        words.extend_from_slice(&movea_dos_base_to_a6());
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // --- child: the minres.o idiom on its own stack; store what it
+        // recovered in the marker; Signal(parent); exit ---
+        let child_entry = TRAP_TABLE_END + (words.len() as u32) * 2;
+        words.extend_from_slice(&minres_stash_and_recover(0x3B3B));
+        let marker_imm_idx_child = words.len();
+        words.push(move_imm_to_a(1)); // A1 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_d0_to_a_indirect(1)); // *marker_addr = D0
+
+        words.extend_from_slice(&movea_exec_base_to_a6());
+        let parent_task_imm_idx = words.len();
+        words.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        words.push(RTS); // -> TASK_EXIT_STUB_ADDR
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 32;
+
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        words[marker_imm_idx_child + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_child + 2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        let parent_task_patch_addr = entry + (parent_task_imm_idx as u32) * 2 + 2;
+        rt.memory_mut()
+            .write_u32(parent_task_patch_addr, parent_task);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x3B3B,
+            "the child should recover its own stashed block through its \
+             own pr_ReturnAddr frame"
+        );
     }
 
     #[test]

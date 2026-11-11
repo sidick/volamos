@@ -2923,27 +2923,52 @@ impl<C: Cpu + 'static> Runtime<C> {
 
         // Stack: a region (see `StartConfig::stack_size`, clamped to at
         // least `guestmem::MIN_STACK_SIZE`) at the top of guest memory,
-        // 4-byte aligned, with the exit sentinel pre-pushed as the
-        // return address for the program's outermost `rts`.
+        // 4-byte aligned, carrying the three-longword entry frame real
+        // AmigaOS hands a CLI command (see below), with the exit
+        // sentinel as the return address for the program's outermost
+        // `rts`.
         let stack_size = config.stack_size.max(MIN_STACK_SIZE);
         let top = (mem.len() as u32) & !3;
-        let sp = top.wrapping_sub(4);
-        mem.write_u32(sp, EXIT_STUB_ADDR);
 
         // Heap: from the loaded program's end (rounded up) to the base
         // of the reserved stack region, so it never overlaps either.
         let stack_base = top.saturating_sub(stack_size) & !3;
         let mut heap = GuestHeap::new(config.load_end, stack_base);
 
-        // pr_ReturnAddr footer (RunCommand convention, issue #178): one
-        // longword holding this run's actual reserved-stack size in
-        // bytes, written immediately below the exit-stub return address
-        // already at `sp` -- together they're the `[stack size, return
-        // address]` pair `pr_ReturnAddr` points at. See
-        // exectask::PR_RETURNADDR_OFFSET's doc for the full convention
-        // and why ixemul.library needs it.
-        let return_addr_footer = sp.wrapping_sub(4);
-        mem.write_u32(return_addr_footer, top - stack_base);
+        // The entry stack frame, in real AmigaOS's `RunCommand`
+        // layout (issues #178 and #279) -- ascending addresses:
+        //
+        //   top - 12  [return address]  <- initial sp
+        //   top -  8  [stack size]      <- pr_ReturnAddr
+        //   top -  4  [caller's stack pointer]
+        //
+        // i.e. the stack size sits *above* the return address the
+        // program's outermost `rts` lands on, and the initial `sp` is
+        // `pr_ReturnAddr - 4`. That ordering is load-bearing: vbcc's
+        // resident startup (`minres.o`) saves its data block at entry
+        // `sp - 4` and reads it back at `pr_ReturnAddr - 8` on exit,
+        // and `_geta4` finds the same block the same way, so a frame
+        // built the other way round makes it `FreeMem` whatever
+        // happened to be 8 bytes lower (issue #279). AROS's m68k
+        // `AOS_CallEntry` (`arch/m68k-all/dos/callentry.S`) builds
+        // exactly this: `move.l %a5,%sp@-` pushes the stack size,
+        // `move.l %sp,%a3@` stores that address into `pr_ReturnAddr`,
+        // and the following `jsr (%a4)` pushes the return address one
+        // longword below it.
+        //
+        // The top slot is the caller's stack pointer on real AmigaOS
+        // (the shell's own `SP`, which `RunCommand` restores from);
+        // this runtime has no guest-side caller -- the outermost `rts`
+        // lands on `EXIT_STUB_ADDR` and `Runtime::run` ends the
+        // program in host code -- so it stays `0`. It exists so
+        // `pr_ReturnAddr + 8` is the stack region's upper bound, the
+        // derivation `ixemul.library`'s startup uses (issue #178);
+        // see exectask::PR_RETURNADDR_OFFSET's doc for that side.
+        mem.write_u32(top.wrapping_sub(4), 0);
+        let return_addr_footer = top.wrapping_sub(8);
+        mem.write_u32(return_addr_footer, return_addr_footer - stack_base);
+        let sp = return_addr_footer.wrapping_sub(4);
+        mem.write_u32(sp, EXIT_STUB_ADDR);
 
         // dos.library state, created here (rather than at this
         // function's end, where it used to live) so its Input() handle
@@ -3055,14 +3080,14 @@ impl<C: Cpu + 'static> Runtime<C> {
         // the region entirely or poison live bytes.
         if let Some(shadow) = mem.shadow_mut() {
             shadow.begin_stack_tracking(stack_base, top, sp);
-            // The pr_ReturnAddr footer longword written above sits
-            // just below this initial `sp`, inside the range
-            // begin_stack_tracking just poisoned as dead below-SP
-            // space -- but it's real, permanent setup data a guest
-            // may legitimately read via pr_ReturnAddr, not a stale
-            // stack frame, so heal it back to Valid (same reasoning
-            // as a grace-band-forgiven push, just not a push).
-            shadow.mark_valid(return_addr_footer, 4);
+            // The pr_ReturnAddr frame written above (stack size,
+            // caller's stack pointer) sits *above* this initial `sp`,
+            // outside the range begin_stack_tracking just poisoned as
+            // dead below-SP space, so a guest reading it through
+            // pr_ReturnAddr -- as a real ixemul.library or vbcc
+            // `minres.o` startup does -- needs no healing here.
+            // Before issue #279 those two longwords lived below `sp`
+            // and did.
         }
 
         cpu.set_address_register(AddressRegister(6), DOS_LIBRARY_BASE);
@@ -4105,12 +4130,11 @@ mod tests {
 
     #[test]
     fn pr_return_addr_footer_survives_sanitizer_below_sp_poisoning() {
-        // Issue #178: the pr_ReturnAddr footer this runtime writes just
-        // below the initial sp (one longword: the reserved stack size)
-        // sits inside begin_stack_tracking's below-SP poisoned range.
-        // Reading it (as a real ixemul.library startup would, via
-        // pr_ReturnAddr) must not be flagged -- it's real, permanent
-        // setup data, not a stale stack frame.
+        // Issues #178 and #279: reading the pr_ReturnAddr entry frame
+        // (as a real ixemul.library or vbcc minres.o startup does)
+        // must not be flagged by the sanitizer. Since #279 the frame
+        // sits above the initial sp, outside begin_stack_tracking's
+        // below-SP poisoned range; before it, it needed healing.
         let mut mem = FlatMemory::new(0x2_0000);
         mem.enable_sanitizer();
         let entry = TRAP_TABLE_END;
