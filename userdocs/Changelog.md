@@ -3,6 +3,18 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.19.0](https://github.com/sidick/volamos/compare/v0.18.0...v0.19.0) (2026-11-11)
+
+
+### Features
+
+* **exec:** provide battclock.resource, backed by the host clock ([#283](https://github.com/sidick/volamos/issues/283)) ([dc3298b](https://github.com/sidick/volamos/commit/dc3298b9e5de8f0965e85e441e02513710d39d6c))
+
+
+### Bug Fixes
+
+* **dos:** build pr_ReturnAddr's entry frame in AmigaOS's order ([#280](https://github.com/sidick/volamos/issues/280)) ([a81f431](https://github.com/sidick/volamos/commit/a81f431e05e235e6433d5aafc658c3d91f72abe9))
+
 ## 0.18
 
 - **`PIPE:` channels implemented** — named pipe channels with blocking
