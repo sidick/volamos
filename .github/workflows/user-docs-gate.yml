@@ -1,0 +1,113 @@
+# Forces every release-triggering PR to make a decision about the
+# user-facing docs site, and to record it.
+#
+# A `fix:`/`feat:` PR that changes crates/** must either touch a page
+# under userdocs/, or say in its body why no page needed changing (a
+# `Docs:` line). Nothing more: this is a decision gate, not a
+# documentation quota. Plenty of real fixes have no surface a user
+# reads about -- PR #280's pr_ReturnAddr entry-frame layout, say -- and
+# a gate with no escape hatch would just teach us to write filler
+# paragraphs to get a green check.
+#
+# Why here and not only in CLAUDE.md: an instruction in CLAUDE.md
+# depends on whoever (or whatever) is driving the session remembering
+# it. This check doesn't. .claude/hooks/check-user-docs.sh raises the
+# same question mid-session, before a PR exists; this job is what
+# actually holds.
+#
+# userdocs/Changelog.md never counts as the docs change: release-please
+# owns that file and it is never hand-edited (see CLAUDE.md).
+#
+# Non-release types (docs, test, chore, refactor, perf, build, ci,
+# style, revert) are skipped entirely -- they don't ship behavior, so
+# there is nothing for a user to read about.
+#
+# pull_request_target (not pull_request), matching pr-title.yml: the
+# check needs the PR title/body and label list with a usable token on
+# fork PRs too. It never checks out or runs PR code -- only the API's
+# own metadata and file list.
+name: User docs
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    name: User docs decision
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code changes are matched by a docs decision
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          # Only fix:/feat: (with optional scope and breaking "!") ship
+          # user-visible behavior. Anything else: nothing to document.
+          if ! printf '%s' "$TITLE" | grep -Eq '^(fix|feat)(\([^)]*\))?!?:'; then
+            echo "::notice::'$TITLE' is not a fix:/feat: PR -- no user-docs decision needed."
+            exit 0
+          fi
+
+          gh pr view "$PR" --repo "$REPO" --json files,labels > pr.json
+          files=$(jq -r '.files[].path' pr.json)
+          labels=$(jq -r '.labels[].name' pr.json)
+
+          if ! printf '%s\n' "$files" | grep -q '^crates/'; then
+            echo "::notice::No crates/** changes -- no user-docs decision needed."
+            exit 0
+          fi
+
+          # userdocs/Changelog.md is release-please's file; it does not count.
+          if printf '%s\n' "$files" | grep '^userdocs/' | grep -qv '^userdocs/Changelog\.md$'; then
+            echo "User-facing docs changed alongside the code:"
+            printf '%s\n' "$files" | grep '^userdocs/' | grep -v '^userdocs/Changelog\.md$' | sed 's/^/  /'
+            exit 0
+          fi
+
+          if printf '%s\n' "$labels" | grep -qx 'no-user-docs'; then
+            echo "::notice::'no-user-docs' label set -- docs decision recorded on the PR."
+            exit 0
+          fi
+
+          # `Docs: <reason>` anywhere in the body, as its own line.
+          if printf '%s' "$BODY" | grep -Eq '^[[:space:]]*(\*\*)?Docs(\*\*)?:[[:space:]]*\S'; then
+            echo "Docs decision recorded in the PR body:"
+            printf '%s' "$BODY" | grep -E '^[[:space:]]*(\*\*)?Docs(\*\*)?:' | sed 's/^/  /'
+            exit 0
+          fi
+
+          cat <<'EOF'
+          This PR changes crates/** but no page under userdocs/ (Changelog.md
+          excluded -- release-please owns that file).
+          
+          Do one of these:
+          
+            * Update the page the change surfaces in:
+                CLI flags or arguments                 -> userdocs/CLI-Reference.md
+                library/handler coverage               -> userdocs/Supported-Libraries.md
+                volume, assign or path rules           -> userdocs/Volumes-and-Assigns.md
+                .volamos config keys                   -> userdocs/Configuration.md
+                a hardware-settled vamos disagreement  -> userdocs/Differences-from-vamos.md
+                a worked example worth showing         -> userdocs/Examples.md
+              (then run `mkdocs build --strict`, as CI does)
+          
+            * Or record that none applies, with a line in the PR body:
+                Docs: n/a -- internal pr_ReturnAddr frame layout, no user-visible surface
+          
+            * Or apply the `no-user-docs` label, which means the same thing.
+          
+          An internal fix with no user-visible surface is a perfectly good
+          answer -- this check only insists that the answer be made explicit.
+          EOF
+          echo "::error::crates/** changed with no userdocs/ change and no 'Docs:' line or 'no-user-docs' label -- see this step's log."
+          exit 1

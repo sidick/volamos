@@ -6,6 +6,30 @@ All changes land through pull requests against `main`; nothing is
 committed to `main` directly. PRs are **squash-merged**, with the PR
 title becoming the commit subject on `main`.
 
+## User-facing docs
+
+A `fix:`/`feat:` PR that changes `crates/**` has to settle one
+question: does this change something a user reads about? The `User
+docs decision` check (`.github/workflows/user-docs-gate.yml`) passes
+when the PR either
+
+* updates a page under `userdocs/` — see the table in `CLAUDE.md` for
+  which page covers what, and run `mkdocs build --strict` afterwards,
+  as CI does; or
+* records that none applies, as a `Docs:` line in the PR body (the PR
+  template has a slot for it) or the `no-user-docs` label.
+
+"No user-visible surface" is a perfectly good answer — an internal
+refactor of a trap-dispatch detail has nothing to document. The check
+exists so that is a stated decision rather than an omission. One
+exception worth naming: `userdocs/Changelog.md` never counts, because
+release-please writes it (see [Releases](#releases)) and it is never
+hand-edited.
+
+Claude Code sessions in this repo get the same reminder before they
+finish, via the `Stop` hook in `.claude/settings.json`
+(`.claude/hooks/check-user-docs.sh`).
+
 ## PR titles (Conventional Commits)
 
 Because [release-please](https://github.com/googleapis/release-please)

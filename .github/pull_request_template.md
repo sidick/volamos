@@ -16,5 +16,16 @@ Full details: CONTRIBUTING.md
 ## Summary
 
 
+## Docs
+
+<!--
+Required for fix:/feat: PRs that touch crates/** (the "User docs decision"
+check). Either list the userdocs/ page(s) you updated, or say why none
+applies, keeping the `Docs:` prefix -- that line is what the check looks
+for. userdocs/Changelog.md doesn't count: release-please owns it.
+-->
+
+Docs:
+
 ## Validation
 

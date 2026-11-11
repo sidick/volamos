@@ -21,3 +21,9 @@ __pycache__/
 # (Kickstart ROMs, etc. -- see assets/README.md); track the README only.
 /assets/*
 !/assets/README.md
+
+# .claude/ is committed now (the project's Claude Code settings and the
+# user-docs Stop hook), but these two are per-machine, not shared:
+# worktrees/ is scratch checkouts, settings.local.json personal overrides.
+/.claude/worktrees/
+/.claude/settings.local.json

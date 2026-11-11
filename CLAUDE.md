@@ -124,8 +124,29 @@ Program exit is the same mechanism: the initial stack's return address is
 - Unit tests live beside the implementation; end-to-end tests in the
   relevant crate's `tests/`. Name tests for the behavior or regression
   they demonstrate, and add regression coverage for every behavioral fix.
-- When the CLI surface changes, update `userdocs/CLI-Reference.md`; when
-  library coverage changes, `userdocs/Supported-Libraries.md`.
+- **The user docs are part of the change, not a follow-up.** Every
+  `fix:`/`feat:` PR that touches `crates/**` either updates a page under
+  `userdocs/` or states why none applies — don't leave the question
+  open. Map the change to its page:
+
+  | What changed | Page |
+  | --- | --- |
+  | CLI flags, arguments, exit behavior | `userdocs/CLI-Reference.md` |
+  | library/handler or device coverage | `userdocs/Supported-Libraries.md` |
+  | volume, assign or Amiga-path rules | `userdocs/Volumes-and-Assigns.md` |
+  | `.volamos` config keys or lookup order | `userdocs/Configuration.md` |
+  | a vamos disagreement hardware settled | `userdocs/Differences-from-vamos.md` |
+  | a worked invocation worth showing | `userdocs/Examples.md` |
+  | install/build/run surface | `userdocs/Installation.md`, `Building-from-Source.md`, `Getting-Started.md` |
+
+  Run `mkdocs build --strict` whenever `userdocs/` changes. An internal
+  fix with no user-visible surface is a legitimate answer — put it in
+  the PR body as a `Docs:` line (e.g. `Docs: n/a — internal
+  pr_ReturnAddr frame layout, no user-visible surface`) or apply the
+  `no-user-docs` label. The `User docs decision` CI check enforces
+  exactly that choice, and `.claude/hooks/check-user-docs.sh` raises it
+  mid-session. `userdocs/Changelog.md` is **never** the answer: it is
+  release-please's file and is never hand-edited.
 
 ## Commits and pull requests
 
