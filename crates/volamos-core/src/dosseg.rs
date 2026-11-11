@@ -292,7 +292,7 @@ use crate::dosfile::{
     map_io_error, map_vfs_error,
 };
 use crate::dospattern::ERROR_LINE_TOO_LONG;
-use crate::exectask::{PR_ARGUMENTS_OFFSET, TC_SPLOWER, TC_SPUPPER};
+use crate::exectask::{PR_ARGUMENTS_OFFSET, PR_RETURNADDR_OFFSET, TC_SPLOWER, TC_SPUPPER};
 use crate::guestmem::{
     GuestHeap, GuestHeapError, MIN_STACK_SIZE, addr_from_bptr, bptr_from_addr, read_c_string,
 };
@@ -1208,10 +1208,29 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let old_input_buf = std::mem::take(&mut ctx.dos.input_buf);
     let old_input_pos = ctx.dos.input_pos;
 
-    let entry_sp = stack_top & !3;
+    // The invoked command's entry frame, in the same
+    // `RunCommand`/`CallEntry` layout `Runtime::new` builds for a
+    // top-level run (see `exectask::PR_RETURNADDR_OFFSET`'s doc, and
+    // issue #279): the caller's stack pointer -- a real one here, this
+    // handler's own `A7` -- then the new stack's reserved size with
+    // `pr_ReturnAddr` pointing at it, then the return address one
+    // longword below, at the command's initial `sp`. That last
+    // longword is `CONTINUATION_STUB_ADDR`, pushed by the
+    // `trampoline` call below (which leaves `A7` one longword under
+    // `entry_sp` once the generic post-dispatch `rts` has popped the
+    // entry address off), so `entry_sp` itself is the size longword.
+    let frame_top = stack_top & !3;
+    ctx.mem.write_u32(frame_top.wrapping_sub(4), old_a7);
+    let entry_sp = frame_top.wrapping_sub(8);
+    ctx.mem.write_u32(entry_sp, entry_sp - stack_base);
     ctx.cpu.set_address_register(AddressRegister(7), entry_sp);
     ctx.mem.write_u32(task + TC_SPLOWER, stack_base);
     ctx.mem.write_u32(task + TC_SPUPPER, stack_top);
+    // pr_ReturnAddr: the child's own frame while it runs, the caller's
+    // again afterwards -- real RunCommand saves and restores it the
+    // same way.
+    let old_pr_return_addr = ctx.mem.read_u32(task + PR_RETURNADDR_OFFSET);
+    ctx.mem.write_u32(task + PR_RETURNADDR_OFFSET, entry_sp);
     // pr_Arguments (see StartConfig::entry's own setup in Runtime::new):
     // a guest startup may read this instead of (or in addition to)
     // A0/D0, so it has to describe the same buffer.
@@ -1251,6 +1270,8 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             ctx.cpu.set_address_register(AddressRegister(6), old_a6);
             ctx.mem.write_u32(task + TC_SPLOWER, old_sp_lower);
             ctx.mem.write_u32(task + TC_SPUPPER, old_sp_upper);
+            ctx.mem
+                .write_u32(task + PR_RETURNADDR_OFFSET, old_pr_return_addr);
             ctx.mem
                 .write_u32(task + PR_ARGUMENTS_OFFSET, old_pr_arguments);
             ctx.dos.input_buf = old_input_buf;
@@ -2301,6 +2322,90 @@ mod tests {
             b"CHILD_TOKEN",
             "the child's ReadArgs should parse the child's own command line from its start, \
              not wherever the parent's prior ReadArgs call left DosState::input_pos"
+        );
+    }
+
+    #[test]
+    fn run_command_child_gets_its_own_pr_return_addr_frame() {
+        // Issue #279, the RunCommand side: the command this handler
+        // invokes gets the same entry frame real RunCommand builds --
+        // stack size above the return address, pr_ReturnAddr pointing
+        // at it, the child's initial sp one longword below -- and
+        // pr_ReturnAddr is restored to the caller's afterwards. The
+        // child here is vbcc `minres.o`'s idiom: stash a marker at
+        // entry `sp - 4`, read it back at `pr_ReturnAddr - 8`, return
+        // it. Before this, the child read the *parent's* frame and got
+        // whatever happened to be 8 bytes under the main stack's top.
+        let tmp = TempDir::new("e2e-runcommand-returnaddr");
+
+        let mut child_words = vec![
+            0x2F3C, 0x0000, 0x4C4C, // move.l #0x4C4C,-(sp)
+            0x2C78, 0x0004, // movea.l (4).w,a6       ; ExecBase
+            0x206E, 0x0114, // movea.l 276(a6),a0     ; ThisTask
+            0x2068, 0x00B0, // movea.l 176(a0),a0     ; pr_ReturnAddr
+            0x2028, 0xFFF8, // move.l -8(a0),d0       ; the stashed marker
+            0x588F, // addq.l #4,sp
+        ];
+        child_words.push(RTS); // D0 = RunCommand's result
+
+        let mut words = Vec::new();
+        let name_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = "SYS:child" (patched below)
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -150); // LoadSeg(a6): D0 = BPTR
+        words.push(move_d0_to_d(1)); // D1 = seglist BPTR
+        words.push(move_imm_to_d(2)); // D2 = requested stack size
+        words.push(0);
+        words.push(8192);
+        words.push(move_imm_to_d(3)); // D3 = paramptr (none)
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(4)); // D4 = paramlen
+        words.push(0);
+        words.push(0);
+        push_jsr(&mut words, 6, -504); // RunCommand(a6): D0 = child's code
+        words.push(RTS); // exit code = what the child recovered
+
+        let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, name_idx, name_addr);
+        let name = b"SYS:child\0";
+
+        fs::write(tmp.path().join("child"), hunk_file_from_words(&child_words)).unwrap();
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(name_addr + i as u32, b);
+        }
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: name_addr + name.len() as u32,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(vfs_over(tmp.path()));
+        let main_task = rt.current_task();
+        let caller_pr_return_addr = rt
+            .memory()
+            .read_u32(main_task + crate::exectask::PR_RETURNADDR_OFFSET);
+
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(
+            code, 0x4C4C,
+            "the invoked command should recover its own stashed block \
+             through its own pr_ReturnAddr frame"
+        );
+        assert_eq!(
+            rt.memory()
+                .read_u32(main_task + crate::exectask::PR_RETURNADDR_OFFSET),
+            caller_pr_return_addr,
+            "RunCommand should restore the caller's pr_ReturnAddr"
         );
     }
 
