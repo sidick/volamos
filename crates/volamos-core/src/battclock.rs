@@ -86,6 +86,27 @@
 //! Each run starts with the offset at `0` (the chip agrees with the
 //! host); nothing persists across runs, as volamos is one process per
 //! invocation with no boot state to keep.
+//!
+//! # The simpler modelling, deliberately not taken
+//!
+//! A real clock is not the only honest answer here. Plenty of real
+//! Amigas -- a stock A500, A600 or A1200 -- have no battery-backed
+//! clock fitted at all, and the autodoc already says what the resource
+//! does then: "if the clock chip returns an invalid date, the clock
+//! chip is reset and 0 is returned". So always reporting `0` would be
+//! a legitimate implementation of this resource, not a stub, and
+//! guests have to cope with it regardless.
+//!
+//! That would also be enough for what prompted the resource: the gcc
+//! startup code needs `OpenResource` to *succeed*, and doesn't care
+//! what time comes back. A working clock is the better answer while it
+//! stays this cheap, and is what this module implements -- but if some
+//! future interaction (a timezone question, a `--clock-*` flag, the
+//! `TR_SETSYSTIME` asymmetry above) ever makes a live clock genuinely
+//! awkward, degrading to "no clock fitted" is a sanctioned
+//! simplification rather than a regression. It would change what
+//! guests see, so it belongs in `userdocs/Supported-Libraries.md` if
+//! it ever happens.
 
 use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{BATTCLOCK_RESOURCE_BASE, DispatchError, HandlerContext, LibraryTable};
