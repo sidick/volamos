@@ -97,8 +97,13 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// [`Cpu::take_hardware_exception`] entirely -- see that constant's doc
 /// for the full mechanism) lands on a clean trap instead of falling
 /// through the deliberately-zeroed exception-vector-table span into
-/// [`crate::dispatch::CONTINUATION_STUB_ADDR`] by accident.
-pub const TRAP_TABLE_SIZE: u32 = 0x2C04;
+/// [`crate::dispatch::CONTINUATION_STUB_ADDR`] by accident -- and
+/// finally once more from `0x2C04` for `battclock.resource`'s real base
+/// (see `crate::dispatch::BATTCLOCK_RESOURCE_BASE`), a `0x200` chunk
+/// like the library bases before it, which pushes those two
+/// end-anchored stubs (both defined relative to [`TRAP_TABLE_END`]) up
+/// with it.
+pub const TRAP_TABLE_SIZE: u32 = 0x2E04;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

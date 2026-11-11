@@ -670,11 +670,25 @@ fn rem_resource_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 /// `OpenResource` (LVO -498): `A1` = name. Returns the first
 /// `ResourceList` node with that (case-sensitive) name in `D0`, or `0`.
 /// A resource this runtime doesn't model (`misc.resource`, `cia.resource`,
-/// ...) is simply absent, so programs probing for one see `NULL`.
+/// ...) is simply absent, so programs probing for one see `NULL`;
+/// `battclock.resource` is on the list from startup (see
+/// [`crate::battclock`]), and a guest can `AddResource` its own.
+///
+/// Fills in `call_detail` either way, so `--snoop` shows resource opens
+/// alongside the library and file opens it already logs -- the gcc
+/// startup code opens resources from the same `__LIB_LIST__` walk as
+/// its libraries (issue #278), and a trace that showed only half of
+/// that walk would be a confusing thing to debug against.
 fn open_resource_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let name = read_c_string(ctx.mem, name_ptr);
     let node = find_name_impl(ctx.mem, RESOURCE_LIST_ADDR, &name);
+    let shown = String::from_utf8_lossy(&name).into_owned();
+    *ctx.call_detail = Some(if node == 0 {
+        format!("resource \"{shown}\" -> NOT FOUND")
+    } else {
+        format!("resource \"{shown}\" -> base {node:#010x}")
+    });
     ctx.cpu.set_data_register(DataRegister(0), node);
     Ok(())
 }

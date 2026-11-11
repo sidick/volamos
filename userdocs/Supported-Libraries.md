@@ -278,6 +278,36 @@ remaining duration first, so a timed wait still measures its real
 requested duration rather than resolving instantly.
 `WaitIO`/`CheckIO`/`AbortIO` all recognize a still-pending request.
 
+## battclock.resource
+
+The battery-backed clock chip, backed by the host clock — the one
+system *resource* on `ExecBase`'s resource list from startup, so
+`OpenResource("battclock.resource")` returns a real base:
+
+- `ReadBattClock()` — seconds since 1978-01-01, the same host clock
+  (and the same epoch) `DateStamp`/`GetSysTime` report, so the RTC and
+  the system clock never disagree.
+- `WriteBattClock(secs)` — sets the chip, which then keeps ticking from
+  there for the rest of the run. Like `SetClock SAVE` on real AmigaOS,
+  it doesn't change the system time, and nothing persists past the
+  invocation (volamos is one process per run, with no boot state).
+- `ResetBattClock()` — puts the chip back to 1978-01-01, per the NDK
+  autodoc.
+
+Other resources (`misc.resource`, `ciaa.resource`/`ciab.resource`,
+`disk.resource`, ...) are absent, so `OpenResource` returns `NULL` for
+them. The CIA resources in particular would mean emulating the CIA
+timers and interrupt wiring — see "Deliberately out of scope" below. A
+guest can still `AddResource` a resource of its own and find it again
+with `OpenResource`; `--snoop` logs every resource open alongside the
+library and file opens.
+
+Why this one matters in practice: the m68k-amigaos-gcc startup code
+opens every library *and resource* on `__LIB_LIST__` before `main()`,
+and the stock crt0 doesn't check the result — so a program that merely
+references `BattClockBase` used to jump through `NULL` and die before
+reaching `main`.
+
 ## Deliberately out of scope
 
 - **Real windowing/GUI** — no `Screen`/`Window`/`Gadget` model, no

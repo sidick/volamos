@@ -471,6 +471,23 @@ pub const MATHIEEESINGBAS_LIBRARY_BASE: u32 = 0x27B0;
 /// Deepest real LVO: `IEEESPLog10` at `-126`.
 pub const MATHIEEESINGTRANS_LIBRARY_BASE: u32 = 0x29B0;
 
+/// Real `battclock.resource` base address -- same chunked layout as
+/// [`MATHTRANS_LIBRARY_BASE`], in the `0x2C04`..`0x2E00` chunk past
+/// `SetFunction`'s stub pool (`crate::execsetfunc::STUB_POOL_BASE`,
+/// `0x2A00`..`0x2C00`) and the 4 bytes after it. A *resource* base,
+/// not a library or device one, but the same shape: guest code holds
+/// what `OpenResource` returned (`BattClockBase`, which NDK
+/// `proto/battclock.h` declares a `struct Library *`) and calls
+/// through its negative offsets. Its deepest LVO is `WriteBattClock`
+/// at `-18`, so the `0x1AC` bytes of negative-offset room here are
+/// enormous headroom; the `0x50` positive bytes hold
+/// [`write_library_node`]'s 34-byte header plus `crate::battclock`'s
+/// own private offset longword and the resource's `ln_Name` string.
+/// See [`crate::battclock`]'s module docs for the resource itself and
+/// why it is the one system resource volamos can provide without
+/// emulating hardware (issue #278).
+pub const BATTCLOCK_RESOURCE_BASE: u32 = 0x2DB0;
+
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
 /// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
@@ -499,7 +516,7 @@ pub const ABS_EXEC_BASE_ADDR: u32 = 4;
 /// `struct Node`'s `ln_Type` byte offset within `struct Library` (see
 /// [`write_library_node`]) -- `struct Node` is `ln_Succ`/`ln_Pred` (4
 /// bytes each) then `ln_Type`.
-const LIB_NODE_TYPE_OFFSET: u32 = 8;
+pub(crate) const LIB_NODE_TYPE_OFFSET: u32 = 8;
 /// `lib_Version`'s byte offset within `struct Library`: `struct Node`
 /// (14 bytes) + `lib_Flags`/`lib_pad` (1 each) + `lib_NegSize`/
 /// `lib_PosSize` (2 each) = 20.
@@ -536,7 +553,7 @@ const LIBRARY_REVISION: u16 = 10;
 /// meaningful to put there. The `Node` link pointers (`ln_Succ`/
 /// `ln_Pred`) are filled in separately, by [`write_library_list_nodes`],
 /// once this base has actually been linked onto `ExecBase.LibList`.
-fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
+pub(crate) fn write_library_node(mem: &mut dyn AddressSpace, base: u32) {
     for i in 0..LIB_STRUCT_SIZE {
         mem.write_u8(base.wrapping_add(i), 0);
     }
@@ -2773,6 +2790,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         // docs.
         crate::graphics::register_graphics_handlers(&mut table, &mut mem);
 
+        // battclock.resource's three vectors (ResetBattClock/
+        // ReadBattClock/WriteBattClock) -- see crate::battclock's
+        // module docs. The resource node itself is installed further
+        // down, once ExecBase's ResourceList header exists.
+        crate::battclock::register_battclock_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -2895,6 +2918,14 @@ impl<C: Cpu + 'static> Runtime<C> {
             &mut mem,
             EXEC_LIBRARY_BASE + EXEC_BASE_RESOURCELIST_OFFSET,
         );
+        // battclock.resource, on the resource list just initialized
+        // (issue #278): the one system resource this runtime can
+        // provide without emulating any hardware, since it is a clock
+        // and volamos already has one. See crate::battclock's module
+        // docs -- including why the gcc/libstubs startup code makes
+        // this the difference between a program running and dying
+        // before main().
+        crate::battclock::install_battclock_resource(&mut mem);
         crate::execlist::init_list_header(
             &mut mem,
             EXEC_LIBRARY_BASE + EXEC_BASE_SEMAPHORELIST_OFFSET,

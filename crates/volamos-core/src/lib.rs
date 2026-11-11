@@ -10,6 +10,7 @@
 //! ([`cpu`], [`memory`]); no concrete m68k emulator is integrated yet.
 
 pub mod backend;
+pub mod battclock;
 pub mod bsdsocket;
 pub mod cpu;
 pub mod dispatch;
