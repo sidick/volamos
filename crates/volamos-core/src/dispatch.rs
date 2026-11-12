@@ -3571,6 +3571,16 @@ impl<C: Cpu + 'static> Runtime<C> {
         Some((self.cpu.emulated_instructions(), reads, writes))
     }
 
+    /// What `--mem-wait`'s modeled data cache observed (issue #148) --
+    /// modeled data cache (issue #148), or `None` when no model is
+    /// installed. Reported next to the cycle count because the hit rate
+    /// is what says *why* a run cost what it did: the same loop over a
+    /// working set that fits the cache and one that doesn't differ in
+    /// nothing else.
+    pub fn mem_timing_counts(&self) -> Option<crate::memory::MemTimingCounts> {
+        self.mem.mem_timing_counts()
+    }
+
     /// Native library-handler dispatch counts (`("library/handler",
     /// count)`, descending) and the total bytes `CopyMem`/`CopyMemQuick`
     /// were asked to copy, over the same top-level-run-only span as
