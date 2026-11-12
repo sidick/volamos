@@ -102,8 +102,11 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// (see `crate::dispatch::BATTCLOCK_RESOURCE_BASE`), a `0x200` chunk
 /// like the library bases before it, which pushes those two
 /// end-anchored stubs (both defined relative to [`TRAP_TABLE_END`]) up
-/// with it.
-pub const TRAP_TABLE_SIZE: u32 = 0x2E04;
+/// with it, and once more from `0x2E04` for `expansion.library`'s real
+/// base (see `crate::dispatch::EXPANSION_LIBRARY_BASE`) -- whose
+/// `struct ExpansionBase` is the largest header this runtime builds, so
+/// its base sits lower in its chunk than the others' do.
+pub const TRAP_TABLE_SIZE: u32 = 0x3004;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this
@@ -1042,6 +1045,17 @@ mod tests {
 
     /// A fresh CPU with its PC set just past the reserved trap table, and
     /// A7 set to the top of memory.
+    /// Guest memory for the tests below, big enough to hold the
+    /// reserved trap-table region plus room for code and data above it.
+    /// Derived from [`TRAP_TABLE_END`] rather than written as a literal:
+    /// the region has grown eight times as libraries were added (see
+    /// `TRAP_TABLE_SIZE`'s doc), and a hardcoded size silently becomes
+    /// *smaller* than the region, at which point every test here
+    /// executes past the end of memory and fails for a reason that has
+    /// nothing to do with what it is testing. Found when
+    /// `expansion.library`'s chunk pushed the region past `0x3000`.
+    const TEST_MEM_SIZE: usize = TRAP_TABLE_END as usize + 0x2000;
+
     fn new_cpu_with_memory(size: usize) -> (M68kCpu, FlatMemory) {
         let mem = FlatMemory::new(size);
         let mut cpu = M68kCpu::new();
@@ -1072,7 +1086,7 @@ mod tests {
         // uninitialized read once --sanitize-uninit (report_uninit) is
         // on, since the value is discarded and the byte is about to
         // become Valid anyway.
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         let start = cpu.pc();
         // 0x4290: CLR.L (A0)
         load_words(&mut mem, start, &[0x4290]);
@@ -1099,7 +1113,7 @@ mod tests {
         // The exemption above is specifically for Uninit, not
         // Unaddressable: CLR through a genuinely bad pointer (e.g. a
         // use-after-free) is a real bug it must not hide.
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         let start = cpu.pc();
         load_words(&mut mem, start, &[0x4290]); // CLR.L (A0)
         let dest = 0x2000u32;
@@ -1134,7 +1148,7 @@ mod tests {
     fn movem_restore_violations(
         prepare: impl FnOnce(&mut crate::sanitize::ShadowMap),
     ) -> Vec<crate::sanitize::Violation> {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         let start = cpu.pc();
         // 0x4CD8 0x0003: MOVEM.L (A0)+,D0-D1
         load_words(&mut mem, start, &[0x4CD8, 0x0003]);
@@ -1187,7 +1201,7 @@ mod tests {
 
     #[test]
     fn moveq_sets_data_register_and_advances_pc() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         let start = cpu.pc();
         // 0x7005: MOVEQ.L #5, D0
         load_words(&mut mem, start, &[0x7005]);
@@ -1201,7 +1215,7 @@ mod tests {
 
     #[test]
     fn nop_advances_pc_without_changing_registers() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         let start = cpu.pc();
         // 0x4E71: NOP
         load_words(&mut mem, start, &[0x4E71]);
@@ -1216,7 +1230,7 @@ mod tests {
 
     #[test]
     fn trap_instruction_surfaces_as_stop_reason_trap() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         let start = cpu.pc();
         // 0x4E40: TRAP #0
         load_words(&mut mem, start, &[0x4E40]);
@@ -1244,7 +1258,7 @@ mod tests {
         // M68kCpu::with_config's doc comment.
         let mut cpu = M68kCpu::with_config(CpuType::M68000, true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
         load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
 
         let reason = cpu.step(&mut mem);
@@ -1265,7 +1279,7 @@ mod tests {
     fn with_config_68020_with_no_fpu_traps_fline() {
         let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
         load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
 
         let reason = cpu.step(&mut mem);
@@ -1286,7 +1300,7 @@ mod tests {
     fn with_config_68020_with_fpu_does_not_trap_fline() {
         let mut cpu = M68kCpu::with_config(CpuType::M68020, true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
         load_words(&mut mem, TRAP_TABLE_END, &[0xF200, 0x0000]);
 
         let reason = cpu.step(&mut mem);
@@ -1333,8 +1347,8 @@ mod tests {
         // silicon.
         let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
-        cpu.set_address_register(AddressRegister(7), 0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
+        cpu.set_address_register(AddressRegister(7), TEST_MEM_SIZE as u32);
         // Displacement word (0) immediately follows the opcode; MOVEP
         // traps before ever reading it, so its value doesn't matter.
         load_words(&mut mem, TRAP_TABLE_END, &[MOVEP_L_MEM_TO_D0, 0x0000]);
@@ -1369,8 +1383,8 @@ mod tests {
         let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
         cpu.set_emulate_unimplemented_060(true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
-        cpu.set_address_register(AddressRegister(7), 0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
+        cpu.set_address_register(AddressRegister(7), TEST_MEM_SIZE as u32);
         let start = cpu.pc();
         load_words(&mut mem, start, &[MOVEP_L_MEM_TO_D0, 0x0000]);
         // A0 points at a scratch area well past the loaded opcode/
@@ -1433,8 +1447,8 @@ mod tests {
         // equivalent is) -- see that method's doc.
         let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
-        cpu.set_address_register(AddressRegister(7), 0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
+        cpu.set_address_register(AddressRegister(7), TEST_MEM_SIZE as u32);
         load_words(&mut mem, TRAP_TABLE_END, &FINT_FP0_TO_FP1);
 
         cpu.step(&mut mem);
@@ -1456,8 +1470,8 @@ mod tests {
         let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
         cpu.set_emulate_unimplemented_040(false);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
-        cpu.set_address_register(AddressRegister(7), 0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
+        cpu.set_address_register(AddressRegister(7), TEST_MEM_SIZE as u32);
         load_words(&mut mem, TRAP_TABLE_END, &FINT_FP0_TO_FP1);
 
         cpu.step(&mut mem);
@@ -1481,8 +1495,8 @@ mod tests {
         let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
         cpu.set_emulate_unimplemented_040(true);
         cpu.set_pc(TRAP_TABLE_END);
-        let mut mem = FlatMemory::new(0x3000);
-        cpu.set_address_register(AddressRegister(7), 0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
+        cpu.set_address_register(AddressRegister(7), TEST_MEM_SIZE as u32);
         load_words(&mut mem, TRAP_TABLE_END, &FINT_FP0_TO_FP1);
 
         cpu.step(&mut mem);
@@ -1496,7 +1510,7 @@ mod tests {
 
     #[test]
     fn aline_opcode_surfaces_as_stop_reason_trap_with_pc_of_trapping_instruction() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         // 0x7007: MOVEQ.L #7, D0 (step 1, just to move PC off the reset value)
         // 0xA000: A-line trap opcode (library jump-table style vector)
         let start = cpu.pc();
@@ -1520,14 +1534,14 @@ mod tests {
 
     #[test]
     fn address_register_roundtrip() {
-        let (mut cpu, _mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, _mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         cpu.set_address_register(AddressRegister(3), 0xDEAD_BEEF);
         assert_eq!(cpu.address_register(AddressRegister(3)), 0xDEAD_BEEF);
     }
 
     #[test]
     fn status_register_roundtrip() {
-        let (mut cpu, _mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, _mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         cpu.set_sr(0x2700);
         assert_eq!(cpu.sr(), 0x2700);
     }
@@ -1544,7 +1558,7 @@ mod tests {
         // only stop if it happened to wrap back around onto something
         // that traps -- reporting a misleading address far from the real
         // bug. `Cpu::run` must catch this immediately instead.
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         cpu.set_pc(0xFFFF_FFD1);
 
         let reason = cpu.run(&mut mem);
@@ -1554,7 +1568,7 @@ mod tests {
 
     #[test]
     fn jit_mode_also_reports_pc_out_of_bounds() {
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         cpu.set_jit(true);
         cpu.set_pc(0xFFFF_FFD1);
 
@@ -1579,13 +1593,13 @@ mod tests {
             0xA000, // A-line trap: stop here
         ];
 
-        let mut interp_mem = FlatMemory::new(0x3000);
+        let mut interp_mem = FlatMemory::new(TEST_MEM_SIZE);
         load_words(&mut interp_mem, TRAP_TABLE_END, words);
         let mut interp_cpu = M68kCpu::new();
         interp_cpu.set_pc(TRAP_TABLE_END);
         let interp_reason = interp_cpu.run(&mut interp_mem);
 
-        let mut jit_mem = FlatMemory::new(0x3000);
+        let mut jit_mem = FlatMemory::new(TEST_MEM_SIZE);
         load_words(&mut jit_mem, TRAP_TABLE_END, words);
         let mut jit_cpu = M68kCpu::new();
         jit_cpu.set_jit(true);
@@ -1661,7 +1675,7 @@ mod tests {
         // requirement from issue #102. set_clock_mhz(None) (the same
         // thing M68kCpu::new()/with_config() already leave it at) must
         // not, on its own, start counting cycles.
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         cpu.set_clock_mhz(None);
         let start = cpu.pc();
         // MOVEQ.L #5, D0, then an A-line trap so `run` (which executes
@@ -1701,7 +1715,7 @@ mod tests {
             0x51C8, 0xFFFC, // DBRA D0, loop (disp = -4)
             0xA000, // A-line trap: stop here
         ];
-        let mut mem = FlatMemory::new(0x3000);
+        let mut mem = FlatMemory::new(TEST_MEM_SIZE);
         load_words(&mut mem, TRAP_TABLE_END, words);
         let mut cpu = M68kCpu::new();
         cpu.set_clock_mhz(Some(25.0));
@@ -1732,7 +1746,7 @@ mod tests {
     fn clock_mhz_mode_also_reports_pc_out_of_bounds() {
         // Same guarantee as jit_mode_also_reports_pc_out_of_bounds above,
         // for the third execution path Cpu::run can now take.
-        let (mut cpu, mut mem) = new_cpu_with_memory(0x3000);
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
         cpu.set_clock_mhz(Some(7.0));
         cpu.set_pc(0xFFFF_FFD1);
 
