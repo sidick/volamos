@@ -770,10 +770,10 @@ struct Cli {
                       cache hit/miss to affect. Also currently a no-op on --cpu 68040 for a \
                       different reason: the m68k crate's 68040 timing model doesn't consult \
                       cache state at all yet (only 68020/68030/68060 do), so --cache changes \
-                      nothing measurable there besides CacheClearU/CacheClearE bookkeeping. \
-                      Data-cache and memory-wait-state modeling are out of scope here -- the \
-                      Data-cache and memory-latency modeling live behind --mem-wait, \
-                      which does not need a crate-side hook (volamos owns the cycle total)."
+                      nothing measurable there besides CacheClearU/CacheClearE bookkeeping \
+                      (tracked as issue #158, filed upstream as benletchford/m68k-rs#234). \
+                      Models instruction fetches only: data-cache and memory-latency modeling \
+                      live behind --mem-wait."
     )]
     cache: bool,
 
@@ -790,7 +790,8 @@ struct Cli {
                       Copperline's accelprobe -- a3640 (motherboard RAM: 32.6 clocks per read \
                       line fill, 9.2 per write), zorro3 (53.3/13.1) or chip (85.4/21.4) -- or \
                       your own clocks as READ or READ,WRITE (e.g. 32.6,9.2). The data cache is \
-                      sized by --cpu (256 bytes on 68030, 4096 on 68040/68060; the 68020 has \
+                      sized by --cpu (256 bytes on 68030, 4096 on 68040, 8192 on 68060 -- \
+                      each part's real size; the 68020 has \
                       none, so every read is a bus access there, as on the real part), \
                       direct-mapped with 16-byte lines, write-through, and flushed by \
                       CacheClearU/CacheClearE alongside --cache's instruction cache. Reads are \
@@ -1355,10 +1356,22 @@ fn parse_mem_wait(raw: &str) -> Result<(f64, f64), String> {
 ///
 /// `0` is a real answer, not "off": the 68020 has an instruction cache
 /// and **no** data cache, so every data read on one really is a bus
-/// access, and the 68000/68010 have neither. Only the 68030 (256-byte
-/// data cache, separate from its same-sized instruction cache) and the
-/// 68040/68060 (4 KB, which this models as direct-mapped and
-/// write-through -- see `MemTimingModel`) have one to model.
+/// access, and the 68000/68010 have neither. The parts that do have
+/// one get their real size -- 256 bytes on the 68030 (separate from
+/// its same-sized instruction cache), 4 KiB on the 68040, 8 KiB on the
+/// 68060 -- because size is the parameter that decides whether a given
+/// working set fits, which is the entire question `--mem-wait` exists
+/// to answer: modeling 4 KiB on a part with 8 would report thrashing
+/// where real silicon holds the data.
+///
+/// The *organization* is still simplified (direct-mapped and
+/// write-through, where both parts are 4-way and copyback -- see
+/// `MemTimingModel`), and note that [`icache_size_for_cpu`] keeps
+/// issue #148's proposed 4 KiB for the 68060's instruction cache,
+/// which is likewise 8 KiB on the real part; its doc owns that as a
+/// deliberate simplification, and changing it would move existing
+/// `--cache` numbers, so it is left for a follow-up rather than
+/// quietly altered here.
 ///
 /// Unlike [`icache_size_for_cpu`] this never returns `None`: a part
 /// with no data cache still pays for its memory accesses, which is
@@ -1366,7 +1379,8 @@ fn parse_mem_wait(raw: &str) -> Result<(f64, f64), String> {
 fn dcache_size_for_cpu(cpu_type: CpuType) -> u32 {
     match cpu_type {
         CpuType::M68EC030 | CpuType::M68030 => 256,
-        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => 4096,
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => 4096,
+        CpuType::M68060 => 8192,
         CpuType::M68000 | CpuType::M68010 | CpuType::M68EC020 | CpuType::M68020 => 0,
         // As `icache_size_for_cpu`: `CpuType` is the crate's, so it can
         // grow a variant without this match knowing.
@@ -2619,8 +2633,8 @@ fn report_emulated_cycles<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime
     {
         eprintln!("volamos: {line}");
     }
-    if let Some((fills, hits, writes)) = runtime.mem_timing_counts()
-        && let Some(line) = format_mem_timing(fills, hits, writes)
+    if let Some((reads, fills, hits, writes)) = runtime.mem_timing_counts()
+        && let Some(line) = format_mem_timing(reads, fills, hits, writes)
     {
         eprintln!("volamos: {line}");
     }
@@ -2731,21 +2745,26 @@ fn format_emulated_work(cycles: u64, instructions: u64, reads: u64, writes: u64)
 ///
 /// `None` when the model saw no data access at all: nothing happened
 /// worth a line, and 0/0 would print a `NaN` hit rate.
-fn format_mem_timing(fills: u64, hits: u64, writes: u64) -> Option<String> {
-    let reads = fills.saturating_add(hits);
+fn format_mem_timing(reads: u64, fills: u64, hits: u64, writes: u64) -> Option<String> {
     if reads == 0 && writes == 0 {
         return None;
     }
-    let rate = if reads == 0 {
+    // The hit rate is over *lines*, which is what residency is tracked
+    // per and what the charge is billed per -- not over `reads`, which
+    // is per access (see `FlatMemory::mem_timing_counts`). Spelled
+    // "cache lines" in the line itself so the two counts can't be
+    // mistaken for the same thing.
+    let lines = fills.saturating_add(hits);
+    let rate = if lines == 0 {
         // Writes only (write-through, so they never consult residency):
         // there is no read hit rate to report.
         String::new()
     } else {
-        format!(" ({:.1}% hit)", hits as f64 * 100.0 / reads as f64)
+        format!(" ({:.1}% hit)", hits as f64 * 100.0 / lines as f64)
     };
     Some(format!(
-        "modeled memory: {reads} data reads -- {hits} cache hits, {fills} line fills{rate} -- \
-         and {writes} writes"
+        "modeled memory: {reads} data reads touching {lines} cache lines -- {hits} hits, \
+         {fills} line fills{rate} -- and {writes} writes"
     ))
 }
 
@@ -3636,7 +3655,8 @@ mod tests {
         assert_eq!(dcache_size_for_cpu(CpuType::M68040), 4096);
         assert_eq!(dcache_size_for_cpu(CpuType::M68LC040), 4096);
         assert_eq!(dcache_size_for_cpu(CpuType::M68EC040), 4096);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68060), 4096);
+        // 8 KiB on the real 68060, not the 68040's 4 -- see the fn's doc.
+        assert_eq!(dcache_size_for_cpu(CpuType::M68060), 8192);
     }
 
     #[test]
@@ -3659,14 +3679,22 @@ mod tests {
 
     #[test]
     fn format_mem_timing_reports_the_hit_rate() {
-        let line = format_mem_timing(1, 3, 2).expect("some traffic");
+        let line = format_mem_timing(4, 1, 3, 2).expect("some traffic");
         assert!(line.contains("4 data reads"), "{line}");
+        assert!(line.contains("4 cache lines"), "{line}");
         assert!(line.contains("75.0% hit"), "{line}");
         assert!(line.contains("2 writes"), "{line}");
+        // Reads and lines are distinct counts: one unaligned read can
+        // touch two lines, and the line must not conflate them.
+        let unaligned = format_mem_timing(1, 2, 0, 0).expect("some traffic");
+        assert!(
+            unaligned.contains("1 data reads touching 2 cache lines"),
+            "{unaligned}"
+        );
         // No data traffic at all: nothing to say, and no NaN hit rate.
-        assert_eq!(format_mem_timing(0, 0, 0), None);
+        assert_eq!(format_mem_timing(0, 0, 0, 0), None);
         // Writes only: no read hit rate to report.
-        let writes_only = format_mem_timing(0, 0, 5).expect("writes happened");
+        let writes_only = format_mem_timing(0, 0, 0, 5).expect("writes happened");
         assert!(!writes_only.contains("hit)"), "{writes_only}");
     }
 

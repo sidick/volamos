@@ -1035,21 +1035,30 @@ fn cache_control_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// [`cache_control_handler`]'s doc), so this stays a genuine no-op in
 /// that case; with `--cache` (issue #148) it invalidates the modeled
 /// instruction cache (`AddressSpace::invalidate_icache`, a no-op of
-/// its own when no cache is installed) -- a real data cache is not
-/// modeled at all yet, so there is nothing else for this to flush
-/// either way. Found running the real SAS/C `sc` compiler's
+/// its own when no cache is installed), and with `--mem-wait` the
+/// modeled data cache too (`AddressSpace::invalidate_dcache`) -- this
+/// is the *unified* clear, so it flushes both, as the real one does.
+/// Found running the real SAS/C `sc` compiler's
 /// `sc1.library`, which calls this immediately after its own
 /// disk-library init code runs.
 fn cache_clear_u_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.mem.invalidate_icache();
+    ctx.mem.invalidate_dcache();
     Ok(())
 }
 
-/// `CACRF_ClearI` (`exec/execbase.h`): "Clear instruction cache" --
-/// the only bit of `CacheClearE`'s `caches` parameter this runtime
-/// acts on (see that handler's doc for why `CACRF_ClearD` has nothing
-/// to do without a modeled data cache).
+/// `CACRF_ClearI` (`exec/execbase.h`): "Clear instruction cache".
 const CACRF_CLEAR_I: u32 = 1 << 3;
+
+/// `CACRF_ClearD` (`exec/execbase.h`, `(1UL<<11)`): "Clear data
+/// cache". Acted on since `--mem-wait` gave this runtime a data cache
+/// to clear (issue #148) -- and acted on *independently* of
+/// [`CACRF_CLEAR_I`], because the documented reason a guest clears one
+/// and not the other is that it means one and not the other: after a
+/// DMA transfer or a buffer rewrite it clears `D`, after building code
+/// it clears `I`. Flushing the wrong model would silently change
+/// `--clock-mhz` timings for a guest that asked correctly.
+const CACRF_CLEAR_D: u32 = 1 << 11;
 
 /// `exec.library`'s `CacheClearE` (LVO -642: `A0` = `address`, `D0` =
 /// `length`, `D1` = `caches`, `void`): the range-qualified sibling of
@@ -1063,12 +1072,18 @@ const CACRF_CLEAR_I: u32 = 1 << 3;
 /// note), and [`AddressSpace::invalidate_icache`] always clears
 /// everything for the same reason (see its own doc) -- there is no
 /// cached *data* to lose by over-invalidating, only hit/miss timing to
-/// reset. Only `caches`' [`CACRF_CLEAR_I`] bit matters: this runtime
-/// has no data cache to act on `CACRF_ClearD` for.
+/// reset. `caches`' [`CACRF_CLEAR_I`] and [`CACRF_CLEAR_D`] bits are
+/// honored separately -- see `CACRF_CLEAR_D`'s doc -- so a guest that
+/// clears only the data cache keeps its modeled instruction-cache
+/// residency, and vice versa. A `caches` of `0` does nothing, as on
+/// real hardware.
 fn cache_clear_e_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let caches = ctx.cpu.data_register(DataRegister(1));
     if caches & CACRF_CLEAR_I != 0 {
         ctx.mem.invalidate_icache();
+    }
+    if caches & CACRF_CLEAR_D != 0 {
+        ctx.mem.invalidate_dcache();
     }
     Ok(())
 }
@@ -2018,11 +2033,115 @@ mod tests {
         );
     }
 
+    /// Builds a `CacheClearE(0x12345678, 64, caches)` program.
+    fn cache_clear_e_program(caches: u16) -> Vec<u16> {
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.push(move_imm_to_a(0)); // A0 = address (ignored)
+        words.push(0x1234);
+        words.push(0x5678);
+        words.push(move_imm_to_d(0)); // D0 = length (ignored)
+        words.push(0);
+        words.push(64);
+        words.push(move_imm_to_d(1)); // D1 = caches
+        words.push(0);
+        words.push(caches);
+        words.extend_from_slice(&jsr_disp16_a6(-642)); // CacheClearE(a6)
+        words.push(RTS);
+        words
+    }
+
     #[test]
-    fn cache_clear_e_only_acts_on_cacrf_clear_i_in_its_caches_argument() {
-        // D1 = 3 (CACRF_EnableI | CACRF_FreezeI, neither of them
-        // CACRF_ClearI) must not invalidate anything -- only bit 3
-        // (CACRF_ClearI) does, per cache_clear_e_handler's doc.
+    fn cache_clear_e_with_cacrf_clear_d_flushes_only_the_data_cache() {
+        // CACRF_ClearD (1<<11) is what a guest issues after a DMA
+        // transfer or a buffer rewrite. It must flush --mem-wait's
+        // modeled data cache -- routing the data flush through
+        // invalidate_icache would have missed this entirely -- and must
+        // leave --cache's instruction-cache residency alone.
+        let mut rt = runtime_with_program(&cache_clear_e_program(1 << 11));
+        rt.memory_mut().enable_icache(16);
+        rt.memory_mut().enable_mem_timing(4096, 32.6, 9.2);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        rt.memory_mut().count_read(0, 4);
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        rt.memory_mut().count_read(0, 4);
+        let (_reads, fills, hits, _writes) = rt
+            .memory()
+            .mem_timing_counts()
+            .expect("--mem-wait model installed");
+        assert_eq!(
+            (fills, hits),
+            (2, 0),
+            "CACRF_ClearD must have flushed the data line, so this refills"
+        );
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(
+            rt.memory().icache_last_fetch_was_cached(),
+            "CACRF_ClearD must not flush the instruction cache"
+        );
+    }
+
+    #[test]
+    fn cache_clear_e_with_cacrf_clear_i_leaves_the_data_cache_warm() {
+        // The other half of the same separation: clearing the
+        // instruction cache after building code must not throw away
+        // data residency, which would silently change --clock-mhz
+        // timings for a guest that asked correctly.
+        let mut rt = runtime_with_program(&cache_clear_e_program(1 << 3));
+        rt.memory_mut().enable_mem_timing(4096, 32.6, 9.2);
+        rt.memory_mut().count_read(0, 4);
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        rt.memory_mut().count_read(0, 4);
+        let (_reads, fills, hits, _writes) = rt
+            .memory()
+            .mem_timing_counts()
+            .expect("--mem-wait model installed");
+        assert_eq!(
+            (fills, hits),
+            (1, 1),
+            "the data line must still be resident"
+        );
+    }
+
+    #[test]
+    fn cache_clear_u_flushes_both_caches() {
+        // The unified clear, as on real hardware.
+        let mut words = movea_exec_base_to_a6().to_vec();
+        words.extend_from_slice(&jsr_disp16_a6(-636)); // CacheClearU(a6)
+        words.push(RTS);
+        let mut rt = runtime_with_program(&words);
+        rt.memory_mut().enable_icache(16);
+        rt.memory_mut().enable_mem_timing(4096, 32.6, 9.2);
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        rt.memory_mut().count_read(0, 4);
+
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+
+        rt.memory_mut().count_read(0, 4);
+        let (_reads, fills, _hits, _writes) = rt
+            .memory()
+            .mem_timing_counts()
+            .expect("--mem-wait model installed");
+        assert_eq!(fills, 2, "data cache flushed");
+        rt.memory_mut().icache_note_instruction_fetch(0, 2);
+        assert!(
+            !rt.memory().icache_last_fetch_was_cached(),
+            "instruction cache flushed"
+        );
+    }
+
+    #[test]
+    fn cache_clear_e_ignores_caches_bits_that_are_not_clear_requests() {
+        // D1 = 3 (CACRF_EnableI | CACRF_FreezeI, neither of them a
+        // clear request) must not invalidate anything -- only
+        // CACRF_ClearI (1<<3) and CACRF_ClearD (1<<11) do, per
+        // cache_clear_e_handler's doc.
         let mut words = movea_exec_base_to_a6().to_vec();
         words.push(move_imm_to_a(0)); // A0 = address (ignored either way)
         words.push(0x1234);

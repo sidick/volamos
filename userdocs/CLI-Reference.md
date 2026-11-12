@@ -618,7 +618,7 @@ different timings:
 
 ```
 volamos: 1153860 emulated cycles, 0.046154 s at 25 MHz
-volamos: modeled memory: 67275 data reads — 50757 cache hits, 16518 line fills (75.4% hit) — and 1523 writes
+volamos: modeled memory: 65536 data reads touching 67275 cache lines — 50757 hits, 16518 line fills (75.4% hit) — and 1523 writes
 ```
 
 ### The model
@@ -636,10 +636,23 @@ volamos: modeled memory: 67275 data reads — 50757 cache hits, 16518 line fills
   stride, i.e. one full line fill per read, so charging them per *access*
   would overcharge ordinary sequential code about fourfold. Four
   consecutive longword reads share one line and cost one fill.
-- **Flushed by `CacheClearU`/`CacheClearE`**, alongside `--cache`'s
-  instruction cache.
+- **Flushed by `CacheClearU`** (the unified clear, which flushes both
+  caches) **and by `CacheClearE` with `CACRF_ClearD`**. The two bits are
+  honored separately, so a guest clearing only its data cache after a
+  DMA transfer keeps `--cache`'s instruction-cache residency, and a
+  guest clearing only `CACRF_ClearI` after building code keeps its data
+  lines.
 - **Fractional clocks accumulate** rather than truncating per access, so
   a long run does not drift low by up to 2%.
+- **The charge is additive**, on top of the cycles the CPU timing model
+  already bills for the access. That model assumes zero wait states but
+  isn't free — a cache-hit load costs a clock or two — while the
+  measured figure is the whole cost of the access on real silicon. So a
+  line fill is billed roughly 1–2 clocks high out of 32.6 (about 5%),
+  biasing `--mem-wait` numbers slightly against memory. Subtracting a
+  nominal hit cost would need a per-CPU figure the `m68k` crate doesn't
+  expose, and a fixed-direction bias largely cancels in the A/B
+  comparisons this is for.
 
 Two things it deliberately doesn't do:
 
