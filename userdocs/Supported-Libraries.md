@@ -277,6 +277,12 @@ progress first — fired early by actually sleeping out the real
 remaining duration first, so a timed wait still measures its real
 requested duration rather than resolving instantly.
 `WaitIO`/`CheckIO`/`AbortIO` all recognize a still-pending request.
+A synchronous `DoIO(TR_ADDREQUEST)` suspends only the calling task,
+as `Delay()` does: the other tasks run until its time is up, measured
+in microseconds, and a request that is due at once (`{0, 0}`) still
+gives them a turn. Like `Delay()`, that relies on the other tasks
+making library calls: volamos doesn't preempt, so a task that
+busy-waits on memory without one keeps the CPU.
 
 ## battclock.resource
 
