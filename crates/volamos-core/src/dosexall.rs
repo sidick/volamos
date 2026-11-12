@@ -212,7 +212,11 @@ impl DosState {
             }
             let entry_path = host_path.join(name);
             let meta = std::fs::metadata(&entry_path).map_err(|e| map_io_error(&e))?;
-            let sidecar = dosmeta::read_sidecar(&entry_path).unwrap_or_default();
+            // ED_DATE below comes from this, so the host mtime has to be
+            // the fallback or an ExAll scan reports 01-Jan-78 for every
+            // entry while ExNext on the same directory shows real dates
+            // (issue #287; the inconsistency was found in review).
+            let sidecar = dosmeta::read_or_host_date(&entry_path);
             let comment = sidecar.comment.as_deref().unwrap_or(b"");
 
             let mut need = fixed_size + name.len() as u32 + 1;
@@ -458,6 +462,37 @@ mod tests {
         assert_eq!(
             chain_names(&mem, BUFFER_ADDR, 3),
             vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"sub".to_vec()]
+        );
+    }
+
+    #[test]
+    fn ed_date_scan_reports_each_entrys_host_mtime() {
+        // Found in review of issue #287's fix: ED_DATE came from
+        // Meta::default() without a sidecar, so an ExAll scan -- the
+        // normal OS 2.0+ directory idiom -- reported 01-Jan-78 for
+        // every entry while ExNext on the same directory showed real
+        // dates. Internally inconsistent, and still divergent from
+        // vamos.
+        let tmp = TempDir::new("eddate");
+        fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let (mut dos, _heap, mut mem, lock) = setup(tmp.path(), "SYS:");
+
+        let more = dos
+            .ex_all(&mut mem, lock, BUFFER_ADDR, 0x400, ED_DATE, CONTROL_ADDR)
+            .expect("ex_all should succeed");
+        assert!(!more);
+        assert_eq!(mem.read_u32(CONTROL_ADDR + EAC_ENTRIES_OFFSET), 1);
+
+        let expected = crate::dosdate::datestamp_for_host_path(&tmp.path().join("f.txt"));
+        assert_ne!(expected, (0, 0, 0), "the host file has a real date");
+        assert_eq!(
+            (
+                mem.read_u32(BUFFER_ADDR + ED_DAYS_OFFSET) as i32,
+                mem.read_u32(BUFFER_ADDR + ED_MINS_OFFSET) as i32,
+                mem.read_u32(BUFFER_ADDR + ED_TICKS_OFFSET) as i32,
+            ),
+            expected,
+            "ExAll must agree with Examine/ExNext about a file's date"
         );
     }
 

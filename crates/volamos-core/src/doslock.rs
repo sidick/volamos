@@ -84,15 +84,23 @@
 //! enumerate.
 //!
 //! `fib_Date`/`fib_Protection`/`fib_Comment` come from the target's
-//! `.uaem` sidecar file if one exists (see [`crate::dosmeta`]), or this
-//! runtime's original defaults otherwise: a fixed `DateStamp`
-//! (`ds_Days`/`ds_Minute`/`ds_Tick` all `0`, i.e. the AmigaOS epoch)
-//! rather than any host mtime, `fib_Protection == 0`, and an empty
-//! comment. Phase 4's parity harness freezes/normalizes virtual time
-//! entirely (see `docs/plan.md`), so a *live* host mtime would just be a
-//! source of non-determinism between runs and runners this side of that
-//! harness; a fixed epoch (or a sidecar's own explicit, checked-in date)
-//! is parity-ready either way.
+//! `.uaem` sidecar file if one exists (see [`crate::dosmeta`]).
+//! Without one, `fib_Protection` is `0` and the comment empty, and
+//! `fib_Date` is **the host file's modification time**, in the host's
+//! local time (see [`crate::dosdate::datestamp_for_host_path`]).
+//!
+//! That date used to be a fixed AmigaOS epoch for every file, on the
+//! reasoning that a live mtime is a source of non-determinism ahead of
+//! Phase 4's time-freezing parity harness. Issue #287 retired that
+//! trade: it made every file equally ancient, so `make`, `List
+//! SINCE`/`UPTO` and a libc `stat()` -- even on a file the guest had
+//! just written and closed -- could not tell any two files apart. It
+//! was also an unnoticed divergence from the parity oracle, which has
+//! always reported the real mtime (`os.path.getmtime` in amitools'
+//! `vamos/lib/dos/Lock.py`); no fixture printed a date, so no harness
+//! run ever compared one. Determinism where it is actually needed
+//! comes from a checked-in sidecar, whose date still outranks the
+//! host's.
 //!
 //! # `MakeLink`/`ReadLink` (issue #160)
 //!
@@ -1055,8 +1063,9 @@ fn alloc_lock_struct(
 /// `size` is its byte length; `size` is ignored -- written as `0` --
 /// for a directory). `fib_Protection`/`fib_Date`/`fib_Comment` come from
 /// `host_path`'s `.uaem` sidecar if one exists ([`crate::dosmeta`]),
-/// else this runtime's original defaults (`0`, the AmigaOS epoch, no
-/// comment) -- see the module docs for the field-by-field layout.
+/// else `0` protection bits, no comment, and the host file's own
+/// modification time (issue #287) -- see the module docs for the
+/// field-by-field layout and why the date is no longer a fixed epoch.
 pub(crate) fn fill_fib(
     mem: &mut dyn AddressSpace,
     fib_addr: u32,
@@ -1071,7 +1080,15 @@ pub(crate) fn fill_fib(
         ENTRY_TYPE_FILE
     };
     let num_blocks = size.div_ceil(BLOCK_SIZE);
-    let meta = dosmeta::read_sidecar(host_path).unwrap_or_default();
+    // fib_Date: the sidecar's date when it has one (SetFileDate wrote
+    // it, so it is the guest's own answer), else the host file's
+    // modification time (issue #287) -- which is what vamos reports,
+    // what FS-UAE and Amiberry report for a directory
+    // hard drive, and what anything comparing dates needs: with a
+    // fixed epoch, `make`, `List SINCE` and a libc `stat()` all saw
+    // every file as equally ancient, including one the guest had just
+    // written.
+    let meta = dosmeta::read_or_host_date(host_path);
 
     mem.write_u32(fib_addr + FIB_DISKKEY_OFFSET, 0);
     mem.write_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET, entry_type as u32);
@@ -2117,6 +2134,144 @@ mod tests {
         assert_eq!(
             err, ERROR_NO_MORE_ENTRIES,
             "the .uaem sidecar should never appear"
+        );
+    }
+
+    /// Sets `path`'s modification time to `unix_secs`, so a test can
+    /// assert an exact `fib_Date` instead of "something recent".
+    fn set_mtime(path: &Path, unix_secs: i64) {
+        let times = [
+            libc::timeval {
+                tv_sec: unix_secs as libc::time_t,
+                tv_usec: 0,
+            }, // atime
+            libc::timeval {
+                tv_sec: unix_secs as libc::time_t,
+                tv_usec: 0,
+            }, // mtime
+        ];
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: both pointers are valid for the call; `times` is a
+        // two-element array as `utimes` requires.
+        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes on {path:?}");
+    }
+
+    fn read_fib_date(mem: &FlatMemory, fib_addr: u32) -> (i32, i32, i32) {
+        (
+            mem.read_u32(fib_addr + FIB_DATE_OFFSET) as i32,
+            mem.read_u32(fib_addr + FIB_DATE_OFFSET + 4) as i32,
+            mem.read_u32(fib_addr + FIB_DATE_OFFSET + 8) as i32,
+        )
+    }
+
+    #[test]
+    fn examine_without_a_sidecar_reports_the_host_files_mtime() {
+        // Issue #287: every file used to come back as 01-Jan-78
+        // whatever its host mtime, so `make`, `List SINCE/UPTO` and a
+        // libc `stat()` all saw them as equally ancient -- including
+        // one the guest had just written. vamos has always reported
+        // the real mtime here (amitools' `Lock.py` calls
+        // `os.path.getmtime`), so this was also an unnoticed
+        // divergence from the parity oracle: nothing in the fixture
+        // corpus printed a date.
+        const MTIME: i64 = 1_762_857_600; // 2025-11-11T08:00:00Z
+        let tmp = TempDir::new("examine-mtime");
+        let file = tmp.path().join("f.txt");
+        fs::write(&file, b"hi").unwrap();
+        set_mtime(&file, MTIME);
+
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        let fib_addr = 0x2000;
+        dos.examine(&mut mem, addr_from_bptr(bptr), fib_addr)
+            .expect("examine file");
+
+        let expected = crate::dosdate::datestamp_from_amiga_secs(
+            crate::dosdate::unix_secs_to_amiga_local(MTIME),
+            0,
+        );
+        assert_eq!(read_fib_date(&mem, fib_addr), expected);
+        assert_ne!(
+            read_fib_date(&mem, fib_addr),
+            (0, 0, 0),
+            "the whole point: not the epoch"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_date_still_wins_over_the_host_mtime() {
+        // SetFileDate records the guest's own answer in the sidecar, so
+        // it outranks whatever the host thinks -- which is what keeps
+        // `utime()` round-tripping (and keeps a checked-in sidecar
+        // deterministic for a parity run).
+        const MTIME: i64 = 1_762_857_600;
+        let tmp = TempDir::new("examine-sidecar-date");
+        let file = tmp.path().join("f.txt");
+        fs::write(&file, b"hi").unwrap();
+        set_mtime(&file, MTIME);
+        crate::dosmeta::write_sidecar(
+            &file,
+            &crate::dosmeta::Meta {
+                prot: 0,
+                date: (1234, 56, 7),
+                comment: None,
+            },
+        )
+        .unwrap();
+
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:f.txt", SHARED_LOCK)
+            .unwrap();
+        let fib_addr = 0x2000;
+        dos.examine(&mut mem, addr_from_bptr(bptr), fib_addr)
+            .expect("examine file");
+        assert_eq!(read_fib_date(&mem, fib_addr), (1234, 56, 7));
+    }
+
+    #[test]
+    fn a_directory_entry_reports_its_own_mtime_through_exnext() {
+        // ExNext goes through the same fill_fib, so the dates a
+        // directory listing shows come from each entry's own file.
+        const OLD: i64 = 1_000_000_000; // 2001
+        const NEW: i64 = 1_762_857_600; // 2025
+        let tmp = TempDir::new("exnext-mtime");
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        fs::write(tmp.path().join("d/old.txt"), b"o").unwrap();
+        fs::write(tmp.path().join("d/new.txt"), b"n").unwrap();
+        set_mtime(&tmp.path().join("d/old.txt"), OLD);
+        set_mtime(&tmp.path().join("d/new.txt"), NEW);
+
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let bptr = dos.lock(&mut heap, &mut mem, "SYS:d", SHARED_LOCK).unwrap();
+        let addr = addr_from_bptr(bptr);
+        let fib_addr = 0x4000;
+        dos.examine(&mut mem, addr, fib_addr).expect("examine dir");
+
+        let mut seen = Vec::new();
+        while dos.ex_next(&mut mem, addr, fib_addr).is_ok() {
+            seen.push((
+                read_c_string(&mem, fib_addr + FIB_FILENAME_OFFSET),
+                read_fib_date(&mem, fib_addr).0,
+            ));
+        }
+        let days = |secs| crate::dosdate::unix_secs_to_amiga_local(secs) / 86_400;
+        assert_eq!(
+            seen,
+            vec![
+                (b"new.txt".to_vec(), days(NEW) as i32),
+                (b"old.txt".to_vec(), days(OLD) as i32),
+            ],
+            "each entry carries its own date, 24 years apart"
         );
     }
 

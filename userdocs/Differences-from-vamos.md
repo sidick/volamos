@@ -108,6 +108,36 @@ program that drives its behaviour off directory transitions — the real
 `List` command uses it to decide when to print a new `Directory "..."`
 header — has nothing to work from.
 
+## Clock and file dates: local time, not UTC
+
+An Amiga has no notion of a time zone. Its battery clock, `DateStamp()`
+and every date a command prints are local time, and nothing converts
+between the two. volamos follows that: `DateStamp`, `GetSysTime`,
+`ReadBattClock`, Intuition's `CurrentTime` and the `fib_Date` a file
+reports all come from the host's clock **in the host's local time**,
+with the UTC offset in force at that instant (so a file written under
+summer time keeps its summer-time reading in December).
+
+`vamos` converts with plain epoch arithmetic and no time-zone offset
+(`sys_to_ami_time` in `amitools/vamos/lib/dos/AmiTime.py`), so it
+reports UTC. On a host that isn't on UTC the two runtimes therefore
+disagree about what time it is, by that host's offset — and `vamos` can
+report a different *day* than the machine it is running on, which is
+what first surfaced this (issue #287, on a JST host where `List`
+printed Thursday on a Friday).
+
+This is one of the few places where matching hardware and matching
+`vamos` point in opposite directions, so any harness comparison whose
+output includes a clock reading is scoped out rather than treated as a
+divergence to chase.
+
+Not a difference, for the record: `fib_Date` for a file with no `.uaem`
+sidecar now comes from the host file's modification time, which is what
+`vamos` has always reported (`os.path.getmtime` in its `Lock.py`).
+volamos used to report the AmigaOS epoch for every such file — a real
+divergence that no harness caught, because nothing in the fixture
+corpus printed a date.
+
 ## What is *not* on this page
 
 Differences where volamos is the one that is wrong get fixed rather than

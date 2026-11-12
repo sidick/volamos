@@ -40,7 +40,9 @@ fn set_comment_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         // has no other host-side effect to fail on otherwise).
         std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
 
-        let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
+        // read_or_host_date, not unwrap_or_default -- see its doc:
+        // creating a sidecar must not reset the file's date (issue #287).
+        let mut sidecar_meta = dosmeta::read_or_host_date(&host_path);
         sidecar_meta.comment = if comment.is_empty() {
             None
         } else {
@@ -192,6 +194,25 @@ mod tests {
 
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn set_comment_does_not_reset_the_files_date() {
+        // Same review finding as SetProtection's: creating a sidecar
+        // from Meta::default() stamped the file 01-Jan-78, because
+        // fib_Date prefers any sidecar over the host mtime (#287).
+        let tmp = TempDir::new("filenote-keeps-date");
+        let path = tmp.path().join("f.txt");
+        fs::write(&path, b"hi").unwrap();
+        let before = crate::dosdate::datestamp_for_host_path(&path);
+        assert_ne!(before, (0, 0, 0));
+
+        let code = run_set_comment(b"SYS:f.txt\0", b"a note\0", tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+
+        let meta = crate::dosmeta::read_sidecar(&path).expect("sidecar written");
+        assert_eq!(meta.comment.as_deref(), Some(&b"a note"[..]));
+        assert_eq!(meta.date, before, "the comment must not cost the date");
     }
 
     #[test]

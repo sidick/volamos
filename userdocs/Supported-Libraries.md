@@ -293,7 +293,10 @@ system *resource* on `ExecBase`'s resource list from startup, so
 - `ReadBattClock()` — seconds since 1978-01-01, the same host clock
   (and the same epoch) `DateStamp`/`GetSysTime` report, so an unwritten
   chip reads the same time as the system clock, and a `SetClock SAVE` /
-  `SetClock LOAD` round trip doesn't shift the time.
+  `SetClock LOAD` round trip doesn't shift the time. In the host's
+  *local* time, as an Amiga clock reads — see
+  [Differences from vamos](Differences-from-vamos.md), which reports
+  UTC.
 - `WriteBattClock(secs)` — sets the chip, which then keeps ticking from
   there for the rest of the run. Like `SetClock SAVE` on real AmigaOS,
   it doesn't change the system time, and nothing persists past the

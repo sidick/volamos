@@ -50,11 +50,14 @@
 //! AmigaOS epoch (1978-01-01) those already use -- so an unwritten
 //! chip and the system clock read the same time, which is what makes a
 //! `SetClock SAVE` / `SetClock LOAD` round trip a no-op rather than a
-//! time shift. (That also means it reports what the host reports,
-//! which on a host configured for UTC is UTC, not local time --
-//! volamos's existing `DateStamp`/`GetSysTime` already behave that
-//! way, and matching them matters more here than matching a real
-//! Amiga's local-time-only world view.)
+//! time shift. It reports that clock in the host's **local** time, as
+//! a real battery clock does -- an Amiga has no time zone, so its RTC,
+//! `DateStamp` and every printed date are local time and nothing
+//! converts between them. (Until issue #287 all three reported UTC,
+//! which on a host away from Greenwich could put `List`'s header on
+//! the wrong day and, worse, made a file's date disagree with
+//! `DateStamp()` by the offset, so `List SINCE` and `make` drew the
+//! wrong conclusion. See `crate::dosdate::unix_secs_to_amiga_local`.)
 //!
 //! The agreement is one-directional, though, and only until something
 //! writes the chip: `timer.device`'s `TR_SETSYSTIME` is a no-op in
