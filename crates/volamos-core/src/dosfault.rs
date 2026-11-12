@@ -172,6 +172,54 @@ fn print_fault_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
+/// The error codes real `ErrorReport` has a requester for -- and, per
+/// its own documented bug, the only ones it sets `IoErr()` from.
+///
+/// `dos/dos.h`'s `ERROR_DISK_NOT_VALIDATED` (213),
+/// `ERROR_DISK_WRITE_PROTECTED` (214), `ERROR_DEVICE_NOT_MOUNTED`
+/// (218), `ERROR_DISK_FULL` (221), `ERROR_NOT_A_DOS_DISK` (225),
+/// `ERROR_NO_DISK` (226), plus `dos/dosextens.h`'s `ABORT_DISK_ERROR`
+/// (296) and `ABORT_BUSY` (288).
+const ERROR_REPORT_CODES: [i32; 8] = [213, 214, 218, 221, 225, 226, 288, 296];
+
+/// `ErrorReport` (`D1` = code, `D2` = type, `D3` = arg1, `D4` =
+/// device). `D0` = `DOSTRUE` for "cancel", `DOSFALSE` for "retry".
+///
+/// Always answers `DOSTRUE`. The autodoc makes that the right answer
+/// for a runtime with no requesters: it returns `DOS_TRUE` "if the
+/// user selects CANCEL or if the attempt to put up the requester
+/// fails, or if the process `pr_WindowPtr` is -1", and `DOS_TRUE`
+/// immediately for a code it doesn't understand. volamos has no
+/// Intuition screen to put a Retry/Cancel requester on, so every one
+/// of those conditions holds; answering `DOSFALSE` instead would tell
+/// the caller to *retry* an operation that cannot start working, which
+/// is how a program ends up in a loop rather than reporting an error.
+///
+/// `IoErr()` is set to `code` only for [`ERROR_REPORT_CODES`], which
+/// is not an oversight but the documented behaviour of every version
+/// volamos targets: "In V36-V47.26 it would only set `IoErr()` to code
+/// for the error codes listed in the INPUTS section. For all other
+/// codes the `IoErr()` status prior to calling `ErrorReport()` would
+/// persist." A caller that needs the general case is documented to
+/// call `SetIoErr(code)` itself first, and one that was written
+/// against a real 3.x machine will be relying on exactly this.
+///
+/// Found needed by clib2's `lstat()` (issue #288), which calls this
+/// for any lock failure other than "not found" or "is a soft link" --
+/// as an AmigaDOS program should -- so an unimplemented `ErrorReport`
+/// ended the run outright.
+fn error_report_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let code = ctx.cpu.data_register(DataRegister(1)) as i32;
+    if ERROR_REPORT_CODES.contains(&code) {
+        ctx.dos.set_io_err(code);
+    }
+    *ctx.call_detail = Some(format!(
+        "ErrorReport code {code} -> cancel (no requester to put up)"
+    ));
+    ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
+    Ok(())
+}
+
 /// Registers `Fault`/`PrintFault` onto [`DOS_LIBRARY_BASE`], looked up
 /// by name through [`DOS_LVOS`]. Called from [`crate::dispatch::
 /// Runtime::new`] alongside the other `dos.library` registrations.
@@ -195,6 +243,7 @@ pub fn register_dosfault_handlers<C: Cpu + 'static>(
     }
     reg!("Fault", fault_handler::<C>);
     reg!("PrintFault", print_fault_handler::<C>);
+    reg!("ErrorReport", error_report_handler::<C>);
 }
 
 #[cfg(test)]
@@ -228,6 +277,89 @@ mod tests {
         words.push((imm >> 16) as u16);
         words.push(imm as u16);
         idx
+    }
+
+    /// Runs `SetIoErr(prior); ErrorReport(code, REPORT_LOCK, 0, 0)` and
+    /// returns `(D0, IoErr())`.
+    fn run_error_report(code: u32, prior: u32) -> (i32, i32) {
+        let mut words = Vec::new();
+        push_move_imm_to_d(&mut words, 1, prior);
+        push_jsr(&mut words, 6, -462); // SetIoErr(a6)
+        push_move_imm_to_d(&mut words, 1, code);
+        push_move_imm_to_d(&mut words, 2, 0); // REPORT_LOCK
+        push_move_imm_to_d(&mut words, 3, 0); // arg1
+        push_move_imm_to_d(&mut words, 4, 0); // device
+        push_jsr(&mut words, 6, -480); // ErrorReport(a6)
+        let d0_cell_idx = words.len();
+        words.push(0x23C0); // MOVE.L D0,(xxx).L
+        words.extend_from_slice(&[0, 0]);
+        push_jsr(&mut words, 6, -132); // IoErr(a6)
+        let err_cell_idx = words.len();
+        words.push(0x23C0);
+        words.extend_from_slice(&[0, 0]);
+        words.push(RTS);
+
+        let d0_cell = (TRAP_TABLE_END + (words.len() as u32) * 2 + 3) & !3;
+        let err_cell = d0_cell + 4;
+        words[d0_cell_idx + 1] = (d0_cell >> 16) as u16;
+        words[d0_cell_idx + 2] = d0_cell as u16;
+        words[err_cell_idx + 1] = (err_cell >> 16) as u16;
+        words[err_cell_idx + 2] = err_cell as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: err_cell + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        (
+            rt.memory().read_u32(d0_cell) as i32,
+            rt.memory().read_u32(err_cell) as i32,
+        )
+    }
+
+    #[test]
+    fn error_report_answers_cancel_with_no_requester_to_put_up() {
+        // Issue #288: unimplemented, so clib2's lstat() -- which calls
+        // this for any lock failure other than "not found" or "is a
+        // soft link", as an AmigaDOS program should -- ended the run.
+        //
+        // DOSTRUE is "cancel". The autodoc gives three separate reasons
+        // it is the right answer here ("if the attempt to put up the
+        // requester fails, or if the process pr_WindowPtr is -1", and
+        // immediately "if the code is not understood"), and all of them
+        // hold for a runtime with no Intuition screen. DOSFALSE would
+        // mean *retry*, which is how a caller ends up looping on an
+        // operation that cannot start working.
+        let (code, io_err) = run_error_report(221, 0); // ERROR_DISK_FULL
+        assert_eq!(code, DOSTRUE as i32, "cancel");
+        assert_eq!(
+            io_err, 221,
+            "a code with a requester sets IoErr to it (autodoc: \"supposed \
+             to set IoErr() to code before returning\")"
+        );
+    }
+
+    #[test]
+    fn error_report_leaves_io_err_alone_for_a_code_it_has_no_requester_for() {
+        // Not an oversight -- the documented behaviour of every version
+        // volamos targets: "In V36-V47.26 it would only set IoErr() to
+        // code for the error codes listed in the INPUTS section. For
+        // all other codes the IoErr() status prior to calling
+        // ErrorReport() would persist." A program written against a
+        // real 3.x machine relies on exactly this, and the autodoc's
+        // own workaround is to SetIoErr(code) first.
+        let (code, io_err) = run_error_report(205, 42); // ERROR_OBJECT_NOT_FOUND
+        assert_eq!(code, DOSTRUE as i32);
+        assert_eq!(io_err, 42, "the prior IoErr persists");
     }
 
     fn push_jsr(words: &mut Vec<u16>, an: u16, disp: i32) {

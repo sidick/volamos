@@ -127,6 +127,13 @@ const DP_ARG2: u32 = 24;
 const DP_ARG3: u32 = 28;
 /// `dp_Arg4` -- only `ACTION_READ_LINK` (issue #186) uses this one.
 const DP_ARG4: u32 = 32;
+/// `dp_Arg5`/`dp_Arg6`/`dp_Arg7`: `dp_Arg4` + 4 each. No action this
+/// runtime services reads past `dp_Arg4`, but `DoPkt` takes seven
+/// arguments (`D3`-`D7` plus two more via `DoPkt`'s own signature), so
+/// [`service_action`] carries all seven for the actions that will.
+const DP_ARG5: u32 = 36;
+const DP_ARG6: u32 = 40;
+const DP_ARG7: u32 = 44;
 
 const ID_VALIDATED: u32 = 82;
 const ID_DOS_DISK: u32 = 0x444F_5300;
@@ -198,12 +205,25 @@ fn fill_info_data(mem: &mut dyn AddressSpace, addr: u32) {
 }
 
 /// `DoPkt` (`D1` = port, `D2` = action, `D3`-`D7` = `arg1`-`arg5`).
+///
+/// The volume-info actions are answered here, gated on the port
+/// naming a volume this runtime knows (see
+/// `crate::dosdevlist::volume_for_task_id`); everything else is
+/// handed to [`service_action`], the same dispatch a hand-built
+/// packet reaches via `PutMsg`. Before issue #288 the fall-through
+/// was a flat `ERROR_ACTION_NOT_KNOWN`, which made
+/// `DoPkt(ACTION_LOCATE_OBJECT)` -- clib2's `lstat()` -- fail on every
+/// file.
 /// `D0` = `dp_Res1`; `IoErr()` set to `dp_Res2`.
 fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let port = ctx.cpu.data_register(DataRegister(1));
     let action = ctx.cpu.data_register(DataRegister(2));
     let arg1 = ctx.cpu.data_register(DataRegister(3));
     let arg2 = ctx.cpu.data_register(DataRegister(4));
+
+    let arg3 = ctx.cpu.data_register(DataRegister(5));
+    let arg4 = ctx.cpu.data_register(DataRegister(6));
+    let arg5 = ctx.cpu.data_register(DataRegister(7));
 
     let known_volume = crate::dosdevlist::volume_for_task_id(ctx.dos, port).is_some();
     let (res1, res2) = match action {
@@ -222,6 +242,31 @@ fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
         // packet directly rather than calling through a simpler
         // wrapper.
         ACTION_IS_FILESYSTEM if known_volume => (DOSTRUE, 0),
+        // Everything else goes to the same dispatch a hand-built
+        // packet reaches through PutMsg (issue #288): DoPkt is just
+        // the library call that builds the packet for you, so it must
+        // answer every action a handler does -- ACTION_LOCATE_OBJECT
+        // above all, which is how clib2's lstat() takes a lock.
+        //
+        // Still gated on the port naming something that answers
+        // packets here -- a volume's dol_Task, or the filesystem
+        // handler port every lock's fl_Task and handle's fh_Type point
+        // at (what GetDeviceProc hands back in dvp_Port). A port this
+        // runtime has never heard of gets ERROR_ACTION_NOT_KNOWN
+        // rather than silent service, so a guest that passes a bogus
+        // port still learns something is wrong, as it would on real
+        // hardware (where PutMsg to a non-port misbehaves outright).
+        _ if known_volume || ctx.dos.is_fs_handler_port(port) => {
+            match service_action(ctx, action, [arg1, arg2, arg3, arg4, arg5, 0, 0])? {
+                ActionOutcome::Done(res1, res2) => (res1, res2),
+                // The action blocked this task (a PIPE: read with
+                // nothing in it). Registers belong to whatever runs
+                // next, and this very DoPkt call is re-entered on
+                // resume -- same contract as every other blocking
+                // handler, so leave D0 alone.
+                ActionOutcome::Switched => return Ok(()),
+            }
+        }
         _ => (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32),
     };
 
@@ -230,62 +275,39 @@ fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     Ok(())
 }
 
-/// Services one guest-sent file-I/O `DosPacket` and replies to it --
-/// the host-side stand-in for a real filesystem handler process's
-/// packet loop, called from [`crate::execlist`]'s `PutMsg` handler
-/// whenever the destination port is [`crate::dosfile::DosState`]'s
-/// filesystem handler port (the port every non-`NIL:` `FileHandle`'s
-/// `fh_Type` points at).
+/// What [`service_action`] decided: a `(dp_Res1, dp_Res2)` pair, or
+/// "this task is now blocked and the whole call will be re-entered
+/// when it resumes" (a `PIPE:` read with nothing in it).
+enum ActionOutcome {
+    Done(u32, u32),
+    Switched,
+}
+
+/// Services one packet *action*, given its arguments, and returns what
+/// `dp_Res1`/`dp_Res2` should be.
 ///
-/// # Why `PutMsg`, not just `DoPkt`
-///
-/// Real programs bypass `Read()`/`Write()` (and `DoPkt`/`SendPkt`)
-/// entirely and speak the packet protocol by hand: build a
-/// `StandardPacket`, `PutMsg` its message to `fh_Type`, then
-/// `WaitPort`/`GetMsg` the reply port. Found via the real SAS/C `sc`
-/// compiler (issue #24): `sc1.library` does all of its source-file
-/// reading and object-file writing this way -- with no host-side
-/// handler behind `fh_Type`, its first read deadlocked waiting for a
-/// reply that could never come. Servicing the packet *synchronously
-/// inside `PutMsg`* -- reply already queued by the time `PutMsg`
-/// returns -- makes the client's subsequent `GetMsg` succeed
-/// immediately, so its `WaitPort` fallback path never needs to block
-/// (`vamos` structures its own equivalent the same way, and the real
-/// `sc` compiles successfully against it).
-///
-/// # Packet anatomy (RKRM `direct-packet-communication.md`)
-///
-/// "`mn_Node.ln_Name` of the exec message is (mis-)used to point to
-/// the `DosPacket` and its `dp_Link` element points back to the
-/// message"; the reply goes to `dp_Port`, and `mn_ReplyPort` is
-/// explicitly not part of the protocol. The reply itself mirrors real
-/// `ReplyPkt()`: fill `dp_Res1`/`dp_Res2`, send the message to
-/// `dp_Port` (`ln_Type` set to `NT_REPLYMSG`, matching what an exec
-/// message that has been replied looks like).
-///
-/// # Actions
-///
-/// `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK`/`ACTION_END` -- the four
-/// packet-level faces of `Read`/`Write`/`Seek`/`Close`, each routed to
-/// the same [`crate::dosfile::DosState`] backing the wrapper LVOs use
-/// (`dp_Arg1` echoes `fh_Arg1`, which this runtime sets to the handle
-/// struct's own guest address -- see `dosfile.rs`'s `FH_ARG1_OFFSET`
-/// doc -- so the lookup is direct). A write to the `Output()` default
-/// handle goes through [`HandlerContext::out`], same special case as
-/// the `Write` LVO handler. Anything else gets `dp_Res1 = -1` /
-/// `dp_Res2 = ERROR_ACTION_NOT_KNOWN`, the real, documented "handler
-/// doesn't implement this packet" convention (RKRM
-/// `packet-documentation.md`'s own `ACTION_SEEK` note: "set `dp_Res1`
-/// to -1 -- *and not 0* -- and `dp_Res2` to `ERROR_ACTION_NOT_KNOWN`").
-pub fn handle_fs_packet<C: Cpu>(
+/// Shared by both ways a guest can send a packet, which is the whole
+/// point of it existing: [`handle_fs_packet`] (a hand-built packet
+/// `PutMsg`'d to a handler port) and [`do_pkt_handler`] (`DoPkt`, the
+/// library call that builds and sends one for you). `DoPkt` used to
+/// have a three-arm match of its own -- the volume-info actions -- and
+/// answered `ERROR_ACTION_NOT_KNOWN` to everything else, so a program
+/// that locks a file by sending `ACTION_LOCATE_OBJECT` through `DoPkt`
+/// got no lock and error 209 for a file that plainly existed (issue
+/// #288). clib2's `lstat()` does exactly that, to learn whether a name
+/// is a soft link, so every `lstat()` in a clib2 program failed. The
+/// dispatch it needed was already here, reachable only through the
+/// other door.
+fn service_action<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
-    msg: u32,
-) -> Result<(), DispatchError> {
-    let pkt = ctx.mem.read_u32(msg + crate::execlist::LN_NAME);
-    let action = ctx.mem.read_u32(pkt + DP_TYPE);
-    let arg1 = ctx.mem.read_u32(pkt + DP_ARG1);
-    let arg2 = ctx.mem.read_u32(pkt + DP_ARG2);
-    let arg3 = ctx.mem.read_u32(pkt + DP_ARG3);
+    action: u32,
+    args: [u32; 7],
+) -> Result<ActionOutcome, DispatchError> {
+    // Named rather than indexed so each arm reads the argument by its
+    // documented number (`dp_Arg1`..`dp_Arg7`); not every action uses
+    // all seven.
+    let [arg1, arg2, arg3, arg4, arg5, arg6, arg7] = args;
+    let _ = (arg5, arg6, arg7);
 
     let (res1, res2) = match action {
         // RKRM packet-documentation.md, ACTION_READ (82): Arg1 =
@@ -296,7 +318,7 @@ pub fn handle_fs_packet<C: Cpu>(
                 crate::dospipe::Outcome::Done(result) => result,
                 // A PIPE: with nothing to read: the task is blocked and
                 // PutMsg runs again, packet and all, once there is.
-                crate::dospipe::Outcome::Switched => return Ok(()),
+                crate::dospipe::Outcome::Switched => return Ok(ActionOutcome::Switched),
             } {
                 Ok(data) => {
                     for (i, b) in data.iter().enumerate() {
@@ -324,7 +346,7 @@ pub fn handle_fs_packet<C: Cpu>(
                 match crate::dospipe::write(ctx, arg1, &buf, -1, "ACTION_WRITE")? {
                     crate::dospipe::Outcome::Done(Ok(n)) => (n as u32, 0),
                     crate::dospipe::Outcome::Done(Err(code)) => (RESULT_ERROR, code as u32),
-                    crate::dospipe::Outcome::Switched => return Ok(()),
+                    crate::dospipe::Outcome::Switched => return Ok(ActionOutcome::Switched),
                 }
             }
         }
@@ -423,7 +445,7 @@ pub fn handle_fs_packet<C: Cpu>(
             let lock_addr = addr_from_bptr(arg1);
             let path = String::from_utf8_lossy(&read_c_string(ctx.mem, arg2)).into_owned();
             let buf = arg3;
-            let size = ctx.mem.read_u32(pkt + DP_ARG4) as i32;
+            let size = arg4 as i32;
             match ctx.dos.read_link(lock_addr, &path) {
                 Ok(target) => {
                     let capacity = (size - 1).max(0) as usize;
@@ -457,7 +479,6 @@ pub fn handle_fs_packet<C: Cpu>(
         // the object, Arg3/Arg4 = lock and BSTR name of the new name.
         // Res1 = boolean.
         ACTION_RENAME_OBJECT => {
-            let arg4 = ctx.mem.read_u32(pkt + DP_ARG4);
             bool_result(path_arg(ctx.dos, ctx.mem, arg1, arg2).and_then(|old| {
                 let new = path_arg(ctx.dos, ctx.mem, arg3, arg4)?;
                 ctx.dos.rename(&old, &new)
@@ -466,7 +487,7 @@ pub fn handle_fs_packet<C: Cpu>(
         // ACTION_SET_PROTECT (21): Arg1 unused, Arg2 = parent lock, Arg3
         // = BSTR name, Arg4 = protection mask. Res1 = boolean.
         ACTION_SET_PROTECT => {
-            let mask = ctx.mem.read_u32(pkt + DP_ARG4);
+            let mask = arg4;
             bool_result(
                 path_arg(ctx.dos, ctx.mem, arg2, arg3)
                     .and_then(|path| crate::dosprotect::set_protection(ctx.dos, &path, mask)),
@@ -475,7 +496,7 @@ pub fn handle_fs_packet<C: Cpu>(
         // ACTION_SET_DATE (34): Arg1 unused, Arg2 = parent lock, Arg3 =
         // BSTR name, Arg4 = struct DateStamp*. Res1 = boolean.
         ACTION_SET_DATE => {
-            let date_ptr = ctx.mem.read_u32(pkt + DP_ARG4);
+            let date_ptr = arg4;
             bool_result(path_arg(ctx.dos, ctx.mem, arg2, arg3).and_then(|path| {
                 crate::dossetfiledate::set_file_date(ctx.dos, ctx.mem, &path, date_ptr)
             }))
@@ -492,7 +513,7 @@ pub fn handle_fs_packet<C: Cpu>(
         // Arg3 = the target: a lock for a hard link, a C string for a
         // soft one, as Arg4 (LINK_HARD/LINK_SOFT) says. Res1 = boolean.
         ACTION_MAKE_LINK => {
-            let soft = ctx.mem.read_u32(pkt + DP_ARG4) == LINK_SOFT;
+            let soft = arg4 == LINK_SOFT;
             bool_result(path_arg(ctx.dos, ctx.mem, arg1, arg2).and_then(|path| {
                 if soft {
                     let target =
@@ -524,6 +545,77 @@ pub fn handle_fs_packet<C: Cpu>(
         // RESULT_ERROR (-1) would read as DOSTRUE to a caller of a
         // boolean action, which would then believe it succeeded.
         _ => (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32),
+    };
+
+    Ok(ActionOutcome::Done(res1, res2))
+}
+
+/// Services one guest-sent file-I/O `DosPacket` and replies to it --
+/// the host-side stand-in for a real filesystem handler process's
+/// packet loop, called from [`crate::execlist`]'s `PutMsg` handler
+/// whenever the destination port is [`crate::dosfile::DosState`]'s
+/// filesystem handler port (the port every non-`NIL:` `FileHandle`'s
+/// `fh_Type` points at).
+///
+/// # Why `PutMsg`, not just `DoPkt`
+///
+/// Real programs bypass `Read()`/`Write()` (and `DoPkt`/`SendPkt`)
+/// entirely and speak the packet protocol by hand: build a
+/// `StandardPacket`, `PutMsg` its message to `fh_Type`, then
+/// `WaitPort`/`GetMsg` the reply port. Found via the real SAS/C `sc`
+/// compiler (issue #24): `sc1.library` does all of its source-file
+/// reading and object-file writing this way -- with no host-side
+/// handler behind `fh_Type`, its first read deadlocked waiting for a
+/// reply that could never come. Servicing the packet *synchronously
+/// inside `PutMsg`* -- reply already queued by the time `PutMsg`
+/// returns -- makes the client's subsequent `GetMsg` succeed
+/// immediately, so its `WaitPort` fallback path never needs to block
+/// (`vamos` structures its own equivalent the same way, and the real
+/// `sc` compiles successfully against it).
+///
+/// # Packet anatomy (RKRM `direct-packet-communication.md`)
+///
+/// "`mn_Node.ln_Name` of the exec message is (mis-)used to point to
+/// the `DosPacket` and its `dp_Link` element points back to the
+/// message"; the reply goes to `dp_Port`, and `mn_ReplyPort` is
+/// explicitly not part of the protocol. The reply itself mirrors real
+/// `ReplyPkt()`: fill `dp_Res1`/`dp_Res2`, send the message to
+/// `dp_Port` (`ln_Type` set to `NT_REPLYMSG`, matching what an exec
+/// message that has been replied looks like).
+///
+/// # Actions
+///
+/// `ACTION_READ`/`ACTION_WRITE`/`ACTION_SEEK`/`ACTION_END` -- the four
+/// packet-level faces of `Read`/`Write`/`Seek`/`Close`, each routed to
+/// the same [`crate::dosfile::DosState`] backing the wrapper LVOs use
+/// (`dp_Arg1` echoes `fh_Arg1`, which this runtime sets to the handle
+/// struct's own guest address -- see `dosfile.rs`'s `FH_ARG1_OFFSET`
+/// doc -- so the lookup is direct). A write to the `Output()` default
+/// handle goes through [`HandlerContext::out`], same special case as
+/// the `Write` LVO handler. Anything else gets `dp_Res1 = -1` /
+/// `dp_Res2 = ERROR_ACTION_NOT_KNOWN`, the real, documented "handler
+/// doesn't implement this packet" convention (RKRM
+/// `packet-documentation.md`'s own `ACTION_SEEK` note: "set `dp_Res1`
+/// to -1 -- *and not 0* -- and `dp_Res2` to `ERROR_ACTION_NOT_KNOWN`").
+pub fn handle_fs_packet<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+    msg: u32,
+) -> Result<(), DispatchError> {
+    let pkt = ctx.mem.read_u32(msg + crate::execlist::LN_NAME);
+    let action = ctx.mem.read_u32(pkt + DP_TYPE);
+    let args = [
+        ctx.mem.read_u32(pkt + DP_ARG1),
+        ctx.mem.read_u32(pkt + DP_ARG2),
+        ctx.mem.read_u32(pkt + DP_ARG3),
+        ctx.mem.read_u32(pkt + DP_ARG4),
+        ctx.mem.read_u32(pkt + DP_ARG5),
+        ctx.mem.read_u32(pkt + DP_ARG6),
+        ctx.mem.read_u32(pkt + DP_ARG7),
+    ];
+    let arg1 = args[0];
+    let (res1, res2) = match service_action(ctx, action, args)? {
+        ActionOutcome::Done(res1, res2) => (res1, res2),
+        ActionOutcome::Switched => return Ok(()),
     };
 
     ctx.mem.write_u32(pkt + DP_RES1, res1);
@@ -760,6 +852,122 @@ mod tests {
             rt.memory().read_u32(infodata_addr + ID_NUMBLOCKS_OFFSET),
             FIXED_NUM_BLOCKS
         );
+    }
+
+    /// Runs `DoPkt(port = the SYS: volume's dol_Task, ACTION_LOCATE_OBJECT,
+    /// arg1 = 0, arg2 = BPTR to a BSTR of `name`, arg3 = SHARED_LOCK)`
+    /// over a VFS rooted at `root`, returning `(D0, IoErr)`.
+    fn run_do_pkt_locate(root: &std::path::Path, name: &[u8]) -> (i32, i32) {
+        let mut words = Vec::new();
+        // D1 = the volume handler's port, via the DosList (same walk
+        // the ACTION_DISK_INFO test above uses).
+        push_move_imm_to_d(&mut words, 1, 0x8); // LDF_VOLUMES
+        push_jsr(&mut words, 6, -654); // LockDosList
+        words.push(MOVE_L_D0_D1);
+        push_move_imm_to_d(&mut words, 2, 0x8);
+        push_jsr(&mut words, 6, -690); // NextDosEntry -> D0 = entry
+        words.push(0x2040); // MOVEA.L D0,A0
+        words.push(0x2228); // MOVE.L (8,A0),D1  -- dol_Task
+        words.push(8);
+
+        push_move_imm_to_d(&mut words, 2, ACTION_LOCATE_OBJECT);
+        push_move_imm_to_d(&mut words, 3, 0); // D3 = parent lock (0 = root)
+        let name_idx = words.len();
+        push_move_imm_to_d(&mut words, 4, 0); // D4 = BPTR to the BSTR (patched)
+        push_move_imm_to_d(&mut words, 5, crate::doslock::SHARED_LOCK as u32);
+        push_jsr(&mut words, 6, -240); // DoPkt(a6)
+        // Stash the lock, then IoErr, in two known cells: there is no
+        // host-side accessor for the guest's registers after the run.
+        let lock_cell_idx = words.len();
+        words.push(0x23C0); // MOVE.L D0,(xxx).L -- the lock (patched)
+        words.extend_from_slice(&[0, 0]);
+        push_jsr(&mut words, 6, -132); // IoErr(a6) -> D0
+        let err_cell_idx = words.len();
+        words.push(0x23C0); // MOVE.L D0,(xxx).L -- IoErr (patched)
+        words.extend_from_slice(&[0, 0]);
+        words.push(RTS);
+
+        let bstr_addr = (TRAP_TABLE_END + (words.len() as u32) * 2 + 3) & !3;
+        let bptr = crate::guestmem::bptr_from_addr(bstr_addr);
+        words[name_idx + 1] = (bptr >> 16) as u16;
+        words[name_idx + 2] = bptr as u16;
+        let lock_cell = bstr_addr + 64;
+        let err_cell = lock_cell + 4;
+        words[lock_cell_idx + 1] = (lock_cell >> 16) as u16;
+        words[lock_cell_idx + 2] = lock_cell as u16;
+        words[err_cell_idx + 1] = (err_cell >> 16) as u16;
+        words[err_cell_idx + 2] = err_cell as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        crate::guestmem::write_bstr(&mut mem, bstr_addr, name);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: err_cell + 64,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        rt.set_vfs(
+            Vfs::new(VfsConfig {
+                volumes: vec![("SYS".to_string(), root.to_path_buf())],
+                assigns: vec![],
+                auto_assign_root: None,
+                cwd: "SYS:".to_string(),
+                ..Default::default()
+            })
+            .expect("build vfs"),
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        (
+            rt.memory().read_u32(lock_cell) as i32,
+            rt.memory().read_u32(err_cell) as i32,
+        )
+    }
+
+    #[test]
+    fn do_pkt_locate_object_returns_a_real_lock() {
+        // Issue #288: DoPkt had a three-arm match of its own and
+        // answered ERROR_ACTION_NOT_KNOWN (209) to everything else, so
+        // locking a file this way -- what clib2's lstat() does, to
+        // learn whether a name is a soft link -- failed for a file that
+        // plainly existed. It now shares one dispatch with the
+        // PutMsg path.
+        let dir = TempDir::new("dopkt-locate");
+        std::fs::write(dir.path.join("there.txt"), b"x").unwrap();
+        let (lock, _io_err) = run_do_pkt_locate(&dir.path, b"there.txt");
+        assert_ne!(lock, 0, "a file that exists must yield a lock");
+    }
+
+    #[test]
+    fn do_pkt_locate_object_reports_not_found_rather_than_action_not_known() {
+        let dir = TempDir::new("dopkt-locate-missing");
+        let (lock, io_err) = run_do_pkt_locate(&dir.path, b"missing.txt");
+        assert_eq!(lock, 0, "no lock for a file that isn't there");
+        assert_eq!(
+            io_err,
+            crate::dosfile::ERROR_OBJECT_NOT_FOUND,
+            "205, not 209 (ERROR_ACTION_NOT_KNOWN) -- the handler knows \
+             this action perfectly well, the object just isn't there"
+        );
+    }
+
+    #[test]
+    fn do_pkt_locate_object_accepts_a_device_qualified_name() {
+        // A handler takes the name with or without the device part:
+        // dos.library passes it through as written, and a handler skips
+        // up to the first ':'. Against a lock on the volume root that
+        // used to build "SYS:SYS:f" and fail with
+        // ERROR_INVALID_COMPONENT_NAME.
+        let dir = TempDir::new("dopkt-locate-qualified");
+        std::fs::write(dir.path.join("there.txt"), b"x").unwrap();
+        let (lock, _io_err) = run_do_pkt_locate(&dir.path, b"SYS:there.txt");
+        assert_ne!(lock, 0, "the device part must not break the lookup");
     }
 
     #[test]

@@ -91,6 +91,26 @@ Changelog.
   `ERROR_ACTION_NOT_KNOWN`; an unknown action's `Res1` is `DOSFALSE`,
   not `-1`, matching real `dos.library` for callers that read it as a
   boolean.
+
+  `DoPkt` answers that same full set — it is just the library call
+  that builds and sends the packet for you — provided the port names
+  something that answers packets here (a volume's task, or the handler
+  port above). A name carrying its own device part works with or
+  without it, as on real hardware, where `dos.library` passes the name
+  through as written and the handler skips up to the first `:`. A port
+  this runtime doesn't recognize still gets `ERROR_ACTION_NOT_KNOWN`
+  rather than silent service.
+- Errors: `Fault`/`PrintFault` render the standard AmigaDOS message,
+  and `ErrorReport` always answers `DOSTRUE` — "cancel". There is no
+  Intuition screen to put a Retry/Cancel requester on, and the autodoc
+  makes cancel the documented answer when the requester can't be put
+  up (or `pr_WindowPtr` is `-1`, or the code isn't one it has a
+  requester for); `DOSFALSE` would tell the caller to *retry* an
+  operation that cannot start working. `IoErr()` is set from the code
+  only for the codes real `ErrorReport` has a requester for, which is
+  the documented behaviour of every version volamos targets rather
+  than an omission — a caller needing the general case is documented
+  to `SetIoErr(code)` first.
 - Path strings: `SplitName` (alongside `AddPart`/`FilePart`/`PathPart`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and

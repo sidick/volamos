@@ -806,6 +806,21 @@ impl DosState {
         if parent_lock_addr == 0 {
             return Ok(name.to_string());
         }
+        // A name that carries its own device/volume part is absolute,
+        // so the lock it was handed is irrelevant -- `"T:f"` against a
+        // lock on `T:` means `T:f`, not `T:T:f`. That is the AmigaDOS
+        // path rule, and at packet level it is also the handler
+        // convention: dos.library passes the name through as the
+        // caller wrote it, and a handler skips anything up to the
+        // first `:` (which is why sending ACTION_LOCATE_OBJECT by hand
+        // works with or without the device part). Without this,
+        // clib2's `lstat()` -- which locks via a packet, with the
+        // device-qualified name it was given -- failed with
+        // ERROR_INVALID_COMPONENT_NAME on a file that existed (issue
+        // #288).
+        if name.contains(':') {
+            return Ok(name.to_string());
+        }
         let entry = self
             .locks
             .get(&parent_lock_addr)
@@ -2413,6 +2428,41 @@ mod tests {
     // --- issue #186: AllocDosObject(DOS_FILEHANDLE)/FreeDosObject,
     // combine_lock_path, open_into_handle, and the close()/
     // dos_object_filehandles interaction. ---
+
+    #[test]
+    fn combine_lock_path_ignores_the_lock_for_a_device_qualified_name() {
+        // "T:f" against a lock on T: is T:f, not T:T:f -- the AmigaDOS
+        // path rule, and at packet level the handler convention too
+        // (dos.library passes the name through as written, and a
+        // handler skips up to the first ':'). Issue #288: clib2's
+        // lstat() locks via a packet with the device-qualified name it
+        // was given, and used to get ERROR_INVALID_COMPONENT_NAME.
+        let mut dos = DosState::new(None);
+        // A lock entry whose amiga_path is a volume root, which is what
+        // GetDeviceProc hands back in dvp_Lock.
+        let lock_addr = 0x1000;
+        dos.locks.insert(
+            lock_addr,
+            crate::doslock::LockEntry {
+                amiga_path: "SYS:".to_string(),
+                host_path: std::path::PathBuf::from("/tmp"),
+                access: crate::doslock::SHARED_LOCK,
+            },
+        );
+        assert_eq!(
+            dos.combine_lock_path(lock_addr, "SYS:f.txt").unwrap(),
+            "SYS:f.txt"
+        );
+        assert_eq!(
+            dos.combine_lock_path(lock_addr, "T:f.txt").unwrap(),
+            "T:f.txt"
+        );
+        // A plain relative name still joins, as before.
+        assert_eq!(
+            dos.combine_lock_path(lock_addr, "f.txt").unwrap(),
+            "SYS:f.txt"
+        );
+    }
 
     #[test]
     fn combine_lock_path_with_no_parent_lock_is_the_bare_name() {
