@@ -78,13 +78,15 @@ const TICKS_PER_SECOND: u32 = 50;
 pub(crate) const UNIX_TO_AMIGA_EPOCH_DAYS: i64 = 8 * 365 + 2;
 
 /// The host's UTC offset in seconds at `unix_secs` -- positive east of
-/// Greenwich -- from `libc::localtime_r`'s `tm_gmtoff`.
+/// Greenwich -- from `libc::localtime_r`'s `tm_gmtoff` on Unix, and
+/// `0` elsewhere (see the non-Unix arm below).
 ///
 /// Computed *per timestamp* rather than once, because the offset isn't
 /// constant: a file written in July and examined in December must come
 /// back with July's DST offset, or its date moves by an hour depending
 /// on when you looked at it. `0` if the host's TZ database can't be
 /// consulted, which degrades to UTC rather than failing.
+#[cfg(unix)]
 pub(crate) fn local_offset_secs_at(unix_secs: i64) -> i64 {
     // SAFETY: `localtime_r` writes into `tm` and reads only `t`; both
     // are owned here, and the pointer is valid for the call. The _r
@@ -97,6 +99,20 @@ pub(crate) fn local_offset_secs_at(unix_secs: i64) -> i64 {
         }
         tm.tm_gmtoff as i64
     }
+}
+
+/// Non-Unix hosts: `0`, i.e. UTC.
+///
+/// `tm_gmtoff` is a Unix extension -- the MSVC/mingw `tm` has no such
+/// field and no `localtime_r` -- and there is no portable std API for
+/// a UTC offset. volamos does cross-compile to Windows (verified for
+/// `x86_64-pc-windows-gnu`), so this keeps that target building and
+/// reporting the pre-#287 UTC behavior rather than failing to compile;
+/// a Windows host wanting local time needs `GetTimeZoneInformation`
+/// via a platform crate, which no one has asked for yet.
+#[cfg(not(unix))]
+pub(crate) fn local_offset_secs_at(_unix_secs: i64) -> i64 {
+    0
 }
 
 /// Converts a host Unix timestamp to AmigaOS-epoch seconds *in the
@@ -120,10 +136,11 @@ pub(crate) fn unix_secs_to_amiga_local(unix_secs: i64) -> i64 {
 /// sidecar round trip goes through the sidecar instead, in Amiga
 /// units, so this is only for host-facing conversions).
 ///
-/// The offset is resolved against the *resulting* instant rather than
-/// the input, which is what makes a round trip stable across a DST
-/// boundary: convert naively first, then correct using the offset in
-/// force at that moment.
+/// The offset is resolved at the naive instant (the local-time value
+/// read as though it were UTC), the usual approximation for an inverse
+/// that has no instant to anchor to yet. Inside the hour a DST shift
+/// skips or repeats, that can be an hour out -- unavoidable without a
+/// full zone search, and it round-trips exactly everywhere else.
 pub(crate) fn amiga_secs_to_unix_local(amiga_secs: i64) -> i64 {
     let naive_utc = amiga_secs + UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
     naive_utc - local_offset_secs_at(naive_utc)
@@ -449,14 +466,16 @@ mod tests {
         // DateStamp, GetSysTime and ReadBattClock must report one
         // clock: a file date that disagreed with DateStamp by the UTC
         // offset was half of issue #287 (List SINCE, make).
-        let (days, minute, _tick) = now_as_datestamp();
+        // Compared as one total rather than field by field: the two
+        // reads can straddle midnight, where days differ by one and
+        // minutes by 1439, and neither is a disagreement.
+        let (days, minute, tick) = now_as_datestamp();
+        let from_datestamp =
+            i64::from(days) * 86_400 + i64::from(minute) * 60 + i64::from(tick) / 50;
         let (secs, _micro) = crate::exectask::host_time_secs_micro();
-        let from_timer_days = (secs / 86_400) as i32;
-        let from_timer_minute = ((secs % 86_400) / 60) as i32;
-        assert_eq!(days, from_timer_days);
         assert!(
-            (minute - from_timer_minute).abs() <= 1,
-            "DateStamp {minute} vs GetSysTime {from_timer_minute}"
+            (from_datestamp - i64::from(secs)).abs() <= 2,
+            "DateStamp says {from_datestamp} s past the epoch, GetSysTime {secs}"
         );
     }
 

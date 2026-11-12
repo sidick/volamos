@@ -58,7 +58,10 @@ pub(crate) fn set_protection(dos: &DosState, name: &str, mask: u32) -> Result<()
     perms.set_readonly(mask & FIBF_WRITE != 0);
     fs::set_permissions(&host_path, perms).map_err(|e| map_io_error(&e))?;
 
-    let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
+    // read_or_host_date, not unwrap_or_default: creating a sidecar
+    // here must not stamp the file with the AmigaOS epoch and lose its
+    // real date (issue #287 -- see that function's doc).
+    let mut sidecar_meta = dosmeta::read_or_host_date(&host_path);
     sidecar_meta.prot = mask;
     // Best-effort: a sidecar write failure shouldn't fail the whole
     // call when the real host permission change (the primary,
@@ -227,6 +230,29 @@ mod tests {
 
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn set_protection_does_not_reset_the_files_date() {
+        // Found in review of the issue #287 fix: SetProtection created
+        // a sidecar from Meta::default(), whose date is the AmigaOS
+        // epoch -- and since fib_Date prefers any sidecar over the host
+        // mtime, `Protect foo +r` on a file with no sidecar silently
+        // stamped it 01-Jan-78, re-introducing the bug #287 fixed.
+        let tmp = TempDir::new("protect-keeps-date");
+        let path = tmp.path().join("f.txt");
+        fs::write(&path, b"hi").unwrap();
+        let before = crate::dosdate::datestamp_for_host_path(&path);
+        assert_ne!(before, (0, 0, 0), "the host file has a real date");
+
+        let code = run_set_protection(b"SYS:f.txt\0", FIBF_WRITE, tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+
+        let meta = crate::dosmeta::read_sidecar(&path).expect("sidecar written");
+        assert_eq!(
+            meta.date, before,
+            "the new sidecar must carry the file's real date, not the epoch"
+        );
     }
 
     #[test]

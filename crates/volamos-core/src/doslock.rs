@@ -1088,10 +1088,7 @@ pub(crate) fn fill_fib(
     // fixed epoch, `make`, `List SINCE` and a libc `stat()` all saw
     // every file as equally ancient, including one the guest had just
     // written.
-    let meta = dosmeta::read_sidecar(host_path).unwrap_or_else(|| dosmeta::Meta {
-        date: crate::dosdate::datestamp_for_host_path(host_path),
-        ..Default::default()
-    });
+    let meta = dosmeta::read_or_host_date(host_path);
 
     mem.write_u32(fib_addr + FIB_DISKKEY_OFFSET, 0);
     mem.write_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET, entry_type as u32);

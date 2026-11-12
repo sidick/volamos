@@ -82,6 +82,29 @@ pub(crate) struct Meta {
     pub comment: Option<Vec<u8>>,
 }
 
+/// `host_path`'s sidecar metadata if it has one, else defaults whose
+/// `date` is the host file's own modification time (issue #287).
+///
+/// **Use this rather than `read_sidecar(..).unwrap_or_default()`** for
+/// anything that reads *or* writes metadata. `Meta::default()`'s date
+/// is the AmigaOS epoch, and since `fib_Date` prefers any existing
+/// sidecar over the host mtime, a caller that defaults-then-writes
+/// turns a file with a real date into one stamped 01-Jan-78 --
+/// re-creating exactly the bug #287 fixed, through a different door.
+/// `SetProtection` and `SetComment` both did this (found in review of
+/// the #287 fix): `Protect foo +r` or `Filenote foo "x"` on a file with
+/// no sidecar silently reset its date.
+///
+/// The host mtime is a *better* default than the epoch for readers too
+/// -- it is what `fill_fib` and `ExAll` report -- so there is no caller
+/// that wants the plain `Default`.
+pub(crate) fn read_or_host_date(host_path: &std::path::Path) -> Meta {
+    read_sidecar(host_path).unwrap_or_else(|| Meta {
+        date: crate::dosdate::datestamp_for_host_path(host_path),
+        ..Default::default()
+    })
+}
+
 impl Default for Meta {
     /// This runtime's previous all-default behavior, for a target with
     /// no sidecar yet: no protection bits set, the AmigaOS epoch, no
@@ -231,6 +254,42 @@ pub(crate) fn write_sidecar(target: &Path, meta: &Meta) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_or_host_date_defaults_the_date_to_the_host_mtime() {
+        // The chokepoint that stops issue #287 being re-introduced by
+        // a caller that defaults-then-writes.
+        let tmp = TempDir::new("read-or-host-date");
+        let target = tmp.path().join("f.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let meta = read_or_host_date(&target);
+        assert_ne!(meta.date, (0, 0, 0), "not the epoch");
+        assert_eq!(
+            meta.prot,
+            Meta::default().prot,
+            "other fields still default"
+        );
+        assert_eq!(meta.comment, None);
+
+        // A sidecar still wins outright.
+        write_sidecar(
+            &target,
+            &Meta {
+                prot: 0x5,
+                date: (99, 1, 2),
+                comment: Some(b"c".to_vec()),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_or_host_date(&target).date, (99, 1, 2));
+    }
+
+    #[test]
+    fn read_or_host_date_on_a_missing_path_is_all_defaults() {
+        let meta = read_or_host_date(std::path::Path::new("/nonexistent/volamos/287"));
+        assert_eq!(meta.date, (0, 0, 0));
+        assert_eq!(meta.prot, 0);
+    }
     use std::fs;
     use std::path::PathBuf as StdPathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -2605,6 +2605,29 @@ pub(crate) fn host_time_secs_micro() -> (u32, u32) {
     (secs as u32, now.subsec_micros())
 }
 
+/// The same host clock as [`host_time_secs_micro`] but **without** the
+/// local-time offset, for `ReadEClock`'s counter.
+///
+/// `ReadEClock`'s documented contract is that only *differences*
+/// between two readings mean anything, and that makes monotonicity the
+/// property to protect: applying a local-time offset would move the
+/// counter by an hour across a DST transition -- backwards, in autumn
+/// -- so a guest subtracting two readings would get a wildly wrong or
+/// negative interval. Keeping it on raw UTC-derived seconds also keeps
+/// `localtime_r` (a lock and a TZ-database lookup) out of a counter
+/// that benchmark loops read constantly. Found in review of issue
+/// #287's local-time change.
+pub(crate) fn host_monotonic_secs_micro() -> (u32, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64 - crate::dosdate::UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+    if secs < 0 {
+        return (0, 0);
+    }
+    (secs as u32, now.subsec_micros())
+}
+
 /// Reads a `struct timeval` (`tv_secs`/`tv_micro`, both `ULONG`) at
 /// `addr`.
 fn read_timeval(mem: &dyn AddressSpace, addr: u32) -> (u32, u32) {
@@ -2740,7 +2763,16 @@ fn read_eclock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             (emulated_secs * f64::from(ECLOCK_PAL_HZ)) as u64
         }
         None => {
-            let (secs, micro) = host_time_secs_micro();
+            // Deliberately *not* host_time_secs_micro: this counter
+            // exists for interval arithmetic (its absolute value is
+            // meaningless, see this handler's doc), so it has to be
+            // monotonic. Local time is neither -- a DST transition
+            // moves it by an hour, and backwards in autumn, which
+            // would make a guest's elapsed-time subtraction wildly
+            // wrong or negative. It also keeps `localtime_r`'s lock
+            // and TZ lookup out of a counter that CoreMark-style
+            // benchmarks read in a tight loop.
+            let (secs, micro) = host_monotonic_secs_micro();
             u64::from(secs) * u64::from(ECLOCK_PAL_HZ)
                 + u64::from(micro) * u64::from(ECLOCK_PAL_HZ) / 1_000_000
         }

@@ -55,7 +55,7 @@ pub(crate) fn set_file_date(
     // otherwise -- same convention as crate::dosnote's SetComment).
     std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
 
-    let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
+    let mut sidecar_meta = dosmeta::read_or_host_date(&host_path);
     sidecar_meta.date = (days, minute, tick);
     dosmeta::write_sidecar(&host_path, &sidecar_meta).map_err(|e| map_io_error(&e))?;
 
@@ -76,6 +76,12 @@ pub(crate) fn set_file_date(
 
 /// Sets `path`'s host modification time from an Amiga `DateStamp`,
 /// ignoring any failure -- see [`set_file_date`]'s own comment.
+///
+/// Uses `std::fs::File::set_modified` rather than `libc::utimes`:
+/// portable (volamos cross-compiles to Windows, where there is no
+/// `utimes` and `time_t` is 32-bit), and it takes a `SystemTime`, so
+/// the tick remainder survives instead of being squeezed through a
+/// `suseconds_t`.
 fn set_host_mtime(path: &std::path::Path, date: (i32, i32, i32)) {
     let (days, minute, tick) = date;
     if days < 0 || minute < 0 || tick < 0 {
@@ -83,27 +89,19 @@ fn set_host_mtime(path: &std::path::Path, date: (i32, i32, i32)) {
     }
     let amiga_secs = i64::from(days) * 86_400 + i64::from(minute) * 60 + i64::from(tick) / 50;
     let unix_secs = crate::dosdate::amiga_secs_to_unix_local(amiga_secs);
-    // Sub-second precision is dropped: a DateStamp's ticks are 1/50 s
-    // and `utimes` takes microseconds, so the remainder is carried
-    // through rather than truncated away.
-    let micros = (i64::from(tick) % 50) * 20_000;
-    let times = [
-        libc::timeval {
-            tv_sec: unix_secs as libc::time_t,
-            tv_usec: micros as libc::suseconds_t,
-        },
-        libc::timeval {
-            tv_sec: unix_secs as libc::time_t,
-            tv_usec: micros as libc::suseconds_t,
-        },
-    ];
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+    if unix_secs < 0 {
+        // Before the Unix epoch: no SystemTime to express it with on
+        // every host, and a date that old is not what the guest meant.
         return;
-    };
-    // SAFETY: both pointers are valid for the call, and `times` is the
-    // two-element array `utimes` expects.
-    unsafe {
-        libc::utimes(c_path.as_ptr(), times.as_ptr());
+    }
+    // A DateStamp's ticks are 1/50 s, so the sub-second part is carried
+    // through as nanoseconds rather than truncated to whole seconds.
+    let nanos = (u64::from(tick as u32 % 50)) * 20_000_000;
+    let when = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(unix_secs as u64)
+        + std::time::Duration::from_nanos(nanos);
+    if let Ok(file) = std::fs::File::options().write(true).open(path) {
+        let _ = file.set_modified(when);
     }
 }
 
