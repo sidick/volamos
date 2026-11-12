@@ -112,22 +112,22 @@ pub const TRAP_TABLE_END: u32 = TRAP_TABLE_BASE + TRAP_TABLE_SIZE;
 
 impl AddressBus for FlatMemory {
     fn read_byte(&mut self, address: u32) -> u8 {
-        self.count_read();
+        self.count_read(address, 1);
         AddressSpace::read_u8(self, address)
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
-        self.count_read();
+        self.count_read(address, 2);
         AddressSpace::read_u16(self, address)
     }
 
     fn read_long(&mut self, address: u32) -> u32 {
-        self.count_read();
+        self.count_read(address, 4);
         AddressSpace::read_u32(self, address)
     }
 
     fn write_byte(&mut self, address: u32, value: u8) {
-        self.count_write();
+        self.count_write(address, 1);
         if self.intercept_store(address, u32::from(value), StoreSize::Byte) {
             return;
         }
@@ -135,7 +135,7 @@ impl AddressBus for FlatMemory {
     }
 
     fn write_word(&mut self, address: u32, value: u16) {
-        self.count_write();
+        self.count_write(address, 2);
         if self.intercept_store(address, u32::from(value), StoreSize::Word) {
             return;
         }
@@ -143,7 +143,7 @@ impl AddressBus for FlatMemory {
     }
 
     fn write_long(&mut self, address: u32, value: u32) {
-        self.count_write();
+        self.count_write(address, 4);
         if self.intercept_store(address, value, StoreSize::Long) {
             return;
         }
@@ -154,12 +154,15 @@ impl AddressBus for FlatMemory {
     /// read_word`] so `--cache`'s modeled instruction cache (issue
     /// #148, [`crate::memory::FlatMemory::enable_icache`]) only ever
     /// sees real opcode/extension-word fetches, never ordinary data
-    /// reads. `count_read` still runs here exactly as it would have
-    /// under the default (which delegates to `read_word`), so
-    /// `--clock-mhz`'s access-count reporting is unaffected by this
-    /// override existing at all.
+    /// reads. The access still counts toward `--clock-mhz`'s
+    /// access-count reporting exactly as it would have under the
+    /// default (which delegates to `read_word`), via
+    /// `count_read_untimed` -- "untimed" because `--mem-wait`'s
+    /// latency model bills data accesses only; see
+    /// `FlatMemory::enable_mem_timing`'s doc for why fetch misses are
+    /// left uncharged for now.
     fn read_immediate_word(&mut self, address: u32) -> u16 {
-        self.count_read();
+        self.count_read_untimed();
         self.icache_note_instruction_fetch(address, 2);
         AddressSpace::read_u16(self, address)
     }
@@ -167,7 +170,7 @@ impl AddressBus for FlatMemory {
     /// As [`Self::read_immediate_word`], for a long instruction-stream
     /// read (a 4-byte immediate operand).
     fn read_immediate_long(&mut self, address: u32) -> u32 {
-        self.count_read();
+        self.count_read_untimed();
         self.icache_note_instruction_fetch(address, 4);
         AddressSpace::read_u32(self, address)
     }
@@ -693,6 +696,13 @@ impl M68kCpu {
             // `max(0)` is just cheap insurance against ever underflowing
             // the u64 accumulator if that documented behavior changes.
             self.cycles = self.cycles.saturating_add(result.cycles.max(0) as u64);
+            // --mem-wait (issue #148): the crate has no way for a bus to
+            // hand wait states back to the core (`AddressBus::sync` is
+            // outbound only, and isn't called above the 68010), so the
+            // data-cache/memory-latency model accumulates its charge in
+            // `FlatMemory` and this -- the owner of the cycle total --
+            // folds it in. Zero unless `--mem-wait` installed a model.
+            self.cycles = self.cycles.saturating_add(mem.take_mem_timing_clocks());
             self.instructions = self
                 .instructions
                 .saturating_add(u64::from(result.instructions));

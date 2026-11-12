@@ -337,6 +337,14 @@ struct Options {
     /// what a `--clock-mhz` benchmark number *means*, which a stale
     /// `~/.volamos`/`.volamos` shouldn't be able to silently flip on.
     cache: bool,
+    /// `--mem-wait` (issue #148): `(read line-fill clocks, write
+    /// clocks)` for the modeled data cache and memory latency, or
+    /// `None` (the default) for the ideal zero-wait-state memory every
+    /// `--clock-mhz` run modeled before this existed. See
+    /// [`parse_mem_wait`] for the accepted spellings and
+    /// [`volamos_core::memory::FlatMemory::enable_mem_timing`] for the
+    /// model. CLI-only, like `cache`/`clock_mhz` above.
+    mem_wait: Option<(f64, f64)>,
     /// `--fpsp-emulate` (issue #129, extended to `--cpu 68040` by issue
     /// #217): software-emulate the real-68060 "unimplemented
     /// instruction" set (most FPU transcendentals plus MOVEP/CHK2/CMP2/
@@ -764,9 +772,36 @@ struct Cli {
                       cache state at all yet (only 68020/68030/68060 do), so --cache changes \
                       nothing measurable there besides CacheClearU/CacheClearE bookkeeping. \
                       Data-cache and memory-wait-state modeling are out of scope here -- the \
-                      m68k crate has no timing hooks for either yet."
+                      Data-cache and memory-latency modeling live behind --mem-wait, \
+                      which does not need a crate-side hook (volamos owns the cycle total)."
     )]
     cache: bool,
+
+    /// Model a data cache and memory latency, as PRESET (a3640/zorro3/chip) or clocks READ[,WRITE] (off by default; needs --clock-mhz)
+    #[arg(
+        long = "mem-wait",
+        value_name = "SPEC",
+        value_parser = parse_mem_wait,
+        help_heading = "Execution",
+        long_help = "Model a data cache and memory latency in --clock-mhz timings, so code \
+                      whose working set doesn't fit -- or data in slower memory -- costs what \
+                      it costs on real hardware instead of being free (issue #148). SPEC is \
+                      either a preset measured on a real A4000 with a 25 MHz A3640 by \
+                      Copperline's accelprobe -- a3640 (motherboard RAM: 32.6 clocks per read \
+                      line fill, 9.2 per write), zorro3 (53.3/13.1) or chip (85.4/21.4) -- or \
+                      your own clocks as READ or READ,WRITE (e.g. 32.6,9.2). The data cache is \
+                      sized by --cpu (256 bytes on 68030, 4096 on 68040/68060; the 68020 has \
+                      none, so every read is a bus access there, as on the real part), \
+                      direct-mapped with 16-byte lines, write-through, and flushed by \
+                      CacheClearU/CacheClearE alongside --cache's instruction cache. Reads are \
+                      charged per line fill, not per access -- the preset numbers were measured \
+                      with a 16-byte stride, so charging them per access would overcharge \
+                      sequential code about fourfold. Instruction-fetch misses are not charged \
+                      yet (see --cache's note on the m68k crate's 68040 timing model). Off by \
+                      default so existing --clock-mhz numbers stay comparable, and an error \
+                      without --clock-mhz, which is the only path that keeps a cycle count."
+    )]
+    mem_wait: Option<(f64, f64)>,
 
     /// Enable shadow-memory checking of guest accesses (off by default)
     #[arg(
@@ -1084,6 +1119,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         sanitize,
         cli.clock_mhz,
         cli.cache,
+        cli.mem_wait,
         cli.fpsp_emulate,
         cli.stack_report,
         cli.libs_dir,
@@ -1225,6 +1261,140 @@ fn cpu_model_name(cpu_type: CpuType) -> &'static str {
             "CPU"
         }
     }
+}
+
+/// One `--mem-wait` preset: a machine's measured memory costs, in CPU
+/// clocks, for one read line fill and one write.
+///
+/// Every number here comes from Copperline's `timing-test/
+/// accelprobe.asm` run on a real A4000 with a 25 MHz A3640 (cited in
+/// issue #148), measured with a 16-byte stride so each read is one
+/// full line fill -- which is why they are billed per line, not per
+/// access (see `FlatMemory::enable_mem_timing`). They describe *that*
+/// machine; `R[,W]` is there for any other.
+struct MemWaitPreset {
+    name: &'static str,
+    read_line_clocks: f64,
+    write_clocks: f64,
+    what: &'static str,
+}
+
+/// The named `--mem-wait` presets, in the order `--help` lists them.
+const MEM_WAIT_PRESETS: &[MemWaitPreset] = &[
+    MemWaitPreset {
+        name: "a3640",
+        read_line_clocks: 32.6,
+        write_clocks: 9.2,
+        what: "A4000 motherboard RAM through a 25 MHz A3640",
+    },
+    MemWaitPreset {
+        name: "zorro3",
+        read_line_clocks: 53.3,
+        write_clocks: 13.1,
+        what: "Zorro III RAM on the same machine",
+    },
+    MemWaitPreset {
+        name: "chip",
+        read_line_clocks: 85.4,
+        write_clocks: 21.4,
+        what: "chip RAM through the same card",
+    },
+];
+
+/// Parses `--mem-wait`: a preset name from [`MEM_WAIT_PRESETS`], or
+/// explicit clocks as `READ` (writes cost the same) or `READ,WRITE`.
+///
+/// Rejects negatives and non-finite values -- a negative charge would
+/// run the cycle counter backwards -- and accepts `0` so
+/// `--mem-wait 0` can express "model the data cache but charge nothing
+/// for a miss", which isolates the cache's hit-rate reporting from its
+/// timing effect.
+fn parse_mem_wait(raw: &str) -> Result<(f64, f64), String> {
+    if let Some(preset) = MEM_WAIT_PRESETS.iter().find(|p| p.name == raw) {
+        return Ok((preset.read_line_clocks, preset.write_clocks));
+    }
+    let (read_raw, write_raw) = match raw.split_once(',') {
+        Some((read, write)) => (read, write),
+        None => (raw, raw),
+    };
+    let parse_one = |what: &str, text: &str| -> Result<f64, String> {
+        let value: f64 = text.trim().parse().map_err(|_| {
+            // Name every preset *and* what it measures: a bad value is
+            // most often a misremembered preset, and "a3640" alone
+            // doesn't tell anyone whether it's the one they want.
+            let presets = MEM_WAIT_PRESETS
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{} ({}, {} read / {} write clocks)",
+                        p.name, p.what, p.read_line_clocks, p.write_clocks
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "invalid --mem-wait value '{raw}': expected clocks as READ or READ,WRITE \
+                 (e.g. 32.6,9.2), or one of these presets: {presets}"
+            )
+        })?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "invalid --mem-wait {what} '{}': must be a finite, non-negative number of clocks",
+                text.trim()
+            ));
+        }
+        Ok(value)
+    };
+    Ok((
+        parse_one("read cost", read_raw)?,
+        parse_one("write cost", write_raw)?,
+    ))
+}
+
+/// `--mem-wait`'s modeled data-cache size in bytes for `cpu_type`.
+///
+/// `0` is a real answer, not "off": the 68020 has an instruction cache
+/// and **no** data cache, so every data read on one really is a bus
+/// access, and the 68000/68010 have neither. Only the 68030 (256-byte
+/// data cache, separate from its same-sized instruction cache) and the
+/// 68040/68060 (4 KB, which this models as direct-mapped and
+/// write-through -- see `MemTimingModel`) have one to model.
+///
+/// Unlike [`icache_size_for_cpu`] this never returns `None`: a part
+/// with no data cache still pays for its memory accesses, which is
+/// exactly what `--mem-wait` is for.
+fn dcache_size_for_cpu(cpu_type: CpuType) -> u32 {
+    match cpu_type {
+        CpuType::M68EC030 | CpuType::M68030 => 256,
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => 4096,
+        CpuType::M68000 | CpuType::M68010 | CpuType::M68EC020 | CpuType::M68020 => 0,
+        // As `icache_size_for_cpu`: `CpuType` is the crate's, so it can
+        // grow a variant without this match knowing.
+        other => {
+            debug_assert!(false, "unnamed CpuType {other:?}");
+            0
+        }
+    }
+}
+
+/// Rejects `--mem-wait` without `--clock-mhz`, the same way
+/// [`check_clock_mhz_jit`] rejects an unusable combination rather than
+/// letting it silently do nothing: `--clock-mhz` is the only execution
+/// path that accumulates a cycle count, so charged memory clocks would
+/// go nowhere.
+fn check_mem_wait_clock_mhz(
+    mem_wait: Option<(f64, f64)>,
+    clock_mhz: Option<f64>,
+) -> Result<(), String> {
+    if mem_wait.is_none() || clock_mhz.is_some() {
+        return Ok(());
+    }
+    Err(
+        "--mem-wait needs --clock-mhz: the modeled memory latency is charged in CPU clocks, and \
+         only --clock-mhz's execution path keeps a cycle count to charge them to -- add \
+         --clock-mhz N (your machine's CPU clock) to use --mem-wait"
+            .to_string(),
+    )
 }
 
 /// `--cache`'s (issue #148) instruction-cache size in bytes for
@@ -1385,6 +1555,7 @@ type RawParsedArgs = (
     InstrumentationOptions,
     Option<f64>,
     bool,
+    Option<(f64, f64)>,
     bool,
     bool,
     Option<PathBuf>,
@@ -1462,6 +1633,7 @@ fn resolve(
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
     cache: bool,
+    mem_wait: Option<(f64, f64)>,
     fpsp_emulate: bool,
     stack_report: bool,
     libs_dir: Option<PathBuf>,
@@ -1507,6 +1679,7 @@ fn resolve(
         sanitize,
         clock_mhz,
         cache,
+        mem_wait,
         fpsp_emulate,
         stack_report,
         net: overrides.net.unwrap_or(false),
@@ -1533,6 +1706,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         sanitize,
         clock_mhz,
         cache,
+        mem_wait,
         fpsp_emulate,
         stack_report,
         libs_dir,
@@ -1545,6 +1719,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         sanitize,
         clock_mhz,
         cache,
+        mem_wait,
         fpsp_emulate,
         stack_report,
         libs_dir,
@@ -1916,6 +2091,7 @@ fn build_nested_runtime(
     sanitize: &InstrumentationOptions,
     clock_mhz: Option<f64>,
     cache: bool,
+    mem_wait: Option<(f64, f64)>,
     fpsp_emulate: bool,
     stack_report: bool,
     net: bool,
@@ -1938,6 +2114,11 @@ fn build_nested_runtime(
     // makes this a no-op there regardless of `cache`.
     if cache && let Some(size) = icache_size_for_cpu(cpu_type) {
         mem.enable_icache(size);
+    }
+    // --mem-wait: inherited by a nested System()/Execute() run exactly
+    // as --cache/--cpu/--clock-mhz are; see `dcache_size_for_cpu`.
+    if let Some((read_clocks, write_clocks)) = mem_wait {
+        mem.enable_mem_timing(dcache_size_for_cpu(cpu_type), read_clocks, write_clocks);
     }
     sanitize.install_debug_ports(&mut mem, cpu_type);
     let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END).ok()?;
@@ -2036,6 +2217,7 @@ fn run_nested_program(
     sanitize: InstrumentationOptions,
     clock_mhz: Option<f64>,
     cache: bool,
+    mem_wait: Option<(f64, f64)>,
     fpsp_emulate: bool,
     stack_report: bool,
     net: bool,
@@ -2053,6 +2235,7 @@ fn run_nested_program(
         &sanitize,
         clock_mhz,
         cache,
+        mem_wait,
         fpsp_emulate,
         stack_report,
         net,
@@ -2161,6 +2344,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     }
     check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source)?;
     check_clock_mhz_sanitize(opts.clock_mhz, opts.sanitize.enabled)?;
+    check_mem_wait_clock_mhz(opts.mem_wait, opts.clock_mhz)?;
 
     let bytes = std::fs::read(&opts.program)
         .map_err(|e| format!("couldn't read '{}': {e}", opts.program))?;
@@ -2222,6 +2406,17 @@ fn run(opts: &Options) -> Result<i32, String> {
         {
             mem.enable_icache(size);
         }
+        // --mem-wait (issue #148): the data cache is sized by --cpu and
+        // may legitimately be 0 bytes (a 68020 has no data cache), so
+        // unlike --cache there's no `None` case to skip -- a part with
+        // no cache still pays for its accesses.
+        if let Some((read_clocks, write_clocks)) = opts.mem_wait {
+            mem.enable_mem_timing(
+                dcache_size_for_cpu(opts.cpu_type),
+                read_clocks,
+                write_clocks,
+            );
+        }
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
@@ -2250,6 +2445,17 @@ fn run(opts: &Options) -> Result<i32, String> {
             && let Some(size) = icache_size_for_cpu(opts.cpu_type)
         {
             mem.enable_icache(size);
+        }
+        // --mem-wait (issue #148): the data cache is sized by --cpu and
+        // may legitimately be 0 bytes (a 68020 has no data cache), so
+        // unlike --cache there's no `None` case to skip -- a part with
+        // no cache still pays for its accesses.
+        if let Some((read_clocks, write_clocks)) = opts.mem_wait {
+            mem.enable_mem_timing(
+                dcache_size_for_cpu(opts.cpu_type),
+                read_clocks,
+                write_clocks,
+            );
         }
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
@@ -2286,6 +2492,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let nested_sanitize = opts.sanitize.clone();
     let nested_clock_mhz = opts.clock_mhz;
     let nested_cache = opts.cache;
+    let nested_mem_wait = opts.mem_wait;
     let nested_fpsp_emulate = opts.fpsp_emulate;
     let nested_stack_report = opts.stack_report;
 
@@ -2304,6 +2511,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_sanitize.clone(),
             nested_clock_mhz,
             nested_cache,
+            nested_mem_wait,
             nested_fpsp_emulate,
             nested_stack_report,
             nested_net,
@@ -2411,6 +2619,11 @@ fn report_emulated_cycles<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime
     {
         eprintln!("volamos: {line}");
     }
+    if let Some((fills, hits, writes)) = runtime.mem_timing_counts()
+        && let Some(line) = format_mem_timing(fills, hits, writes)
+    {
+        eprintln!("volamos: {line}");
+    }
     if let Some((counts, copy_mem_bytes)) = runtime.native_call_counts()
         && let Some(line) = format_native_calls(&counts, copy_mem_bytes)
     {
@@ -2508,6 +2721,34 @@ fn format_emulated_work(cycles: u64, instructions: u64, reads: u64, writes: u64)
     ))
 }
 
+/// Formats `--mem-wait`'s line of [`report_emulated_cycles`]: how the
+/// modeled data cache actually behaved (issue #148). The hit rate is
+/// the number that explains the cycle count -- a working set that fits
+/// the cache and one that doesn't produce the same instruction stream
+/// and wildly different timings -- and seeing "0% hit" is also the
+/// quickest way to notice that `--cpu 68020` models no data cache at
+/// all, which is true of the real part.
+///
+/// `None` when the model saw no data access at all: nothing happened
+/// worth a line, and 0/0 would print a `NaN` hit rate.
+fn format_mem_timing(fills: u64, hits: u64, writes: u64) -> Option<String> {
+    let reads = fills.saturating_add(hits);
+    if reads == 0 && writes == 0 {
+        return None;
+    }
+    let rate = if reads == 0 {
+        // Writes only (write-through, so they never consult residency):
+        // there is no read hit rate to report.
+        String::new()
+    } else {
+        format!(" ({:.1}% hit)", hits as f64 * 100.0 / reads as f64)
+    };
+    Some(format!(
+        "modeled memory: {reads} data reads -- {hits} cache hits, {fills} line fills{rate} -- \
+         and {writes} writes"
+    ))
+}
+
 /// Formats [`report_emulated_cycles`]' one line, split out from the
 /// printing so the wording and the arithmetic are testable without
 /// capturing stderr.
@@ -2567,6 +2808,7 @@ fn main() -> ExitCode {
         sanitize,
         clock_mhz,
         cache,
+        mem_wait,
         fpsp_emulate,
         stack_report,
         libs_dir,
@@ -2610,6 +2852,7 @@ fn main() -> ExitCode {
         sanitize,
         clock_mhz,
         cache,
+        mem_wait,
         fpsp_emulate,
         stack_report,
         libs_dir,
@@ -3316,6 +3559,117 @@ mod tests {
         assert_eq!(opts.guest_args, vec!["one".to_string()]);
     }
 
+    // --- --mem-wait (issue #148) ---
+
+    #[test]
+    fn mem_wait_presets_are_the_measured_a3640_numbers() {
+        // The provenance matters more than the values: these come from
+        // Copperline's accelprobe on a real A4000 + 25 MHz A3640, cited
+        // in issue #148. If they're ever recalibrated, this test is the
+        // place that records what they were.
+        assert_eq!(parse_mem_wait("a3640"), Ok((32.6, 9.2)));
+        assert_eq!(parse_mem_wait("zorro3"), Ok((53.3, 13.1)));
+        assert_eq!(parse_mem_wait("chip"), Ok((85.4, 21.4)));
+    }
+
+    #[test]
+    fn mem_wait_accepts_explicit_clocks() {
+        assert_eq!(parse_mem_wait("32.6,9.2"), Ok((32.6, 9.2)));
+        assert_eq!(parse_mem_wait("8"), Ok((8.0, 8.0)), "one value covers both");
+        assert_eq!(
+            parse_mem_wait(" 12 , 4 "),
+            Ok((12.0, 4.0)),
+            "spaces ignored"
+        );
+        assert_eq!(
+            parse_mem_wait("0"),
+            Ok((0.0, 0.0)),
+            "zero models the cache without charging, for hit-rate-only runs"
+        );
+    }
+
+    #[test]
+    fn mem_wait_rejects_values_that_would_run_the_cycle_counter_backwards() {
+        for bad in ["-1", "32.6,-1", "nan", "inf", "fast", "32.6,9.2,1"] {
+            assert!(
+                parse_mem_wait(bad).is_err(),
+                "--mem-wait {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mem_wait_error_names_the_presets() {
+        // A bad value is most likely a misremembered preset name, so
+        // the message lists them rather than only describing the
+        // numeric form.
+        let err = parse_mem_wait("a4000").expect_err("not a preset");
+        assert!(err.contains("a3640"), "{err}");
+        assert!(err.contains("READ,WRITE"), "{err}");
+    }
+
+    #[test]
+    fn mem_wait_without_clock_mhz_is_rejected() {
+        // Same posture as --clock-mhz + --jit: an unusable combination
+        // fails loudly instead of silently modeling nothing.
+        assert!(check_mem_wait_clock_mhz(Some((32.6, 9.2)), None).is_err());
+        assert!(check_mem_wait_clock_mhz(Some((32.6, 9.2)), Some(25.0)).is_ok());
+        assert!(check_mem_wait_clock_mhz(None, None).is_ok());
+    }
+
+    #[test]
+    fn mem_wait_rejection_explains_the_fix() {
+        let err = check_mem_wait_clock_mhz(Some((32.6, 9.2)), None).expect_err("needs a clock");
+        assert!(err.contains("--clock-mhz"), "{err}");
+    }
+
+    #[test]
+    fn dcache_size_for_cpu_models_only_the_parts_that_have_one() {
+        // The 68020 is the interesting row: instruction cache, no data
+        // cache, so 0 is the real answer rather than "unmodeled".
+        assert_eq!(dcache_size_for_cpu(CpuType::M68000), 0);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68010), 0);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68020), 0);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68EC020), 0);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68030), 256);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68EC030), 256);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68040), 4096);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68LC040), 4096);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68EC040), 4096);
+        assert_eq!(dcache_size_for_cpu(CpuType::M68060), 4096);
+    }
+
+    #[test]
+    fn mem_wait_flag_parses_onto_options() {
+        let opts = parse_args(
+            ["--clock-mhz", "25", "--mem-wait", "a3640", "prog"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .expect("parses");
+        assert_eq!(opts.mem_wait, Some((32.6, 9.2)));
+        assert_eq!(
+            parse_args(["prog"].iter().map(|s| s.to_string()))
+                .expect("parses")
+                .mem_wait,
+            None,
+            "off by default, so existing --clock-mhz numbers stay comparable"
+        );
+    }
+
+    #[test]
+    fn format_mem_timing_reports_the_hit_rate() {
+        let line = format_mem_timing(1, 3, 2).expect("some traffic");
+        assert!(line.contains("4 data reads"), "{line}");
+        assert!(line.contains("75.0% hit"), "{line}");
+        assert!(line.contains("2 writes"), "{line}");
+        // No data traffic at all: nothing to say, and no NaN hit rate.
+        assert_eq!(format_mem_timing(0, 0, 0), None);
+        // Writes only: no read hit rate to report.
+        let writes_only = format_mem_timing(0, 0, 5).expect("writes happened");
+        assert!(!writes_only.contains("hit)"), "{writes_only}");
+    }
+
     #[test]
     fn value_flag_spellings_cover_every_value_taking_flag() {
         // `split_program_boundary` consumes a value-taking flag's next
@@ -3337,6 +3691,7 @@ mod tests {
             "--ram",
             "--cpu",
             "--clock-mhz",
+            "--mem-wait",
             "--sanitize-ignore-pc",
             "--volumes-dir",
             "--libs-dir",
@@ -3749,7 +4104,7 @@ mod tests {
         // literal has no field for it at all, so this documents the
         // invariant: the flag's value flows out of `cli_to_raw` as a
         // plain `bool` alongside (not inside) `overrides`.
-        let (overrides, _, _, cache, _, _, _, _, _) =
+        let (overrides, _, _, cache, _, _, _, _, _, _) =
             parse_args_raw(args(&["--cache", "prog"])).unwrap();
         assert!(cache);
         let _ = overrides;
@@ -3807,7 +4162,7 @@ mod tests {
         // it at all, so this is really just documenting the invariant:
         // the flag's value flows out of `cli_to_raw` as a plain `bool`
         // alongside (not inside) `overrides`.
-        let (overrides, _, _, _, fpsp_emulate, _, _, _, _) =
+        let (overrides, _, _, _, _, fpsp_emulate, _, _, _, _) =
             parse_args_raw(args(&["--fpsp-emulate", "prog"])).unwrap();
         assert!(fpsp_emulate);
         // `Overrides` has no `fpsp_emulate` field to assert on by name;
@@ -3837,7 +4192,7 @@ mod tests {
         // this is really just documenting the invariant: the flag's
         // value flows out of `cli_to_raw` as a plain `bool` alongside
         // (not inside) `overrides`.
-        let (overrides, _, _, _, _, stack_report, _, _, _) =
+        let (overrides, _, _, _, _, _, stack_report, _, _, _) =
             parse_args_raw(args(&["--stack-report", "prog"])).unwrap();
         assert!(stack_report);
         let _ = overrides;
@@ -3937,14 +4292,14 @@ mod tests {
 
     #[test]
     fn defaults_flag_sets_standard_volumes_on() {
-        let (overrides, _, _, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(true));
     }
 
     #[test]
     fn no_defaults_flag_sets_standard_volumes_off() {
-        let (overrides, _, _, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--no-defaults", "prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, Some(false));
     }
@@ -3955,13 +4310,13 @@ mod tests {
         // CLI parse itself must report "not specified", so a config
         // file's own DEFAULTS= can still be told apart from an explicit
         // --defaults.
-        let (overrides, _, _, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
+        let (overrides, _, _, _, _, _, _, _, _, _) = parse_args_raw(args(&["prog"])).unwrap();
         assert_eq!(overrides.standard_volumes, None);
     }
 
     #[test]
     fn volumes_dir_flag_sets_the_override() {
-        let (overrides, _, _, _, _, _, _, _, _) =
+        let (overrides, _, _, _, _, _, _, _, _, _) =
             parse_args_raw(args(&["--volumes-dir", "/custom/vols", "prog"])).unwrap();
         assert_eq!(overrides.volumes_dir, Some(PathBuf::from("/custom/vols")));
     }
@@ -4172,6 +4527,7 @@ mod tests {
             &InstrumentationOptions::default(),
             None,
             false, // cache
+            None,  // mem_wait
             false, // fpsp_emulate
             false, // stack_report
             false, // net

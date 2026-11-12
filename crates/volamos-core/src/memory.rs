@@ -93,6 +93,14 @@ pub trait AddressSpace {
         (0, 0)
     }
 
+    /// `--mem-wait`'s modeled data-cache counts, as `(read line fills,
+    /// read hits, writes)` -- `None` by default, like
+    /// [`AddressSpace::shadow`], for address spaces with no model
+    /// installed. See [`FlatMemory::mem_timing_counts`].
+    fn mem_timing_counts(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+
     /// Reads a single byte. Returns `0` if `addr` is out of range.
     fn read_u8(&self, addr: u32) -> u8;
 
@@ -208,6 +216,155 @@ pub trait AddressSpace {
     /// timing to reset, so a full clear is simpler and just as
     /// correct as a precise one.
     fn invalidate_icache(&mut self) {}
+}
+
+/// A data cache plus memory latency model for `--mem-wait` (issue
+/// #148) -- see [`FlatMemory::enable_mem_timing`].
+///
+/// Where [`IcacheModel`] answers "was this fetch cached?" for the
+/// `m68k` crate's own timing tables, this one answers "what did this
+/// access cost?" and bills it. The crate has no mechanism for a bus to
+/// hand wait states back to the core (`AddressBus::sync` is outbound
+/// only, and is not even called above the 68010 -- see
+/// `prefetch_enabled`), so the clocks are accumulated here and folded
+/// into the run's total by `crate::backend`'s `run_via_cycles`, which
+/// already owns that total.
+///
+/// # Why a cache is not optional here
+///
+/// Issue #105 considered a flat per-access charge and rejected it:
+/// billing bus latency for every access "would bill at bus rate where
+/// silicon serves from cache -- replacing a documented gap with a
+/// plausible wrong number". That objection is the reason this type
+/// exists in this shape. The numbers it is calibrated against
+/// (Copperline's `accelprobe` on a real A4000/A3640 at 25 MHz: 32.6
+/// CPU clocks for a motherboard-RAM read, 9.2 for a write) were
+/// measured with a **16-byte stride**, i.e. one full line fill per
+/// access. Charging 32.6 per access rather than per line fill would
+/// therefore overcharge ordinary sequential code roughly fourfold --
+/// the same class of plausible wrong number, just with a citation
+/// attached. Lines, not accesses, are what the probe measured and what
+/// this bills.
+///
+/// # The model
+///
+/// Direct-mapped, one tag per [`Self::LINE_SIZE`]-byte line, exactly
+/// as [`IcacheModel`] is (and as Copperline's `src/cache.rs`, cited as
+/// a design reference in issue #148, models both caches -- GPL-3.0, so
+/// a reference rather than shared code). Tags only: cached *contents*
+/// are never modeled, since a guest read always returns real current
+/// memory. Three deliberate simplifications:
+///
+/// - **Write-through, no write-allocate.** A write costs
+///   [`Self::write_clocks`] and leaves cache residency alone. Real
+///   68040/060 data caches are copyback and 4-way; Copperline's model
+///   documents why write-through is enough for timing purposes, and
+///   the measured write cost (9.2 clocks, 3.5x cheaper than a read) is
+///   a write-through cost.
+/// - **Reads are billed per line, writes per access.** A read that
+///   spans two lines (an unaligned longword) bills both.
+/// - **No cache at all when sized 0**, which is the right answer for a
+///   plain 68020: it has an instruction cache and no data cache, so
+///   every data read really is a bus access.
+///
+/// Instruction fetches are deliberately *not* billed here -- see
+/// [`FlatMemory::enable_mem_timing`]'s doc for why that needs
+/// something this model cannot currently give it.
+struct MemTimingModel {
+    /// One tag slot per line, direct-mapped; empty means "no data
+    /// cache", so every read misses.
+    lines: Vec<Option<u32>>,
+    /// Clocks charged for one read line fill.
+    read_line_clocks: f64,
+    /// Clocks charged for one write (write-through, so every write
+    /// reaches memory).
+    write_clocks: f64,
+    /// Clocks charged but not yet handed to the cycle total, including
+    /// the fractional part -- the measured costs are fractional (32.6,
+    /// 9.2) and truncating each access to a whole clock would lose up
+    /// to 2% of a read-heavy run and 7% of a write-heavy one.
+    owed: f64,
+    /// Read line fills, read hits, and writes, for the exit report.
+    fills: u64,
+    hits: u64,
+    writes: u64,
+}
+
+impl MemTimingModel {
+    /// 16 bytes: the 68040/68060 cache line, and the stride
+    /// `accelprobe` used to measure the line-fill costs this model is
+    /// calibrated against (see the type doc). Deliberately *not*
+    /// [`IcacheModel::LINE_SIZE`], whose longword "lines" are a
+    /// residency approximation for the crate's cache-case flag rather
+    /// than a fill unit.
+    const LINE_SIZE: u32 = 16;
+
+    fn new(dcache_bytes: u32, read_line_clocks: f64, write_clocks: f64) -> Self {
+        let lines = (dcache_bytes / Self::LINE_SIZE) as usize;
+        Self {
+            lines: vec![None; lines],
+            read_line_clocks,
+            write_clocks,
+            owed: 0.0,
+            fills: 0,
+            hits: 0,
+            writes: 0,
+        }
+    }
+
+    fn line_base(addr: u32) -> u32 {
+        addr & !(Self::LINE_SIZE - 1)
+    }
+
+    /// Bills a data read of `len` bytes at `addr`: one line fill per
+    /// line it touches that was not already resident.
+    fn note_read(&mut self, addr: u32, len: u32) {
+        let first = Self::line_base(addr);
+        let last = Self::line_base(addr.wrapping_add(len.saturating_sub(1)));
+        let mut line = first;
+        loop {
+            if self.lines.is_empty() {
+                // No data cache (a plain 68020): every read is a fill,
+                // and there is nowhere to record it.
+                self.fills += 1;
+                self.owed += self.read_line_clocks;
+            } else {
+                let index = (line / Self::LINE_SIZE) as usize % self.lines.len();
+                if self.lines[index] == Some(line) {
+                    self.hits += 1;
+                } else {
+                    self.lines[index] = Some(line);
+                    self.fills += 1;
+                    self.owed += self.read_line_clocks;
+                }
+            }
+            if line == last {
+                break;
+            }
+            line = line.wrapping_add(Self::LINE_SIZE);
+        }
+    }
+
+    /// Bills a data write: write-through, so it always reaches memory,
+    /// and no-write-allocate, so residency is untouched.
+    fn note_write(&mut self, _addr: u32, _len: u32) {
+        self.writes += 1;
+        self.owed += self.write_clocks;
+    }
+
+    /// Hands over the whole clocks accrued so far, keeping the
+    /// fraction for the next call.
+    fn take_whole_clocks(&mut self) -> u64 {
+        let whole = self.owed.floor();
+        self.owed -= whole;
+        whole.max(0.0) as u64
+    }
+
+    /// Drops every resident line -- `CacheClearU`/`CPUSH` and friends
+    /// flush the data cache along with the instruction cache.
+    fn invalidate_all(&mut self) {
+        self.lines.fill(None);
+    }
 }
 
 /// A direct-mapped instruction-cache hit/miss model for `--cache`
@@ -337,6 +494,13 @@ pub struct FlatMemory {
     /// matching [`m68k::AddressBus::last_fetch_was_cached`]'s own
     /// "cached by default" contract.
     icache: Option<IcacheModel>,
+    /// The modeled data cache and memory latency (`--mem-wait`, issue
+    /// #148), if [`Self::enable_mem_timing`] was called. `None` (the
+    /// default) charges nothing, preserving the zero-wait-state
+    /// timings every `--clock-mhz` run reported before this existed.
+    /// Boxed for the same reason [`Self::shadow`] is: the disabled
+    /// case shouldn't carry the model's `Vec` inline.
+    mem_timing: Option<Box<MemTimingModel>>,
     /// Whether the most recent instruction-stream fetch hit
     /// [`Self::icache`] -- backs
     /// [`m68k::AddressBus::last_fetch_was_cached`] (via
@@ -374,6 +538,7 @@ impl FlatMemory {
             shadow: None,
             ports: Vec::new(),
             icache: None,
+            mem_timing: None,
             icache_last_fetch_cached: true,
             icache_fetches_cached_since_begin: true,
         }
@@ -435,17 +600,41 @@ impl FlatMemory {
         (self.reads, self.writes)
     }
 
-    /// Records one guest-CPU bus read. Called only from the
+    /// Records one guest-CPU bus read of `len` bytes at `address`, and
+    /// bills it against [`Self::mem_timing`] if `--mem-wait` is
+    /// modeling memory latency. Called only from the
     /// [`m68k::AddressBus`] impl -- see [`FlatMemory::access_counts`].
+    ///
+    /// `address`/`len` describe the access only so the data-cache model
+    /// can tell which line(s) it touches; the counter itself is
+    /// per-access, as it always was.
     #[inline]
-    pub(crate) fn count_read(&mut self) {
+    pub(crate) fn count_read(&mut self, address: u32, len: u32) {
+        self.reads = self.reads.wrapping_add(1);
+        if let Some(timing) = &mut self.mem_timing {
+            timing.note_read(address, len);
+        }
+    }
+
+    /// Records one guest-CPU bus read that the `--mem-wait` model must
+    /// *not* bill: an instruction-stream fetch. It still counts toward
+    /// [`Self::access_counts`] exactly as it always did -- only the
+    /// latency charge is skipped, for the reasons in
+    /// [`Self::enable_mem_timing`]'s doc (the instruction cache's
+    /// longword lines can't price a line fill, and the crate's 68040
+    /// timing model ignores fetch residency anyway).
+    #[inline]
+    pub(crate) fn count_read_untimed(&mut self) {
         self.reads = self.reads.wrapping_add(1);
     }
 
     /// Records one guest-CPU bus write. See [`FlatMemory::count_read`].
     #[inline]
-    pub(crate) fn count_write(&mut self) {
+    pub(crate) fn count_write(&mut self, address: u32, len: u32) {
         self.writes = self.writes.wrapping_add(1);
+        if let Some(timing) = &mut self.mem_timing {
+            timing.note_write(address, len);
+        }
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -559,6 +748,62 @@ impl FlatMemory {
     /// [`Self::enable_sanitizer`]'s doc: the model tracks addresses
     /// only, never cached *contents*, so there's nothing for load
     /// order to get wrong.
+    /// Installs the modeled data cache and memory latency
+    /// (`--mem-wait`, issue #148): `dcache_bytes` of direct-mapped data
+    /// cache (`0` for a part that has none), with a read line fill
+    /// costing `read_line_clocks` and a write `write_clocks`. See
+    /// [`MemTimingModel`]'s doc for the model and why the costs are
+    /// per line rather than per access, and the CLI's `--mem-wait` for
+    /// where the numbers come from.
+    ///
+    /// Charges data accesses only. Instruction-fetch misses are left
+    /// uncharged on purpose, for two reasons that both have to change
+    /// before billing them would mean anything: [`IcacheModel`]'s
+    /// longword "lines" are a residency approximation, so pricing them
+    /// as fills would overcharge a sequential fetch stream about
+    /// fourfold (the exact error this model's line granularity exists
+    /// to avoid), and the `m68k` crate's 68040 timing model discards
+    /// cache residency entirely (`finalize_cycles` passes
+    /// `fetch_cached` to its 020 and 060 models but not its 040 one --
+    /// reported upstream as benletchford/m68k-rs#234), so on the part
+    /// these numbers were measured from there is nothing to bill
+    /// against yet.
+    ///
+    /// Harmless before or after [`crate::loader::load`], same
+    /// reasoning as [`Self::enable_icache`]: tags only, no contents.
+    pub fn enable_mem_timing(
+        &mut self,
+        dcache_bytes: u32,
+        read_line_clocks: f64,
+        write_clocks: f64,
+    ) {
+        self.mem_timing = Some(Box::new(MemTimingModel::new(
+            dcache_bytes,
+            read_line_clocks,
+            write_clocks,
+        )));
+    }
+
+    /// Whole clocks charged by [`Self::enable_mem_timing`]'s model
+    /// since the last call, for `crate::backend`'s `run_via_cycles` to
+    /// fold into the run's cycle total. `0` when no model is installed.
+    pub(crate) fn take_mem_timing_clocks(&mut self) -> u64 {
+        match &mut self.mem_timing {
+            Some(timing) => timing.take_whole_clocks(),
+            None => 0,
+        }
+    }
+
+    /// `(read line fills, read hits, writes)` from the `--mem-wait`
+    /// model, or `None` when none is installed -- for the CLI's exit
+    /// report, so a run's hit rate is visible next to its cycle count
+    /// (the number that says whether the working set fit).
+    pub fn mem_timing_counts(&self) -> Option<(u64, u64, u64)> {
+        self.mem_timing
+            .as_ref()
+            .map(|t| (t.fills, t.hits, t.writes))
+    }
+
     pub fn enable_icache(&mut self, size_bytes: u32) {
         self.icache = Some(IcacheModel::new(size_bytes));
     }
@@ -600,11 +845,21 @@ impl AddressSpace for FlatMemory {
         self.access_counts()
     }
 
+    fn mem_timing_counts(&self) -> Option<(u64, u64, u64)> {
+        FlatMemory::mem_timing_counts(self)
+    }
+
     fn len(&self) -> usize {
         self.bytes.len()
     }
 
     fn invalidate_icache(&mut self) {
+        // CacheClearU/CacheClearE and CPUSH flush data alongside
+        // instructions, so the data cache goes too -- see
+        // MemTimingModel::invalidate_all.
+        if let Some(timing) = &mut self.mem_timing {
+            timing.invalidate_all();
+        }
         if let Some(icache) = &mut self.icache {
             icache.invalidate_all();
         }
@@ -893,6 +1148,178 @@ mod tests {
         assert_eq!(mem.read_u8(3), 0xBB);
         // Bytes 4 and 5 don't exist; reading them back gives 0.
         assert_eq!(mem.read_u8(4), 0);
+    }
+
+    // --- MemTimingModel / --mem-wait (issue #148) ---
+
+    /// The A3640 preset (see the CLI's `--mem-wait`): one read line
+    /// fill, one write, in CPU clocks.
+    const A3640_READ: f64 = 32.6;
+    const A3640_WRITE: f64 = 9.2;
+
+    #[test]
+    fn without_enable_mem_timing_memory_is_free() {
+        // The pre-issue-#148 default, preserved exactly: no model, no
+        // charge, so every --clock-mhz number recorded before this
+        // existed stays reproducible.
+        let mut mem = FlatMemory::new(256);
+        mem.count_read(0, 4);
+        mem.count_write(128, 4);
+        assert_eq!(mem.take_mem_timing_clocks(), 0);
+        assert_eq!(mem.mem_timing_counts(), None);
+    }
+
+    #[test]
+    fn a_sequential_walk_pays_one_line_fill_per_line_not_per_access() {
+        // The property the whole model exists for, and the reason the
+        // A3640 numbers can be used at all: they were measured with a
+        // 16-byte stride (one fill per access), so billing them per
+        // access would overcharge ordinary sequential code fourfold.
+        // Four consecutive longwords share one 16-byte line.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        for i in 0..4 {
+            mem.count_read(i * 4, 4);
+        }
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (1, 3), "one fill, three hits in one line");
+        assert_eq!(mem.take_mem_timing_clocks(), 32);
+    }
+
+    #[test]
+    fn a_sixteen_byte_stride_walk_pays_a_fill_every_access() {
+        // The probe's own access pattern: every read lands on a new
+        // line, so every read is a full fill -- 4x the cost of the
+        // sequential walk above over the same number of reads, which is
+        // exactly the effect #148 wants visible in --clock-mhz.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        for i in 0..4 {
+            mem.count_read(i * 16, 4);
+        }
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (4, 0));
+        assert_eq!(mem.take_mem_timing_clocks(), 130); // 4 * 32.6, less the kept fraction
+    }
+
+    #[test]
+    fn fractional_clocks_accumulate_instead_of_truncating() {
+        // 32.6 per fill: truncating each access to 32 would lose 1.8%
+        // of a read-heavy run. Ten fills must bill 326, not 320.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(0, A3640_READ, A3640_WRITE);
+        let mut charged = 0;
+        for i in 0..10 {
+            mem.count_read(i * 16, 4);
+            charged += mem.take_mem_timing_clocks();
+        }
+        assert_eq!(charged, 326);
+    }
+
+    #[test]
+    fn a_zero_sized_data_cache_misses_every_read() {
+        // --cpu 68020 (and 68000/68010): no data cache on the real
+        // part, so every data read is a bus access. Not "modeling
+        // disabled" -- the charge still applies.
+        let mut mem = FlatMemory::new(256);
+        mem.enable_mem_timing(0, A3640_READ, A3640_WRITE);
+        mem.count_read(0, 4);
+        mem.count_read(0, 4);
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (2, 0), "no cache to hit in");
+    }
+
+    #[test]
+    fn writes_are_write_through_and_do_not_allocate() {
+        // Every write reaches memory and is charged; residency is
+        // untouched, so reading the same address afterwards still
+        // misses. See MemTimingModel's doc for why write-through is
+        // enough for timing.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.count_write(64, 4);
+        mem.count_write(64, 4);
+        let (fills, hits, writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits, writes), (0, 0, 2));
+        assert_eq!(mem.take_mem_timing_clocks(), 18); // 2 * 9.2
+
+        mem.count_read(64, 4);
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (1, 0), "a written line was not allocated");
+    }
+
+    #[test]
+    fn an_unaligned_read_spanning_two_lines_pays_both() {
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.count_read(14, 4); // bytes 14..18: lines 0 and 16
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (2, 0));
+    }
+
+    #[test]
+    fn a_working_set_larger_than_the_cache_thrashes_a_direct_mapped_one() {
+        // The effect #148 is for: the same loop costs nothing when its
+        // working set fits and a fill per access when it doesn't. A
+        // 64-byte cache is 4 lines; touching 8 distinct lines in a loop
+        // evicts every one before it comes round again.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(64, A3640_READ, A3640_WRITE);
+        for _pass in 0..3 {
+            for line in 0..8 {
+                mem.count_read(line * 16, 4);
+            }
+        }
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!(
+            (fills, hits),
+            (24, 0),
+            "every access evicted by the next pass"
+        );
+
+        // The same loop over a working set that *does* fit: one fill
+        // per line, then hits for the rest of the run.
+        let mut fits = FlatMemory::new(4096);
+        fits.enable_mem_timing(64, A3640_READ, A3640_WRITE);
+        for _pass in 0..3 {
+            for line in 0..4 {
+                fits.count_read(line * 16, 4);
+            }
+        }
+        let (fills, hits, _writes) = fits.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (4, 8));
+    }
+
+    #[test]
+    fn instruction_fetches_are_not_charged() {
+        // Deliberate, and documented in enable_mem_timing's doc: the
+        // instruction cache models longword lines (can't price a
+        // 16-byte fill) and the crate's 68040 timing model ignores
+        // fetch residency anyway (benletchford/m68k-rs#234). Fetches
+        // still count as bus reads, as they always did.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.count_read_untimed();
+        mem.count_read_untimed();
+        assert_eq!(mem.take_mem_timing_clocks(), 0);
+        assert_eq!(mem.mem_timing_counts(), Some((0, 0, 0)));
+        assert_eq!(mem.access_counts(), (2, 0));
+    }
+
+    #[test]
+    fn cache_control_flushes_the_data_cache_too() {
+        // CacheClearU/CacheClearE and CPUSH flush data alongside
+        // instructions on real hardware.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.count_read(0, 4);
+        mem.count_read(0, 4);
+        assert_eq!(mem.mem_timing_counts().map(|c| c.1), Some(1), "one hit");
+
+        AddressSpace::invalidate_icache(&mut mem);
+        mem.count_read(0, 4);
+        let (fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        assert_eq!((fills, hits), (2, 1), "flushed, so the line refills");
     }
 
     // --- IcacheModel / --cache (issue #148) ---

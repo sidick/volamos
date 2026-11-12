@@ -567,17 +567,96 @@ default so existing `--clock-mhz` numbers stay comparable across runs
 cache-coherency convention for self-modifying code and freshly loaded
 code.
 
-Two known gaps, both out of scope for issue #148 and left as follow-up:
+Two known gaps:
 
 - **No effect on `--cpu 68040`.** The `m68k` crate's 68040 timing model
   doesn't consult cache state at all yet (only 68020/68030/68060 do), so
   `--cache` changes nothing measurable there besides
-  `CacheClearU`/`CacheClearE` bookkeeping.
-- **No data cache or memory-wait-state modeling.** The `m68k` crate has
-  no timing hooks for either yet, and `CacheControl`'s `CACRF_EnableI`
-  toggle isn't wired to the model — `--cache` is an unconditional
-  CLI-level choice for the whole run, not something a guest can turn
-  on/off at runtime.
+  `CacheClearU`/`CacheClearE` bookkeeping. Tracked as
+  [issue #158](https://github.com/sidick/volamos/issues/158) and filed
+  upstream as
+  [benletchford/m68k-rs#234](https://github.com/benletchford/m68k-rs/issues/234).
+- **Instruction fetches only.** Data-cache and memory-latency modeling
+  live behind [`--mem-wait`](#-mem-wait-spec) instead.
+  `CacheControl`'s `CACRF_EnableI` toggle isn't wired to the model
+  either — `--cache` is an unconditional CLI-level choice for the whole
+  run, not something a guest can turn on/off at runtime.
+
+## `--mem-wait SPEC`
+
+Models a data cache and memory latency, so code whose working set
+doesn't fit — or data in slower memory — costs what it costs on real
+hardware instead of being free
+([issue #148](https://github.com/sidick/volamos/issues/148)). Requires
+[`--clock-mhz`](#-clock-mhz-n), the only execution path that keeps a
+cycle count to charge against; without it volamos exits with an error
+rather than silently modeling nothing.
+
+`SPEC` is either a preset or your own numbers:
+
+| `SPEC` | Read line fill | Write | What it measures |
+| --- | ---: | ---: | --- |
+| `a3640` | 32.6 | 9.2 | A4000 motherboard RAM through a 25 MHz A3640 |
+| `zorro3` | 53.3 | 13.1 | Zorro III RAM on the same machine |
+| `chip` | 85.4 | 21.4 | Chip RAM through the same card |
+| `READ` | `READ` | `READ` | Both costs the same |
+| `READ,WRITE` | `READ` | `WRITE` | e.g. `32.6,9.2` |
+
+Costs are in CPU clocks. Every preset is a deterministic capture from a
+real A4000 with a 25 MHz A3640, measured by Copperline's
+`timing-test/accelprobe.asm`; they describe *that* machine, and the
+numeric form is there for any other.
+
+```sh
+volamos --cpu 68040 --clock-mhz 25 --mem-wait a3640 ./bench
+```
+
+The exit report gains a line showing how the cache behaved, which is
+what explains the cycle count — the same loop over a working set that
+fits and one that doesn't produce the same instruction stream and very
+different timings:
+
+```
+volamos: 1153860 emulated cycles, 0.046154 s at 25 MHz
+volamos: modeled memory: 67275 data reads — 50757 cache hits, 16518 line fills (75.4% hit) — and 1523 writes
+```
+
+### The model
+
+- **Sized by `--cpu`**: 256 bytes on 68030, 4096 on 68040/68060. The
+  68020 has an instruction cache and *no* data cache, and the
+  68000/68010 have neither, so on those every data read is a bus
+  access — as on the real part. That is a real answer rather than
+  "unmodeled", so `--mem-wait` applies on every `--cpu`.
+- **Direct-mapped, 16-byte lines, write-through.** Real 68040/68060 data
+  caches are 4-way and copyback; write-through is enough for timing, and
+  the measured write cost is a write-through cost.
+- **Reads are charged per line fill, writes per access.** This is the
+  load-bearing detail: the preset numbers were measured with a 16-byte
+  stride, i.e. one full line fill per read, so charging them per *access*
+  would overcharge ordinary sequential code about fourfold. Four
+  consecutive longword reads share one line and cost one fill.
+- **Flushed by `CacheClearU`/`CacheClearE`**, alongside `--cache`'s
+  instruction cache.
+- **Fractional clocks accumulate** rather than truncating per access, so
+  a long run does not drift low by up to 2%.
+
+Two things it deliberately doesn't do:
+
+- **Instruction-fetch misses aren't charged.** `--cache`'s model tracks
+  longword granularity, which can't price a 16-byte line fill without
+  the same fourfold overcharge this model's line granularity exists to
+  avoid; and on the 68040 the crate's timing model discards cache
+  residency anyway (see `--cache`'s note and
+  [benletchford/m68k-rs#234](https://github.com/benletchford/m68k-rs/issues/234)).
+- **No chip/fast RAM split.** One cost applies to all of guest memory;
+  per-region costs need
+  [issue #135](https://github.com/sidick/volamos/issues/135) first. The
+  `chip` preset is there for a run whose working set you know lives in
+  chip RAM.
+
+Off by default, so `--clock-mhz` numbers recorded before this existed
+stay reproducible.
 
 ## `--sanitize`
 
