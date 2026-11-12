@@ -3,6 +3,20 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.20.0](https://github.com/sidick/volamos/compare/v0.19.0...v0.20.0) (2026-11-12)
+
+
+### Features
+
+* **cli:** --mem-wait models a data cache and memory latency ([#286](https://github.com/sidick/volamos/issues/286)) ([5f1f481](https://github.com/sidick/volamos/commit/5f1f4813015c04f47bb676366114bda7e4e74429))
+
+
+### Bug Fixes
+
+* **dos:** DoPkt services every handler action, and add ErrorReport ([#290](https://github.com/sidick/volamos/issues/290)) ([445f37b](https://github.com/sidick/volamos/commit/445f37b361e5e73233c07310f6c3e307fc3d4200))
+* **dos:** fib_Date from the host mtime, local time, and CompareDates' sign ([#289](https://github.com/sidick/volamos/issues/289)) ([fbe528f](https://github.com/sidick/volamos/commit/fbe528f016ab726a051d0bfc5c887e72c6ac3614))
+* **exec:** DoIO(TR_ADDREQUEST) lets the other tasks run ([#284](https://github.com/sidick/volamos/issues/284)) ([c437056](https://github.com/sidick/volamos/commit/c4370561288e9edcb4e4198712130ea30acf61ca))
+
 ## [0.19.0](https://github.com/sidick/volamos/compare/v0.18.0...v0.19.0) (2026-11-11)
 
 
