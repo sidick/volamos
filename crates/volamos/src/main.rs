@@ -92,7 +92,7 @@ use volamos_core::dispatch::{
 };
 use volamos_core::exectask::install_host_break_handler;
 use volamos_core::loader::Location;
-use volamos_core::memory::FlatMemory;
+use volamos_core::memory::{DcacheGeometry, FlatMemory, MemWaitCosts};
 use volamos_core::vfs::{Vfs, VfsConfig};
 use volamos_core::{DEFAULT_STACK_SIZE, LoadError, loader};
 
@@ -789,12 +789,17 @@ struct Cli {
                       either a preset measured on a real A4000 with a 25 MHz A3640 by \
                       Copperline's accelprobe -- a3640 (motherboard RAM: 32.6 clocks per read \
                       line fill, 9.2 per write), zorro3 (53.3/13.1) or chip (85.4/21.4) -- or \
-                      your own clocks as READ or READ,WRITE (e.g. 32.6,9.2). The data cache is \
-                      sized by --cpu (256 bytes on 68030, 4096 on 68040, 8192 on 68060 -- \
-                      each part's real size; the 68020 has \
-                      none, so every read is a bus access there, as on the real part), \
-                      direct-mapped with 16-byte lines, write-through, and flushed by \
-                      CacheClearU/CacheClearE alongside --cache's instruction cache. Reads are \
+                      your own clocks as READ or READ,WRITE (e.g. 32.6,9.2). The data cache models \
+                      each part's real organization: 256 bytes direct-mapped and write-through \
+                      on the 68030, 4 KiB 4-way copyback on the 68040, 8 KiB 4-way copyback on \
+                      the 68060, and none at all on the 68000/68010/68020, where every data \
+                      read is a bus access as on the real part. 16-byte lines, LRU within a \
+                      set, flushed by CacheClearU/CacheClearE alongside --cache's instruction \
+                      cache. Stores follow the part: write-through bills every store, while \
+                      copyback (what 68040.library configures for fast RAM, so what programs \
+                      actually run under) bills nothing for a store that hits, allocates the \
+                      line on one that misses, and pays once when a dirty line is evicted. \
+                      Reads are \
                       charged per line fill, not per access -- the preset numbers were measured \
                       with a 16-byte stride, so charging them per access would overcharge \
                       sequential code about fourfold. Instruction-fetch misses are not charged \
@@ -1352,42 +1357,61 @@ fn parse_mem_wait(raw: &str) -> Result<(f64, f64), String> {
     ))
 }
 
-/// `--mem-wait`'s modeled data-cache size in bytes for `cpu_type`.
+/// `--mem-wait`'s modeled data-cache organization for `cpu_type`:
+/// size, associativity, and store policy, each the real part's.
 ///
-/// `0` is a real answer, not "off": the 68020 has an instruction cache
-/// and **no** data cache, so every data read on one really is a bus
-/// access, and the 68000/68010 have neither. The parts that do have
-/// one get their real size -- 256 bytes on the 68030 (separate from
-/// its same-sized instruction cache), 4 KiB on the 68040, 8 KiB on the
-/// 68060 -- because size is the parameter that decides whether a given
-/// working set fits, which is the entire question `--mem-wait` exists
-/// to answer: modeling 4 KiB on a part with 8 would report thrashing
-/// where real silicon holds the data.
+/// | part | data cache | ways | stores |
+/// | --- | --- | --- | --- |
+/// | 68000/68010/68020 | none | -- | straight to the bus |
+/// | 68030 | 256 B | 1 (direct-mapped) | write-through |
+/// | 68040 | 4 KiB | 4 (64 sets) | copyback |
+/// | 68060 | 8 KiB | 4 (128 sets) | copyback |
 ///
-/// The *organization* is still simplified (direct-mapped and
-/// write-through, where both parts are 4-way and copyback -- see
-/// `MemTimingModel`), and note that [`icache_size_for_cpu`] keeps
-/// issue #148's proposed 4 KiB for the 68060's instruction cache,
-/// which is likewise 8 KiB on the real part; its doc owns that as a
-/// deliberate simplification, and changing it would move existing
-/// `--cache` numbers, so it is left for a follow-up rather than
-/// quietly altered here.
+/// Three of those columns were learned the expensive way, by codewiz
+/// benchmarking #286's first version against Benchwork:
 ///
-/// Unlike [`icache_size_for_cpu`] this never returns `None`: a part
-/// with no data cache still pays for its memory accesses, which is
-/// exactly what `--mem-wait` is for.
-fn dcache_size_for_cpu(cpu_type: CpuType) -> u32 {
-    match cpu_type {
-        CpuType::M68EC030 | CpuType::M68030 => 256,
-        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => 4096,
-        CpuType::M68060 => 8192,
-        CpuType::M68000 | CpuType::M68010 | CpuType::M68EC020 | CpuType::M68020 => 0,
+/// - **Size** decides whether a working set fits, which is the whole
+///   question `--mem-wait` answers, so the 68060 gets its real 8 KiB
+///   rather than #148's proposed 4 (which would report thrashing where
+///   silicon holds the data).
+/// - **Associativity** decides how much of the answer is noise. Two
+///   GCC builds of Dhrystone with identical read and write counts
+///   differed 50% in line fills under a direct-mapped model, purely
+///   from aliasing the real 4-way part would absorb -- 4.5% of
+///   runtime, bigger than most compiler effects.
+/// - **Store policy** decides whether store-heavy code is billed at
+///   all. `68040.library` runs fast RAM copyback on both later parts
+///   (hence every C2P routine's mandatory data-cache flush before the
+///   Blitter reads), so stores that hit cost nothing on the bus; the
+///   68030 has no copyback mode and really is write-through.
+///
+/// A `0`-byte cache is a real answer rather than "unmodeled": the
+/// 68020 has an instruction cache and no data cache, so every data
+/// read on one is a bus access. Unlike [`icache_size_for_cpu`] this
+/// never returns `None`.
+///
+/// Note that `icache_size_for_cpu` still carries #148's proposed 4 KiB
+/// for the 68060's (really 8 KiB) instruction cache, and models it
+/// direct-mapped with longword lines; its doc owns both as deliberate
+/// simplifications, and changing them would move existing `--cache`
+/// numbers, so they are tracked in #158 rather than altered here.
+fn dcache_geometry_for_cpu(cpu_type: CpuType) -> DcacheGeometry {
+    let (bytes, ways, copyback) = match cpu_type {
+        CpuType::M68EC030 | CpuType::M68030 => (256, 1, false),
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => (4096, 4, true),
+        CpuType::M68060 => (8192, 4, true),
+        CpuType::M68000 | CpuType::M68010 | CpuType::M68EC020 | CpuType::M68020 => (0, 1, false),
         // As `icache_size_for_cpu`: `CpuType` is the crate's, so it can
         // grow a variant without this match knowing.
         other => {
             debug_assert!(false, "unnamed CpuType {other:?}");
-            0
+            (0, 1, false)
         }
+    };
+    DcacheGeometry {
+        bytes,
+        ways,
+        copyback,
     }
 }
 
@@ -2132,7 +2156,13 @@ fn build_nested_runtime(
     // --mem-wait: inherited by a nested System()/Execute() run exactly
     // as --cache/--cpu/--clock-mhz are; see `dcache_size_for_cpu`.
     if let Some((read_clocks, write_clocks)) = mem_wait {
-        mem.enable_mem_timing(dcache_size_for_cpu(cpu_type), read_clocks, write_clocks);
+        mem.enable_mem_timing(
+            dcache_geometry_for_cpu(cpu_type),
+            MemWaitCosts {
+                read_line_clocks: read_clocks,
+                write_clocks,
+            },
+        );
     }
     sanitize.install_debug_ports(&mut mem, cpu_type);
     let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END).ok()?;
@@ -2426,9 +2456,11 @@ fn run(opts: &Options) -> Result<i32, String> {
         // no cache still pays for its accesses.
         if let Some((read_clocks, write_clocks)) = opts.mem_wait {
             mem.enable_mem_timing(
-                dcache_size_for_cpu(opts.cpu_type),
-                read_clocks,
-                write_clocks,
+                dcache_geometry_for_cpu(opts.cpu_type),
+                MemWaitCosts {
+                    read_line_clocks: read_clocks,
+                    write_clocks,
+                },
             );
         }
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
@@ -2466,9 +2498,11 @@ fn run(opts: &Options) -> Result<i32, String> {
         // no cache still pays for its accesses.
         if let Some((read_clocks, write_clocks)) = opts.mem_wait {
             mem.enable_mem_timing(
-                dcache_size_for_cpu(opts.cpu_type),
-                read_clocks,
-                write_clocks,
+                dcache_geometry_for_cpu(opts.cpu_type),
+                MemWaitCosts {
+                    read_line_clocks: read_clocks,
+                    write_clocks,
+                },
             );
         }
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
@@ -2633,8 +2667,8 @@ fn report_emulated_cycles<C: volamos_core::cpu::Cpu + 'static>(runtime: &Runtime
     {
         eprintln!("volamos: {line}");
     }
-    if let Some((reads, fills, hits, writes)) = runtime.mem_timing_counts()
-        && let Some(line) = format_mem_timing(reads, fills, hits, writes)
+    if let Some(counts) = runtime.mem_timing_counts()
+        && let Some(line) = format_mem_timing(counts)
     {
         eprintln!("volamos: {line}");
     }
@@ -2745,7 +2779,14 @@ fn format_emulated_work(cycles: u64, instructions: u64, reads: u64, writes: u64)
 ///
 /// `None` when the model saw no data access at all: nothing happened
 /// worth a line, and 0/0 would print a `NaN` hit rate.
-fn format_mem_timing(reads: u64, fills: u64, hits: u64, writes: u64) -> Option<String> {
+fn format_mem_timing(counts: volamos_core::memory::MemTimingCounts) -> Option<String> {
+    let volamos_core::memory::MemTimingCounts {
+        reads,
+        fills,
+        hits,
+        writes,
+        evictions,
+    } = counts;
     if reads == 0 && writes == 0 {
         return None;
     }
@@ -2762,9 +2803,12 @@ fn format_mem_timing(reads: u64, fills: u64, hits: u64, writes: u64) -> Option<S
     } else {
         format!(" ({:.1}% hit)", hits as f64 * 100.0 / lines as f64)
     };
+    // Evictions are where a copyback cache's stores actually reach the
+    // bus, so "N writes" alone would misleadingly suggest N bus writes.
     Some(format!(
         "modeled memory: {reads} data reads touching {lines} cache lines -- {hits} hits, \
-         {fills} line fills{rate} -- and {writes} writes"
+         {fills} line fills{rate} -- and {writes} writes causing {evictions} dirty-line \
+         writebacks"
     ))
 }
 
@@ -3643,20 +3687,38 @@ mod tests {
     }
 
     #[test]
-    fn dcache_size_for_cpu_models_only_the_parts_that_have_one() {
-        // The 68020 is the interesting row: instruction cache, no data
-        // cache, so 0 is the real answer rather than "unmodeled".
-        assert_eq!(dcache_size_for_cpu(CpuType::M68000), 0);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68010), 0);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68020), 0);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68EC020), 0);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68030), 256);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68EC030), 256);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68040), 4096);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68LC040), 4096);
-        assert_eq!(dcache_size_for_cpu(CpuType::M68EC040), 4096);
-        // 8 KiB on the real 68060, not the 68040's 4 -- see the fn's doc.
-        assert_eq!(dcache_size_for_cpu(CpuType::M68060), 8192);
+    fn dcache_geometry_for_cpu_is_each_parts_real_organization() {
+        // Size decides thrash-vs-fits, associativity decides how much
+        // of the answer is conflict-miss noise, and store policy
+        // decides whether store-heavy code is billed at all -- see the
+        // fn's doc for the Benchwork measurements behind each.
+        for cpu in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68020,
+            CpuType::M68EC020,
+        ] {
+            let g = dcache_geometry_for_cpu(cpu);
+            assert_eq!(g.bytes, 0, "{cpu:?} has no data cache");
+            assert!(!g.copyback, "{cpu:?} cannot copyback what it cannot cache");
+        }
+        for cpu in [CpuType::M68030, CpuType::M68EC030] {
+            let g = dcache_geometry_for_cpu(cpu);
+            assert_eq!((g.bytes, g.ways), (256, 1), "{cpu:?}: 256 B, direct-mapped");
+            assert!(!g.copyback, "the 68030 has no copyback mode at all");
+        }
+        for cpu in [CpuType::M68040, CpuType::M68LC040, CpuType::M68EC040] {
+            let g = dcache_geometry_for_cpu(cpu);
+            assert_eq!(
+                (g.bytes, g.ways),
+                (4096, 4),
+                "{cpu:?}: 4 KiB, 4-way (64 sets)"
+            );
+            assert!(g.copyback, "AmigaOS runs the 040's data cache copyback");
+        }
+        let g = dcache_geometry_for_cpu(CpuType::M68060);
+        assert_eq!((g.bytes, g.ways), (8192, 4), "8 KiB, 4-way (128 sets)");
+        assert!(g.copyback);
     }
 
     #[test]
@@ -3678,23 +3740,36 @@ mod tests {
     }
 
     #[test]
-    fn format_mem_timing_reports_the_hit_rate() {
-        let line = format_mem_timing(4, 1, 3, 2).expect("some traffic");
+    fn format_mem_timing_reports_the_hit_rate_and_writebacks() {
+        use volamos_core::memory::MemTimingCounts;
+        let counts = |reads, fills, hits, writes, evictions| MemTimingCounts {
+            reads,
+            fills,
+            hits,
+            writes,
+            evictions,
+        };
+        let line = format_mem_timing(counts(4, 1, 3, 2, 1)).expect("some traffic");
         assert!(line.contains("4 data reads"), "{line}");
         assert!(line.contains("4 cache lines"), "{line}");
         assert!(line.contains("75.0% hit"), "{line}");
-        assert!(line.contains("2 writes"), "{line}");
+        // Stores and the bus traffic they actually cause are separate
+        // numbers under copyback, where most stores never reach the bus.
+        assert!(
+            line.contains("2 writes causing 1 dirty-line writebacks"),
+            "{line}"
+        );
         // Reads and lines are distinct counts: one unaligned read can
         // touch two lines, and the line must not conflate them.
-        let unaligned = format_mem_timing(1, 2, 0, 0).expect("some traffic");
+        let unaligned = format_mem_timing(counts(1, 2, 0, 0, 0)).expect("some traffic");
         assert!(
             unaligned.contains("1 data reads touching 2 cache lines"),
             "{unaligned}"
         );
         // No data traffic at all: nothing to say, and no NaN hit rate.
-        assert_eq!(format_mem_timing(0, 0, 0, 0), None);
+        assert_eq!(format_mem_timing(counts(0, 0, 0, 0, 0)), None);
         // Writes only: no read hit rate to report.
-        let writes_only = format_mem_timing(0, 0, 0, 5).expect("writes happened");
+        let writes_only = format_mem_timing(counts(0, 0, 0, 5, 0)).expect("writes happened");
         assert!(!writes_only.contains("hit)"), "{writes_only}");
     }
 

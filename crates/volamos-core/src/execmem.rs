@@ -1168,6 +1168,7 @@ mod tests {
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
     use crate::dispatch::{Runtime, StartConfig};
     use crate::memory::{AddressSpace, FlatMemory};
+    use crate::memory::{DcacheGeometry, MemWaitCosts};
 
     fn load_words(mem: &mut FlatMemory, addr: u32, words: &[u16]) {
         let mut offset = addr;
@@ -2059,7 +2060,17 @@ mod tests {
         // leave --cache's instruction-cache residency alone.
         let mut rt = runtime_with_program(&cache_clear_e_program(1 << 11));
         rt.memory_mut().enable_icache(16);
-        rt.memory_mut().enable_mem_timing(4096, 32.6, 9.2);
+        rt.memory_mut().enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: 32.6,
+                write_clocks: 9.2,
+            },
+        );
         rt.memory_mut().icache_note_instruction_fetch(0, 2);
         rt.memory_mut().count_read(0, 4);
 
@@ -2067,10 +2078,11 @@ mod tests {
         rt.run(&mut out, None).expect("run should succeed");
 
         rt.memory_mut().count_read(0, 4);
-        let (_reads, fills, hits, _writes) = rt
+        let counts = rt
             .memory()
             .mem_timing_counts()
             .expect("--mem-wait model installed");
+        let (fills, hits) = (counts.fills, counts.hits);
         assert_eq!(
             (fills, hits),
             (2, 0),
@@ -2090,17 +2102,28 @@ mod tests {
         // data residency, which would silently change --clock-mhz
         // timings for a guest that asked correctly.
         let mut rt = runtime_with_program(&cache_clear_e_program(1 << 3));
-        rt.memory_mut().enable_mem_timing(4096, 32.6, 9.2);
+        rt.memory_mut().enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: 32.6,
+                write_clocks: 9.2,
+            },
+        );
         rt.memory_mut().count_read(0, 4);
 
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed");
 
         rt.memory_mut().count_read(0, 4);
-        let (_reads, fills, hits, _writes) = rt
+        let counts = rt
             .memory()
             .mem_timing_counts()
             .expect("--mem-wait model installed");
+        let (fills, hits) = (counts.fills, counts.hits);
         assert_eq!(
             (fills, hits),
             (1, 1),
@@ -2116,7 +2139,17 @@ mod tests {
         words.push(RTS);
         let mut rt = runtime_with_program(&words);
         rt.memory_mut().enable_icache(16);
-        rt.memory_mut().enable_mem_timing(4096, 32.6, 9.2);
+        rt.memory_mut().enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: 32.6,
+                write_clocks: 9.2,
+            },
+        );
         rt.memory_mut().icache_note_instruction_fetch(0, 2);
         rt.memory_mut().count_read(0, 4);
 
@@ -2124,10 +2157,11 @@ mod tests {
         rt.run(&mut out, None).expect("run should succeed");
 
         rt.memory_mut().count_read(0, 4);
-        let (_reads, fills, _hits, _writes) = rt
+        let fills = rt
             .memory()
             .mem_timing_counts()
-            .expect("--mem-wait model installed");
+            .expect("--mem-wait model installed")
+            .fills;
         assert_eq!(fills, 2, "data cache flushed");
         rt.memory_mut().icache_note_instruction_fetch(0, 2);
         assert!(

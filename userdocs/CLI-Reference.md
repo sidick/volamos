@@ -618,26 +618,47 @@ different timings:
 
 ```
 volamos: 1153860 emulated cycles, 0.046154 s at 25 MHz
-volamos: modeled memory: 65536 data reads touching 67275 cache lines — 50757 hits, 16518 line fills (75.4% hit) — and 1523 writes
+volamos: modeled memory: 67275 data reads touching 67378 cache lines — 50835 hits, 16543 line fills (75.4% hit) — and 1523 writes causing 33 dirty-line writebacks
 ```
 
 ### The model
 
-- **Sized by `--cpu`**: 256 bytes on 68030, 4096 on 68040/68060. The
-  68020 has an instruction cache and *no* data cache, and the
-  68000/68010 have neither, so on those every data read is a bus
-  access — as on the real part. That is a real answer rather than
-  "unmodeled", so `--mem-wait` applies on every `--cpu`.
-- **Direct-mapped, 16-byte lines, write-through.** Real 68040/68060 data
-  caches are 4-way and copyback; write-through is enough for timing, and
-  the measured write cost is a write-through cost.
-- **Reads are charged per line fill, writes per access.** This is the
-  load-bearing detail: the preset numbers were measured with a 16-byte
-  stride, i.e. one full line fill per read, so charging them per *access*
-  would overcharge ordinary sequential code about fourfold. Four
-  consecutive longword reads share one line and cost one fill.
+- **Each part's real organization**, because all three columns here
+  change the answer:
+
+  | `--cpu` | data cache | ways | stores |
+  | --- | --- | --- | --- |
+  | 68000 / 68010 / 68020 | none | — | straight to the bus |
+  | 68030 | 256 B | 1 (direct-mapped) | write-through |
+  | 68040 | 4 KiB | 4 (64 sets) | copyback |
+  | 68060 | 8 KiB | 4 (128 sets) | copyback |
+
+  16-byte lines throughout, LRU within a set. "No data cache" is a real
+  answer rather than "unmodeled" — the 68020 has an instruction cache
+  and no data cache — so `--mem-wait` applies on every `--cpu`.
+- **Reads are charged per line fill, not per access.** The preset
+  numbers were measured with a 16-byte stride, i.e. one full line fill
+  per read, so charging them per *access* would overcharge ordinary
+  sequential code about fourfold. Four consecutive longword reads share
+  one line and cost one fill.
+- **Stores follow the part.** Write-through (68030) bills every store.
+  Copyback (68040/68060 — what `68040.library` configures for fast RAM,
+  so what programs actually run under on the Amiga) bills nothing for a
+  store that hits, allocates the line on one that misses by reading it
+  in first as the hardware does, and pays once — as a single 16-byte
+  burst — when a dirty line is evicted. So repeated stores into live
+  data (stack spills, accumulators) are free, while streaming stores
+  into cold memory still pay their fill and eventual writeback.
+- **Why associativity is modeled rather than simplified away.** A
+  direct-mapped model invents conflict misses a real 4-way part never
+  has, and the noise is bigger than the signal: two GCC builds of
+  Dhrystone with *identical* read and write counts differed 50% in line
+  fills — 4.5% of runtime — purely from two hot addresses aliasing, on
+  a working set that fits 4 KiB several times over.
 - **Flushed by `CacheClearU`** (the unified clear, which flushes both
-  caches) **and by `CacheClearE` with `CACRF_ClearD`**. The two bits are
+  caches) **and by `CacheClearE` with `CACRF_ClearD`** — and under
+  copyback a flush charges every dirty line's writeback, which is why
+  `CacheClearU` is the expensive one on a 68040. The two bits are
   honored separately, so a guest clearing only its data cache after a
   DMA transfer keeps `--cache`'s instruction-cache residency, and a
   guest clearing only `CACRF_ClearI` after building code keeps its data

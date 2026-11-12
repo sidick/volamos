@@ -97,7 +97,7 @@ pub trait AddressSpace {
     /// line fills, read hits, writes)` -- `None` by default, like
     /// [`AddressSpace::shadow`], for address spaces with no model
     /// installed. See [`FlatMemory::mem_timing_counts`].
-    fn mem_timing_counts(&self) -> Option<(u64, u64, u64, u64)> {
+    fn mem_timing_counts(&self) -> Option<MemTimingCounts> {
         None
     }
 
@@ -297,14 +297,121 @@ pub trait AddressSpace {
 /// Instruction fetches are deliberately *not* billed here -- see
 /// [`FlatMemory::enable_mem_timing`]'s doc for why that needs
 /// something this model cannot currently give it.
+/// What `--mem-wait`'s model observed, for the CLI's exit report.
+///
+/// `reads` is per access; `fills`/`hits` are per *line*, so they need
+/// not sum to it (an unaligned access touching two lines counts once
+/// as a read and twice as a line). `evictions` is dirty-line
+/// writebacks, which is where a copyback cache's store traffic
+/// actually reaches the bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemTimingCounts {
+    pub reads: u64,
+    pub fills: u64,
+    pub hits: u64,
+    pub writes: u64,
+    pub evictions: u64,
+}
+
+/// One part's data-cache organization, for
+/// [`FlatMemory::enable_mem_timing`]: total size, associativity, and
+/// whether stores are copyback (as AmigaOS configures the 68040/68060)
+/// or write-through (the 68030, which has no copyback mode).
+///
+/// Set-associativity is not a refinement for its own sake. codewiz
+/// benchmarked #286's first direct-mapped version against Benchwork
+/// and found conflict misses swamping the signal: two GCC builds of
+/// Dhrystone with *identical* read and write counts differed by 50% in
+/// line fills (81,085 vs 121,060) purely from two hot addresses
+/// aliasing, worth 4.5% of runtime -- on a working set that fits 4 KB
+/// several times over, where the real 4-way part would have held both.
+/// Noise like that is larger than most effects a compiler change
+/// produces, which defeats the entire purpose of the flag.
+#[derive(Clone, Copy, Debug)]
+pub struct DcacheGeometry {
+    /// Total data-cache size in bytes; `0` for a part with none.
+    pub bytes: u32,
+    /// Lines per set; `1` is direct-mapped.
+    pub ways: usize,
+    /// Whether stores are copyback rather than write-through.
+    pub copyback: bool,
+}
+
+/// `--mem-wait`'s measured costs in CPU clocks: one read line fill,
+/// and one line's worth of writing (per store when write-through, per
+/// dirty-line eviction when copyback).
+#[derive(Clone, Copy, Debug)]
+pub struct MemWaitCosts {
+    pub read_line_clocks: f64,
+    pub write_clocks: f64,
+}
+
+/// How a modeled data cache handles stores -- the difference between
+/// what the 68030 does and what AmigaOS makes the 68040/68060 do.
+///
+/// Found by codewiz benchmarking #286 against Benchwork: billing every
+/// store at bus rate overcharged store-heavy code badly enough to flip
+/// the sign of an A/B comparison (sha512 swung from 5% faster to 8%
+/// slower between two GCC builds depending only on how stores were
+/// billed), because a real AmigaOS machine isn't paying for most of
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WritePolicy {
+    /// Every store reaches memory and is charged; a store never
+    /// allocates a line. The 68030's data cache, which has no copyback
+    /// mode at all.
+    WriteThrough,
+    /// A store that hits stays in the cache and costs nothing on the
+    /// bus; a store that misses allocates the line (reading it in
+    /// first, as the 68040 does); the bus is paid once, as a single
+    /// 16-byte burst, when a dirty line is evicted.
+    ///
+    /// This is what programs actually run under on the Amiga:
+    /// `68040.library` configures fast RAM copyback (`CM = 01` in the
+    /// MMU descriptors, `CACRF_CopyBack` in `CACR`), leaving chip RAM
+    /// uncached or write-through, which is why every C2P routine has
+    /// to flush the data cache before the Blitter reads its output. A
+    /// stock 3.2.3 machine reports `(DATA: Cache CopyBack)` from `CPU`.
+    CopyBack,
+}
+
+/// One modeled cache line: which line it holds, whether a store has
+/// dirtied it since, and when it was last used (for LRU within its
+/// set).
+#[derive(Clone, Copy)]
+struct CacheLine {
+    tag: Option<u32>,
+    dirty: bool,
+    used: u64,
+}
+
 struct MemTimingModel {
-    /// One tag slot per line, direct-mapped; empty means "no data
-    /// cache", so every read misses.
-    lines: Vec<Option<u32>>,
+    /// `sets * ways` lines, indexed `set * ways + way`; empty means
+    /// "no data cache", so every read misses. `ways == 1` is the
+    /// direct-mapped case (the 68030).
+    lines: Vec<CacheLine>,
+    /// Number of sets; `0` when there is no cache.
+    sets: usize,
+    /// Associativity -- lines per set.
+    ways: usize,
+    /// Monotonic counter stamped into [`CacheLine::used`] on every
+    /// access, so the least-recently-used line in a set is the one with
+    /// the smallest stamp. Real 68040 replacement is pseudo-random and
+    /// the 68060's is not quite LRU either; LRU is deterministic, which
+    /// is what an A/B comparison needs, and reads slightly optimistic
+    /// rather than slightly noisy.
+    clock: u64,
+    /// How stores behave -- see [`WritePolicy`].
+    write_policy: WritePolicy,
     /// Clocks charged for one read line fill.
     read_line_clocks: f64,
-    /// Clocks charged for one write (write-through, so every write
-    /// reaches memory).
+    /// Clocks charged for one line's worth of writing: per store under
+    /// [`WritePolicy::WriteThrough`], per dirty-line eviction under
+    /// [`WritePolicy::CopyBack`]. The preset figure (9.2 on the A3640)
+    /// was measured with a 16-byte-stride store loop on a machine
+    /// running AmigaOS -- i.e. in copyback, one allocate plus one
+    /// eviction burst per line -- so it is already the cost of writing
+    /// a line, which is what makes it the right number for both.
     write_clocks: f64,
     /// Clocks charged but not yet handed to the cycle total, including
     /// the fractional part -- the measured costs are fractional (32.6,
@@ -323,6 +430,10 @@ struct MemTimingModel {
     /// the line above it for no visible reason.
     reads: u64,
     writes: u64,
+    /// Dirty-line writebacks: copyback's share of the bus traffic, and
+    /// the number that explains why a store-heavy run still costs
+    /// something.
+    evictions: u64,
 }
 
 impl MemTimingModel {
@@ -334,10 +445,31 @@ impl MemTimingModel {
     /// than a fill unit.
     const LINE_SIZE: u32 = 16;
 
-    fn new(dcache_bytes: u32, read_line_clocks: f64, write_clocks: f64) -> Self {
-        let lines = (dcache_bytes / Self::LINE_SIZE) as usize;
+    /// `ways` lines per set, `dcache_bytes` total (so `sets =
+    /// dcache_bytes / LINE_SIZE / ways`), with `write_policy` governing
+    /// stores. `dcache_bytes == 0` models a part with no data cache at
+    /// all; `ways == 1` is direct-mapped.
+    fn new(
+        dcache_bytes: u32,
+        ways: usize,
+        write_policy: WritePolicy,
+        read_line_clocks: f64,
+        write_clocks: f64,
+    ) -> Self {
+        let ways = ways.max(1);
+        let total_lines = (dcache_bytes / Self::LINE_SIZE) as usize;
+        let sets = total_lines / ways;
+        let empty = CacheLine {
+            tag: None,
+            dirty: false,
+            used: 0,
+        };
         Self {
-            lines: vec![None; lines],
+            lines: vec![empty; sets * ways],
+            sets,
+            ways,
+            clock: 0,
+            write_policy,
             read_line_clocks,
             write_clocks,
             owed: 0.0,
@@ -345,6 +477,7 @@ impl MemTimingModel {
             hits: 0,
             reads: 0,
             writes: 0,
+            evictions: 0,
         }
     }
 
@@ -352,29 +485,66 @@ impl MemTimingModel {
         addr & !(Self::LINE_SIZE - 1)
     }
 
-    /// Bills a data read of `len` bytes at `addr`: one line fill per
-    /// line it touches that was not already resident.
-    fn note_read(&mut self, addr: u32, len: u32) {
-        self.reads += 1;
+    /// The set a line maps to.
+    fn set_of(&self, line_base: u32) -> usize {
+        (line_base / Self::LINE_SIZE) as usize % self.sets
+    }
+
+    /// Looks `line` up in its set. `Some(index)` into [`Self::lines`]
+    /// on a hit, with the line's LRU stamp refreshed.
+    fn find(&mut self, line: u32) -> Option<usize> {
+        let base = self.set_of(line) * self.ways;
+        for index in base..base + self.ways {
+            if self.lines[index].tag == Some(line) {
+                self.clock += 1;
+                self.lines[index].used = self.clock;
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Brings `line` into its set, charging the read line fill, and
+    /// charging a write for the victim's dirty data if it had any (a
+    /// single 16-byte burst, as the hardware does). Returns the index
+    /// it was placed at. Prefers an empty way, else the
+    /// least-recently-used one.
+    fn fill(&mut self, line: u32) -> usize {
+        let base = self.set_of(line) * self.ways;
+        let victim = (base..base + self.ways)
+            .min_by_key(|&index| {
+                // An empty way always wins: `None` sorts before any
+                // occupied line regardless of its stamp.
+                (self.lines[index].tag.is_some(), self.lines[index].used)
+            })
+            .expect("ways >= 1, so the set is never empty");
+
+        if self.lines[victim].dirty {
+            // Copyback only: a write-through cache never holds dirty
+            // data, so this cannot fire there.
+            self.evictions += 1;
+            self.owed += self.write_clocks;
+        }
+        self.fills += 1;
+        self.owed += self.read_line_clocks;
+        self.clock += 1;
+        self.lines[victim] = CacheLine {
+            tag: Some(line),
+            dirty: false,
+            used: self.clock,
+        };
+        victim
+    }
+
+    /// Calls `f` for each line the access at `addr` of `len` bytes
+    /// touches -- two of them for an unaligned access that straddles a
+    /// line boundary.
+    fn for_each_line(addr: u32, len: u32, mut f: impl FnMut(u32)) {
         let first = Self::line_base(addr);
         let last = Self::line_base(addr.wrapping_add(len.saturating_sub(1)));
         let mut line = first;
         loop {
-            if self.lines.is_empty() {
-                // No data cache (a plain 68020): every read is a fill,
-                // and there is nowhere to record it.
-                self.fills += 1;
-                self.owed += self.read_line_clocks;
-            } else {
-                let index = (line / Self::LINE_SIZE) as usize % self.lines.len();
-                if self.lines[index] == Some(line) {
-                    self.hits += 1;
-                } else {
-                    self.lines[index] = Some(line);
-                    self.fills += 1;
-                    self.owed += self.read_line_clocks;
-                }
-            }
+            f(line);
             if line == last {
                 break;
             }
@@ -382,11 +552,66 @@ impl MemTimingModel {
         }
     }
 
-    /// Bills a data write: write-through, so it always reaches memory,
-    /// and no-write-allocate, so residency is untouched.
-    fn note_write(&mut self, _addr: u32, _len: u32) {
+    /// Bills a data read: a hit costs nothing, a miss costs one line
+    /// fill (plus the victim's writeback, if it was dirty).
+    fn note_read(&mut self, addr: u32, len: u32) {
+        self.reads += 1;
+        let (sets, uncached) = (self.sets, self.lines.is_empty());
+        let _ = sets;
+        let mut lines = Vec::new();
+        Self::for_each_line(addr, len, |line| lines.push(line));
+        for line in lines {
+            if uncached {
+                // No data cache (a 68020, or a part with none): every
+                // read is a bus access, and there is nowhere to record
+                // it.
+                self.fills += 1;
+                self.owed += self.read_line_clocks;
+            } else if self.find(line).is_some() {
+                self.hits += 1;
+            } else {
+                self.fill(line);
+            }
+        }
+    }
+
+    /// Bills a data write, per [`Self::write_policy`]: write-through
+    /// charges every store and never allocates; copyback charges
+    /// nothing for a store that hits, allocates (reading the line in
+    /// first, as the 68040 does) on one that misses, and leaves the
+    /// bus cost to the eventual eviction in [`Self::fill`].
+    fn note_write(&mut self, addr: u32, len: u32) {
         self.writes += 1;
-        self.owed += self.write_clocks;
+        match self.write_policy {
+            WritePolicy::WriteThrough => {
+                self.owed += self.write_clocks;
+                // Keeps residency (and LRU) accurate without
+                // allocating: a write-through store that hits leaves
+                // the line valid and clean.
+                let mut lines = Vec::new();
+                Self::for_each_line(addr, len, |line| lines.push(line));
+                for line in lines {
+                    self.find(line);
+                }
+            }
+            WritePolicy::CopyBack => {
+                if self.lines.is_empty() {
+                    // Nothing to hold the store: it goes to the bus,
+                    // like a write-through one.
+                    self.owed += self.write_clocks;
+                    return;
+                }
+                let mut lines = Vec::new();
+                Self::for_each_line(addr, len, |line| lines.push(line));
+                for line in lines {
+                    let index = match self.find(line) {
+                        Some(index) => index,
+                        None => self.fill(line),
+                    };
+                    self.lines[index].dirty = true;
+                }
+            }
+        }
     }
 
     /// Hands over the whole clocks accrued so far, keeping the
@@ -397,10 +622,22 @@ impl MemTimingModel {
         whole.max(0.0) as u64
     }
 
-    /// Drops every resident line -- `CacheClearU`/`CPUSH` and friends
-    /// flush the data cache along with the instruction cache.
+    /// Drops every resident line. Under copyback this is a *flush*, so
+    /// every dirty line's writeback is charged -- which is the real
+    /// cost of `CacheClearU` on a 68040 with a dirty cache, and the
+    /// reason the RKRM quotes it as the expensive one.
     fn invalidate_all(&mut self) {
-        self.lines.fill(None);
+        for index in 0..self.lines.len() {
+            if self.lines[index].dirty {
+                self.evictions += 1;
+                self.owed += self.write_clocks;
+            }
+            self.lines[index] = CacheLine {
+                tag: None,
+                dirty: false,
+                used: 0,
+            };
+        }
     }
 }
 
@@ -812,16 +1049,17 @@ impl FlatMemory {
     ///
     /// Harmless before or after [`crate::loader::load`], same
     /// reasoning as [`Self::enable_icache`]: tags only, no contents.
-    pub fn enable_mem_timing(
-        &mut self,
-        dcache_bytes: u32,
-        read_line_clocks: f64,
-        write_clocks: f64,
-    ) {
+    pub fn enable_mem_timing(&mut self, geometry: DcacheGeometry, costs: MemWaitCosts) {
         self.mem_timing = Some(Box::new(MemTimingModel::new(
-            dcache_bytes,
-            read_line_clocks,
-            write_clocks,
+            geometry.bytes,
+            geometry.ways,
+            if geometry.copyback {
+                WritePolicy::CopyBack
+            } else {
+                WritePolicy::WriteThrough
+            },
+            costs.read_line_clocks,
+            costs.write_clocks,
         )));
     }
 
@@ -845,10 +1083,14 @@ impl FlatMemory {
     /// counts once as a read and twice as a line). Reported separately
     /// rather than reconstructed, so the read count agrees with the
     /// per-access one on the line above it in the report.
-    pub fn mem_timing_counts(&self) -> Option<(u64, u64, u64, u64)> {
-        self.mem_timing
-            .as_ref()
-            .map(|t| (t.reads, t.fills, t.hits, t.writes))
+    pub fn mem_timing_counts(&self) -> Option<MemTimingCounts> {
+        self.mem_timing.as_ref().map(|t| MemTimingCounts {
+            reads: t.reads,
+            fills: t.fills,
+            hits: t.hits,
+            writes: t.writes,
+            evictions: t.evictions,
+        })
     }
 
     /// Records one instruction-stream fetch of `len` bytes at `addr`,
@@ -888,7 +1130,7 @@ impl AddressSpace for FlatMemory {
         self.access_counts()
     }
 
-    fn mem_timing_counts(&self) -> Option<(u64, u64, u64, u64)> {
+    fn mem_timing_counts(&self) -> Option<MemTimingCounts> {
         FlatMemory::mem_timing_counts(self)
     }
 
@@ -1220,11 +1462,22 @@ mod tests {
         // access would overcharge ordinary sequential code fourfold.
         // Four consecutive longwords share one 16-byte line.
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         for i in 0..4 {
             mem.count_read(i * 4, 4);
         }
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (1, 3), "one fill, three hits in one line");
         assert_eq!(mem.take_mem_timing_clocks(), 32);
     }
@@ -1236,11 +1489,22 @@ mod tests {
         // sequential walk above over the same number of reads, which is
         // exactly the effect #148 wants visible in --clock-mhz.
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         for i in 0..4 {
             mem.count_read(i * 16, 4);
         }
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (4, 0));
         assert_eq!(mem.take_mem_timing_clocks(), 130); // 4 * 32.6, less the kept fraction
     }
@@ -1250,7 +1514,17 @@ mod tests {
         // 32.6 per fill: truncating each access to 32 would lose 1.8%
         // of a read-heavy run. Ten fills must bill 326, not 320.
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(0, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 0,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         let mut charged = 0;
         for i in 0..10 {
             mem.count_read(i * 16, 4);
@@ -1265,10 +1539,21 @@ mod tests {
         // part, so every data read is a bus access. Not "modeling
         // disabled" -- the charge still applies.
         let mut mem = FlatMemory::new(256);
-        mem.enable_mem_timing(0, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 0,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         mem.count_read(0, 4);
         mem.count_read(0, 4);
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (2, 0), "no cache to hit in");
     }
 
@@ -1279,24 +1564,47 @@ mod tests {
         // misses. See MemTimingModel's doc for why write-through is
         // enough for timing.
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         mem.count_write(64, 4);
         mem.count_write(64, 4);
-        let (_reads, fills, hits, writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits, writes) = (c.fills, c.hits, c.writes);
         assert_eq!((fills, hits, writes), (0, 0, 2));
         assert_eq!(mem.take_mem_timing_clocks(), 18); // 2 * 9.2
 
         mem.count_read(64, 4);
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (1, 0), "a written line was not allocated");
     }
 
     #[test]
     fn an_unaligned_read_spanning_two_lines_pays_both() {
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         mem.count_read(14, 4); // bytes 14..18: lines 0 and 16
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (2, 0));
     }
 
@@ -1307,13 +1615,24 @@ mod tests {
         // 64-byte cache is 4 lines; touching 8 distinct lines in a loop
         // evicts every one before it comes round again.
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(64, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 64,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         for _pass in 0..3 {
             for line in 0..8 {
                 mem.count_read(line * 16, 4);
             }
         }
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!(
             (fills, hits),
             (24, 0),
@@ -1323,13 +1642,24 @@ mod tests {
         // The same loop over a working set that *does* fit: one fill
         // per line, then hits for the rest of the run.
         let mut fits = FlatMemory::new(4096);
-        fits.enable_mem_timing(64, A3640_READ, A3640_WRITE);
+        fits.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 64,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         for _pass in 0..3 {
             for line in 0..4 {
                 fits.count_read(line * 16, 4);
             }
         }
-        let (_reads, fills, hits, _writes) = fits.mem_timing_counts().expect("model installed");
+        let c = fits.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (4, 8));
     }
 
@@ -1341,25 +1671,49 @@ mod tests {
         // fetch residency anyway (benletchford/m68k-rs#234). Fetches
         // still count as bus reads, as they always did.
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         mem.count_read_untimed();
         mem.count_read_untimed();
         assert_eq!(mem.take_mem_timing_clocks(), 0);
-        assert_eq!(mem.mem_timing_counts(), Some((0, 0, 0, 0)));
+        assert_eq!(
+            mem.mem_timing_counts().map(|c| (c.fills, c.hits, c.reads)),
+            Some((0, 0, 0))
+        );
         assert_eq!(mem.access_counts(), (2, 0));
     }
 
     #[test]
     fn invalidate_dcache_flushes_the_data_cache() {
         let mut mem = FlatMemory::new(4096);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         mem.count_read(0, 4);
         mem.count_read(0, 4);
-        assert_eq!(mem.mem_timing_counts().map(|c| c.2), Some(1), "one hit");
+        assert_eq!(mem.mem_timing_counts().map(|c| c.hits), Some(1), "one hit");
 
         AddressSpace::invalidate_dcache(&mut mem);
         mem.count_read(0, 4);
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!((fills, hits), (2, 1), "flushed, so the line refills");
     }
 
@@ -1372,13 +1726,24 @@ mod tests {
         // timings), nor the reverse.
         let mut mem = FlatMemory::new(4096);
         mem.enable_icache(16);
-        mem.enable_mem_timing(4096, A3640_READ, A3640_WRITE);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
         mem.icache_note_instruction_fetch(0, 2);
         mem.count_read(0, 4);
 
         AddressSpace::invalidate_icache(&mut mem);
         mem.count_read(0, 4);
-        let (_reads, fills, hits, _writes) = mem.mem_timing_counts().expect("model installed");
+        let c = mem.mem_timing_counts().expect("model installed");
+        let (fills, hits) = (c.fills, c.hits);
         assert_eq!(
             (fills, hits),
             (1, 1),
@@ -1393,6 +1758,203 @@ mod tests {
         assert!(
             mem.icache_last_fetch_was_cached(),
             "a data-cache clear must leave instruction lines resident"
+        );
+    }
+
+    /// A 68040-shaped data cache: 4 KiB, 4-way (64 sets), copyback.
+    fn mem_040(mem: &mut FlatMemory) {
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 4,
+                copyback: true,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
+    }
+
+    #[test]
+    fn four_ways_absorb_the_aliasing_that_thrashes_a_direct_mapped_cache() {
+        // The finding behind set-associativity (codewiz, benchmarking
+        // #286 against Benchwork): two addresses that map to the same
+        // set evict each other in a direct-mapped cache, inventing
+        // misses a real 4-way part never has -- enough noise (4.5% on
+        // Dhrystone between builds with identical access counts) to
+        // swamp the compiler effects the flag exists to measure.
+        //
+        // Two addresses exactly one cache-size apart share a set in
+        // both models; only the 4-way one can hold both.
+        const STRIDE: u32 = 4096; // one whole cache
+        let mut direct = FlatMemory::new(0x2_0000);
+        direct.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 4096,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
+        let mut four_way = FlatMemory::new(0x2_0000);
+        mem_040(&mut four_way);
+
+        for _ in 0..10 {
+            for mem in [&mut direct, &mut four_way] {
+                mem.count_read(0, 4);
+                mem.count_read(STRIDE, 4);
+            }
+        }
+
+        let d = direct.mem_timing_counts().expect("installed");
+        let f = four_way.mem_timing_counts().expect("installed");
+        assert_eq!(
+            (d.fills, d.hits),
+            (20, 0),
+            "direct-mapped: the two lines evict each other every time"
+        );
+        assert_eq!(
+            (f.fills, f.hits),
+            (2, 18),
+            "4-way: both lines live in different ways of the same set"
+        );
+    }
+
+    #[test]
+    fn lru_evicts_the_least_recently_used_way() {
+        // Five lines competing for one 4-way set: the fifth evicts the
+        // oldest, and re-reading the three still resident must hit.
+        const STRIDE: u32 = 4096;
+        let mut mem = FlatMemory::new(0x2_0000);
+        mem_040(&mut mem);
+        for i in 0..4 {
+            mem.count_read(i * STRIDE, 4); // fills ways 0..4
+        }
+        mem.count_read(STRIDE, 4); // touch line 1, making line 0 the LRU
+        mem.count_read(4 * STRIDE, 4); // fills, evicting line 0
+        let before = mem.mem_timing_counts().expect("installed");
+
+        mem.count_read(STRIDE, 4);
+        mem.count_read(2 * STRIDE, 4);
+        mem.count_read(3 * STRIDE, 4);
+        let after = mem.mem_timing_counts().expect("installed");
+        assert_eq!(
+            after.fills, before.fills,
+            "lines 1..4 must still be resident; LRU evicted line 0"
+        );
+
+        mem.count_read(0, 4);
+        let final_counts = mem.mem_timing_counts().expect("installed");
+        assert_eq!(
+            final_counts.fills,
+            before.fills + 1,
+            "line 0 was the evicted one, so it refills"
+        );
+    }
+
+    #[test]
+    fn copyback_stores_that_hit_cost_nothing_on_the_bus() {
+        // What AmigaOS actually runs on a 68040 (68040.library sets
+        // fast RAM copyback). Billing every store at bus rate
+        // overcharged store-heavy code badly enough to flip the sign
+        // of an A/B comparison -- sha512 swung from 5% faster to 8%
+        // slower between two GCC builds depending only on this.
+        let mut mem = FlatMemory::new(0x2_0000);
+        mem_040(&mut mem);
+        mem.count_read(0, 4); // warm the line: one fill
+        let after_fill = mem.take_mem_timing_clocks();
+        assert_eq!(after_fill, 32, "the read line fill");
+
+        for _ in 0..100 {
+            mem.count_write(0, 4);
+        }
+        assert_eq!(
+            mem.take_mem_timing_clocks(),
+            0,
+            "100 stores into a resident line must not touch the bus"
+        );
+        let counts = mem.mem_timing_counts().expect("installed");
+        assert_eq!((counts.writes, counts.evictions), (100, 0));
+    }
+
+    #[test]
+    fn copyback_pays_once_when_the_dirty_line_is_evicted() {
+        // The bus cost of a copyback store arrives later, as a single
+        // 16-byte burst, when the line is replaced.
+        const STRIDE: u32 = 4096;
+        let mut mem = FlatMemory::new(0x2_0000);
+        mem_040(&mut mem);
+        mem.count_write(0, 4); // write-allocate: fill, then dirty
+        let _ = mem.take_mem_timing_clocks();
+        assert_eq!(
+            mem.mem_timing_counts().map(|c| (c.fills, c.evictions)),
+            Some((1, 0)),
+            "a store miss allocates by reading the line in, as the 040 does"
+        );
+
+        // Fill the other three ways, then a fifth line to force the
+        // dirty one out.
+        for i in 1..5 {
+            mem.count_read(i * STRIDE, 4);
+        }
+        let counts = mem.mem_timing_counts().expect("installed");
+        assert_eq!(counts.evictions, 1, "the dirty line's writeback");
+    }
+
+    #[test]
+    fn write_through_charges_every_store_and_never_allocates() {
+        // The 68030, which has no copyback mode at all.
+        let mut mem = FlatMemory::new(0x2_0000);
+        mem.enable_mem_timing(
+            DcacheGeometry {
+                bytes: 256,
+                ways: 1,
+                copyback: false,
+            },
+            MemWaitCosts {
+                read_line_clocks: A3640_READ,
+                write_clocks: A3640_WRITE,
+            },
+        );
+        for _ in 0..10 {
+            mem.count_write(0, 4);
+        }
+        let counts = mem.mem_timing_counts().expect("installed");
+        assert_eq!(
+            (counts.fills, counts.evictions),
+            (0, 0),
+            "write-through neither allocates nor holds dirty data"
+        );
+        assert_eq!(mem.take_mem_timing_clocks(), 92, "10 stores x 9.2 clocks");
+    }
+
+    #[test]
+    fn flushing_a_dirty_copyback_cache_pays_for_the_writebacks() {
+        // CacheClearU on a 68040 with a dirty cache is the expensive
+        // one precisely because every dirty line has to go out.
+        let mut mem = FlatMemory::new(0x2_0000);
+        mem_040(&mut mem);
+        for i in 0..4 {
+            mem.count_write(i * 64, 4); // four separate lines, all dirty
+        }
+        let _ = mem.take_mem_timing_clocks();
+        AddressSpace::invalidate_dcache(&mut mem);
+        assert_eq!(
+            mem.mem_timing_counts().map(|c| c.evictions),
+            Some(4),
+            "every dirty line is written back by the flush"
+        );
+        // 4 x 9.2 = 36.8, plus the 0.4 carried over from the four
+        // 32.6-clock fills above (130.4, of which 130 was taken) --
+        // the fractional carry at work.
+        assert_eq!(
+            mem.take_mem_timing_clocks(),
+            37,
+            "4 writebacks x 9.2, plus carry"
         );
     }
 
