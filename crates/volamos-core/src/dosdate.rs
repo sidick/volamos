@@ -77,6 +77,95 @@ const TICKS_PER_SECOND: u32 = 50;
 /// (1978-01-01): 8 full years, 2 of them leap (1972, 1976).
 pub(crate) const UNIX_TO_AMIGA_EPOCH_DAYS: i64 = 8 * 365 + 2;
 
+/// The host's UTC offset in seconds at `unix_secs` -- positive east of
+/// Greenwich -- from `libc::localtime_r`'s `tm_gmtoff`.
+///
+/// Computed *per timestamp* rather than once, because the offset isn't
+/// constant: a file written in July and examined in December must come
+/// back with July's DST offset, or its date moves by an hour depending
+/// on when you looked at it. `0` if the host's TZ database can't be
+/// consulted, which degrades to UTC rather than failing.
+pub(crate) fn local_offset_secs_at(unix_secs: i64) -> i64 {
+    // SAFETY: `localtime_r` writes into `tm` and reads only `t`; both
+    // are owned here, and the pointer is valid for the call. The _r
+    // form is used precisely because it needs no global buffer.
+    unsafe {
+        let t = unix_secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+/// Converts a host Unix timestamp to AmigaOS-epoch seconds *in the
+/// host's local time*, which is what an Amiga clock reads.
+///
+/// AmigaOS has no notion of a time zone: the battery clock, `DateStamp`
+/// and every date a command prints are local time, full stop. Reporting
+/// UTC meant `List` could print Thursday on a machine where it was
+/// already Friday (issue #287, found on a JST host), and -- worse --
+/// that a file's date and `DateStamp()` disagreed by the offset, so
+/// `List SINCE`, `make` and anything else comparing the two drew the
+/// wrong conclusion. Saturates at the epoch for a timestamp before
+/// 1978.
+pub(crate) fn unix_secs_to_amiga_local(unix_secs: i64) -> i64 {
+    let local = unix_secs + local_offset_secs_at(unix_secs);
+    (local - UNIX_TO_AMIGA_EPOCH_DAYS * 86_400).max(0)
+}
+
+/// The inverse of [`unix_secs_to_amiga_local`], for a guest-supplied
+/// Amiga date that has to land on the host clock (`SetFileDate`'s
+/// sidecar round trip goes through the sidecar instead, in Amiga
+/// units, so this is only for host-facing conversions).
+///
+/// The offset is resolved against the *resulting* instant rather than
+/// the input, which is what makes a round trip stable across a DST
+/// boundary: convert naively first, then correct using the offset in
+/// force at that moment.
+pub(crate) fn amiga_secs_to_unix_local(amiga_secs: i64) -> i64 {
+    let naive_utc = amiga_secs + UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+    naive_utc - local_offset_secs_at(naive_utc)
+}
+
+/// Splits AmigaOS-epoch seconds plus a sub-second remainder into
+/// `(ds_Days, ds_Minute, ds_Tick)`.
+pub(crate) fn datestamp_from_amiga_secs(amiga_secs: i64, subsec_nanos: u32) -> (i32, i32, i32) {
+    if amiga_secs < 0 {
+        return (0, 0, 0);
+    }
+    let days = amiga_secs / 86_400;
+    let secs_of_day = amiga_secs % 86_400;
+    let minute = secs_of_day / 60;
+    let secs_of_minute = secs_of_day % 60;
+    let tick = secs_of_minute * i64::from(TICKS_PER_SECOND)
+        + (u64::from(subsec_nanos) * u64::from(TICKS_PER_SECOND) / 1_000_000_000) as i64;
+    (days as i32, minute as i32, tick as i32)
+}
+
+/// `(ds_Days, ds_Minute, ds_Tick)` for a host file's modification time,
+/// in the host's local time -- what `fib_Date` reports for a file with
+/// no `.uaem` sidecar (issue #287).
+///
+/// The AmigaOS epoch is the fallback for a host that can't answer
+/// (a file that vanished between the directory scan and this call, or
+/// a filesystem with no mtime), which is also what this runtime
+/// reported for *every* file before #287.
+pub(crate) fn datestamp_for_host_path(path: &std::path::Path) -> (i32, i32, i32) {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return (0, 0, 0);
+    };
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => datestamp_from_amiga_secs(
+            unix_secs_to_amiga_local(since_epoch.as_secs() as i64),
+            since_epoch.subsec_nanos(),
+        ),
+        // Before 1970, so certainly before 1978.
+        Err(_) => (0, 0, 0),
+    }
+}
+
 /// Computes `(ds_Days, ds_Minute, ds_Tick)` for the current host wall
 /// clock. Saturates to `0` if the host clock is somehow before the
 /// Amiga epoch (never happens in practice, but avoids an underflow
@@ -87,7 +176,7 @@ pub(crate) fn now_as_datestamp() -> (i32, i32, i32) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let amiga_secs = now.as_secs() as i64 - UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+    let amiga_secs = unix_secs_to_amiga_local(now.as_secs() as i64);
     if amiga_secs < 0 {
         return (0, 0, 0);
     }
@@ -200,19 +289,33 @@ fn read_datestamp<C: Cpu>(ctx: &HandlerContext<'_, C>, addr: u32) -> (i32, i32, 
 }
 
 /// `CompareDates` (`D1` = `struct DateStamp* date1`, `D2` = `struct
-/// DateStamp* date2`). `D0` = negative if `date1` is earlier than
-/// `date2`, 0 if equal, positive if later -- compared field by field
-/// (`ds_Days`, then `ds_Minute`, then `ds_Tick`), matching the field
-/// order's own significance. Cannot fail.
+/// DateStamp* date2`). Compared field by field (`ds_Days`, then
+/// `ds_Minute`, then `ds_Tick`), matching the field order's own
+/// significance. Cannot fail.
+///
+/// **The sign is reversed from `strcmp`'s**, which is what the autodoc
+/// spends a sentence insisting on: "`<0` is returned if `date1` is
+/// *later* than `date2`, 0 if they are equal, or `>0` if `date2` is
+/// later than `date1`. NOTE: this is NOT the same ordering as
+/// strcmp!" (NDK 3.2 `dos.doc`, `(V36)`).
+///
+/// This runtime had it the intuitive way round until issue #287, which
+/// made it visible: the real `List` command filters `SINCE`/`UPTO` by
+/// comparing each entry's `fib_Date` against its parsed argument, so
+/// an inverted sign inverts the filter -- `SINCE 01-Jan-78` listed
+/// nothing and `UPTO 01-Jan-78` listed everything. Nothing caught it
+/// earlier because every file reported the same epoch date (#287's
+/// other half), which makes every such comparison degenerate.
 fn compare_dates_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let date1_ptr = ctx.cpu.data_register(DataRegister(1));
     let date2_ptr = ctx.cpu.data_register(DataRegister(2));
     let date1 = read_datestamp(ctx, date1_ptr);
     let date2 = read_datestamp(ctx, date2_ptr);
 
-    let diff = match date1.0.cmp(&date2.0) {
-        std::cmp::Ordering::Equal => match date1.1.cmp(&date2.1) {
-            std::cmp::Ordering::Equal => date1.2 - date2.2,
+    // date2 against date1, not the other way round -- see the doc.
+    let diff = match date2.0.cmp(&date1.0) {
+        std::cmp::Ordering::Equal => match date2.1.cmp(&date1.1) {
+            std::cmp::Ordering::Equal => date2.2 - date1.2,
             other => other as i32,
         },
         other => other as i32,
@@ -267,6 +370,95 @@ mod tests {
     use crate::backend::{M68kCpu, TRAP_TABLE_END};
     use crate::dispatch::{Runtime, StartConfig};
     use crate::memory::FlatMemory;
+
+    // --- local time and host mtimes (issue #287) ---
+
+    /// 2026-01-15T12:00:00Z and 2026-07-15T12:00:00Z: two instants six
+    /// months apart, so a host with DST has a different UTC offset for
+    /// each.
+    const WINTER: i64 = 1_768_478_400;
+    const SUMMER: i64 = 1_784_116_800;
+
+    #[test]
+    fn unix_to_amiga_uses_the_offset_in_force_at_that_instant() {
+        // Each timestamp is converted with *its own* offset, not one
+        // sampled at startup -- otherwise a file written in July and
+        // examined in December reads an hour out, on a host where that
+        // matters.
+        for unix in [WINTER, SUMMER] {
+            let expected = unix + local_offset_secs_at(unix) - UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+            assert_eq!(unix_secs_to_amiga_local(unix), expected, "at {unix}");
+        }
+        // On a host that actually observes DST the two offsets differ,
+        // which is the case this guards; on UTC or a DST-free zone they
+        // are equal and the assertion above still holds.
+        let (w, s) = (local_offset_secs_at(WINTER), local_offset_secs_at(SUMMER));
+        if w != s {
+            assert_ne!(
+                unix_secs_to_amiga_local(WINTER) - WINTER,
+                unix_secs_to_amiga_local(SUMMER) - SUMMER,
+                "a DST host must convert the two instants differently"
+            );
+        }
+    }
+
+    #[test]
+    fn amiga_to_unix_round_trips_both_sides_of_dst() {
+        for unix in [WINTER, SUMMER] {
+            let amiga = unix_secs_to_amiga_local(unix);
+            assert_eq!(
+                amiga_secs_to_unix_local(amiga),
+                unix,
+                "round trip at {unix}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_before_the_amiga_epoch_saturates_rather_than_wrapping() {
+        // A host clock set to 1970 (or a file with a pre-1978 mtime)
+        // must not produce a negative ds_Days that a guest would read
+        // as a date far in the future.
+        assert_eq!(unix_secs_to_amiga_local(0), 0);
+        assert_eq!(datestamp_from_amiga_secs(-1, 0), (0, 0, 0));
+    }
+
+    #[test]
+    fn datestamp_from_amiga_secs_splits_days_minutes_and_ticks() {
+        // 2 days, 3 minutes, 4.5 seconds past the epoch.
+        let secs = 2 * 86_400 + 3 * 60 + 4;
+        assert_eq!(
+            datestamp_from_amiga_secs(secs, 500_000_000),
+            (2, 3, 4 * 50 + 25),
+            "ticks are 1/50 s, including the half second"
+        );
+    }
+
+    #[test]
+    fn datestamp_for_a_missing_host_path_is_the_epoch() {
+        // The pre-#287 answer, kept as the fallback for a file that
+        // vanished between the directory scan and the Examine.
+        assert_eq!(
+            datestamp_for_host_path(std::path::Path::new("/nonexistent/volamos/287")),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn now_as_datestamp_agrees_with_the_timer_devices_clock() {
+        // DateStamp, GetSysTime and ReadBattClock must report one
+        // clock: a file date that disagreed with DateStamp by the UTC
+        // offset was half of issue #287 (List SINCE, make).
+        let (days, minute, _tick) = now_as_datestamp();
+        let (secs, _micro) = crate::exectask::host_time_secs_micro();
+        let from_timer_days = (secs / 86_400) as i32;
+        let from_timer_minute = ((secs % 86_400) / 60) as i32;
+        assert_eq!(days, from_timer_days);
+        assert!(
+            (minute - from_timer_minute).abs() <= 1,
+            "DateStamp {minute} vs GetSysTime {from_timer_minute}"
+        );
+    }
 
     #[test]
     fn now_as_datestamp_is_plausibly_recent() {
@@ -415,17 +607,44 @@ mod tests {
 
     #[test]
     fn end_to_end_compare_dates_date1_earlier_by_days() {
-        assert!(run_compare_dates((100, 200, 300), (101, 0, 0)) < 0);
+        // Reversed from strcmp: date1 *earlier* gives a POSITIVE
+        // result. "<0 is returned if date1 is later than date2, 0 if
+        // they are equal, or >0 if date2 is later than date1. NOTE:
+        // this is NOT the same ordering as strcmp!" (NDK 3.2 dos.doc).
+        // These three tests asserted the intuitive sign until issue
+        // #287 surfaced the real List command filtering SINCE/UPTO
+        // backwards.
+        assert!(run_compare_dates((100, 200, 300), (101, 0, 0)) > 0);
     }
 
     #[test]
     fn end_to_end_compare_dates_date1_later_by_minute() {
-        assert!(run_compare_dates((100, 201, 0), (100, 200, 999)) > 0);
+        assert!(run_compare_dates((100, 201, 0), (100, 200, 999)) < 0);
     }
 
     #[test]
     fn end_to_end_compare_dates_date1_earlier_by_tick_only() {
-        assert!(run_compare_dates((100, 200, 300), (100, 200, 301)) < 0);
+        assert!(run_compare_dates((100, 200, 300), (100, 200, 301)) > 0);
+    }
+
+    #[test]
+    fn compare_dates_sign_matches_the_autodocs_exact_wording() {
+        // Pinned as prose-to-assertion, because the intuitive reading
+        // is wrong and a future reader will be tempted by it:
+        //   "<0 ... if date1 is later than date2"
+        //   "0 if they are equal"
+        //   ">0 if date2 is later than date1"
+        let earlier = (1000, 0, 0);
+        let later = (2000, 0, 0);
+        assert!(
+            run_compare_dates(later, earlier) < 0,
+            "date1 later -> negative"
+        );
+        assert_eq!(run_compare_dates(later, later), 0, "equal -> zero");
+        assert!(
+            run_compare_dates(earlier, later) > 0,
+            "date2 later -> positive"
+        );
     }
 
     #[test]

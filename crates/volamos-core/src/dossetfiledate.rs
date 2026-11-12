@@ -57,7 +57,54 @@ pub(crate) fn set_file_date(
 
     let mut sidecar_meta = dosmeta::read_sidecar(&host_path).unwrap_or_default();
     sidecar_meta.date = (days, minute, tick);
-    dosmeta::write_sidecar(&host_path, &sidecar_meta).map_err(|e| map_io_error(&e))
+    dosmeta::write_sidecar(&host_path, &sidecar_meta).map_err(|e| map_io_error(&e))?;
+
+    // Move the host file's own modification time too, not just the
+    // sidecar. Since issue #287 that mtime is what `fib_Date` reports
+    // for a file *without* a sidecar, so leaving it stale would mean a
+    // guest's own `SetFileDate` was invisible to anything reading the
+    // file another way -- host `make`, or volamos itself once the
+    // sidecar is gone. The sidecar still wins when both exist, since
+    // it holds the guest's answer at Amiga resolution.
+    //
+    // Best effort: a read-only directory or a filesystem with no
+    // settable mtime must not fail a call whose documented effect
+    // (the date a guest reads back) has already succeeded above.
+    set_host_mtime(&host_path, (days, minute, tick));
+    Ok(())
+}
+
+/// Sets `path`'s host modification time from an Amiga `DateStamp`,
+/// ignoring any failure -- see [`set_file_date`]'s own comment.
+fn set_host_mtime(path: &std::path::Path, date: (i32, i32, i32)) {
+    let (days, minute, tick) = date;
+    if days < 0 || minute < 0 || tick < 0 {
+        return;
+    }
+    let amiga_secs = i64::from(days) * 86_400 + i64::from(minute) * 60 + i64::from(tick) / 50;
+    let unix_secs = crate::dosdate::amiga_secs_to_unix_local(amiga_secs);
+    // Sub-second precision is dropped: a DateStamp's ticks are 1/50 s
+    // and `utimes` takes microseconds, so the remainder is carried
+    // through rather than truncated away.
+    let micros = (i64::from(tick) % 50) * 20_000;
+    let times = [
+        libc::timeval {
+            tv_sec: unix_secs as libc::time_t,
+            tv_usec: micros as libc::suseconds_t,
+        },
+        libc::timeval {
+            tv_sec: unix_secs as libc::time_t,
+            tv_usec: micros as libc::suseconds_t,
+        },
+    ];
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    // SAFETY: both pointers are valid for the call, and `times` is the
+    // two-element array `utimes` expects.
+    unsafe {
+        libc::utimes(c_path.as_ptr(), times.as_ptr());
+    }
 }
 
 /// `SetFileDate` (`D1` = name `CString*`, `D2` = `struct DateStamp*`).
@@ -213,6 +260,51 @@ mod tests {
 
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed")
+    }
+
+    #[test]
+    fn set_file_date_also_moves_the_host_mtime() {
+        // Issue #287 made the host mtime the fallback fib_Date, so a
+        // guest's SetFileDate has to move it too -- otherwise the
+        // guest's own change is invisible to host tools, and to volamos
+        // itself once the sidecar is removed.
+        let tmp = TempDir::new("setfiledate-mtime");
+        let file = tmp.path().join("f.txt");
+        fs::write(&file, b"x").unwrap();
+        // 6282 days past 1978-01-01 is 1995-03-16; 720 minutes is noon.
+        let code = run_set_file_date(b"SYS:f.txt\0", 6282, 720, 0, tmp.path());
+        assert_eq!(code, DOSTRUE as i32, "SetFileDate should report success");
+
+        let mtime = fs::metadata(&file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expected = crate::dosdate::amiga_secs_to_unix_local(6282 * 86_400 + 720 * 60);
+        assert_eq!(mtime, expected, "host mtime should hold the date just set");
+
+        // And the date reads back through Examine, which prefers the
+        // sidecar -- so both stores now agree.
+        let amiga = crate::dosdate::unix_secs_to_amiga_local(mtime);
+        assert_eq!(amiga / 86_400, 6282, "same day either way round");
+    }
+
+    #[test]
+    fn set_host_mtime_ignores_a_host_that_refuses() {
+        // The documented effect of SetFileDate -- the date a guest
+        // reads back -- comes from the sidecar, so a host that can't
+        // take the mtime must not turn a successful call into a
+        // failure. The call simply discards the result; this pins that
+        // it also can't panic on a path the host rejects.
+        set_host_mtime(
+            std::path::Path::new("/nonexistent/volamos/287"),
+            (6282, 720, 0),
+        );
+        // A negative DateStamp is nonsense rather than a time: skipped
+        // rather than converted into some wrapped-around host date.
+        set_host_mtime(std::path::Path::new("/nonexistent/volamos/287"), (-1, 0, 0));
     }
 
     #[test]

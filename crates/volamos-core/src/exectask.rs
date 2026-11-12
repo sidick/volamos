@@ -2584,7 +2584,8 @@ fn abort_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 /// per the RKRM Devices book's "Timer Device" chapter ("By convention,
 /// it tells how many seconds have passed since midnight, January 1,
 /// 1978"). Reads the same host clock as
-/// [`crate::dosdate::now_as_datestamp`], but keeps the microseconds
+/// [`crate::dosdate::now_as_datestamp`] -- in the host's *local* time,
+/// as an Amiga clock reads (issue #287) -- but keeps the microseconds
 /// instead of going through DateStamp's 1/50s ticks: `ReadEClock` is
 /// built on this too, and programs time short intervals with it. Also
 /// reused by `crate::intuition`'s `CurrentTime`, which is documented to
@@ -2593,7 +2594,11 @@ pub(crate) fn host_time_secs_micro() -> (u32, u32) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs() as i64 - crate::dosdate::UNIX_TO_AMIGA_EPOCH_DAYS * 86_400;
+    // Local time, not UTC: an Amiga's clock has no time zone, so
+    // everything that reads it -- this, DateStamp, ReadBattClock,
+    // Intuition's CurrentTime -- must agree with the dates files carry
+    // (issue #287). See crate::dosdate::unix_secs_to_amiga_local.
+    let secs = crate::dosdate::unix_secs_to_amiga_local(now.as_secs() as i64);
     if secs < 0 {
         return (0, 0);
     }
