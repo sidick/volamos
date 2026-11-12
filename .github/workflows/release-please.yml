@@ -315,3 +315,76 @@ jobs:
     uses: sidick/amiga-workflows/.github/workflows/docs.yml@6ad7098bebba603db43f7c9e25706fa9047eeddc # v1
     with:
       version: ${{ needs.release-please.outputs.tag_name }}
+
+  # The last word on whether a release actually shipped. Everything
+  # above is `needs`-chained, so one lost runner leaves the tag and the
+  # GitHub release in place while every publish job is *skipped* -- the
+  # exact shape of the v0.20.0 run, where the macos test job logged no
+  # steps for 15 minutes and was cancelled, and the release sat public
+  # with zero assets until someone went looking.
+  #
+  # A failed job does send mail, which is how that one was caught, but
+  # it says "a job failed", not "the release is incomplete" -- and the
+  # cases this is really for send nothing at all: three of the four
+  # binaries uploading, `gh release upload` partially succeeding, or a
+  # publish job being skipped by an `if` that quietly stops matching.
+  # Those are green runs today.
+  #
+  # `always()` is load-bearing: without it this job is skipped along
+  # with the publish jobs it is supposed to be judging.
+  verify-release:
+    name: Release is complete
+    needs:
+      - release-please
+      - docker
+      - release-publish
+      - docs
+    if: ${{ always() && needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Every standalone binary is attached to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          # One name per target the matrix above builds; spelled out
+          # rather than counted, so a *wrong* asset is caught as well as
+          # a missing one.
+          expected="volamos-${TAG}-aarch64-apple-darwin.tar.gz
+          volamos-${TAG}-aarch64-unknown-linux-musl.tar.gz
+          volamos-${TAG}-x86_64-pc-windows-gnu.zip
+          volamos-${TAG}-x86_64-unknown-linux-musl.tar.gz"
+          got=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+                  --jq '.assets[].name' | sort)
+          missing=$(comm -23 <(echo "$expected" | sed 's/^ *//' | sort) <(echo "$got") || true)
+          if [ -n "$missing" ]; then
+            echo "::error::$TAG is published without every binary. Missing:"
+            echo "$missing" | sed 's/^/  /'
+            echo "Attached:"; echo "$got" | sed 's/^/  /'
+            echo "Re-run the failed jobs on this run (gh run rerun <id> --failed) once the"
+            echo "cause is understood; the tag and release already exist, so re-running is"
+            echo "the recovery, not a new release."
+            exit 1
+          fi
+          echo "All four binaries are attached to $TAG:"; echo "$got" | sed 's/^/  /'
+
+      - name: The Docker image is pullable
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # What a user would actually do -- a manifest query, not a
+          # registry API call, so it fails the same way their `docker
+          # pull` would.
+          for ref in "ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}" "ghcr.io/${GITHUB_REPOSITORY,,}:latest"; do
+            if ! docker manifest inspect "$ref" >/dev/null 2>&1; then
+              echo "::error::$ref is not pullable, so the release's image did not publish"
+              exit 1
+            fi
+            echo "$ref is pullable"
+          done
