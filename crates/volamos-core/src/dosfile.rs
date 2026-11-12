@@ -806,25 +806,36 @@ impl DosState {
         if parent_lock_addr == 0 {
             return Ok(name.to_string());
         }
-        // A name that carries its own device/volume part is absolute,
-        // so the lock it was handed is irrelevant -- `"T:f"` against a
-        // lock on `T:` means `T:f`, not `T:T:f`. That is the AmigaDOS
-        // path rule, and at packet level it is also the handler
-        // convention: dos.library passes the name through as the
-        // caller wrote it, and a handler skips anything up to the
-        // first `:` (which is why sending ACTION_LOCATE_OBJECT by hand
-        // works with or without the device part). Without this,
-        // clib2's `lstat()` -- which locks via a packet, with the
-        // device-qualified name it was given -- failed with
-        // ERROR_INVALID_COMPONENT_NAME on a file that existed (issue
-        // #288).
-        if name.contains(':') {
-            return Ok(name.to_string());
-        }
+        // The lock is validated first, before the absolute-name
+        // shortcut below: a caller passing a stale or garbage lock
+        // should hear ERROR_INVALID_LOCK about it whatever the name
+        // says (found in review of issue #288).
         let entry = self
             .locks
             .get(&parent_lock_addr)
             .ok_or(ERROR_INVALID_LOCK)?;
+        // A name carrying its own device/volume part is absolute, so
+        // the lock is not a base for it: `"T:f"` against a lock on
+        // `T:` means `T:f`, not `T:T:f` -- which is what used to
+        // happen, and failed with ERROR_INVALID_COMPONENT_NAME.
+        // clib2's `lstat()` locks via a packet with the
+        // device-qualified name it was given, so every `lstat()` hit
+        // it (issue #288).
+        //
+        // It resolves against the volume the name *names*, which is
+        // where this runtime deliberately differs from real hardware:
+        // there, each volume has its own handler, and the convention
+        // is that a handler skips up to the first `:` and resolves the
+        // remainder on its own volume, because it knows of no other.
+        // volamos serves every volume from one synthetic handler,
+        // which does know them all, so routing to the named volume is
+        // both well-defined and what the caller asked for. The two
+        // only differ when the name's volume isn't the lock's, which
+        // no caller can usefully intend -- on hardware that case
+        // silently resolves somewhere else entirely.
+        if name.contains(':') {
+            return Ok(name.to_string());
+        }
         if name.is_empty() {
             Ok(entry.amiga_path.clone())
         } else if entry.amiga_path.ends_with(':') {
@@ -2431,12 +2442,15 @@ mod tests {
 
     #[test]
     fn combine_lock_path_ignores_the_lock_for_a_device_qualified_name() {
-        // "T:f" against a lock on T: is T:f, not T:T:f -- the AmigaDOS
-        // path rule, and at packet level the handler convention too
-        // (dos.library passes the name through as written, and a
-        // handler skips up to the first ':'). Issue #288: clib2's
-        // lstat() locks via a packet with the device-qualified name it
-        // was given, and used to get ERROR_INVALID_COMPONENT_NAME.
+        // "SYS:f" against a lock on SYS: is SYS:f, not SYS:SYS:f --
+        // what used to happen, and what made clib2's lstat() fail with
+        // ERROR_INVALID_COMPONENT_NAME (issue #288).
+        //
+        // A name naming a *different* volume resolves there, which
+        // differs from a real per-volume handler (it would strip the
+        // prefix and stay on its own volume, knowing no other) -- see
+        // the function's doc for why one handler serving every volume
+        // makes routing the better-defined choice here.
         let mut dos = DosState::new(None);
         // A lock entry whose amiga_path is a volume root, which is what
         // GetDeviceProc hands back in dvp_Lock.
@@ -2461,6 +2475,12 @@ mod tests {
         assert_eq!(
             dos.combine_lock_path(lock_addr, "f.txt").unwrap(),
             "SYS:f.txt"
+        );
+        // And a bad lock is still reported as one, qualified name or
+        // not: the validation happens first (found in review).
+        assert_eq!(
+            dos.combine_lock_path(0xDEAD_BEEF, "SYS:f.txt"),
+            Err(ERROR_INVALID_LOCK)
         );
     }
 

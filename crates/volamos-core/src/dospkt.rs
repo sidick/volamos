@@ -127,13 +127,28 @@ const DP_ARG2: u32 = 24;
 const DP_ARG3: u32 = 28;
 /// `dp_Arg4` -- only `ACTION_READ_LINK` (issue #186) uses this one.
 const DP_ARG4: u32 = 32;
-/// `dp_Arg5`/`dp_Arg6`/`dp_Arg7`: `dp_Arg4` + 4 each. No action this
-/// runtime services reads past `dp_Arg4`, but `DoPkt` takes seven
-/// arguments (`D3`-`D7` plus two more via `DoPkt`'s own signature), so
-/// [`service_action`] carries all seven for the actions that will.
-const DP_ARG5: u32 = 36;
-const DP_ARG6: u32 = 40;
-const DP_ARG7: u32 = 44;
+/// Whether `action` reads `dp_Arg4`.
+///
+/// Consulted so [`handle_fs_packet`] reads that longword only for the
+/// actions that actually use it. Reading it unconditionally looks
+/// harmless and isn't: a guest builds its packet by filling the fields
+/// its action needs, so for `ACTION_READ` the `dp_Arg4` longword is
+/// whatever the allocation happened to contain -- and
+/// `--sanitize-uninit` then reports a read of uninitialized memory
+/// that the guest never performed. The real SAS/C `sc1.library`
+/// packet loop (issue #24) does exactly this on every read, and a
+/// packet allocated to end at `dp_Arg4` would also take a spurious
+/// redzone hit. Found in review of issue #288.
+fn action_reads_arg4(action: u32) -> bool {
+    matches!(
+        action,
+        ACTION_READ_LINK
+            | ACTION_RENAME_OBJECT
+            | ACTION_SET_PROTECT
+            | ACTION_SET_DATE
+            | ACTION_MAKE_LINK
+    )
+}
 
 const ID_VALIDATED: u32 = 82;
 const ID_DOS_DISK: u32 = 0x444F_5300;
@@ -222,8 +237,9 @@ fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let arg2 = ctx.cpu.data_register(DataRegister(4));
 
     let arg3 = ctx.cpu.data_register(DataRegister(5));
+    // D7 would be dp_Arg5, which no action this runtime services reads
+    // (see action_reads_arg4), so it is deliberately not forwarded.
     let arg4 = ctx.cpu.data_register(DataRegister(6));
-    let arg5 = ctx.cpu.data_register(DataRegister(7));
 
     let known_volume = crate::dosdevlist::volume_for_task_id(ctx.dos, port).is_some();
     let (res1, res2) = match action {
@@ -257,7 +273,48 @@ fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
         // port still learns something is wrong, as it would on real
         // hardware (where PutMsg to a non-port misbehaves outright).
         _ if known_volume || ctx.dos.is_fs_handler_port(port) => {
-            match service_action(ctx, action, [arg1, arg2, arg3, arg4, arg5, 0, 0])? {
+            // A packet addressed to a *particular* volume's task with
+            // no lock means "relative to that volume's root" -- the
+            // port is the only thing naming the volume, and
+            // `combine_lock_path(0, name)` would otherwise resolve the
+            // name against the process's current directory, on
+            // whatever volume that happens to be. Found in review of
+            // issue #288: before this fall-through existed the answer
+            // was ERROR_ACTION_NOT_KNOWN, so a silently *wrong* lock
+            // is newly reachable rather than pre-existing.
+            //
+            // Handled by taking a real lock on that volume's root and
+            // passing it as dp_Arg1, which is exactly what the caller
+            // means; released again below, since the action's own
+            // result (a new lock, for ACTION_LOCATE_OBJECT) is
+            // independent of it.
+            let mut root_lock = None;
+            let arg1 = if arg1 == 0
+                && let Some(volume) = crate::dosdevlist::volume_for_task_id(ctx.dos, port)
+            {
+                match ctx.dos.lock(
+                    ctx.heap,
+                    ctx.mem,
+                    &format!("{volume}:"),
+                    crate::doslock::SHARED_LOCK,
+                ) {
+                    Ok(bptr) => {
+                        root_lock = Some(addr_from_bptr(bptr));
+                        bptr
+                    }
+                    // No lock to be had on the volume root (it vanished
+                    // from under us): leave arg1 alone and let the
+                    // action report its own failure.
+                    Err(_) => arg1,
+                }
+            } else {
+                arg1
+            };
+            let outcome = service_action(ctx, action, [arg1, arg2, arg3, arg4]);
+            if let Some(addr) = root_lock {
+                ctx.dos.unlock(ctx.heap, addr);
+            }
+            match outcome? {
                 ActionOutcome::Done(res1, res2) => (res1, res2),
                 // The action blocked this task (a PIPE: read with
                 // nothing in it). Registers belong to whatever runs
@@ -301,13 +358,13 @@ enum ActionOutcome {
 fn service_action<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     action: u32,
-    args: [u32; 7],
+    args: [u32; 4],
 ) -> Result<ActionOutcome, DispatchError> {
     // Named rather than indexed so each arm reads the argument by its
-    // documented number (`dp_Arg1`..`dp_Arg7`); not every action uses
-    // all seven.
-    let [arg1, arg2, arg3, arg4, arg5, arg6, arg7] = args;
-    let _ = (arg5, arg6, arg7);
+    // documented number (`dp_Arg1`..`dp_Arg4`). No action this runtime
+    // services reads past `dp_Arg4`; see [`action_reads_arg4`] for why
+    // even that one is read conditionally.
+    let [arg1, arg2, arg3, arg4] = args;
 
     let (res1, res2) = match action {
         // RKRM packet-documentation.md, ACTION_READ (82): Arg1 =
@@ -607,10 +664,12 @@ pub fn handle_fs_packet<C: Cpu>(
         ctx.mem.read_u32(pkt + DP_ARG1),
         ctx.mem.read_u32(pkt + DP_ARG2),
         ctx.mem.read_u32(pkt + DP_ARG3),
-        ctx.mem.read_u32(pkt + DP_ARG4),
-        ctx.mem.read_u32(pkt + DP_ARG5),
-        ctx.mem.read_u32(pkt + DP_ARG6),
-        ctx.mem.read_u32(pkt + DP_ARG7),
+        // Only for the actions that use it -- see action_reads_arg4.
+        if action_reads_arg4(action) {
+            ctx.mem.read_u32(pkt + DP_ARG4)
+        } else {
+            0
+        },
     ];
     let arg1 = args[0];
     let (res1, res2) = match service_action(ctx, action, args)? {
@@ -858,6 +917,13 @@ mod tests {
     /// arg1 = 0, arg2 = BPTR to a BSTR of `name`, arg3 = SHARED_LOCK)`
     /// over a VFS rooted at `root`, returning `(D0, IoErr)`.
     fn run_do_pkt_locate(root: &std::path::Path, name: &[u8]) -> (i32, i32) {
+        run_do_pkt_locate_in(root, "SYS:", name)
+    }
+
+    /// As [`run_do_pkt_locate`], with the process's current directory
+    /// set to `cwd` -- so a test can tell "resolved at the volume root"
+    /// apart from "resolved at the current directory".
+    fn run_do_pkt_locate_in(root: &std::path::Path, cwd: &str, name: &[u8]) -> (i32, i32) {
         let mut words = Vec::new();
         // D1 = the volume handler's port, via the DosList (same walk
         // the ACTION_DISK_INFO test above uses).
@@ -917,7 +983,7 @@ mod tests {
                 volumes: vec![("SYS".to_string(), root.to_path_buf())],
                 assigns: vec![],
                 auto_assign_root: None,
-                cwd: "SYS:".to_string(),
+                cwd: cwd.to_string(),
                 ..Default::default()
             })
             .expect("build vfs"),
@@ -954,6 +1020,36 @@ mod tests {
             crate::dosfile::ERROR_OBJECT_NOT_FOUND,
             "205, not 209 (ERROR_ACTION_NOT_KNOWN) -- the handler knows \
              this action perfectly well, the object just isn't there"
+        );
+    }
+
+    #[test]
+    fn do_pkt_with_no_lock_on_a_volume_port_resolves_at_that_volumes_root() {
+        // Found in review: the port is the only thing naming the
+        // volume, so dp_Arg1 == 0 means "that volume's root". Without
+        // this, combine_lock_path(0, name) resolved the name against
+        // the process's current directory instead -- a silently wrong
+        // lock, newly reachable once DoPkt stopped answering
+        // ERROR_ACTION_NOT_KNOWN to everything.
+        //
+        // The VFS here puts SYS: at the temp dir with the CWD one
+        // level down, so a bare name resolves differently depending on
+        // which of the two the lookup starts from.
+        let dir = TempDir::new("dopkt-zero-lock");
+        std::fs::create_dir(dir.path.join("work")).unwrap();
+        std::fs::write(dir.path.join("at-root.txt"), b"x").unwrap();
+        std::fs::write(dir.path.join("work/in-cwd.txt"), b"x").unwrap();
+
+        let (lock, io_err) = run_do_pkt_locate_in(&dir.path, "SYS:work", b"at-root.txt");
+        assert_ne!(
+            lock, 0,
+            "a zero lock on the SYS: port means SYS:, not the current dir \
+             (IoErr {io_err})"
+        );
+        let (cwd_lock, _) = run_do_pkt_locate_in(&dir.path, "SYS:work", b"in-cwd.txt");
+        assert_eq!(
+            cwd_lock, 0,
+            "...and so a file that only exists in the current dir is not found"
         );
     }
 
