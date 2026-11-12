@@ -806,10 +806,36 @@ impl DosState {
         if parent_lock_addr == 0 {
             return Ok(name.to_string());
         }
+        // The lock is validated first, before the absolute-name
+        // shortcut below: a caller passing a stale or garbage lock
+        // should hear ERROR_INVALID_LOCK about it whatever the name
+        // says (found in review of issue #288).
         let entry = self
             .locks
             .get(&parent_lock_addr)
             .ok_or(ERROR_INVALID_LOCK)?;
+        // A name carrying its own device/volume part is absolute, so
+        // the lock is not a base for it: `"T:f"` against a lock on
+        // `T:` means `T:f`, not `T:T:f` -- which is what used to
+        // happen, and failed with ERROR_INVALID_COMPONENT_NAME.
+        // clib2's `lstat()` locks via a packet with the
+        // device-qualified name it was given, so every `lstat()` hit
+        // it (issue #288).
+        //
+        // It resolves against the volume the name *names*, which is
+        // where this runtime deliberately differs from real hardware:
+        // there, each volume has its own handler, and the convention
+        // is that a handler skips up to the first `:` and resolves the
+        // remainder on its own volume, because it knows of no other.
+        // volamos serves every volume from one synthetic handler,
+        // which does know them all, so routing to the named volume is
+        // both well-defined and what the caller asked for. The two
+        // only differ when the name's volume isn't the lock's, which
+        // no caller can usefully intend -- on hardware that case
+        // silently resolves somewhere else entirely.
+        if name.contains(':') {
+            return Ok(name.to_string());
+        }
         if name.is_empty() {
             Ok(entry.amiga_path.clone())
         } else if entry.amiga_path.ends_with(':') {
@@ -2413,6 +2439,50 @@ mod tests {
     // --- issue #186: AllocDosObject(DOS_FILEHANDLE)/FreeDosObject,
     // combine_lock_path, open_into_handle, and the close()/
     // dos_object_filehandles interaction. ---
+
+    #[test]
+    fn combine_lock_path_ignores_the_lock_for_a_device_qualified_name() {
+        // "SYS:f" against a lock on SYS: is SYS:f, not SYS:SYS:f --
+        // what used to happen, and what made clib2's lstat() fail with
+        // ERROR_INVALID_COMPONENT_NAME (issue #288).
+        //
+        // A name naming a *different* volume resolves there, which
+        // differs from a real per-volume handler (it would strip the
+        // prefix and stay on its own volume, knowing no other) -- see
+        // the function's doc for why one handler serving every volume
+        // makes routing the better-defined choice here.
+        let mut dos = DosState::new(None);
+        // A lock entry whose amiga_path is a volume root, which is what
+        // GetDeviceProc hands back in dvp_Lock.
+        let lock_addr = 0x1000;
+        dos.locks.insert(
+            lock_addr,
+            crate::doslock::LockEntry {
+                amiga_path: "SYS:".to_string(),
+                host_path: std::path::PathBuf::from("/tmp"),
+                access: crate::doslock::SHARED_LOCK,
+            },
+        );
+        assert_eq!(
+            dos.combine_lock_path(lock_addr, "SYS:f.txt").unwrap(),
+            "SYS:f.txt"
+        );
+        assert_eq!(
+            dos.combine_lock_path(lock_addr, "T:f.txt").unwrap(),
+            "T:f.txt"
+        );
+        // A plain relative name still joins, as before.
+        assert_eq!(
+            dos.combine_lock_path(lock_addr, "f.txt").unwrap(),
+            "SYS:f.txt"
+        );
+        // And a bad lock is still reported as one, qualified name or
+        // not: the validation happens first (found in review).
+        assert_eq!(
+            dos.combine_lock_path(0xDEAD_BEEF, "SYS:f.txt"),
+            Err(ERROR_INVALID_LOCK)
+        );
+    }
 
     #[test]
     fn combine_lock_path_with_no_parent_lock_is_the_bare_name() {
