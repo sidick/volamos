@@ -194,6 +194,15 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     // benchmark, which opens it for its GUI. No LVOs registered; calls
     // into it hit the fake-library diagnostic path.
     "layers.library",
+    // ROM-resident on 3.x -- it isn't on a Workbench 3.1.4 install disk's
+    // LIBS: at all, so the disk-library path can only ever answer NULL
+    // for it, and a guest reads that as a broken Kickstart. No handlers
+    // are implemented, so the first real call fails loudly *by name*
+    // ("icon.library/GetDiskObject") instead of the caller exiting with
+    // an unexplained RETURN_FAIL: the real BindDrivers opens
+    // dos.library, expansion.library and then this, and used to die on
+    // the NULL with no output at all.
+    "icon.library",
 ];
 
 /// The `Vfs` volume name a `--libs-dir` override directory is mounted
@@ -487,6 +496,22 @@ pub const MATHIEEESINGTRANS_LIBRARY_BASE: u32 = 0x29B0;
 /// why it is the one system resource volamos can provide without
 /// emulating hardware (issue #278).
 pub const BATTCLOCK_RESOURCE_BASE: u32 = 0x2DB0;
+
+/// Real `expansion.library` base address -- the `0x2E04`..`0x3000`
+/// chunk past [`BATTCLOCK_RESOURCE_BASE`]'s. Placed lower in its chunk
+/// than the library bases before it (`0x2F80`, not `0x2FB0`) because
+/// `struct ExpansionBase` is the largest header this runtime builds:
+/// 88 bytes through `eb_MountList` (see
+/// [`crate::expansion::EXPANSION_BASE_SIZE`]), where the usual `0x50`
+/// of positive room would not fit it. That leaves `0x17C` (380) bytes
+/// of negative-offset room for a jump table whose deepest vector is
+/// `AddDosNode` at `-150`.
+///
+/// See [`crate::expansion`]'s module docs for why a runtime with no
+/// expansion bus has this library at all: it is in Kickstart on every
+/// real Amiga, and its absence had the real `BindDrivers` exiting `20`
+/// instead of reporting -- correctly -- that there is nothing to bind.
+pub const EXPANSION_LIBRARY_BASE: u32 = 0x2F80;
 
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
@@ -2796,6 +2821,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         // down, once ExecBase's ResourceList header exists.
         crate::battclock::register_battclock_handlers(&mut table, &mut mem);
 
+        // expansion.library: the autoconfig enumeration and bookkeeping
+        // calls, answering truthfully that there are no boards -- see
+        // crate::expansion's module docs for what is deliberately left
+        // unimplemented (anything that configures hardware or mounts a
+        // filesystem).
+        crate::expansion::register_expansion_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -2926,6 +2958,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // this the difference between a program running and dying
         // before main().
         crate::battclock::install_battclock_resource(&mut mem);
+        // expansion.library's struct ExpansionBase: a real header and
+        // two well-formed empty lists (boards, mounts). See
+        // crate::expansion's module docs -- "nothing is plugged in" is
+        // the true answer here, and a guest has to be able to ask.
+        crate::expansion::install_expansion_base(&mut mem);
         crate::execlist::init_list_header(
             &mut mem,
             EXEC_LIBRARY_BASE + EXEC_BASE_SEMAPHORELIST_OFFSET,
@@ -2945,6 +2982,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("locale.library", LOCALE_LIBRARY_BASE);
         registry.register_real("intuition.library", INTUITION_LIBRARY_BASE);
         registry.register_real("graphics.library", GRAPHICS_LIBRARY_BASE);
+        registry.register_real("expansion.library", EXPANSION_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using

@@ -50,6 +50,7 @@ pub mod execmem;
 pub mod execsem;
 pub mod execsetfunc;
 pub mod exectask;
+pub mod expansion;
 pub mod graphics;
 pub mod guestmem;
 pub mod intuition;

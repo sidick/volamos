@@ -304,6 +304,54 @@ gives them a turn. Like `Delay()`, that relies on the other tasks
 making library calls: volamos doesn't preempt, so a task that
 busy-waits on memory without one keeps the CPU.
 
+## expansion.library
+
+The Zorro autoconfig bookkeeping library — and here, the truthful
+answer that nothing is plugged in. It's in Kickstart on every real
+Amiga, including a bare A500 with an empty expansion connector, so
+returning `NULL` for it (as volamos did until
+[issue #292](https://github.com/sidick/volamos/issues/292)) let a guest
+read "no expansion bus" as "broken Kickstart" — the real Workbench
+3.1.4 `BindDrivers` took the second reading and exited 20 in silence.
+
+Implemented, and answering for real:
+
+- `FindConfigDev` walks a real `ConfigDev` list, with `-1` wildcards for
+  manufacturer and product. It finds nothing, because nothing is
+  plugged in — and finds a board a guest added itself with
+  `AddConfigDev`, which `RemConfigDev` takes back off.
+- `ObtainConfigBinding`/`ReleaseConfigBinding` — no-ops. They exist so
+  two driver binders don't claim the same board; with no boards there's
+  nothing to serialize. `BindDrivers` calls them.
+- `GetCurrentBinding`/`SetCurrentBinding` round-trip the
+  `CurrentBinding` struct through `ExpansionBase`'s own private field,
+  as on hardware.
+- `AllocConfigDev`/`FreeConfigDev` really allocate and free a zeroed
+  `ConfigDev`.
+- `AllocExpansionMem`/`AllocBoardMem` fail (`0`): there is no
+  autoconfig address space to carve a board window out of, and "cannot"
+  is the honest answer. `FreeExpansionMem`/`FreeBoardMem` are no-ops.
+
+`ExpansionBase` itself is real — `eb_Flags`, the private
+`CurrentBinding`, and well-formed empty board and mount lists at their
+documented offsets — so a guest walking `eb_MountList` finds an empty
+list rather than garbage.
+
+Deliberately *not* implemented, because each one **acts** and a silent
+success would leave a guest believing something false:
+`ConfigBoard`/`ConfigChain` (configure a board into the address map),
+`ReadExpansionRom`/`ReadExpansionByte`/`WriteExpansionByte` (address a
+board's autoconfig space — with no boards there's no address to pass),
+and `MakeDosNode`/`AddDosNode`/`AddBootNode` (mount a filesystem;
+volumes come from `-V`/`-a` instead). Each fails loudly, naming the
+library and LVO.
+
+`icon.library` is ROM-resident on 3.x too — it isn't on a Workbench
+3.1.4 install disk at all — so it now *opens*, with no functions
+implemented: the first real call fails loudly by name
+(`icon.library/GetDiskObject`) instead of the caller exiting with an
+unexplained failure.
+
 ## battclock.resource
 
 The battery-backed clock chip, backed by the host clock — the one

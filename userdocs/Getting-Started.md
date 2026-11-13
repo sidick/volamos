@@ -49,7 +49,8 @@ ERR
 (`fixtures/filetest` tries to `Open("TEST:out.txt", MODE_NEWFILE)`;
 with no `TEST:` volume mapped, that fails, and the fixture prints its
 own `"ERR"` marker and exits `1` — this is the guest program's own
-documented failure path, not a volamos crash.)
+documented failure path, not a volamos crash, which would exit `98`
+instead; see [Exit codes](CLI-Reference.md#exit-codes).)
 
 `-V NAME:hostdir` maps an Amiga volume onto a real host directory:
 

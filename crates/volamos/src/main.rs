@@ -1922,6 +1922,23 @@ fn report_sanitizer_violations(
 /// from 1, so a harness can tell the two failures apart.
 const SANITIZER_EXIT_CODE: i32 = 99;
 
+/// The exit status of a run that volamos itself could not carry to the
+/// guest's own `rts`: the program couldn't be read or didn't parse as a
+/// hunk executable, or the run started and then died inside the runtime
+/// (an unimplemented library call, an invalid instruction, a stack
+/// overflow). Every one of those also prints a `volamos: ...`
+/// diagnostic to stderr.
+///
+/// Distinct from `1` so a harness can tell "volamos failed" from "the
+/// guest ran to completion and returned 1", which until now shared a
+/// status and forced test programs to avoid returning 1 at all. Like
+/// [`SANITIZER_EXIT_CODE`] it sits above the small codes AmigaOS
+/// programs return (`RETURN_WARN` 5, `RETURN_ERROR` 10, `RETURN_FAIL`
+/// 20), and a guest is still free to return 98 itself -- the status
+/// alone can't be a proof, only a strong signal, which is why the
+/// stderr diagnostic is the other half of the contract.
+const RUNTIME_ERROR_EXIT_CODE: u8 = 98;
+
 /// Checks that `ram_size` is an address space the configured CPU can
 /// actually reach (issue #98).
 ///
@@ -2883,7 +2900,7 @@ fn main() -> ExitCode {
         Ok(overrides) => overrides,
         Err(msg) => {
             eprintln!("volamos: {msg}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(RUNTIME_ERROR_EXIT_CODE);
         }
     };
 
@@ -2948,7 +2965,7 @@ fn main() -> ExitCode {
         }
         Err(msg) => {
             eprintln!("volamos: {msg}");
-            ExitCode::FAILURE
+            ExitCode::from(RUNTIME_ERROR_EXIT_CODE)
         }
     }
 }
