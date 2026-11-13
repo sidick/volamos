@@ -3,6 +3,21 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.21.0](https://github.com/sidick/volamos/compare/v0.20.0...v0.21.0) (2026-11-13)
+
+
+### Features
+
+* **cli:** exit 98 when volamos itself fails, not 1 ([#300](https://github.com/sidick/volamos/issues/300)) ([7925bde](https://github.com/sidick/volamos/commit/7925bde21fddcfa7cf2893804b9440c0318e19c5))
+* **exec:** expansion.library, answering that nothing is plugged in ([#293](https://github.com/sidick/volamos/issues/293)) ([032caf8](https://github.com/sidick/volamos/commit/032caf8d460b1bd07b8a8e198bc79a3da774d885))
+
+
+### Bug Fixes
+
+* **backend:** start --cpu 68060 superscalar, as a booted machine is ([#308](https://github.com/sidick/volamos/issues/308)) ([685e848](https://github.com/sidick/volamos/commit/685e84883b3f8cab972a47a20651f9fdecc8a463))
+* **deps:** update rust crate m68k to v0.16.1 ([#304](https://github.com/sidick/volamos/issues/304)) ([80ab425](https://github.com/sidick/volamos/commit/80ab425e61167b5050f90fb87fd5a5c48d7fd6e2))
+* **loader:** honour HUNKF_ADVISORY instead of failing the load ([#303](https://github.com/sidick/volamos/issues/303)) ([bb8caa7](https://github.com/sidick/volamos/commit/bb8caa786a8e3637a8acd7011526b75d48fee45e))
+
 ## [0.20.0](https://github.com/sidick/volamos/compare/v0.19.0...v0.20.0) (2026-11-12)
 
 
