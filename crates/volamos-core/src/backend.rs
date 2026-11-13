@@ -435,6 +435,17 @@ impl M68kCpu {
         core.set_cpu_type(cpu_type);
         core.fpu_present = fpu_present;
         core.reset_soft();
+        // A booted 68060 Amiga has superscalar dispatch on: the crate
+        // documents `PCR.ESS` as "set by 68060.library at boot; reset
+        // state is scalar", and the crate's cycle model only pairs
+        // instructions (and only lets `--cache` matter) once it's set.
+        // volamos has no boot sequence to run 68060.library, so it
+        // starts in the post-boot state -- the same stance as
+        // `AFF_68881|AFF_68882` on 68040/68060 (issue #175). Affects
+        // reported cycle counts only (`--clock-mhz`), never results.
+        if cpu_type == CpuType::M68060 {
+            core.pcr |= m68k::core::cpu::PCR_ESS;
+        }
         Self {
             core,
             jit: false,
@@ -1781,6 +1792,45 @@ mod tests {
         cpu.set_pc(TRAP_TABLE_END);
         cpu.set_clock_mhz(Some(25.0));
         (cpu, mem)
+    }
+
+    /// 400 independent `addq.l #1,dN` (pairable on a superscalar 060)
+    /// then an A-line stop, run under `--clock-mhz` on `cpu_type`.
+    fn pairable_loop_cycles(cpu_type: CpuType) -> u64 {
+        let mut words = Vec::new();
+        for i in 0..400u16 {
+            words.push(0x5280 | (i % 5)); // addq.l #1,d0..d4
+        }
+        words.push(0xA000);
+        let mut mem = FlatMemory::new(0x4000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        let mut cpu = M68kCpu::with_config(cpu_type, false);
+        cpu.set_pc(TRAP_TABLE_END);
+        cpu.set_clock_mhz(Some(25.0));
+        assert!(matches!(cpu.run(&mut mem), StopReason::Trap(_)));
+        cpu.emulated_cycles()
+    }
+
+    #[test]
+    fn a_68060_starts_superscalar_like_a_booted_machine() {
+        // 68060.library sets PCR.ESS at boot; the crate pairs
+        // instructions only once it's set. Independent addq's pair on
+        // the real part, so the 060 must come out well under one cycle
+        // per instruction -- scalar would cost at least 1 each.
+        let cycles = pairable_loop_cycles(CpuType::M68060);
+        assert!(
+            cycles < 400,
+            "a superscalar 060 should pair independent addq's (< 1 cycle each), got {cycles} \
+             cycles for 400 instructions -- PCR.ESS is not being set at construction"
+        );
+    }
+
+    #[test]
+    fn only_the_68060_gets_pcr_ess() {
+        let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
+        assert_ne!(cpu.core.pcr & m68k::core::cpu::PCR_ESS, 0);
+        cpu = M68kCpu::with_config(CpuType::M68040, false);
+        assert_eq!(cpu.core.pcr & m68k::core::cpu::PCR_ESS, 0);
     }
 
     #[test]

@@ -433,6 +433,20 @@ whatever else is running on the box at the time).
 volamos --clock-mhz 25 fixtures/hello
 ```
 
+**`--cpu 68060` times as a booted machine, not a freshly reset one.**
+A reset 68060 issues one instruction at a time; it is `68060.library`,
+at boot, that switches on superscalar dispatch (`PCR.ESS`). volamos has
+no boot sequence to run that, so it sets `PCR.ESS` itself at startup,
+the same post-`SetPatch` stance as the `AFF_68881`/`AFF_68882` flags
+above. The effect is on reported cycle counts only, never on results:
+independent integer instructions pair, so pairable code costs well under
+a cycle per instruction instead of one or more. Counts reported by
+earlier volamos versions for `--cpu 68060` were scalar and run several
+times higher on such code, so don't compare them against new ones.
+Superscalar dispatch is also what lets [`--cache`](#-cache) matter on
+the 68060 at all, since pairing needs both instructions to stream from
+the instruction cache.
+
 Cannot be combined with an explicit `--jit`: the trace JIT
 (`CpuCore::run_batch`) never tracks a cycle count at all, so there would
 be nothing for `--clock-mhz` to derive `ReadEClock`'s reported time
