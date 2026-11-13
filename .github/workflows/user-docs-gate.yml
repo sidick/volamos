@@ -18,6 +18,10 @@
 # userdocs/Changelog.md never counts as the docs change: release-please
 # owns that file and it is never hand-edited (see CLAUDE.md).
 #
+# Dependency bumps (`fix(deps):` with no .rs change) are exempt -- see
+# the step below for why a bot that cannot write a `Docs:` line should
+# not be given a canned one instead.
+#
 # Non-release types (docs, test, chore, refactor, perf, build, ci,
 # style, revert) are skipped entirely -- they don't ship behavior, so
 # there is nothing for a user to read about.
@@ -64,6 +68,26 @@ jobs:
 
           if ! printf '%s\n' "$files" | grep -q '^crates/'; then
             echo "::notice::No crates/** changes -- no user-docs decision needed."
+            exit 0
+          fi
+
+          # Dependency bumps. Renovate titles these `fix(deps):`, which
+          # is a release-triggering type (correctly -- a new m68k crate
+          # really can change what a guest does), and they touch
+          # crates/**, because that is where Cargo.toml lives. But the
+          # bot cannot write a `Docs:` line, and a canned one added to
+          # its PR template would be exactly the filler this gate's
+          # escape hatch exists to avoid.
+          #
+          # So: the `deps` scope is exempt, but only while the PR is
+          # *purely* a dependency move. Touch a .rs file -- adapting our
+          # own code to the new version, which is where a user-visible
+          # surface would actually appear -- and the gate applies again,
+          # bot or not. A human bumping a dependency by hand gets the
+          # same treatment; nothing here keys off the author.
+          if printf '%s' "$TITLE" | grep -Eq '^(fix|feat)\(deps[^)]*\)!?:' \
+            && ! printf '%s\n' "$files" | grep -q '\.rs$'; then
+            echo "::notice::Dependency-only change ('$TITLE', no .rs files) -- no user-docs decision needed."
             exit 0
           fi
 
