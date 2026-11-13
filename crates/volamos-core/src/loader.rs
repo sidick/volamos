@@ -237,6 +237,23 @@ const HUNK_BREAK: u32 = 0x3F6;
 /// its trackdisk I/O buffers.
 const HUNK_SIZE_FLAGS_MASK: u32 = 0xC000_0000;
 
+/// `HUNKB_ADVISORY` (NDK 3.2 `dos/doshunks.h`): set in a block type
+/// word, it means "ignore this block if you don't understand it".
+///
+/// > Any hunks that have the HUNKB_ADVISORY bit set will be ignored if
+/// > they aren't understood. When ignored, they're treated like
+/// > HUNK_DEBUG hunks. NOTE: this handling of HUNKB_ADVISORY started as
+/// > of V39 dos.library!
+///
+/// volamos targets V40, so it honours the bit: an advisory block of an
+/// unknown type is skipped with `HUNK_DEBUG`'s on-disk shape (a
+/// longword count, then that many longwords) rather than failing the
+/// load. Without this a perfectly loadable 3.x executable is refused.
+/// The bit is also masked off before matching, so an advisory block of
+/// a type we *do* understand is processed normally rather than falling
+/// through to the skip.
+const HUNKF_ADVISORY: u32 = 1 << 29;
+
 /// Errors that can occur while parsing or loading a hunk executable.
 ///
 /// Parsing never panics on malformed input; every failure mode is a
@@ -1242,7 +1259,9 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
             // put-back case below can see a flagged CODE/DATA/BSS word
             // (unread_u32 rewinds, so the outer loop re-reads the raw
             // word and does its own masking/extra-longword handling).
-            let block_type = r.read_u32()? & !HUNK_SIZE_FLAGS_MASK;
+            let raw_block_type = r.read_u32()? & !HUNK_SIZE_FLAGS_MASK;
+            let advisory = raw_block_type & HUNKF_ADVISORY != 0;
+            let block_type = raw_block_type & !HUNKF_ADVISORY;
             match block_type {
                 HUNK_RELOC32 => loop {
                     let count = r.read_u32()?;
@@ -1331,6 +1350,13 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
                     break;
                 }
                 other => {
+                    // An unknown block whose HUNKF_ADVISORY bit is set
+                    // is skipped, not fatal -- see HUNKF_ADVISORY.
+                    if advisory {
+                        let n_longwords = r.read_u32()?;
+                        r.skip_longwords(n_longwords as usize)?;
+                        continue;
+                    }
                     return Err(LoadError::UnknownBlockType {
                         hunk_index,
                         found: other,
@@ -2442,6 +2468,65 @@ mod tests {
                 hunk_index: 0,
                 found: 0xDEAD
             }
+        );
+    }
+
+    /// An unknown block type with `HUNKF_ADVISORY` set is skipped
+    /// instead of failing the load, matching V39+ `LoadSeg` -- the file
+    /// is otherwise a perfectly ordinary executable, and a V40 target
+    /// that refused it would reject binaries real 3.x machines run.
+    #[test]
+    fn skips_an_unknown_advisory_block_instead_of_rejecting_the_file() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x4E75_0000); // rts
+        // An unknown block, advisory, with HUNK_DEBUG's shape: a
+        // longword count then that many longwords of payload.
+        push_u32(&mut buf, 0x400 | HUNKF_ADVISORY);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, 0xAAAA_AAAA);
+        push_u32(&mut buf, 0xBBBB_BBBB);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("advisory block should be skipped, not fatal");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].data, 0x4E75_0000u32.to_be_bytes());
+    }
+
+    /// The advisory bit is masked off *before* matching, so an advisory
+    /// block of a type the loader does understand is still processed
+    /// normally rather than being silently skipped.
+    #[test]
+    fn an_advisory_block_of_a_known_type_is_still_processed() {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 1);
+
+        push_u32(&mut buf, HUNK_CODE);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, HUNK_DEBUG | HUNKF_ADVISORY);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0x1234_5678);
+        push_u32(&mut buf, HUNK_END);
+
+        let file = parse(&buf).expect("parse");
+        assert_eq!(
+            file.hunks[0].debug_blocks,
+            vec![0x1234_5678u32.to_be_bytes().to_vec()],
+            "the debug payload should be kept, not skipped as unknown"
         );
     }
 
