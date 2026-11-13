@@ -35,19 +35,34 @@ Every flag below can also be given a default value in `~/.volamos`/
 
 volamos propagates the **guest program's own exit code** on a normal
 run — whatever it returned in `D0` at `rts`, same as running it on a
-real Amiga would produce as its process return code. There is no
-volamos-specific exit code convention layered on top of that.
+real Amiga would produce as its process return code — `1` from a
+guest reaches your shell as `1`.
 
-volamos only ever produces its own exit code when the guest never got
-to run at all: `2` for a command-line parse error (an unknown or
-malformed flag, a bad `-V`/`-a` value, a missing `<program>` — the
-conventional usage-error code), and `1` when the command line parsed
-but the run couldn't start or crashed the runtime — the program path
-couldn't be read, didn't parse as a valid hunk executable, or the guest
-genuinely crashed the runtime (an unimplemented library call, a stack
-overflow, an invalid instruction). In every one of those cases volamos
-prints a diagnostic to stderr naming exactly what went wrong before
-exiting. `--help` and `--version` exit `0`.
+volamos produces its own exit code only when the guest never ran to
+its own `rts`:
+
+- **`2`** — a command-line parse error (an unknown or malformed flag, a
+  bad `-V`/`-a` value, a missing `<program>`), the conventional
+  usage-error code.
+- **`98`** — the command line parsed, but volamos couldn't carry the
+  run through: the program path couldn't be read, didn't parse as a
+  valid hunk executable, a config file was malformed, or the run died
+  inside the runtime (an unimplemented library call, a stack overflow,
+  an invalid instruction).
+
+In every one of those cases volamos prints a `volamos: …` diagnostic to
+stderr naming exactly what went wrong before exiting. `--help` and
+`--version` exit `0`.
+
+`98` exists so that a test harness can tell "volamos failed" apart from
+"the guest ran fine and returned a failure status". Both used to be `1`,
+which meant a program deliberately returning `1` was indistinguishable
+from a crash, and test programs had to avoid returning `1` at all. It
+sits above the small codes AmigaOS programs conventionally return
+(`RETURN_WARN` 5, `RETURN_ERROR` 10, `RETURN_FAIL` 20) and next to
+[`--sanitize`](#-sanitize)'s `99`. A guest is of course still free to
+return `98` itself, so the status is a strong signal rather than a
+proof — the stderr diagnostic is the other half of the contract.
 
 The one case where a normal run's own exit code is overridden: under
 [`--sanitize`](#-sanitize), a run that reported any violation exits
