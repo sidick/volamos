@@ -18,6 +18,8 @@
 #     decides; the PR gate is where the decision gets recorded.
 #   - userdocs/Changelog.md does NOT count as a docs change: it is
 #     release-please's file and is never hand-edited (see CLAUDE.md).
+#   - A dependency-only change (Cargo.toml/Cargo.lock, no .rs) is
+#     exempt, matching the CI gate's `deps` scope exemption.
 #   - Anything unexpected (no git, no jq, detached HEAD, no merge base)
 #     exits 0 silently. A broken hook must not stop work.
 
@@ -50,6 +52,14 @@ changed=$(
 
 touches_code=$(printf '%s\n' "$changed" | grep -c '^crates/')
 [ "$touches_code" -gt 0 ] || exit 0
+
+# Dependency bumps are exempt, matching the CI gate: a PR that only
+# moves Cargo.toml/Cargo.lock has no volamos surface of its own to
+# document. Touch a .rs file -- adapting our code to the new version,
+# which is where a user-visible surface would appear -- and the
+# reminder applies again.
+non_manifest=$(printf '%s\n' "$changed" | grep '^crates/' | grep -cvE '/Cargo\.(toml|lock)$')
+[ "$non_manifest" -gt 0 ] || exit 0
 
 # userdocs/Changelog.md is release-please's; it never satisfies the rule.
 touches_docs=$(printf '%s\n' "$changed" | grep '^userdocs/' | grep -cv '^userdocs/Changelog\.md$')

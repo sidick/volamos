@@ -146,7 +146,11 @@ Program exit is the same mechanism: the initial stack's return address is
   `no-user-docs` label. The `User docs decision` CI check enforces
   exactly that choice, and `.claude/hooks/check-user-docs.sh` raises it
   mid-session. `userdocs/Changelog.md` is **never** the answer: it is
-  release-please's file and is never hand-edited.
+  release-please's file and is never hand-edited. Dependency bumps are
+  the one exemption: a `fix(deps):` PR that moves only
+  `Cargo.toml`/`Cargo.lock` has no volamos surface of its own to
+  document, and Renovate can't write a `Docs:` line. Add a `.rs`
+  change to one and the rule applies again.
 
 ## Commits and pull requests
 
