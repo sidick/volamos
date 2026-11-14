@@ -28,9 +28,3 @@ codegen-units = 1
 # address).
 [profile.dev]
 debug = "line-tables-only"
-
-# DRAFT ONLY -- remove once m68k > 0.16.1 is released and the pin in
-# crates/volamos-core/Cargo.toml is bumped to it. The release isn't out
-# yet, so this builds against the merge commit of m68k-rs#248.
-[patch.crates-io]
-m68k = { git = "https://github.com/benletchford/m68k-rs", rev = "1ec050f252a06d4e6f26146772443680f51e526a" }
