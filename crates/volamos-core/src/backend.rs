@@ -196,6 +196,13 @@ impl AddressBus for FlatMemory {
         self.icache_fetches_were_cached()
     }
 
+    /// See [`m68k::AddressBus::instruction_fetch_stall_cycles`]'s doc;
+    /// backed by [`FlatMemory::fetch_stall_cycles`]. `0` unless
+    /// [`FlatMemory::enable_fetch_stall`] installed a fill cost.
+    fn instruction_fetch_stall_cycles(&self) -> u32 {
+        self.fetch_stall_cycles()
+    }
+
     /// The whole guest address space is one plain, side-effect-free
     /// `Vec<u8>` (see [`FlatMemory`]'s doc comment) -- exactly what the
     /// `jit` feature's [`m68k::CpuCore::run_batch`] fast path needs, and
@@ -1809,6 +1816,54 @@ mod tests {
         cpu.set_clock_mhz(Some(25.0));
         assert!(matches!(cpu.run(&mut mem), StopReason::Trap(_)));
         cpu.emulated_cycles()
+    }
+
+    /// `n` NOPs then an A-line stop, on `cpu_type`, with the fetch-stall
+    /// model installed iff `stall` -- returns the emulated cycles.
+    fn nop_run_cycles(cpu_type: CpuType, n: usize, stall: Option<f64>) -> u64 {
+        let mut words = vec![0x4E71; n];
+        words.push(0xA000);
+        let mut mem = FlatMemory::new(0x4000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        if let Some(fill) = stall {
+            mem.enable_fetch_stall(4096, 16, 4, fill);
+        }
+        let mut cpu = M68kCpu::with_config(cpu_type, false);
+        cpu.set_pc(TRAP_TABLE_END);
+        cpu.set_clock_mhz(Some(25.0));
+        assert!(matches!(cpu.run(&mut mem), StopReason::Trap(_)));
+        cpu.emulated_cycles()
+    }
+
+    #[test]
+    fn a_68040_is_charged_for_instruction_fetch_misses_once_a_fill_cost_is_installed() {
+        // 64 NOPs = 128 bytes = 8 cold 16-byte lines, and the stop word
+        // starts a ninth. The crate's own 040 table assumes every fetch
+        // hits, so the entire difference is our billed stalls.
+        let base = nop_run_cycles(CpuType::M68040, 64, None);
+        let billed = nop_run_cycles(CpuType::M68040, 64, Some(10.0));
+        assert_eq!(
+            billed - base,
+            90,
+            "9 line fills at 10 clocks, got {base} -> {billed}"
+        );
+    }
+
+    #[test]
+    fn the_fetch_stall_hook_does_not_move_other_models() {
+        // The crate documents that 020/030/060 ignore the reported stall
+        // (they select a cached/uncached table case from residency
+        // themselves). Compared against a zero fill cost, not against no
+        // model at all: installing the 16-byte-line cache changes what
+        // those models see as resident, which is a separate effect from
+        // the stall value this checks is ignored.
+        for cpu in [CpuType::M68020, CpuType::M68030, CpuType::M68060] {
+            assert_eq!(
+                nop_run_cycles(cpu, 64, Some(0.0)),
+                nop_run_cycles(cpu, 64, Some(10.0)),
+                "{cpu:?}"
+            );
+        }
     }
 
     #[test]

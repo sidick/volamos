@@ -767,11 +767,11 @@ struct Cli {
                       default so existing --clock-mhz numbers stay comparable across runs \
                       (opt in, as issue #148 asked); meaningless without --clock-mhz, since \
                       that's the only execution path that reports a cycle count for a modeled \
-                      cache hit/miss to affect. Also currently a no-op on --cpu 68040 for a \
-                      different reason: the m68k crate's 68040 timing model doesn't consult \
-                      cache state at all yet (only 68020/68030/68060 do), so --cache changes \
-                      nothing measurable there besides CacheClearU/CacheClearE bookkeeping \
-                      (tracked as issue #158, filed upstream as benletchford/m68k-rs#234). \
+                      cache hit/miss to affect. On --cpu 68040 it changes timing only together \
+                      with --mem-wait: the m68k crate's 68040 model assumes every fetch hits, \
+                      so the only way a miss costs anything is the line-fill figure --mem-wait \
+                      supplies (without it --cache there changes nothing besides \
+                      CacheClearU/CacheClearE bookkeeping; issue #158). \
                       Models instruction fetches only: data-cache and memory-latency modeling \
                       live behind --mem-wait."
     )]
@@ -802,8 +802,8 @@ struct Cli {
                       Reads are \
                       charged per line fill, not per access -- the preset numbers were measured \
                       with a 16-byte stride, so charging them per access would overcharge \
-                      sequential code about fourfold. Instruction-fetch misses are not charged \
-                      yet (see --cache's note on the m68k crate's 68040 timing model). Off by \
+                      sequential code about fourfold. Instruction-fetch misses are charged only on \
+                      --cpu 68040, and only when --cache is also given (see --cache). Off by \
                       default so existing --clock-mhz numbers stay comparable, and an error \
                       without --clock-mhz, which is the only path that keeps a cycle count."
     )]
@@ -1433,6 +1433,38 @@ fn check_mem_wait_clock_mhz(
          --clock-mhz N (your machine's CPU clock) to use --mem-wait"
             .to_string(),
     )
+}
+
+/// `--cache` with `--mem-wait` on a 68040 family part: bills each
+/// instruction-cache line fill, through the `m68k` crate's
+/// `instruction_fetch_stall_cycles` hook (issue #158; crate side
+/// benchmarking m68k-rs#234/#248). Replaces the plain `--cache` model
+/// for these parts with the real geometry -- the MC68040 User's Manual's
+/// 4 KiB, four-way set-associative, 16-byte-line instruction cache --
+/// because pricing a fill needs a real line, not the 4-byte residency
+/// approximation the other models use. A no-op for every other part
+/// (the crate's 020/030/060 models take cache residency themselves) and
+/// without both flags: the fill cost is `--mem-wait`'s read-line figure,
+/// so without it there is nothing to charge, and `--cache` stays the
+/// residency-only model it was.
+fn enable_fetch_stall_for_cpu(
+    mem: &mut FlatMemory,
+    cpu_type: CpuType,
+    cache: bool,
+    mem_wait: Option<(f64, f64)>,
+) {
+    if !cache {
+        return;
+    }
+    let Some((read_line_clocks, _)) = mem_wait else {
+        return;
+    };
+    if matches!(
+        cpu_type,
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040
+    ) {
+        mem.enable_fetch_stall(4096, 16, 4, read_line_clocks);
+    }
 }
 
 /// `--cache`'s (issue #148) instruction-cache size in bytes for
@@ -2181,6 +2213,7 @@ fn build_nested_runtime(
             },
         );
     }
+    enable_fetch_stall_for_cpu(&mut mem, cpu_type, cache, mem_wait);
     sanitize.install_debug_ports(&mut mem, cpu_type);
     let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END).ok()?;
     check_ram_fits(load_result.end, stack_size, ram_size).ok()?;
@@ -2480,6 +2513,7 @@ fn run(opts: &Options) -> Result<i32, String> {
                 },
             );
         }
+        enable_fetch_stall_for_cpu(&mut mem, opts.cpu_type, opts.cache, opts.mem_wait);
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
@@ -2522,6 +2556,7 @@ fn run(opts: &Options) -> Result<i32, String> {
                 },
             );
         }
+        enable_fetch_stall_for_cpu(&mut mem, opts.cpu_type, opts.cache, opts.mem_wait);
         opts.sanitize.install_debug_ports(&mut mem, opts.cpu_type);
         let load_result = loader::load(&hunk_file, &mut mem, TRAP_TABLE_END)
             .map_err(|e| format!("couldn't load '{}': {e}", opts.program))?;
