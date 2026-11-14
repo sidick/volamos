@@ -440,7 +440,7 @@ impl MemTimingModel {
     /// 16 bytes: the 68040/68060 cache line, and the stride
     /// `accelprobe` used to measure the line-fill costs this model is
     /// calibrated against (see the type doc). Deliberately *not*
-    /// [`IcacheModel::LINE_SIZE`], whose longword "lines" are a
+    /// [`IcacheModel::DEFAULT_LINE_SIZE`], whose longword "lines" are a
     /// residency approximation for the crate's cache-case flag rather
     /// than a fill unit.
     const LINE_SIZE: u32 = 16;
@@ -656,8 +656,9 @@ impl MemTimingModel {
 ///
 /// Modeled the way Copperline's `src/cache.rs` is (cited as a design
 /// reference in issue #148, GPL-3.0 so not shared code): one tag slot
-/// per [`Self::LINE_SIZE`]-byte line, direct-mapped by `(line base /
-/// LINE_SIZE) % lines.len()`.
+/// per line (4 bytes by default), direct-mapped by `(line base /
+/// line size) % lines.len()` unless [`FlatMemory::enable_fetch_stall`]
+/// asked for a set-associative geometry.
 ///
 /// Two simplifications, both deliberate (see the CLI's `--cache` flag
 /// doc): a real `CACRF_EnableI` toggle (`crate::execmem`'s
@@ -669,69 +670,92 @@ impl MemTimingModel {
 /// so only [`FlatMemory::invalidate_icache`] ever clears it.
 struct IcacheModel {
     lines: Vec<Option<u32>>,
+    /// LRU stamps, parallel to `lines`; only consulted when `ways > 1`.
+    used: Vec<u64>,
+    line_size: u32,
+    ways: usize,
+    sets: usize,
+    clock: u64,
 }
 
 impl IcacheModel {
-    /// One cache line per longword -- matches Copperline's model (see
-    /// this type's doc) and is small enough that a 256-byte 68020/030
-    /// cache still gets 64 independent tag slots.
-    const LINE_SIZE: u32 = 4;
+    /// One cache line per longword by default -- matches Copperline's
+    /// model (see this type's doc) and is small enough that a 256-byte
+    /// 68020/030 cache still gets 64 independent tag slots.
+    const DEFAULT_LINE_SIZE: u32 = 4;
 
     /// `size_bytes` is the CLI's `--cache` sizing by `--cpu` (256 on
     /// 68020/68030, 4096 on 68040/68060); rounded down to a whole
-    /// number of [`Self::LINE_SIZE`]-byte lines, at least one.
-    fn new(size_bytes: u32) -> Self {
-        let lines = ((size_bytes / Self::LINE_SIZE) as usize).max(1);
+    /// number of `line_size`-byte lines, at least one, arranged as
+    /// `ways`-way sets with LRU replacement (`ways == 1` is the
+    /// direct-mapped default every existing `--cache` run uses).
+    fn new(size_bytes: u32, line_size: u32, ways: usize) -> Self {
+        let total = ((size_bytes / line_size) as usize).max(1);
+        let ways = ways.clamp(1, total);
         Self {
-            lines: vec![None; lines],
+            lines: vec![None; total],
+            used: vec![0; total],
+            line_size,
+            ways,
+            sets: (total / ways).max(1),
+            clock: 0,
         }
     }
 
     /// The base address of the line containing `addr`.
-    fn line_base(addr: u32) -> u32 {
-        addr & !(Self::LINE_SIZE - 1)
-    }
-
-    fn index(&self, line_base: u32) -> usize {
-        (line_base / Self::LINE_SIZE) as usize % self.lines.len()
+    fn line_base(&self, addr: u32) -> u32 {
+        addr & !(self.line_size - 1)
     }
 
     /// Looks up the line covering `addr`, filling it in (recording a
     /// miss) if it wasn't already resident. Returns whether this was
     /// a hit.
     fn access(&mut self, addr: u32) -> bool {
-        let base = Self::line_base(addr);
-        let idx = self.index(base);
-        let hit = self.lines[idx] == Some(base);
-        self.lines[idx] = Some(base);
-        hit
+        let base = self.line_base(addr);
+        let first = (base / self.line_size) as usize % self.sets * self.ways;
+        self.clock += 1;
+        for i in first..first + self.ways {
+            if self.lines[i] == Some(base) {
+                self.used[i] = self.clock;
+                return true;
+            }
+        }
+        // Prefer an empty way, else the least recently used.
+        let victim = (first..first + self.ways)
+            .min_by_key(|&i| (self.lines[i].is_some(), self.used[i]))
+            .expect("ways >= 1");
+        self.lines[victim] = Some(base);
+        self.used[victim] = self.clock;
+        false
     }
 
     /// As [`Self::access`], but for a fetch spanning `len` bytes from
     /// `addr` (a word or long immediate can straddle two lines when
-    /// `addr` isn't [`Self::LINE_SIZE`]-aligned, e.g. a 4-byte fetch
-    /// at a merely 2-byte-aligned PC) -- a hit only if *every* line
-    /// the fetch touches was already resident, matching how a real
-    /// cache miss stalls the whole access regardless of which word
-    /// within it was the one missing. Only ever called with `len` of
-    /// 2 or 4 (a word or long instruction-stream read), so this always
-    /// terminates in at most two [`Self::access`] calls.
-    fn access_span(&mut self, addr: u32, len: u32) -> bool {
+    /// `addr` isn't line-aligned, e.g. a 4-byte fetch at a merely
+    /// 2-byte-aligned PC). Returns how many of the lines the fetch
+    /// touched were *not* resident (and so were just filled): `0` is a
+    /// hit, and a real cache miss stalls the whole access regardless
+    /// of which word within it was the one missing. Only ever called
+    /// with `len` of 2 or 4 (a word or long instruction-stream read),
+    /// so this always terminates in at most two [`Self::access`] calls.
+    fn access_span(&mut self, addr: u32, len: u32) -> u32 {
         debug_assert!(
             len == 2 || len == 4,
             "instruction fetches are word/long only"
         );
-        let last = Self::line_base(addr.wrapping_add(len - 1));
-        let mut hit = true;
-        let mut base = Self::line_base(addr);
+        let last = self.line_base(addr.wrapping_add(len - 1));
+        let mut fills = 0;
+        let mut base = self.line_base(addr);
         loop {
-            hit &= self.access(base);
+            if !self.access(base) {
+                fills += 1;
+            }
             if base == last {
                 break;
             }
-            base = base.wrapping_add(Self::LINE_SIZE);
+            base = base.wrapping_add(self.line_size);
         }
-        hit
+        fills
     }
 
     fn invalidate_all(&mut self) {
@@ -787,6 +811,18 @@ pub struct FlatMemory {
     /// [`Self::icache_fetches_were_cached`]), consulted only by the
     /// 68020/68030 timing tables; see that method's doc.
     icache_fetches_cached_since_begin: bool,
+    /// Clocks one instruction-cache line fill stalls the CPU
+    /// (`--cache` with `--mem-wait` on a 68040 family part); `0.0`
+    /// means fetch misses are not billed. See
+    /// [`Self::enable_fetch_stall`].
+    fetch_fill_clocks: f64,
+    /// Fractional clocks owed from earlier fetches, carried so the
+    /// fractional fill cost (32.6 on the A3640) isn't truncated away
+    /// instruction by instruction.
+    fetch_stall_frac: f64,
+    /// Whole clocks stalled by the fetches since the current
+    /// instruction's [`Self::icache_begin_instruction_fetches`].
+    fetch_stall_since_begin: u32,
 }
 
 impl std::fmt::Debug for FlatMemory {
@@ -815,6 +851,9 @@ impl FlatMemory {
             mem_timing: None,
             icache_last_fetch_cached: true,
             icache_fetches_cached_since_begin: true,
+            fetch_fill_clocks: 0.0,
+            fetch_stall_frac: 0.0,
+            fetch_stall_since_begin: 0,
         }
     }
 
@@ -1023,7 +1062,38 @@ impl FlatMemory {
     /// only, never cached *contents*, so there's nothing for load
     /// order to get wrong.
     pub fn enable_icache(&mut self, size_bytes: u32) {
-        self.icache = Some(IcacheModel::new(size_bytes));
+        self.icache = Some(IcacheModel::new(
+            size_bytes,
+            IcacheModel::DEFAULT_LINE_SIZE,
+            1,
+        ));
+    }
+
+    /// Installs an instruction cache of `size_bytes`, `line_bytes` per
+    /// line and `ways`-way set-associative (LRU), and bills each line
+    /// fill `fill_clocks` through
+    /// [`m68k::AddressBus::instruction_fetch_stall_cycles`] -- the hook
+    /// the `m68k` crate added so a host can charge 68040 fetch stalls
+    /// (benchmarking issue #158, upstream benletchford/m68k-rs#234/#248).
+    ///
+    /// Only meaningful on the 68040 family: the crate's other timing
+    /// models select a cached or uncached table case from fetch
+    /// residency themselves and ignore the stall value. That is also why
+    /// this exists beside [`Self::enable_icache`] instead of changing
+    /// it: those models want [`IcacheModel`]'s 4-byte "lines" (a
+    /// residency approximation), while pricing a *fill* needs the real
+    /// 16-byte line -- charging 32.6 clocks per longword would
+    /// overcharge a sequential fetch stream fourfold, the same error
+    /// [`MemTimingModel`]'s line granularity exists to avoid.
+    pub fn enable_fetch_stall(
+        &mut self,
+        size_bytes: u32,
+        line_bytes: u32,
+        ways: usize,
+        fill_clocks: f64,
+    ) {
+        self.icache = Some(IcacheModel::new(size_bytes, line_bytes, ways));
+        self.fetch_fill_clocks = fill_clocks;
     }
 
     /// Installs the modeled data cache and memory latency
@@ -1034,18 +1104,15 @@ impl FlatMemory {
     /// per line rather than per access, and the CLI's `--mem-wait` for
     /// where the numbers come from.
     ///
-    /// Charges data accesses only. Instruction-fetch misses are left
-    /// uncharged on purpose, for two reasons that both have to change
-    /// before billing them would mean anything: [`IcacheModel`]'s
-    /// longword "lines" are a residency approximation, so pricing them
-    /// as fills would overcharge a sequential fetch stream about
-    /// fourfold (the exact error this model's line granularity exists
-    /// to avoid), and the `m68k` crate's 68040 timing model discards
-    /// cache residency entirely (`finalize_cycles` passes
-    /// `fetch_cached` to its 020 and 060 models but not its 040 one --
-    /// reported upstream as benletchford/m68k-rs#234), so on the part
-    /// these numbers were measured from there is nothing to bill
-    /// against yet.
+    /// Charges data accesses only. Instruction-fetch misses are billed
+    /// separately, by [`Self::enable_fetch_stall`] (68040 family, with
+    /// `--cache`), because pricing a fill needs a real 16-byte line:
+    /// [`IcacheModel`]'s default longword "lines" are a residency
+    /// approximation, and pricing them as fills would overcharge a
+    /// sequential fetch stream about fourfold (the exact error this
+    /// model's line granularity exists to avoid). Every other part
+    /// leaves fetch misses uncharged -- the crate's 020/030/060 timing
+    /// models take residency themselves.
     ///
     /// Harmless before or after [`crate::loader::load`], same
     /// reasoning as [`Self::enable_icache`]: tags only, no contents.
@@ -1101,17 +1168,31 @@ impl FlatMemory {
     /// [`Self::icache`] is `None`, so `--cache`'s absence costs
     /// nothing and changes nothing.
     pub(crate) fn icache_note_instruction_fetch(&mut self, addr: u32, len: u32) {
-        let hit = match &mut self.icache {
+        let fills = match &mut self.icache {
             Some(icache) => icache.access_span(addr, len),
-            None => true,
+            None => 0,
         };
+        let hit = fills == 0;
         self.icache_last_fetch_cached = hit;
         self.icache_fetches_cached_since_begin &= hit;
+        if fills > 0 && self.fetch_fill_clocks > 0.0 {
+            let owed = self.fetch_stall_frac + f64::from(fills) * self.fetch_fill_clocks;
+            let whole = owed.floor();
+            self.fetch_stall_frac = owed - whole;
+            self.fetch_stall_since_begin =
+                self.fetch_stall_since_begin.saturating_add(whole as u32);
+        }
     }
 
     /// See [`m68k::AddressBus::begin_instruction_fetches`].
     pub(crate) fn icache_begin_instruction_fetches(&mut self) {
         self.icache_fetches_cached_since_begin = true;
+        self.fetch_stall_since_begin = 0;
+    }
+
+    /// See [`m68k::AddressBus::instruction_fetch_stall_cycles`].
+    pub(crate) fn fetch_stall_cycles(&self) -> u32 {
+        self.fetch_stall_since_begin
     }
 
     /// See [`m68k::AddressBus::last_fetch_was_cached`].
@@ -1665,11 +1746,9 @@ mod tests {
 
     #[test]
     fn instruction_fetches_are_not_charged() {
-        // Deliberate, and documented in enable_mem_timing's doc: the
-        // instruction cache models longword lines (can't price a
-        // 16-byte fill) and the crate's 68040 timing model ignores
-        // fetch residency anyway (benletchford/m68k-rs#234). Fetches
-        // still count as bus reads, as they always did.
+        // enable_mem_timing alone bills data accesses only; fetch
+        // misses are billed by enable_fetch_stall (issue #158), not
+        // here. Fetches still count as bus reads, as they always did.
         let mut mem = FlatMemory::new(4096);
         mem.enable_mem_timing(
             DcacheGeometry {
@@ -1956,6 +2035,90 @@ mod tests {
             37,
             "4 writebacks x 9.2, plus carry"
         );
+    }
+
+    // --- fetch-stall billing (issue #158) ---
+
+    #[test]
+    fn a_fetch_miss_stalls_one_line_fill_and_a_hit_in_the_same_line_stalls_nothing() {
+        let mut mem = FlatMemory::new(256);
+        mem.enable_fetch_stall(64, 16, 1, 10.0);
+
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(0, 2);
+        assert_eq!(mem.fetch_stall_cycles(), 10, "cold 16-byte line: one fill");
+
+        // The next instruction's word is in the line just filled -- the
+        // 4-byte "lines" of plain --cache would have charged this again.
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(8, 2);
+        assert_eq!(mem.fetch_stall_cycles(), 0);
+    }
+
+    #[test]
+    fn an_immediate_straddling_two_lines_pays_for_both_when_cold() {
+        let mut mem = FlatMemory::new(256);
+        mem.enable_fetch_stall(64, 16, 1, 10.0);
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(14, 4); // bytes 14..18: two lines
+        assert_eq!(mem.fetch_stall_cycles(), 20);
+    }
+
+    #[test]
+    fn the_stall_accumulates_across_one_instructions_fetches_and_resets_at_the_next() {
+        let mut mem = FlatMemory::new(256);
+        mem.enable_fetch_stall(64, 16, 1, 10.0);
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(0, 2);
+        mem.icache_note_instruction_fetch(16, 2);
+        assert_eq!(mem.fetch_stall_cycles(), 20);
+        mem.icache_begin_instruction_fetches();
+        assert_eq!(mem.fetch_stall_cycles(), 0);
+    }
+
+    #[test]
+    fn a_fractional_fill_cost_is_carried_not_truncated() {
+        // 32.6 clocks a fill (the A3640 preset): ten fills must total
+        // 326, not ten times the truncated 32.
+        let mut mem = FlatMemory::new(4096);
+        mem.enable_fetch_stall(4096, 16, 1, 32.6);
+        let mut total = 0;
+        for line in 0..10u32 {
+            mem.icache_begin_instruction_fetches();
+            mem.icache_note_instruction_fetch(line * 16, 2);
+            total += mem.fetch_stall_cycles();
+        }
+        assert_eq!(total, 326);
+    }
+
+    #[test]
+    fn without_a_fill_cost_a_miss_stalls_nothing() {
+        let mut mem = FlatMemory::new(256);
+        mem.enable_icache(64);
+        mem.icache_begin_instruction_fetches();
+        mem.icache_note_instruction_fetch(0, 2);
+        assert_eq!(mem.fetch_stall_cycles(), 0);
+    }
+
+    #[test]
+    fn a_set_associative_cache_holds_lines_a_direct_mapped_one_would_conflict_on() {
+        // 4 lines of 16 bytes. Direct-mapped: lines 0 and 64 collide.
+        // 4-way (one set): both stay resident.
+        let conflict = |ways| {
+            let mut mem = FlatMemory::new(256);
+            mem.enable_fetch_stall(64, 16, ways, 1.0);
+            let mut stalled = 0;
+            for _ in 0..4 {
+                for addr in [0u32, 64] {
+                    mem.icache_begin_instruction_fetches();
+                    mem.icache_note_instruction_fetch(addr, 2);
+                    stalled += mem.fetch_stall_cycles();
+                }
+            }
+            stalled
+        };
+        assert_eq!(conflict(1), 8, "direct-mapped: every access misses");
+        assert_eq!(conflict(4), 2, "4-way: only the two cold fills");
     }
 
     // --- IcacheModel / --cache (issue #148) ---

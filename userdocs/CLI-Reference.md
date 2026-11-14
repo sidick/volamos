@@ -598,15 +598,21 @@ default so existing `--clock-mhz` numbers stay comparable across runs
 cache-coherency convention for self-modifying code and freshly loaded
 code.
 
-Two known gaps:
+**On `--cpu 68040`, `--cache` only changes timing together with
+[`--mem-wait`](#-mem-wait-spec).** The `m68k` crate's 68040 timing
+model assumes every instruction fetch hits the cache, so a miss costs
+nothing unless the host charges it
+([benletchford/m68k-rs#248](https://github.com/benletchford/m68k-rs/pull/248)
+added the hook for that). With both flags, volamos models the real
+68040 instruction cache — 4 KiB, four-way set-associative, 16-byte
+lines — and bills each line fill at `--mem-wait`'s read-line figure
+(32.6 clocks with `a3640`). A loop that fits the cache pays its cold
+fills once; one that doesn't pays on every pass. Without `--mem-wait`
+there is no fill cost to charge, so `--cache` on a 68040 changes
+nothing besides `CacheClearU`/`CacheClearE` bookkeeping.
 
-- **No effect on `--cpu 68040`.** The `m68k` crate's 68040 timing model
-  doesn't consult cache state at all yet (only 68020/68030/68060 do), so
-  `--cache` changes nothing measurable there besides
-  `CacheClearU`/`CacheClearE` bookkeeping. Tracked as
-  [issue #158](https://github.com/sidick/volamos/issues/158) and filed
-  upstream as
-  [benletchford/m68k-rs#234](https://github.com/benletchford/m68k-rs/issues/234).
+Known gap:
+
 - **Instruction fetches only.** Data-cache and memory-latency modeling
   live behind [`--mem-wait`](#-mem-wait-spec) instead.
   `CacheControl`'s `CACRF_EnableI` toggle isn't wired to the model
@@ -708,12 +714,10 @@ volamos: modeled memory: 67275 data reads touching 67378 cache lines — 50835 h
 
 Two things it deliberately doesn't do:
 
-- **Instruction-fetch misses aren't charged.** `--cache`'s model tracks
-  longword granularity, which can't price a 16-byte line fill without
-  the same fourfold overcharge this model's line granularity exists to
-  avoid; and on the 68040 the crate's timing model discards cache
-  residency anyway (see `--cache`'s note and
-  [benletchford/m68k-rs#234](https://github.com/benletchford/m68k-rs/issues/234)).
+- **Instruction-fetch misses are charged on `--cpu 68040` only, and
+  only with `--cache`.** The 68020/68030/68060 timing models take cache
+  residency themselves rather than a fill cost (see
+  [`--cache`](#-cache)).
 - **No chip/fast RAM split.** One cost applies to all of guest memory;
   per-region costs need
   [issue #135](https://github.com/sidick/volamos/issues/135) first. The
