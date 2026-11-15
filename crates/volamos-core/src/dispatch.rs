@@ -2362,7 +2362,7 @@ pub struct Runtime<C: Cpu> {
     table: LibraryTable<C>,
     heap: GuestHeap,
     registry: LibraryRegistry,
-    dos: DosState,
+    pub(crate) dos: DosState,
     /// Guest address of the fake "current task" struct -- see
     /// [`HandlerContext::current_task`] and [`crate::exectask`]. Always
     /// equal to `tasks.current()`; kept as its own field (rather than
@@ -3206,8 +3206,33 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// [`crate::dosfile::ERROR_OBJECT_NOT_FOUND`] (see
     /// [`crate::dosfile`]'s module docs); `Input`/`Output`/`PutStr`/
     /// `IoErr`/`SetIoErr` work either way.
+    ///
+    /// Also seeds the process's `pr_CurrentDir` with a real lock on the
+    /// [`Vfs`]'s initial current directory, as a Shell launch leaves it:
+    /// a guest that reads the field directly (a `getcwd()` doing
+    /// `NameFromLock(pr_CurrentDir)`) otherwise saw `0` -- `SYS:` -- until
+    /// its first `CurrentDir`. A `SYS:` cwd stays `0`, which already
+    /// means the boot volume's root, so installing a `Vfs` still doesn't
+    /// create the lazily-backed `SYS:` directory on the host. A cwd that
+    /// can't be locked stays `0` too; `Vfs::new` has already validated
+    /// its volume, so that's only a host directory that's gone missing.
     pub fn set_vfs(&mut self, vfs: Vfs) {
+        let cwd = vfs.cwd().to_string();
         self.dos.vfs = Some(vfs);
+        if cwd.eq_ignore_ascii_case("SYS:") {
+            return;
+        }
+        let Ok(bptr) = self.dos.lock(
+            &mut self.heap,
+            &mut self.mem,
+            &cwd,
+            crate::doslock::SHARED_LOCK,
+        ) else {
+            return;
+        };
+        self.dos.current_dir_lock = Some(crate::guestmem::addr_from_bptr(bptr));
+        self.mem
+            .write_u32(self.task + crate::exectask::PR_CURRENT_DIR_OFFSET, bptr);
     }
 
     /// Enables the `--libs-dir` override: `OpenLibrary` checks the
