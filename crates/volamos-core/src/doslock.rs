@@ -3142,6 +3142,54 @@ mod tests {
         );
     }
 
+    /// `set_vfs` with `cwd` as the initial current directory, running
+    /// only an `rts`, so the test reads the process the guest starts with.
+    fn runtime_with_cwd(root: &Path, cwd: &str) -> Runtime<M68kCpu> {
+        let mut rt = runtime_with_program_and_extra(&[RTS], TRAP_TABLE_END + 2, &[], None);
+        rt.set_vfs(
+            Vfs::new(VfsConfig {
+                volumes: vec![
+                    ("SYS".to_string(), root.join("sys")),
+                    ("Work".to_string(), root.join("work")),
+                ],
+                cwd: cwd.to_string(),
+                ..Default::default()
+            })
+            .expect("build vfs"),
+        );
+        rt
+    }
+
+    #[test]
+    fn initial_pr_current_dir_is_a_lock_on_the_starting_directory() {
+        let tmp = TempDir::new("initial-prcurrentdir");
+        fs::create_dir_all(tmp.path().join("work/sub")).unwrap();
+        let rt = runtime_with_cwd(tmp.path(), "Work:sub");
+
+        let bptr = rt
+            .memory()
+            .read_u32(rt.current_task() + crate::exectask::PR_CURRENT_DIR_OFFSET);
+        assert_ne!(bptr, 0, "a Shell launch starts with pr_CurrentDir set");
+        assert_eq!(
+            rt.dos.name_from_lock(addr_from_bptr(bptr)).unwrap(),
+            "Work:sub"
+        );
+    }
+
+    #[test]
+    fn initial_pr_current_dir_on_sys_stays_zero_and_leaves_the_host_alone() {
+        let tmp = TempDir::new("initial-prcurrentdir-sys");
+        let rt = runtime_with_cwd(tmp.path(), "SYS:");
+
+        assert_eq!(
+            rt.memory()
+                .read_u32(rt.current_task() + crate::exectask::PR_CURRENT_DIR_OFFSET),
+            0,
+            "0 already means the boot volume's root"
+        );
+        assert!(!tmp.path().join("sys").exists());
+    }
+
     #[test]
     fn end_to_end_name_from_lock_writes_the_absolute_path() {
         let tmp = TempDir::new("e2e-namefromlock");
