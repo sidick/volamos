@@ -346,11 +346,34 @@ and `MakeDosNode`/`AddDosNode`/`AddBootNode` (mount a filesystem;
 volumes come from `-V`/`-a` instead). Each fails loudly, naming the
 library and LVO.
 
-`icon.library` is ROM-resident on 3.x too — it isn't on a Workbench
-3.1.4 install disk at all — so it now *opens*, with no functions
-implemented: the first real call fails loudly by name
-(`icon.library/GetDiskObject`) instead of the caller exiting with an
-unexplained failure.
+## icon.library
+
+ROM-resident on 3.x — it isn't on a Workbench 3.1.4 install disk at
+all — so it always opens. Implemented are the calls whose answer
+doesn't depend on reading or writing a `.info` file's contents:
+
+- `GetDiskObject` on a name with no `name.info` returns `NULL`, with
+  `IoErr()` set to why (`ERROR_OBJECT_NOT_FOUND` for a plain missing
+  icon) — the routine "does this file have an icon?" question.
+- `GetDefDiskObject` returns `NULL` + `IoErr()` when
+  `ENV:Sys/def_<type>.info` is absent (`WBDEVICE`, which 3.1 has no
+  default for, gives `ERROR_BAD_NUMBER`).
+- `DeleteDiskObject` deletes `name.info` exactly as `DeleteFile` would.
+- `FreeDiskObject(NULL)` is ignored.
+- `FindToolType`, `MatchToolValue` and `BumpRevision` are implemented in
+  full: case-insensitive tool-type lookup (a bare flag entry like
+  `DONOTWAIT` is found), `|`-separated value matching, and
+  `copy_of_`/`copy_<n>_of_` renaming truncated to 30 characters.
+
+Reading or writing a real icon isn't supported yet
+([issue #313](https://github.com/sidick/volamos/issues/313)):
+`GetDiskObject`/`GetDefDiskObject` finding the file *present*,
+`GetDiskObject(NULL)`, `GetDiskObjectNew`, `PutDiskObject`,
+`PutDefDiskObject` and the free-list calls each fail the run loudly,
+naming the call — rather than telling the guest "no icon" when there is
+one, or that a write succeeded when nothing was written. The 3.5+ calls
+(`GetIconTagList` and friends) aren't part of the 3.1 interface and fail
+the same way.
 
 ## battclock.resource
 

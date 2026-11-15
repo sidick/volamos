@@ -196,12 +196,11 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "layers.library",
     // ROM-resident on 3.x -- it isn't on a Workbench 3.1.4 install disk's
     // LIBS: at all, so the disk-library path can only ever answer NULL
-    // for it, and a guest reads that as a broken Kickstart. No handlers
-    // are implemented, so the first real call fails loudly *by name*
-    // ("icon.library/GetDiskObject") instead of the caller exiting with
-    // an unexplained RETURN_FAIL: the real BindDrivers opens
-    // dos.library, expansion.library and then this, and used to die on
-    // the NULL with no output at all.
+    // for it, and a guest reads that as a broken Kickstart: the real
+    // BindDrivers opens dos.library, expansion.library and then this,
+    // and used to die on the NULL with no output at all. Now a real
+    // base (ICON_LIBRARY_BASE) with the calls crate::icon can answer
+    // truthfully; the rest still fail loudly by name.
     "icon.library",
 ];
 
@@ -512,6 +511,14 @@ pub const BATTCLOCK_RESOURCE_BASE: u32 = 0x2DB0;
 /// real Amiga, and its absence had the real `BindDrivers` exiting `20`
 /// instead of reporting -- correctly -- that there is nothing to bind.
 pub const EXPANSION_LIBRARY_BASE: u32 = 0x2F80;
+
+/// Real `icon.library` base address -- the `0x3004`..`0x3204` chunk past
+/// [`EXPANSION_LIBRARY_BASE`]'s, at the usual `0x1AC` into it. Deepest
+/// LVO is `ChangeToSelectedIconColor` at `-198`, well inside the `0x1AC`
+/// bytes of negative-offset room; the `0x50` positive bytes hold
+/// [`write_library_node`]'s header. See [`crate::icon`]'s module docs
+/// for which calls are implemented and why the rest fail loudly.
+pub const ICON_LIBRARY_BASE: u32 = 0x31B0;
 
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
@@ -2828,6 +2835,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // filesystem).
         crate::expansion::register_expansion_handlers(&mut table, &mut mem);
 
+        // icon.library: the calls answerable without the .info disk
+        // format (a missing icon, tool-type parsing, BumpRevision) --
+        // see crate::icon's module docs for what still fails loudly.
+        crate::icon::register_icon_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -2895,6 +2907,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHFFP_LIBRARY_BASE);
         write_library_node(&mut mem, LOCALE_LIBRARY_BASE);
         write_library_node(&mut mem, INTUITION_LIBRARY_BASE);
+        write_library_node(&mut mem, ICON_LIBRARY_BASE);
         write_library_node(&mut mem, TIMER_DEVICE_BASE);
         // A device's node type is NT_DEVICE, not write_library_node's
         // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
@@ -2983,6 +2996,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("intuition.library", INTUITION_LIBRARY_BASE);
         registry.register_real("graphics.library", GRAPHICS_LIBRARY_BASE);
         registry.register_real("expansion.library", EXPANSION_LIBRARY_BASE);
+        registry.register_real("icon.library", ICON_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using
