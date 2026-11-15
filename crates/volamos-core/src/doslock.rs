@@ -1430,12 +1430,22 @@ fn parent_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 
 /// `CurrentDir` (`D1` = `BPTR`). `D0` = the *previous* current-dir lock's
 /// `BPTR` (`0` if there wasn't one), or `0` with `IoErr()` set on
-/// failure.
+/// failure. On success also writes `D1` into the calling process's
+/// `pr_CurrentDir` ([`crate::exectask::PR_CURRENT_DIR_OFFSET`]), the
+/// field real `CurrentDir` swaps (`<dos/dosextens.h>`), so guests that
+/// read it directly agree with relative-path resolution -- same pattern
+/// as `SelectInput`'s `pr_CIS` write.
 fn current_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let addr = addr_from_bptr(bptr);
     match ctx.dos.current_dir(addr) {
-        Ok(old_bptr) => ctx.cpu.set_data_register(DataRegister(0), old_bptr),
+        Ok(old_bptr) => {
+            ctx.mem.write_u32(
+                ctx.current_task + crate::exectask::PR_CURRENT_DIR_OFFSET,
+                bptr,
+            );
+            ctx.cpu.set_data_register(DataRegister(0), old_bptr)
+        }
         Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -3092,6 +3102,44 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_ne!(code, 0, "Open of the relative path should now succeed");
+    }
+
+    #[test]
+    fn end_to_end_current_dir_writes_pr_current_dir() {
+        let tmp = TempDir::new("e2e-prcurrentdir");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        let dir_name = b"SYS:work\0";
+
+        // Lock("SYS:work"), keep the BPTR in D7, CurrentDir(it), then
+        // exit with D7 so the test can compare it to pr_CurrentDir.
+        let mut words = Vec::new();
+        let dir_name_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32);
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = BPTR of SYS:work
+        words.push(0x2200); // move.l d0,d1
+        words.push(0x2E00); // move.l d0,d7
+        push_jsr(&mut words, 6, -126); // CurrentDir(a6)
+        words.push(0x2007); // move.l d7,d0
+        words.push(RTS);
+
+        let dir_name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, dir_name_idx, dir_name_addr);
+
+        let mut rt =
+            runtime_with_program_and_extra(&words, dir_name_addr, dir_name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let lock_bptr = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(lock_bptr, 0, "Lock(SYS:work) should succeed");
+        let task = rt.current_task();
+        assert_eq!(
+            rt.memory()
+                .read_u32(task + crate::exectask::PR_CURRENT_DIR_OFFSET),
+            lock_bptr,
+            "CurrentDir must store its lock in the process's pr_CurrentDir"
+        );
     }
 
     #[test]
