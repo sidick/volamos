@@ -2000,7 +2000,7 @@ const TR_SETSYSTIME: u16 = 11;
 /// reports in `D0`: 709379 Hz on a PAL machine (the system master clock
 /// divided by 10), the rate every real PAL Amiga reports and the value
 /// this runtime's fixed PAL-like identity uses.
-const ECLOCK_PAL_HZ: u32 = 709_379;
+pub(crate) const ECLOCK_PAL_HZ: u32 = 709_379;
 
 /// `exec.library`'s `OpenDevice` (LVO -444: `A0` = device name
 /// `CString*`, `D0` = unit, `A1` = `struct IORequest*`, `D1` = flags).
