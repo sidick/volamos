@@ -281,6 +281,7 @@ impl DosState {
             }
         };
         mem.write_u32(addr.wrapping_add(FL_TASK_OFFSET), fl_task);
+        self.released_lock_paths.remove(&addr);
         self.locks.insert(
             addr,
             LockEntry {
@@ -492,11 +493,9 @@ impl DosState {
             return;
         }
         self.exnext.remove(&addr);
-        if self.locks.remove(&addr).is_some() {
+        if let Some(entry) = self.locks.remove(&addr) {
             let _ = heap.free(addr);
-        }
-        if self.current_dir_lock == Some(addr) {
-            self.current_dir_lock = None;
+            self.released_lock_paths.insert(addr, entry.amiga_path);
         }
     }
 
@@ -862,9 +861,16 @@ impl DosState {
     /// `CurrentDir(lock)`: sets the `Vfs` current directory to `lock`'s
     /// path (`lock == 0` restores the initial current directory -- see
     /// the module docs), returning the *previous* current-dir lock's
-    /// `BPTR` (`0` if there wasn't one yet). Fails with
-    /// [`ERROR_INVALID_LOCK`] if `addr != 0` isn't a currently-open
-    /// lock. Real AmigaDOS accepts a lock on a *file*, not just a
+    /// `BPTR` (`0` if there wasn't one yet), even if that lock has since
+    /// been released.
+    ///
+    /// Never fails on the lock itself: real `CurrentDir` just swaps raw
+    /// BPTRs (amitools#280 restores a directory after its lock went
+    /// through `FreeDeviceProc`; issue #320). A lock still open, or one
+    /// released but remembered in `released_lock_paths`, also moves the
+    /// `Vfs` cwd; an address this runtime never issued (a guest-built
+    /// or inherited BPTR) is stored but leaves the cwd as it was, since
+    /// there is no path to resolve it to. Real AmigaDOS accepts a lock on a *file*, not just a
     /// directory, here -- confirmed via the AmigaDOS Manual's own
     /// `CurrentDir(lock); Open("", MODE_OLDFILE)` idiom, which it
     /// documents as relying on this exact case ("the empty string
@@ -882,14 +888,18 @@ impl DosState {
         }
 
         let new_path = if addr == 0 {
-            self.initial_cwd.clone().expect("just set above")
+            self.initial_cwd.clone()
         } else {
-            let entry = self.locks.get(&addr).ok_or(ERROR_INVALID_LOCK)?;
-            entry.amiga_path.clone()
+            self.locks
+                .get(&addr)
+                .map(|entry| entry.amiga_path.clone())
+                .or_else(|| self.released_lock_paths.get(&addr).cloned())
         };
 
-        let vfs = self.vfs.as_mut().expect("checked above");
-        vfs.set_cwd(&new_path).map_err(|e| map_vfs_error(&e))?;
+        if let Some(new_path) = new_path {
+            let vfs = self.vfs.as_mut().expect("checked above");
+            vfs.set_cwd(&new_path).map_err(|e| map_vfs_error(&e))?;
+        }
 
         let old = self.current_dir_lock.map(bptr_from_addr).unwrap_or(0);
         self.current_dir_lock = if addr == 0 { None } else { Some(addr) };
@@ -2821,6 +2831,65 @@ mod tests {
         assert!(
             dos.lock(&mut heap, &mut mem, "inner.txt", SHARED_LOCK)
                 .is_err()
+        );
+    }
+
+    /// amitools#280 / issue #320: restoring a directory whose lock was
+    /// already released must still work, and `CurrentDir` must hand back
+    /// the raw previous BPTR whether or not it is still a live lock.
+    #[test]
+    fn current_dir_restores_a_released_lock_and_returns_the_raw_old_bptr() {
+        let tmp = TempDir::new("currentdir-released");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        fs::write(tmp.path().join("work/inner.txt"), b"x").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let work_bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:work", SHARED_LOCK)
+            .unwrap();
+        let work_addr = addr_from_bptr(work_bptr);
+        dos.current_dir(work_addr).unwrap();
+        let root_bptr = dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap();
+        // old = CurrentDir(root); the old (work) lock is then released.
+        let old = dos.current_dir(addr_from_bptr(root_bptr)).unwrap();
+        assert_eq!(old, work_bptr);
+        dos.unlock(&mut heap, work_addr);
+        assert!(
+            dos.lock(&mut heap, &mut mem, "inner.txt", SHARED_LOCK)
+                .is_err(),
+            "cwd is SYS: now"
+        );
+
+        // CurrentDir(old) with the already-released lock: succeeds, and
+        // the directory is restored.
+        let prev = dos
+            .current_dir(work_addr)
+            .expect("a released lock must not fail CurrentDir");
+        assert_eq!(prev, root_bptr);
+        dos.lock(&mut heap, &mut mem, "inner.txt", SHARED_LOCK)
+            .expect("cwd should be SYS:work again");
+
+        // Releasing the *current* lock doesn't change what the next
+        // CurrentDir returns.
+        dos.unlock(&mut heap, work_addr);
+        assert_eq!(dos.current_dir(0).unwrap(), work_bptr);
+    }
+
+    /// A BPTR this runtime never issued is stored without error and
+    /// leaves the cwd unchanged, rather than failing like an
+    /// `ERROR_INVALID_LOCK` lookup (issue #320).
+    #[test]
+    fn current_dir_with_an_unknown_bptr_succeeds_and_keeps_the_cwd() {
+        let tmp = TempDir::new("currentdir-unknown");
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let before = dos.current_dir_name().unwrap();
+        assert_eq!(dos.current_dir(0x7000).unwrap(), 0);
+        assert_eq!(dos.current_dir_name().unwrap(), before);
+        assert_eq!(
+            dos.current_dir(0).unwrap(),
+            crate::guestmem::bptr_from_addr(0x7000)
         );
     }
 
