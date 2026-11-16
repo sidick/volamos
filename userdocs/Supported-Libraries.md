@@ -113,6 +113,12 @@ Changelog.
   to `SetIoErr(code)` first.
 - Path strings: `SplitName` (alongside `AddPart`/`FilePart`/`PathPart`).
 - The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
+  `Info` and `ACTION_DISK_INFO`/`ACTION_INFO` report the real size and
+  free space of the host filesystem behind the volume (in 512-byte
+  blocks, larger when a huge disk would overflow a 32-bit block count),
+  so two volumes on the same host disk show overlapping capacity. Where
+  the host can't be asked (non-Unix), a fixed 100,000-block disk is
+  reported instead.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
   `SystemTagList`/`System`/`Execute` for tools that shell out to
   another guest program.
