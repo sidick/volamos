@@ -363,6 +363,14 @@ pub const PR_MSGPORT_OFFSET: u32 = TASK_STRUCT_SIZE;
 /// [`crate::dosfile::cli_handler`] (`dos.library`'s `Cli()`, which
 /// just returns this same field) for the guest-visible read path.
 pub const PR_CLI_OFFSET: u32 = 172;
+/// `pr_CurrentDir`: `BPTR`, offset 152 (`pr_StackBase` 144 +
+/// `pr_Result2` 4 + 4 -- the field immediately before `pr_CIS`). The lock `CurrentDir`
+/// installed, `0` meaning the boot volume's root. Startup code and
+/// ports that read it directly instead of calling `CurrentDir` twice
+/// (e.g. a `getcwd()` that does `NameFromLock(pr_CurrentDir)`) saw `0`
+/// -- `SYS:` -- forever while it went unwritten. Written by
+/// [`crate::doslock`]'s `CurrentDir` handler.
+pub const PR_CURRENT_DIR_OFFSET: u32 = 152;
 /// `pr_CIS`: `BPTR`, offset 156 (`pr_CLI` 172 - `pr_FileSystemTask` 4 -
 /// `pr_ConsoleTask` 4 - `pr_COS` 4 - `pr_CIS` 4). The process's current
 /// input handle, the same one `Input()` returns: startup code that reads
@@ -1992,7 +2000,7 @@ const TR_SETSYSTIME: u16 = 11;
 /// reports in `D0`: 709379 Hz on a PAL machine (the system master clock
 /// divided by 10), the rate every real PAL Amiga reports and the value
 /// this runtime's fixed PAL-like identity uses.
-const ECLOCK_PAL_HZ: u32 = 709_379;
+pub(crate) const ECLOCK_PAL_HZ: u32 = 709_379;
 
 /// `exec.library`'s `OpenDevice` (LVO -444: `A0` = device name
 /// `CString*`, `D0` = unit, `A1` = `struct IORequest*`, `D1` = flags).

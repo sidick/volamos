@@ -281,6 +281,7 @@ impl DosState {
             }
         };
         mem.write_u32(addr.wrapping_add(FL_TASK_OFFSET), fl_task);
+        self.released_lock_paths.remove(&addr);
         self.locks.insert(
             addr,
             LockEntry {
@@ -492,11 +493,9 @@ impl DosState {
             return;
         }
         self.exnext.remove(&addr);
-        if self.locks.remove(&addr).is_some() {
+        if let Some(entry) = self.locks.remove(&addr) {
             let _ = heap.free(addr);
-        }
-        if self.current_dir_lock == Some(addr) {
-            self.current_dir_lock = None;
+            self.released_lock_paths.insert(addr, entry.amiga_path);
         }
     }
 
@@ -862,9 +861,16 @@ impl DosState {
     /// `CurrentDir(lock)`: sets the `Vfs` current directory to `lock`'s
     /// path (`lock == 0` restores the initial current directory -- see
     /// the module docs), returning the *previous* current-dir lock's
-    /// `BPTR` (`0` if there wasn't one yet). Fails with
-    /// [`ERROR_INVALID_LOCK`] if `addr != 0` isn't a currently-open
-    /// lock. Real AmigaDOS accepts a lock on a *file*, not just a
+    /// `BPTR` (`0` if there wasn't one yet), even if that lock has since
+    /// been released.
+    ///
+    /// Never fails on the lock itself: real `CurrentDir` just swaps raw
+    /// BPTRs (amitools#280 restores a directory after its lock went
+    /// through `FreeDeviceProc`; issue #320). A lock still open, or one
+    /// released but remembered in `released_lock_paths`, also moves the
+    /// `Vfs` cwd; an address this runtime never issued (a guest-built
+    /// or inherited BPTR) is stored but leaves the cwd as it was, since
+    /// there is no path to resolve it to. Real AmigaDOS accepts a lock on a *file*, not just a
     /// directory, here -- confirmed via the AmigaDOS Manual's own
     /// `CurrentDir(lock); Open("", MODE_OLDFILE)` idiom, which it
     /// documents as relying on this exact case ("the empty string
@@ -882,14 +888,18 @@ impl DosState {
         }
 
         let new_path = if addr == 0 {
-            self.initial_cwd.clone().expect("just set above")
+            self.initial_cwd.clone()
         } else {
-            let entry = self.locks.get(&addr).ok_or(ERROR_INVALID_LOCK)?;
-            entry.amiga_path.clone()
+            self.locks
+                .get(&addr)
+                .map(|entry| entry.amiga_path.clone())
+                .or_else(|| self.released_lock_paths.get(&addr).cloned())
         };
 
-        let vfs = self.vfs.as_mut().expect("checked above");
-        vfs.set_cwd(&new_path).map_err(|e| map_vfs_error(&e))?;
+        if let Some(new_path) = new_path {
+            let vfs = self.vfs.as_mut().expect("checked above");
+            vfs.set_cwd(&new_path).map_err(|e| map_vfs_error(&e))?;
+        }
 
         let old = self.current_dir_lock.map(bptr_from_addr).unwrap_or(0);
         self.current_dir_lock = if addr == 0 { None } else { Some(addr) };
@@ -1430,12 +1440,22 @@ fn parent_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 
 /// `CurrentDir` (`D1` = `BPTR`). `D0` = the *previous* current-dir lock's
 /// `BPTR` (`0` if there wasn't one), or `0` with `IoErr()` set on
-/// failure.
+/// failure. On success also writes `D1` into the calling process's
+/// `pr_CurrentDir` ([`crate::exectask::PR_CURRENT_DIR_OFFSET`]), the
+/// field real `CurrentDir` swaps (`<dos/dosextens.h>`), so guests that
+/// read it directly agree with relative-path resolution -- same pattern
+/// as `SelectInput`'s `pr_CIS` write.
 fn current_dir_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let addr = addr_from_bptr(bptr);
     match ctx.dos.current_dir(addr) {
-        Ok(old_bptr) => ctx.cpu.set_data_register(DataRegister(0), old_bptr),
+        Ok(old_bptr) => {
+            ctx.mem.write_u32(
+                ctx.current_task + crate::exectask::PR_CURRENT_DIR_OFFSET,
+                bptr,
+            );
+            ctx.cpu.set_data_register(DataRegister(0), old_bptr)
+        }
         Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -2814,6 +2834,65 @@ mod tests {
         );
     }
 
+    /// amitools#280 / issue #320: restoring a directory whose lock was
+    /// already released must still work, and `CurrentDir` must hand back
+    /// the raw previous BPTR whether or not it is still a live lock.
+    #[test]
+    fn current_dir_restores_a_released_lock_and_returns_the_raw_old_bptr() {
+        let tmp = TempDir::new("currentdir-released");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        fs::write(tmp.path().join("work/inner.txt"), b"x").unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        let work_bptr = dos
+            .lock(&mut heap, &mut mem, "SYS:work", SHARED_LOCK)
+            .unwrap();
+        let work_addr = addr_from_bptr(work_bptr);
+        dos.current_dir(work_addr).unwrap();
+        let root_bptr = dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap();
+        // old = CurrentDir(root); the old (work) lock is then released.
+        let old = dos.current_dir(addr_from_bptr(root_bptr)).unwrap();
+        assert_eq!(old, work_bptr);
+        dos.unlock(&mut heap, work_addr);
+        assert!(
+            dos.lock(&mut heap, &mut mem, "inner.txt", SHARED_LOCK)
+                .is_err(),
+            "cwd is SYS: now"
+        );
+
+        // CurrentDir(old) with the already-released lock: succeeds, and
+        // the directory is restored.
+        let prev = dos
+            .current_dir(work_addr)
+            .expect("a released lock must not fail CurrentDir");
+        assert_eq!(prev, root_bptr);
+        dos.lock(&mut heap, &mut mem, "inner.txt", SHARED_LOCK)
+            .expect("cwd should be SYS:work again");
+
+        // Releasing the *current* lock doesn't change what the next
+        // CurrentDir returns.
+        dos.unlock(&mut heap, work_addr);
+        assert_eq!(dos.current_dir(0).unwrap(), work_bptr);
+    }
+
+    /// A BPTR this runtime never issued is stored without error and
+    /// leaves the cwd unchanged, rather than failing like an
+    /// `ERROR_INVALID_LOCK` lookup (issue #320).
+    #[test]
+    fn current_dir_with_an_unknown_bptr_succeeds_and_keeps_the_cwd() {
+        let tmp = TempDir::new("currentdir-unknown");
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        let before = dos.current_dir_name().unwrap();
+        assert_eq!(dos.current_dir(0x7000).unwrap(), 0);
+        assert_eq!(dos.current_dir_name().unwrap(), before);
+        assert_eq!(
+            dos.current_dir(0).unwrap(),
+            crate::guestmem::bptr_from_addr(0x7000)
+        );
+    }
+
     #[test]
     fn current_dir_accepts_a_file_lock_and_relative_open_resolves_to_it() {
         // Real AmigaDOS's own documented idiom (CurrentDir(lock);
@@ -3092,6 +3171,92 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_ne!(code, 0, "Open of the relative path should now succeed");
+    }
+
+    #[test]
+    fn end_to_end_current_dir_writes_pr_current_dir() {
+        let tmp = TempDir::new("e2e-prcurrentdir");
+        fs::create_dir(tmp.path().join("work")).unwrap();
+        let dir_name = b"SYS:work\0";
+
+        // Lock("SYS:work"), keep the BPTR in D7, CurrentDir(it), then
+        // exit with D7 so the test can compare it to pr_CurrentDir.
+        let mut words = Vec::new();
+        let dir_name_idx = words.len();
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        push_move_imm_to_d(&mut words, 2, SHARED_LOCK as u32);
+        push_jsr(&mut words, 6, -84); // Lock(a6): D0 = BPTR of SYS:work
+        words.push(0x2200); // move.l d0,d1
+        words.push(0x2E00); // move.l d0,d7
+        push_jsr(&mut words, 6, -126); // CurrentDir(a6)
+        words.push(0x2007); // move.l d7,d0
+        words.push(RTS);
+
+        let dir_name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
+        patch_imm32(&mut words, dir_name_idx, dir_name_addr);
+
+        let mut rt =
+            runtime_with_program_and_extra(&words, dir_name_addr, dir_name, Some(tmp.path()));
+        let mut out = Vec::new();
+        let lock_bptr = rt.run(&mut out, None).expect("run should succeed") as u32;
+        assert_ne!(lock_bptr, 0, "Lock(SYS:work) should succeed");
+        let task = rt.current_task();
+        assert_eq!(
+            rt.memory()
+                .read_u32(task + crate::exectask::PR_CURRENT_DIR_OFFSET),
+            lock_bptr,
+            "CurrentDir must store its lock in the process's pr_CurrentDir"
+        );
+    }
+
+    /// `set_vfs` with `cwd` as the initial current directory, running
+    /// only an `rts`, so the test reads the process the guest starts with.
+    fn runtime_with_cwd(root: &Path, cwd: &str) -> Runtime<M68kCpu> {
+        let mut rt = runtime_with_program_and_extra(&[RTS], TRAP_TABLE_END + 2, &[], None);
+        rt.set_vfs(
+            Vfs::new(VfsConfig {
+                volumes: vec![
+                    ("SYS".to_string(), root.join("sys")),
+                    ("Work".to_string(), root.join("work")),
+                ],
+                cwd: cwd.to_string(),
+                ..Default::default()
+            })
+            .expect("build vfs"),
+        );
+        rt
+    }
+
+    #[test]
+    fn initial_pr_current_dir_is_a_lock_on_the_starting_directory() {
+        let tmp = TempDir::new("initial-prcurrentdir");
+        fs::create_dir_all(tmp.path().join("work/sub")).unwrap();
+        let rt = runtime_with_cwd(tmp.path(), "Work:sub");
+
+        let bptr = rt
+            .memory()
+            .read_u32(rt.current_task() + crate::exectask::PR_CURRENT_DIR_OFFSET);
+        assert_ne!(bptr, 0, "a Shell launch starts with pr_CurrentDir set");
+        assert_eq!(
+            rt.dos.name_from_lock(addr_from_bptr(bptr)).unwrap(),
+            "Work:sub"
+        );
+    }
+
+    #[test]
+    fn initial_pr_current_dir_on_sys_stays_zero_and_leaves_the_host_alone() {
+        let tmp = TempDir::new("initial-prcurrentdir-sys");
+        let rt = runtime_with_cwd(tmp.path(), "SYS:");
+
+        assert_eq!(
+            rt.memory()
+                .read_u32(rt.current_task() + crate::exectask::PR_CURRENT_DIR_OFFSET),
+            0,
+            "0 already means the boot volume's root"
+        );
+        assert!(!tmp.path().join("sys").exists());
     }
 
     #[test]

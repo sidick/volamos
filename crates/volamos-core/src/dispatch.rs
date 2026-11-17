@@ -196,12 +196,11 @@ const STANDARD_WORKBENCH_LIBRARIES: &[&str] = &[
     "layers.library",
     // ROM-resident on 3.x -- it isn't on a Workbench 3.1.4 install disk's
     // LIBS: at all, so the disk-library path can only ever answer NULL
-    // for it, and a guest reads that as a broken Kickstart. No handlers
-    // are implemented, so the first real call fails loudly *by name*
-    // ("icon.library/GetDiskObject") instead of the caller exiting with
-    // an unexplained RETURN_FAIL: the real BindDrivers opens
-    // dos.library, expansion.library and then this, and used to die on
-    // the NULL with no output at all.
+    // for it, and a guest reads that as a broken Kickstart: the real
+    // BindDrivers opens dos.library, expansion.library and then this,
+    // and used to die on the NULL with no output at all. Now a real
+    // base (ICON_LIBRARY_BASE) with the calls crate::icon can answer
+    // truthfully; the rest still fail loudly by name.
     "icon.library",
 ];
 
@@ -308,11 +307,19 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     NDK-documented offset 378 from EXEC_LIBRARY_BASE,
 ///                     since real guest code, not just this runtime's
 ///                     own handlers, walks it directly by that offset)
-/// 0x1088 .. 0x1190   headroom, and the three real libraries' ln_Name
-///                     strings ("dos.library"/"exec.library"/
+/// 0x1088 .. 0x1190   the rest of the real struct ExecBase (PortList
+///                     through ex_EClockFrequency at offset 568 =
+///                     0x1138, incl. VBlankFrequency/
+///                     PowerSupplyFrequency at 0x1112/0x1113 and
+///                     SemaphoreList at 0x1114); only the fields this
+///                     runtime populates hold data, the rest read 0
+/// 0x1190 .. 0x11C0   the three real libraries' ln_Name strings
+///                     ("dos.library"/"exec.library"/
 ///                     "utility.library", pointed to by their LibList
-///                     nodes -- see write_library_list_nodes)
-/// 0x1190 .. 0x11FC   headroom
+///                     nodes -- see write_library_list_nodes). They
+///                     used to sit at 0x1088, which is inside the
+///                     struct ExecBase fields above
+/// 0x11C0 .. 0x11FC   headroom
 /// 0x11FC .. 0x1200   EXIT_STUB_ADDR (the last word of the region)
 /// ```
 ///
@@ -513,6 +520,14 @@ pub const BATTCLOCK_RESOURCE_BASE: u32 = 0x2DB0;
 /// instead of reporting -- correctly -- that there is nothing to bind.
 pub const EXPANSION_LIBRARY_BASE: u32 = 0x2F80;
 
+/// Real `icon.library` base address -- the `0x3004`..`0x3204` chunk past
+/// [`EXPANSION_LIBRARY_BASE`]'s, at the usual `0x1AC` into it. Deepest
+/// LVO is `ChangeToSelectedIconColor` at `-198`, well inside the `0x1AC`
+/// bytes of negative-offset room; the `0x50` positive bytes hold
+/// [`write_library_node`]'s header. See [`crate::icon`]'s module docs
+/// for which calls are implemented and why the rest fail loudly.
+pub const ICON_LIBRARY_BASE: u32 = 0x31B0;
+
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
 /// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
@@ -629,6 +644,28 @@ pub(crate) const EXEC_BASE_RESOURCELIST_OFFSET: u32 = 336;
 /// real, walkable public semaphore list here, same reasoning as
 /// `LibList` above.
 pub(crate) const EXEC_BASE_SEMAPHORELIST_OFFSET: u32 = 532;
+
+/// Byte offset of `ExecBase.VBlankFrequency` (`UBYTE`) from
+/// [`EXEC_LIBRARY_BASE`]; `PowerSupplyFrequency` follows at +1. See
+/// [`EXEC_BASE_SEMAPHORELIST_OFFSET`]'s derivation: `SemaphoreList` is
+/// 532, and these two bytes sit immediately before it. NDK 3.2
+/// `exec/execbase.h` order: `LastAlert[4]`, `VBlankFrequency`,
+/// `PowerSupplyFrequency`, `SemaphoreList`.
+pub(crate) const EXEC_BASE_VBLANKFREQUENCY_OFFSET: u32 = 530;
+
+/// Byte offset of `ExecBase.ex_EClockFrequency` (`ULONG`) from
+/// [`EXEC_LIBRARY_BASE`]. Continuing past `SemaphoreList` (532, 14
+/// bytes): `KickMemPtr`/`KickTagPtr`/`KickCheckSum` (4 each, 12) = 558,
+/// `ex_Pad0` (`UWORD`, 2) = 560, `ex_LaunchPoint` (4) = 564,
+/// `ex_RamLibPrivate` (4) = 568. Cross-checked against the SAS/C
+/// 6.58 `exec/execbase.h` (V36 additions), which documents the field as
+/// "typically 715909 for NTSC, or 709379 for PAL".
+pub(crate) const EXEC_BASE_ECLOCKFREQUENCY_OFFSET: u32 = 568;
+
+/// Where the three real libraries' `ln_Name` strings live, in the
+/// headroom past the struct ExecBase fields -- see the "Reserved-region
+/// memory map" doc on [`EXEC_LIBRARY_BASE`].
+const EXEC_BASE_LIBRARY_NAMES_ADDR: u32 = EXEC_LIBRARY_BASE + 0x290;
 
 /// Byte offset of `ExecBase.SoftVer` from [`EXEC_LIBRARY_BASE`]: right
 /// after `LibNode` ([`LIB_STRUCT_SIZE`], 34). Documented in NDK
@@ -857,7 +894,7 @@ pub fn install_fpu_disabled_060_decline_stub<C: Cpu>(
 /// terminator, as laid out by [`write_library_list_nodes`] in the
 /// headroom above `ExecBase.LibList` -- see the "Reserved-region memory
 /// map" doc on [`EXEC_LIBRARY_BASE`].
-const LIBRARY_NAME_AREA_SIZE: u32 = 64;
+const LIBRARY_NAME_AREA_SIZE: u32 = 16;
 
 /// Builds a real, walkable `ExecBase.LibList` (see
 /// [`EXEC_BASE_LIBLIST_OFFSET`]'s docs for why a real list, not just
@@ -876,7 +913,7 @@ fn write_library_list_nodes(mem: &mut dyn AddressSpace) {
     let list_addr = EXEC_LIBRARY_BASE + EXEC_BASE_LIBLIST_OFFSET;
     crate::execlist::init_list_header(mem, list_addr);
 
-    let names_start = list_addr + crate::execlist::LIST_SIZE;
+    let names_start = EXEC_BASE_LIBRARY_NAMES_ADDR;
     let libraries: [(u32, &str); 3] = [
         (DOS_LIBRARY_BASE, "dos.library"),
         (EXEC_LIBRARY_BASE, "exec.library"),
@@ -2362,7 +2399,7 @@ pub struct Runtime<C: Cpu> {
     table: LibraryTable<C>,
     heap: GuestHeap,
     registry: LibraryRegistry,
-    dos: DosState,
+    pub(crate) dos: DosState,
     /// Guest address of the fake "current task" struct -- see
     /// [`HandlerContext::current_task`] and [`crate::exectask`]. Always
     /// equal to `tasks.current()`; kept as its own field (rather than
@@ -2828,6 +2865,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // filesystem).
         crate::expansion::register_expansion_handlers(&mut table, &mut mem);
 
+        // icon.library: the calls answerable without the .info disk
+        // format (a missing icon, tool-type parsing, BumpRevision) --
+        // see crate::icon's module docs for what still fails loudly.
+        crate::icon::register_icon_handlers(&mut table, &mut mem);
+
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
         // RemTail/Insert/Enqueue/FindName and CreateMsgPort/
@@ -2895,6 +2937,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, MATHFFP_LIBRARY_BASE);
         write_library_node(&mut mem, LOCALE_LIBRARY_BASE);
         write_library_node(&mut mem, INTUITION_LIBRARY_BASE);
+        write_library_node(&mut mem, ICON_LIBRARY_BASE);
         write_library_node(&mut mem, TIMER_DEVICE_BASE);
         // A device's node type is NT_DEVICE, not write_library_node's
         // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
@@ -2944,6 +2987,14 @@ impl<C: Cpu + 'static> Runtime<C> {
             EXEC_LIBRARY_BASE + EXEC_BASE_ATTNFLAGS_OFFSET,
             config.attn_flags,
         );
+        // A PAL machine: 50 Hz vertical/mains, 709379 Hz E clock --
+        // the same rate ReadEClock() reports (ECLOCK_PAL_HZ).
+        mem.write_u8(EXEC_LIBRARY_BASE + EXEC_BASE_VBLANKFREQUENCY_OFFSET, 50);
+        mem.write_u8(EXEC_LIBRARY_BASE + EXEC_BASE_VBLANKFREQUENCY_OFFSET + 1, 50);
+        mem.write_u32(
+            EXEC_LIBRARY_BASE + EXEC_BASE_ECLOCKFREQUENCY_OFFSET,
+            crate::exectask::ECLOCK_PAL_HZ,
+        );
         mem.write_u32(CACHE_BITS_ADDR, CACHE_BITS_DEFAULT);
         write_library_list_nodes(&mut mem);
         crate::execlist::init_list_header(
@@ -2983,6 +3034,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         registry.register_real("intuition.library", INTUITION_LIBRARY_BASE);
         registry.register_real("graphics.library", GRAPHICS_LIBRARY_BASE);
         registry.register_real("expansion.library", EXPANSION_LIBRARY_BASE);
+        registry.register_real("icon.library", ICON_LIBRARY_BASE);
 
         // Exit sentinel: any A-line word works (we never decode it; the
         // exit path is short-circuited on address, not opcode), but using
@@ -3206,8 +3258,33 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// [`crate::dosfile::ERROR_OBJECT_NOT_FOUND`] (see
     /// [`crate::dosfile`]'s module docs); `Input`/`Output`/`PutStr`/
     /// `IoErr`/`SetIoErr` work either way.
+    ///
+    /// Also seeds the process's `pr_CurrentDir` with a real lock on the
+    /// [`Vfs`]'s initial current directory, as a Shell launch leaves it:
+    /// a guest that reads the field directly (a `getcwd()` doing
+    /// `NameFromLock(pr_CurrentDir)`) otherwise saw `0` -- `SYS:` -- until
+    /// its first `CurrentDir`. A `SYS:` cwd stays `0`, which already
+    /// means the boot volume's root, so installing a `Vfs` still doesn't
+    /// create the lazily-backed `SYS:` directory on the host. A cwd that
+    /// can't be locked stays `0` too; `Vfs::new` has already validated
+    /// its volume, so that's only a host directory that's gone missing.
     pub fn set_vfs(&mut self, vfs: Vfs) {
+        let cwd = vfs.cwd().to_string();
         self.dos.vfs = Some(vfs);
+        if cwd.eq_ignore_ascii_case("SYS:") {
+            return;
+        }
+        let Ok(bptr) = self.dos.lock(
+            &mut self.heap,
+            &mut self.mem,
+            &cwd,
+            crate::doslock::SHARED_LOCK,
+        ) else {
+            return;
+        };
+        self.dos.current_dir_lock = Some(crate::guestmem::addr_from_bptr(bptr));
+        self.mem
+            .write_u32(self.task + crate::exectask::PR_CURRENT_DIR_OFFSET, bptr);
     }
 
     /// Enables the `--libs-dir` override: `OpenLibrary` checks the
@@ -3933,6 +4010,69 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Test: the ExecBase frequency fields a guest reads straight from
+    /// `SysBase` hold a consistent PAL machine (amitools#273 had the
+    /// E-clock field at the wrong offset; here they were never written,
+    /// so every one read 0 -- a divide-by-zero for a program deriving a
+    /// frame rate from `VBlankFrequency`).
+    #[test]
+    fn execbase_frequency_fields_describe_a_pal_machine() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, 0x4000, &[0x4E75u16]);
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: 0x4000,
+                load_end: 0x4100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let m = rt.memory();
+        assert_eq!(m.read_u8(EXEC_LIBRARY_BASE + 530), 50, "VBlankFrequency");
+        assert_eq!(
+            m.read_u8(EXEC_LIBRARY_BASE + 531),
+            50,
+            "PowerSupplyFrequency"
+        );
+        assert_eq!(
+            m.read_u32(EXEC_LIBRARY_BASE + 568),
+            709_379,
+            "ex_EClockFrequency (NDK exec/execbase.h offset 568)"
+        );
+    }
+
+    /// Test: the real libraries' `LibList` names survive intact next to
+    /// the struct fields written above. The name strings used to live
+    /// at `LibList + 14`, on top of ExecBase's PortList..SemaphoreList
+    /// span, so `SemaphoreList`'s header overwrote the tail of
+    /// "utility.library".
+    #[test]
+    fn execbase_liblist_names_are_not_clobbered_by_other_execbase_fields() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, 0x4000, &[0x4E75u16]);
+        let rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: 0x4000,
+                load_end: 0x4100,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let m = rt.memory();
+        for (base, want) in [
+            (DOS_LIBRARY_BASE, "dos.library"),
+            (EXEC_LIBRARY_BASE, "exec.library"),
+            (UTILITY_LIBRARY_BASE, "utility.library"),
+        ] {
+            let name = m.read_u32(base + crate::execlist::LN_NAME);
+            assert_eq!(crate::guestmem::read_c_string(m, name), want.as_bytes());
+        }
+    }
 
     /// Test: `Runtime::emulated_cycles` reports `None` unless a clock
     /// rate was configured, and the CPU's own accumulated count once one

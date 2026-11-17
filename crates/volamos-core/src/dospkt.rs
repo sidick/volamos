@@ -7,7 +7,7 @@
 //! `NameOfVolume` example code does the same thing for
 //! `ACTION_CURRENT_VOLUME`).
 //!
-//! # Scope: three packet types, host-independent stats
+//! # Scope: three packet types, real host capacity
 //!
 //! This runtime has no real handler processes (see `crate::dosdevproc`'s
 //! module docs for the established "no packet round-trip" scope
@@ -17,16 +17,23 @@
 //! and answers three packet types directly for a known volume:
 //! `ACTION_IS_FILESYSTEM` (always `DOSTRUE` -- every volume this runtime
 //! knows about is backed by a real host directory), and
-//! `ACTION_DISK_INFO`/`ACTION_INFO`, which fill a `struct InfoData` with
-//! fixed, host-independent stats (a fixed large capacity, `0` used)
-//! rather than querying the host filesystem for real free-space numbers
-//! -- this runtime has no portable way to do that, and per this
-//! project's established "don't reintroduce host-state non-determinism"
-//! principle (see `crate::dosmeta`'s module docs), a fixed answer is
-//! preferable to a host-specific one anyway. Any other packet type, or a
-//! `port` this runtime doesn't recognize, fails cleanly with
-//! `ERROR_ACTION_NOT_KNOWN` (the real, documented "handler doesn't
-//! understand this packet" convention) rather than panicking or lying.
+//! `ACTION_DISK_INFO`/`ACTION_INFO`, which fill a `struct InfoData`.
+//!
+//! The capacity fields (`id_NumBlocks`/`id_NumBlocksUsed`/
+//! `id_BytesPerBlock`) report the host filesystem behind the volume
+//! (`statvfs`, issue #319, as amitools#275 does for vamos): total size
+//! and the space *available to the user* (`f_bavail`, so the free count
+//! matches what a write can really use), in 512-byte blocks, the block
+//! size doubled until the count fits the signed 32-bit LONG real
+//! `Info` formats it from ([`scale_capacity`]). Two volumes on the same
+//! host filesystem therefore report overlapping capacity, and the
+//! numbers change as the host fills up. The earlier fixed answer (a
+//! constant 100,000 blocks, nothing used) is kept only as the fallback
+//! when the host can't be asked (non-Unix hosts, or a `statvfs`
+//! failure). Any other packet type, or a `port` this runtime doesn't
+//! recognize, fails cleanly with `ERROR_ACTION_NOT_KNOWN` (the real,
+//! documented "handler doesn't understand this packet" convention)
+//! rather than panicking or lying.
 //!
 //! # Known gap: `Info`'s "Mounted disks" table
 //!
@@ -163,8 +170,8 @@ const ID_DISKTYPE_OFFSET: u32 = 24;
 const ID_VOLUMENODE_OFFSET: u32 = 28;
 const ID_INUSE_OFFSET: u32 = 32;
 
-/// A plausible, fixed 512-byte-block capacity -- see the module docs
-/// for why this isn't queried from the host.
+/// Fallback capacity when the host filesystem can't be queried -- see
+/// the module docs.
 const FIXED_NUM_BLOCKS: u32 = 100_000;
 const BYTES_PER_BLOCK: u32 = 512;
 
@@ -207,16 +214,92 @@ fn object_exists(dos: &crate::dosfile::DosState, path: &str) -> Result<(), i32> 
         .map_err(|e| crate::dosfile::map_vfs_error(&e))
 }
 
-fn fill_info_data(mem: &mut dyn AddressSpace, addr: u32) {
+/// `(id_NumBlocks, id_NumBlocksUsed, id_BytesPerBlock)` for a
+/// filesystem of `total_bytes` with `avail_bytes` usable: 512-byte
+/// blocks, doubled while the block count would overflow a signed
+/// 32-bit LONG (real `Info` reads these as signed).
+fn scale_capacity(total_bytes: u64, avail_bytes: u64) -> (u32, u32, u32) {
+    let mut block = u64::from(BYTES_PER_BLOCK);
+    while total_bytes / block > i32::MAX as u64 {
+        block *= 2;
+    }
+    let total = total_bytes / block;
+    let free = avail_bytes.min(total_bytes) / block;
+    (total as u32, (total - free) as u32, block as u32)
+}
+
+/// The host filesystem's `(total, available-to-user)` bytes behind
+/// `path`, or `None` if it can't be asked.
+// The `statvfs` field widths differ per platform (u32 on macOS's block
+// counts, u64 elsewhere), so the casts are needed on some hosts and
+// redundant on others.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn host_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `c_path` is NUL-terminated and `st` is a valid out-pointer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statvfs succeeded, so it filled the struct.
+    let st = unsafe { st.assume_init() };
+    let frsize = (if st.f_frsize != 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    }) as u64;
+    Some((
+        (st.f_blocks as u64).saturating_mul(frsize),
+        (st.f_bavail as u64).saturating_mul(frsize),
+    ))
+}
+
+#[cfg(not(unix))]
+fn host_space(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Fills the `struct InfoData` at `addr`. `host_dir` is a directory on
+/// the volume being asked about, used for the capacity fields; `None`,
+/// or a host that can't answer, gives the fixed fallback.
+fn fill_info_data(mem: &mut dyn AddressSpace, addr: u32, host_dir: Option<&std::path::Path>) {
+    let (blocks, used, bytes_per_block) = host_dir
+        .and_then(host_space)
+        .map(|(total, avail)| scale_capacity(total, avail))
+        .unwrap_or((FIXED_NUM_BLOCKS, 0, BYTES_PER_BLOCK));
     mem.write_u32(addr + ID_NUMSOFTERRORS_OFFSET, 0);
     mem.write_u32(addr + ID_UNITNUMBER_OFFSET, 0);
     mem.write_u32(addr + ID_DISKSTATE_OFFSET, ID_VALIDATED);
-    mem.write_u32(addr + ID_NUMBLOCKS_OFFSET, FIXED_NUM_BLOCKS);
-    mem.write_u32(addr + ID_NUMBLOCKSUSED_OFFSET, 0);
-    mem.write_u32(addr + ID_BYTESPERBLOCK_OFFSET, BYTES_PER_BLOCK);
+    mem.write_u32(addr + ID_NUMBLOCKS_OFFSET, blocks);
+    mem.write_u32(addr + ID_NUMBLOCKSUSED_OFFSET, used);
+    mem.write_u32(addr + ID_BYTESPERBLOCK_OFFSET, bytes_per_block);
     mem.write_u32(addr + ID_DISKTYPE_OFFSET, ID_DOS_DISK);
     mem.write_u32(addr + ID_VOLUMENODE_OFFSET, 0);
     mem.write_u32(addr + ID_INUSE_OFFSET, 0);
+}
+
+/// A host directory on the volume named `name` (its root), for the
+/// capacity query.
+fn volume_host_dir(dos: &crate::dosfile::DosState, name: &str) -> Option<std::path::PathBuf> {
+    dos.vfs
+        .as_ref()?
+        .volumes()
+        .iter()
+        .find(|(vol, _)| vol.eq_ignore_ascii_case(name))
+        .map(|(_, root)| root.clone())
+}
+
+/// A host directory on the volume of `lock_bptr` (a lock, or `0` for the
+/// current directory), for the capacity query.
+fn lock_host_dir(dos: &crate::dosfile::DosState, lock_bptr: u32) -> Option<std::path::PathBuf> {
+    if let Some(entry) = dos.locks.get(&addr_from_bptr(lock_bptr)) {
+        return Some(entry.host_path.clone());
+    }
+    let vfs = dos.vfs.as_ref()?;
+    vfs.resolve(vfs.cwd(), crate::vfs::ResolveMode::MustExist)
+        .ok()
 }
 
 /// `DoPkt` (`D1` = port, `D2` = action, `D3`-`D7` = `arg1`-`arg5`).
@@ -244,11 +327,15 @@ fn do_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let known_volume = crate::dosdevlist::volume_for_task_id(ctx.dos, port).is_some();
     let (res1, res2) = match action {
         ACTION_DISK_INFO if known_volume => {
-            fill_info_data(ctx.mem, addr_from_bptr(arg1));
+            let dir = crate::dosdevlist::volume_for_task_id(ctx.dos, port)
+                .and_then(|v| volume_host_dir(ctx.dos, &v));
+            fill_info_data(ctx.mem, addr_from_bptr(arg1), dir.as_deref());
             (DOSTRUE, 0)
         }
         ACTION_INFO if known_volume => {
-            fill_info_data(ctx.mem, addr_from_bptr(arg2));
+            let dir = crate::dosdevlist::volume_for_task_id(ctx.dos, port)
+                .and_then(|v| volume_host_dir(ctx.dos, &v));
+            fill_info_data(ctx.mem, addr_from_bptr(arg2), dir.as_deref());
             (DOSTRUE, 0)
         }
         // Every volume this runtime knows about is backed by a real
@@ -588,10 +675,12 @@ fn service_action<C: Cpu>(
             Err(code) => (RESULT_ERROR, code as u32),
         },
         // ACTION_DISK_INFO (25): Arg1 = BPTR to an InfoData. Res1 =
-        // boolean. The same fixed InfoData as DoPkt's (see the module
-        // docs).
+        // boolean. The same InfoData as DoPkt's (see the module docs);
+        // the packet names no volume, so it describes the current
+        // directory's.
         ACTION_DISK_INFO => {
-            fill_info_data(ctx.mem, addr_from_bptr(arg1));
+            let dir = lock_host_dir(ctx.dos, 0);
+            fill_info_data(ctx.mem, addr_from_bptr(arg1), dir.as_deref());
             (DOSTRUE, 0)
         }
         // ACTION_WAIT_CHAR (20): Arg1 = timeout in microseconds. Res1 =
@@ -689,13 +778,15 @@ pub fn handle_fs_packet<C: Cpu>(
 }
 
 /// `Info` (`D1` = lock `BPTR`, `D2` = `struct InfoData*`, longword
-/// aligned). `D0` = `DOSTRUE`. Fills the same fixed `InfoData` as
-/// `ACTION_DISK_INFO` (see the module docs), whatever volume the lock is
-/// on. Found needed running an ixemul.library program (issue #196),
+/// aligned). `D0` = `DOSTRUE`. Fills the same `InfoData` as
+/// `ACTION_DISK_INFO` (see the module docs), describing the volume the
+/// lock is on. Found needed running an ixemul.library program (issue #196),
 /// which calls it when it resolves a path through the root, `/`.
 fn info_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let lock = ctx.cpu.data_register(DataRegister(1));
     let info = ctx.cpu.data_register(DataRegister(2));
-    fill_info_data(ctx.mem, info);
+    let dir = lock_host_dir(ctx.dos, lock);
+    fill_info_data(ctx.mem, info, dir.as_deref());
     ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
     Ok(())
 }
@@ -907,9 +998,14 @@ mod tests {
             rt.memory().read_u32(infodata_addr + ID_DISKTYPE_OFFSET),
             ID_DOS_DISK
         );
+        // The volume is rooted at /tmp: its capacity is the host's
+        // (or the fixed fallback where the host can't be asked).
+        let expected = host_space(std::path::Path::new("/tmp"))
+            .map(|(total, avail)| scale_capacity(total, avail).0)
+            .unwrap_or(FIXED_NUM_BLOCKS);
         assert_eq!(
             rt.memory().read_u32(infodata_addr + ID_NUMBLOCKS_OFFSET),
-            FIXED_NUM_BLOCKS
+            expected
         );
     }
 
@@ -1626,6 +1722,49 @@ mod tests {
             rt.memory().read_u32(buf + ID_BYTESPERBLOCK_OFFSET),
             BYTES_PER_BLOCK
         );
+    }
+
+    #[test]
+    fn scale_capacity_reports_512_byte_blocks_with_used_derived_from_available() {
+        // 1 MiB total, 256 KiB available: 2048 blocks, 1536 used.
+        assert_eq!(scale_capacity(1 << 20, 1 << 18), (2048, 1536, 512));
+        // Available can't exceed total.
+        assert_eq!(scale_capacity(4096, 1 << 30), (8, 0, 512));
+    }
+
+    #[test]
+    fn scale_capacity_doubles_the_block_size_until_the_count_fits_a_signed_long() {
+        // 4 TiB / 512 = 2^33 blocks: overflows; 4 TiB / 4096 = 2^30 fits.
+        let (blocks, used, bpb) = scale_capacity(4 << 40, 1 << 40);
+        assert_eq!(bpb, 4096);
+        assert_eq!(blocks, 1 << 30);
+        assert_eq!(used, 3 << 28);
+        assert!(blocks <= i32::MAX as u32);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_space_reports_a_nonempty_filesystem_and_none_for_a_missing_path() {
+        let dir = TempDir::new("pkt-hostspace");
+        let (total, avail) = host_space(&dir.path).expect("a real directory has a filesystem");
+        assert!(total > 0 && avail <= total);
+        assert_eq!(host_space(&dir.path.join("does-not-exist")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_disk_info_reports_the_host_filesystem_not_the_fixed_placeholder() {
+        let dir = TempDir::new("pkt-diskinfo-real");
+        let (_, _, rt, addrs) =
+            run_path_packet(&dir, ACTION_DISK_INFO, vec![PktArg::BytesBptr(vec![0; 36])]);
+        let (total, avail) = host_space(&dir.path).unwrap();
+        let (blocks, _, bpb) = scale_capacity(total, avail);
+        let m = rt.memory();
+        assert_eq!(m.read_u32(addrs[0] + ID_NUMBLOCKS_OFFSET), blocks);
+        assert_eq!(m.read_u32(addrs[0] + ID_BYTESPERBLOCK_OFFSET), bpb);
+        // Free space can move between the two statvfs calls; the used
+        // count only has to be a sane fraction of the total.
+        assert!(m.read_u32(addrs[0] + ID_NUMBLOCKSUSED_OFFSET) <= blocks);
     }
 
     #[test]

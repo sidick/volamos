@@ -22,6 +22,7 @@ pub mod bsdsocket;
 pub mod dos;
 pub mod exec;
 pub mod graphics;
+pub mod icon;
 pub mod intuition;
 pub mod locale;
 pub mod mathffp;

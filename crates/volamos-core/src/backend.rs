@@ -105,8 +105,10 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// with it, and once more from `0x2E04` for `expansion.library`'s real
 /// base (see `crate::dispatch::EXPANSION_LIBRARY_BASE`) -- whose
 /// `struct ExpansionBase` is the largest header this runtime builds, so
-/// its base sits lower in its chunk than the others' do.
-pub const TRAP_TABLE_SIZE: u32 = 0x3004;
+/// its base sits lower in its chunk than the others' do -- and once more
+/// from `0x3004` for `icon.library`'s real base (see
+/// `crate::dispatch::ICON_LIBRARY_BASE`).
+pub const TRAP_TABLE_SIZE: u32 = 0x3204;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this
@@ -1066,7 +1068,7 @@ mod tests {
     /// Guest memory for the tests below, big enough to hold the
     /// reserved trap-table region plus room for code and data above it.
     /// Derived from [`TRAP_TABLE_END`] rather than written as a literal:
-    /// the region has grown eight times as libraries were added (see
+    /// the region has grown nine times as libraries were added (see
     /// `TRAP_TABLE_SIZE`'s doc), and a hardcoded size silently becomes
     /// *smaller* than the region, at which point every test here
     /// executes past the end of memory and fails for a reason that has

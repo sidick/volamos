@@ -400,10 +400,18 @@ pub struct DosState {
     /// keyed by the same guest `FileLock` address as `locks`. Populated
     /// by `Examine` on a directory lock, consumed by `ExNext`.
     pub(crate) exnext: HashMap<u32, crate::doslock::ExNextState>,
-    /// Guest address of the `FileLock` `CurrentDir` last switched to, or
-    /// `None` if the process is still on its initial (no-lock) current
-    /// directory.
+    /// Guest address `CurrentDir` last switched to, or `None` if the
+    /// process is still on its initial (no-lock) current directory. Kept
+    /// verbatim even after that lock is released: real `CurrentDir`
+    /// exchanges raw BPTRs and never inspects the old one, so the value
+    /// it returns next time is whatever was stored, freed or not.
     pub(crate) current_dir_lock: Option<u32>,
+    /// Amiga path of each lock `UnLock` has released, keyed by the
+    /// lock's former guest address, so `CurrentDir` can still restore a
+    /// directory whose lock was released first (amitools#280's
+    /// `FreeDeviceProc` case). Entry dropped when the address is reused
+    /// for a new lock.
+    pub(crate) released_lock_paths: HashMap<u32, String>,
     /// The `Vfs` current directory (Amiga path string) captured the first
     /// time `CurrentDir` runs, before it's ever changed -- `CurrentDir(0)`
     /// restores this. `None` until the first `CurrentDir` call.
@@ -574,6 +582,7 @@ impl DosState {
             locks: HashMap::new(),
             exnext: HashMap::new(),
             current_dir_lock: None,
+            released_lock_paths: HashMap::new(),
             initial_cwd: None,
             next_lock_id: 0,
             seglists: HashMap::new(),
