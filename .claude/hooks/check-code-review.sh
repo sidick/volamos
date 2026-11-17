@@ -20,8 +20,11 @@ cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 # phrase (echo, grep, a commit message) does not trip it.
 printf '%s' "$cmd" | grep -Eq '(^|[;&|(])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+pr[[:space:]]+create' || exit 0
 
-# Escape hatch for a PR that genuinely needs no review (typo, dep bump).
-printf '%s' "$cmd" | grep -q 'CLAUDE_SKIP_CODE_REVIEW=1' && exit 0
+# Escape hatch for a PR that genuinely needs no review (typo, dep bump):
+# the assignment has to sit in front of `gh` like any env var, not just
+# appear somewhere in the text (a --body that quotes the docs must not
+# bypass the gate).
+printf '%s' "$cmd" | grep -Eq '(^|[;&|(])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*CLAUDE_SKIP_CODE_REVIEW=1[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+pr[[:space:]]+create' && exit 0
 
 git rev-parse --show-toplevel >/dev/null 2>&1 || exit 0
 head=$(git rev-parse HEAD 2>/dev/null) || exit 0
