@@ -804,8 +804,9 @@ impl Segment {
 /// Everything outside every segment is unmapped: reads give 0, writes
 /// are dropped (see [`AddressSpace::read_u8`]).
 ///
-/// The sanitizer shadow map and [`FlatMemory::as_slice`] cover the
-/// primary segment only; see their docs.
+/// The sanitizer shadow map has one segment per run of RAM (primary
+/// and extra alike); [`FlatMemory::as_slice`] covers the primary
+/// segment only.
 pub struct FlatMemory {
     bytes: Vec<u8>,
     /// ANDed into every address a host-side access uses; see
@@ -1226,19 +1227,14 @@ impl FlatMemory {
     /// what forces the m68k crate's trace JIT off the raw-pointer fast
     /// path that would otherwise bypass every check installed here.
     pub fn enable_sanitizer(&mut self) {
-        // The shadow map is indexed by address from 0 and so covers the
-        // primary segment only (issue #332). Refuse a layout with extra
-        // segments rather than report "no violations" for RAM that was
-        // never checked; the allocator phase extends the map.
-        assert!(
-            self.extra.is_empty(),
-            "--sanitize does not yet cover non-contiguous RAM layouts (issue #332)"
-        );
-        self.shadow = Some(Box::new(ShadowMap::new(self.bytes.len())));
+        // One shadow segment per run of RAM (issue #332), so extra
+        // segments -- slow, Zorro and CPU-board RAM -- are checked like
+        // the primary one. A segment mapped later (`map_segment`, the
+        // `--uae-debug` trap stub) is not RAM and stays unshadowed.
+        let ranges: Vec<(u32, u64)> = self.ranges();
+        self.shadow = Some(Box::new(ShadowMap::with_ranges(&ranges)));
     }
 
-    /// The installed [`ShadowMap`], if [`Self::enable_sanitizer`] was
-    /// called.
     pub fn shadow(&self) -> Option<&ShadowMap> {
         self.shadow.as_deref()
     }
@@ -1767,10 +1763,78 @@ mod layout_tests {
         assert_eq!(mem.read_u32(0), 0x1122_3344, "low memory untouched");
     }
 
+    /// Issue #332: the shadow map covers every RAM segment, so the
+    /// sanitizer finds heap bugs in slow/Zorro/CPU-board RAM exactly as
+    /// it does in the primary segment -- a write one byte past an
+    /// allocation, a read of freed memory, and a read of uninitialised
+    /// bytes.
     #[test]
-    #[should_panic(expected = "does not yet cover non-contiguous")]
-    fn the_sanitizer_refuses_a_split_layout_instead_of_silently_covering_part_of_it() {
-        FlatMemory::from_layout(&split_layout()).enable_sanitizer();
+    fn the_sanitizer_checks_ram_in_extra_segments() {
+        use crate::guestmem::GuestHeap;
+        use crate::sanitize::ViolationKind;
+        let layout = split_layout();
+        let mut mem = FlatMemory::from_layout(&layout);
+        mem.enable_sanitizer();
+        mem.shadow_mut().unwrap().report_uninit = true;
+        let mut heap = GuestHeap::with_layout(layout, 0x4000, u32::MAX);
+        heap.set_redzone_size(16);
+        // A block in the Zorro III segment (the highest-priority region).
+        let a = heap.alloc_for(&mut mem, 32, 32, 0).unwrap();
+        assert!(a >= 0x1000_0000, "allocated in the extra segment: {a:#X}");
+        // What execmem::poison_allocation_edges does after an AllocMem:
+        // the user bytes are uninitialised, the redzones off limits.
+        let e = heap.extent_of_live_alloc(a).unwrap();
+        let shadow = mem.shadow_mut().unwrap();
+        shadow.mark_uninit(e.user_start, e.user_size);
+        shadow.mark_unaddressable(
+            e.block_start,
+            e.user_start - e.block_start,
+            crate::sanitize::PoisonReason::Redzone,
+        );
+        shadow.mark_unaddressable(
+            e.user_start + e.user_size,
+            e.block_end - (e.user_start + e.user_size),
+            crate::sanitize::PoisonReason::Redzone,
+        );
+
+        mem.write_u8(a, 1); // in bounds: fine
+        assert!(mem.shadow().unwrap().violations().is_empty());
+        // One byte past the end lands in the trailing redzone.
+        mem.write_u8(a + 32, 0xFF);
+        let v = mem.shadow().unwrap().violations();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].kind, ViolationKind::InvalidWrite);
+        assert_eq!(v[0].addr, a + 32);
+        // A read of a byte nothing ever wrote is an uninitialised read.
+        let _ = mem.read_u8(a + 8);
+        assert!(
+            mem.shadow()
+                .unwrap()
+                .violations()
+                .iter()
+                .any(|v| v.kind == ViolationKind::UninitRead && v.addr == a + 8)
+        );
+    }
+
+    /// RAM in extra segments is shadowed; an address in no segment (and
+    /// the `--uae-debug` stub mapped after the shadow map was built) is
+    /// not, and reads as valid rather than panicking.
+    #[test]
+    fn unshadowed_addresses_read_as_valid() {
+        let mut mem = FlatMemory::from_layout(&split_layout());
+        mem.enable_sanitizer();
+        assert!(mem.map_segment(0xF0_FF60, 2));
+        let shadow = mem.shadow().unwrap();
+        assert_eq!(shadow.state(0xF0_FF60), crate::sanitize::ShadowState::Valid);
+        assert_eq!(
+            shadow.state(0x5000_0000),
+            crate::sanitize::ShadowState::Valid
+        );
+        // Shadow covers the primary, slow and Zorro III segments.
+        assert_eq!(shadow.len(), (2 + 1 + 4) * MIB as usize);
+        mem.write_u8(0xF0_FF60, 7);
+        assert_eq!(mem.read_u8(0xF0_FF60), 7);
+        assert!(mem.shadow().unwrap().violations().is_empty());
     }
 
     #[test]

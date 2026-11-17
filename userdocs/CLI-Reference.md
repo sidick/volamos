@@ -256,9 +256,12 @@ tagged value. With a 32-bit `--cpu` the top byte is a real address bit.
 The guest stack lives at the top of the one run of RAM that starts at
 address 0 (chip plus an abutting `--fast`).
 
-Under [`--sanitize`](#-sanitize) the memory map is limited to that same
-run: the default layout drops its slow/CPU-board RAM rather than leave
-it unchecked, and asking for them explicitly is an error.
+[`--sanitize`](#-sanitize) checks all of it: slow, Zorro and CPU-board RAM
+are shadowed like chip and fast RAM, so an overrun, a use-after-free or
+an uninitialised read in memory allocated there is reported the same way.
+(The shadow map costs one byte per guest byte, but only the pages the
+program's allocations and stack touch are ever committed, so a large
+`--accel` or `--z3` is cheap unless the guest uses it.)
 
 ## `--ram SIZE`
 

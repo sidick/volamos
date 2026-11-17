@@ -541,16 +541,6 @@ impl MemoryLayout {
         Self::new(regions)
     }
 
-    /// The part of this layout that is one gap-free run from address 0:
-    /// what the sanitizer can shadow today (see
-    /// [`crate::memory::FlatMemory::enable_sanitizer`]).
-    pub fn contiguous_part(&self) -> MemoryLayout {
-        let (_, count) = self.contiguous_prefix();
-        MemoryLayout {
-            regions: self.regions[..count].to_vec(),
-        }
-    }
-
     /// Index into [`Self::regions`] of the region containing `addr`.
     pub fn region_index_at(&self, addr: u32) -> Option<usize> {
         self.regions.iter().position(|r| r.contains(addr))

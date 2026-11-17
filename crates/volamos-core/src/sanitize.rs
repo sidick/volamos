@@ -691,12 +691,19 @@ struct CallFrame {
 /// go through `FlatMemory::write_u8`, which does take `&mut self`).
 #[derive(Debug, Clone)]
 pub struct ShadowMap {
-    /// One encoded byte per guest byte, indexed by guest address -- see
+    /// One encoded byte per guest byte, in address-ordered, non-
+    /// overlapping segments -- one per run of guest RAM (issue #332: a
+    /// memory map has chip, slow, Zorro and CPU-board RAM at separate
+    /// addresses, not one block from 0). An address outside every
+    /// segment is unshadowed and reads as [`ShadowState::Valid`]. See
     /// the "shadow byte encoding" doc above. Replaces the old
     /// `states: Vec<ShadowState>` + `reasons: HashMap<u32, PoisonReason>`
     /// pair; decode with [`Self::decode_byte`], encode with
     /// [`Self::encode_unaddressable`]/[`VALID_BYTE`]/[`UNINIT_BYTE`].
-    bytes: Vec<u8>,
+    /// Every access by address goes through [`Self::slot`],
+    /// [`Self::slot_mut`] or [`Self::fill_with`], never indexing a
+    /// segment directly.
+    segments: Vec<ShadowSegment>,
     /// Deduplicated violations seen so far, in first-seen order. Capped
     /// at [`MAX_VIOLATIONS`] distinct entries. `RefCell`-wrapped -- see
     /// this struct's doc.
@@ -762,12 +769,44 @@ pub struct ShadowMap {
     movem_dummy_read: Cell<Option<u32>>,
 }
 
+/// One run of shadowed guest memory: `bytes[i]` is the shadow of guest
+/// address `base + i`.
+#[derive(Debug, Clone)]
+struct ShadowSegment {
+    base: u32,
+    bytes: Vec<u8>,
+}
+
+impl ShadowSegment {
+    fn end(&self) -> u64 {
+        u64::from(self.base) + self.bytes.len() as u64
+    }
+}
+
 impl ShadowMap {
-    /// Creates a new shadow map covering `len` guest bytes, all
-    /// initially [`ShadowState::Valid`] (see this module's doc for why).
+    /// Creates a new shadow map covering `len` guest bytes from address
+    /// 0, all initially [`ShadowState::Valid`] (see this module's doc
+    /// for why).
     pub fn new(len: usize) -> Self {
+        Self::with_ranges(&[(0, len as u64)])
+    }
+
+    /// Creates a shadow map over each `[base, end)` range of guest RAM
+    /// (address-ordered, non-overlapping; `end` is a `u64` so a range
+    /// can end at the top of the 32-bit space), all initially
+    /// [`ShadowState::Valid`]. [`VALID_BYTE`] is 0, so a large range is
+    /// a lazily zeroed allocation: only the pages the guest's
+    /// allocations and stack actually touch cost memory.
+    pub fn with_ranges(ranges: &[(u32, u64)]) -> Self {
         Self {
-            bytes: vec![VALID_BYTE; len],
+            segments: ranges
+                .iter()
+                .filter(|&&(base, end)| end > u64::from(base))
+                .map(|&(base, end)| ShadowSegment {
+                    base,
+                    bytes: vec![VALID_BYTE; (end - u64::from(base)) as usize],
+                })
+                .collect(),
             violations: RefCell::new(Vec::new()),
             index: RefCell::new(HashMap::new()),
             suppressed: Cell::new(0),
@@ -811,12 +850,59 @@ impl ShadowMap {
 
     /// The number of guest bytes this map covers.
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.segments.iter().map(|s| s.bytes.len()).sum()
     }
 
     /// Returns `true` if this map covers zero bytes.
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.segments.iter().all(|s| s.bytes.is_empty())
+    }
+
+    /// Every shadow byte, segment after segment, for tests that compare
+    /// before/after states.
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<u8> {
+        self.segments.iter().flat_map(|s| s.bytes.clone()).collect()
+    }
+
+    /// The shadow byte of `addr`, or `None` if it is outside every
+    /// segment. The first segment (guest RAM from address 0) is tried
+    /// first: it holds the stack and, usually, everything a hot access
+    /// touches.
+    fn slot(&self, addr: u32) -> Option<&u8> {
+        self.segments
+            .iter()
+            .find(|s| addr >= s.base && u64::from(addr) < s.end())
+            .map(|s| &s.bytes[(addr - s.base) as usize])
+    }
+
+    fn slot_mut(&mut self, addr: u32) -> Option<&mut u8> {
+        self.segments
+            .iter_mut()
+            .find(|s| addr >= s.base && u64::from(addr) < s.end())
+            .map(|s| &mut s.bytes[(addr - s.base) as usize])
+    }
+
+    /// Calls `f` on the shadow bytes of `[addr, addr + len)`, one slice
+    /// per segment the range overlaps (clamped to each segment's bounds,
+    /// so a range running off the end of RAM, or across a gap, touches
+    /// only shadowed bytes and can never panic). Shared by every
+    /// range-wide mutation; see this crate's "out-of-range is total, not
+    /// an error" convention ([`crate::memory::AddressSpace`]'s doc).
+    fn fill_with(&mut self, addr: u32, len: u32, mut f: impl FnMut(&mut [u8])) {
+        if len == 0 {
+            return;
+        }
+        let start = u64::from(addr);
+        let end = start + u64::from(len);
+        for seg in &mut self.segments {
+            let lo = start.max(u64::from(seg.base));
+            let hi = end.min(seg.end());
+            if hi > lo {
+                let base = u64::from(seg.base);
+                f(&mut seg.bytes[(lo - base) as usize..(hi - base) as usize]);
+            }
+        }
     }
 
     /// Encodes `reason` as an [`ShadowState::Unaddressable`] shadow byte
@@ -848,27 +934,6 @@ impl ShadowMap {
         }
     }
 
-    /// Clamps `[addr, addr + len)` to `[0, self.len())`, returning
-    /// `None` if the range is entirely out of bounds (or `len == 0`).
-    /// Shared by every `mark_*` method so none of them can panic on an
-    /// out-of-range or overflowing request -- see this crate's general
-    /// "out-of-range is total, not an error" convention (`crate::
-    /// memory::AddressSpace`'s doc).
-    fn clamp_range(&self, addr: u32, len: u32) -> Option<std::ops::Range<usize>> {
-        if len == 0 {
-            return None;
-        }
-        let start = addr as usize;
-        if start >= self.bytes.len() {
-            return None;
-        }
-        let end = addr
-            .checked_add(len)
-            .map_or(self.bytes.len(), |e| e as usize);
-        let end = end.min(self.bytes.len());
-        if end <= start { None } else { Some(start..end) }
-    }
-
     /// Marks `[addr, addr + len)` [`ShadowState::Valid`] (addressable,
     /// initialized), clearing any [`PoisonReason`] over that range.
     /// Used both to bring a freshly-allocated block into service and
@@ -876,10 +941,7 @@ impl ShadowMap {
     /// moment guest or host code writes to it -- see
     /// [`crate::memory`]'s write path.
     pub fn mark_valid(&mut self, addr: u32, len: u32) {
-        let Some(range) = self.clamp_range(addr, len) else {
-            return;
-        };
-        self.bytes[range].fill(VALID_BYTE);
+        self.fill_with(addr, len, |bytes| bytes.fill(VALID_BYTE));
     }
 
     /// Marks `[addr, addr + len)` [`ShadowState::Uninit`] (addressable,
@@ -887,10 +949,7 @@ impl ShadowMap {
     /// allocator hands out a fresh block, before the guest has had a
     /// chance to initialize it.
     pub fn mark_uninit(&mut self, addr: u32, len: u32) {
-        let Some(range) = self.clamp_range(addr, len) else {
-            return;
-        };
-        self.bytes[range].fill(UNINIT_BYTE);
+        self.fill_with(addr, len, |bytes| bytes.fill(UNINIT_BYTE));
     }
 
     /// Marks `[addr, addr + len)` [`ShadowState::Unaddressable`] for
@@ -899,10 +958,8 @@ impl ShadowMap {
     /// (until the range is next `mark_valid`/`mark_uninit`'d) is a
     /// violation.
     pub fn mark_unaddressable(&mut self, addr: u32, len: u32, reason: PoisonReason) {
-        let Some(range) = self.clamp_range(addr, len) else {
-            return;
-        };
-        self.bytes[range].fill(Self::encode_unaddressable(reason));
+        let byte = Self::encode_unaddressable(reason);
+        self.fill_with(addr, len, |bytes| bytes.fill(byte));
     }
 
     /// Promotes every byte in `[addr, addr + len)` that is currently
@@ -924,18 +981,17 @@ impl ShadowMap {
     /// per instruction, and the delta here is typically tiny (2, 4, or
     /// up to [`BELOW_SP_GRACE_BYTES`] bytes for the widest single-
     /// instruction `MOVEM`), so a per-byte loop over just the delta
-    /// costs nothing extra worth avoiding -- see [`Self::clamp_range`]
+    /// costs nothing extra worth avoiding -- see [`Self::fill_with`]
     /// for why this can never touch more than `[addr, addr + len)`
     /// clamped to the map's own bounds.
     fn promote_unaddressable_to_uninit(&mut self, addr: u32, len: u32) {
-        let Some(range) = self.clamp_range(addr, len) else {
-            return;
-        };
-        for byte in &mut self.bytes[range] {
-            if *byte & UNADDRESSABLE_TAG != 0 {
-                *byte = UNINIT_BYTE;
+        self.fill_with(addr, len, |bytes| {
+            for byte in bytes {
+                if *byte & UNADDRESSABLE_TAG != 0 {
+                    *byte = UNINIT_BYTE;
+                }
             }
-        }
+        });
     }
 
     /// The current [`ShadowState`] of `addr`, or [`ShadowState::Valid`]
@@ -944,8 +1000,7 @@ impl ShadowMap {
     /// [`crate::memory::AddressSpace`] itself, so the shadow map has
     /// nothing useful to add there.
     pub fn state(&self, addr: u32) -> ShadowState {
-        self.bytes
-            .get(addr as usize)
+        self.slot(addr)
             .map_or(ShadowState::Valid, |&b| Self::decode_byte(b).0)
     }
 
@@ -957,9 +1012,7 @@ impl ShadowMap {
     /// state around a crash -- wants the same "why is this poisoned"
     /// answer the violation log already reports.
     pub fn poison_reason(&self, addr: u32) -> Option<PoisonReason> {
-        self.bytes
-            .get(addr as usize)
-            .and_then(|&b| Self::decode_byte(b).1)
+        self.slot(addr).and_then(|&b| Self::decode_byte(b).1)
     }
 
     /// Publishes `pc` as the guest program counter responsible for
@@ -1170,7 +1223,7 @@ impl ShadowMap {
                 if reason == Some(PoisonReason::BelowStackPointer)
                     && self.below_sp_violation_is_within_grace_band(addr)
                 {
-                    if let Some(slot) = self.bytes.get_mut(addr as usize) {
+                    if let Some(slot) = self.slot_mut(addr) {
                         *slot = VALID_BYTE;
                     }
                     return false;
@@ -1178,7 +1231,7 @@ impl ShadowMap {
                 self.record(addr, size, ViolationKind::InvalidWrite, reason)
             }
             ShadowState::Uninit => {
-                if let Some(slot) = self.bytes.get_mut(addr as usize) {
+                if let Some(slot) = self.slot_mut(addr) {
                     *slot = VALID_BYTE;
                 }
                 false
@@ -1344,7 +1397,7 @@ impl ShadowMap {
                     VALID_BYTE
                 }
             };
-            if let Some(slot) = self.bytes.get_mut(d as usize) {
+            if let Some(slot) = self.slot_mut(d) {
                 *slot = new_byte;
             }
         }
@@ -1355,7 +1408,7 @@ impl ShadowMap {
     /// reported. See [`Self::check_write`].
     fn heal_uninit_byte(&mut self, addr: u32) {
         if self.state(addr) == ShadowState::Uninit
-            && let Some(slot) = self.bytes.get_mut(addr as usize)
+            && let Some(slot) = self.slot_mut(addr)
         {
             *slot = VALID_BYTE;
         }
@@ -2519,13 +2572,17 @@ mod tests {
     fn unchanged_stack_pointer_does_nothing() {
         let mut shadow = ShadowMap::new(0x2000);
         shadow.begin_stack_tracking(0x1000, 0x2000, 0x1800);
-        let before = shadow.bytes.clone();
+        let before = shadow.snapshot();
 
         shadow.update_stack_pointer(0x1800);
         shadow.update_stack_pointer(0x1800);
         shadow.update_stack_pointer(0x1800);
 
-        assert_eq!(shadow.bytes, before, "no shadow byte should have moved");
+        assert_eq!(
+            shadow.snapshot(),
+            before,
+            "no shadow byte should have moved"
+        );
     }
 
     #[test]
@@ -2556,10 +2613,10 @@ mod tests {
 
         // While suspended, further moves (even ones that look like a
         // huge "delta" against the old sp) must still be no-ops.
-        let after_leaving = shadow.bytes.clone();
+        let after_leaving = shadow.snapshot();
         shadow.update_stack_pointer(0x8100);
         shadow.update_stack_pointer(0x7000);
-        assert_eq!(shadow.bytes, after_leaving);
+        assert_eq!(shadow.snapshot(), after_leaving);
     }
 
     #[test]
@@ -3089,5 +3146,57 @@ mod tests {
         shadow.check_return(0x1000, 0x4141_4141);
 
         assert_eq!(shadow.violation_count(), 0);
+    }
+    // --- multi-segment shadow (issue #332) ---
+
+    fn two_segment_shadow() -> ShadowMap {
+        // RAM at 0x1000..0x2000 and 0x8000_0000..0x8000_1000, nothing between.
+        ShadowMap::with_ranges(&[(0x1000, 0x2000), (0x8000_0000, 0x8000_1000)])
+    }
+
+    #[test]
+    fn ranges_in_different_segments_are_marked_independently() {
+        let mut shadow = two_segment_shadow();
+        assert_eq!(shadow.len(), 0x1000 + 0x1000);
+        shadow.mark_unaddressable(0x1FF0, 16, PoisonReason::Redzone);
+        shadow.mark_uninit(0x8000_0010, 4);
+        assert_eq!(shadow.state(0x1FF0), ShadowState::Unaddressable);
+        assert_eq!(shadow.state(0x1FEF), ShadowState::Valid);
+        assert_eq!(shadow.state(0x8000_0010), ShadowState::Uninit);
+        assert_eq!(shadow.poison_reason(0x1FFF), Some(PoisonReason::Redzone));
+        assert_eq!(shadow.poison_reason(0x8000_0010), None);
+        // The gap and everything outside is unshadowed: valid, no panic.
+        for addr in [0, 0x0FFF, 0x2000, 0x7FFF_FFFF, 0x8000_1000, u32::MAX] {
+            assert_eq!(shadow.state(addr), ShadowState::Valid, "{addr:#X}");
+        }
+    }
+
+    #[test]
+    fn a_range_spanning_a_gap_touches_only_the_shadowed_bytes() {
+        let mut shadow = two_segment_shadow();
+        // From the last 8 bytes of the first segment across 2 GiB of
+        // nothing into the first 8 bytes of the second.
+        shadow.mark_unaddressable(0x1FF8, 0x8000_0010 - 0x1FF8, PoisonReason::Freed);
+        assert_eq!(shadow.state(0x1FF7), ShadowState::Valid);
+        for addr in (0x1FF8..0x2000).chain(0x8000_0000..0x8000_0010) {
+            assert_eq!(shadow.state(addr), ShadowState::Unaddressable, "{addr:#X}");
+        }
+        assert_eq!(shadow.state(0x8000_0010), ShadowState::Valid);
+        // A range running off the top of the address space is clamped.
+        shadow.mark_uninit(0x8000_0FF0, u32::MAX);
+        assert_eq!(shadow.state(0x8000_0FFF), ShadowState::Uninit);
+        // And a zero-length one is a no-op.
+        shadow.mark_valid(0x1000, 0);
+    }
+
+    #[test]
+    fn violations_in_a_later_segment_are_reported_with_their_address() {
+        let mut shadow = two_segment_shadow();
+        shadow.mark_unaddressable(0x8000_0100, 8, PoisonReason::Freed);
+        shadow.check_read(0x8000_0104, 4);
+        let v = shadow.violations();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].kind, ViolationKind::InvalidRead);
+        assert_eq!(v[0].addr, 0x8000_0104);
     }
 }

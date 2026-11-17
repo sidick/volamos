@@ -1818,7 +1818,7 @@ fn resolve(
 ) -> Result<Options, String> {
     let (cpu_type, fpu, cpu_fpu_substituted) =
         resolve_cpu_and_fpu(overrides.cpu_type, overrides.fpu);
-    let layout = resolve_memory_layout(&overrides, cpu_type, sanitize.enabled)?;
+    let layout = resolve_memory_layout(&overrides, cpu_type)?;
     let ram_size = layout.contiguous_prefix().0 as u32;
     let jit = overrides.jit.unwrap_or(false);
     // See JitSource's doc: only matters when `jit` is actually `true`,
@@ -2098,16 +2098,9 @@ fn new_guest_memory(layout: &volamos_core::memmap::MemoryLayout, cpu_type: CpuTy
 /// `--cpu`'s default sizes and override the named classes; with neither,
 /// the CPU default. Mixing `--ram` with a region flag is an error, as
 /// is a layout the CPU's address bus cannot reach.
-///
-/// The sanitizer's shadow map covers one gap-free run of RAM from
-/// address 0 (see `FlatMemory::enable_sanitizer`), so under
-/// `--sanitize` the *default* layout drops the RAM beyond that run
-/// (slow/accelerator) rather than leave it unchecked, and an explicit
-/// layout that needs it is refused.
 fn resolve_memory_layout(
     overrides: &config::Overrides,
     cpu_type: CpuType,
-    sanitize: bool,
 ) -> Result<volamos_core::memmap::MemoryLayout, String> {
     use volamos_core::memmap::{MemoryLayout, RegionSizes};
     let bits = if addressable_bytes(cpu_type) <= (1 << 24) {
@@ -2154,23 +2147,11 @@ fn resolve_memory_layout(
             layout
                 .check_address_bits(bits)
                 .map_err(|e| format!("invalid memory layout: {e} -- ask for a 32-bit address bus with --cpu 68020 (or any later model)"))?;
-            if sanitize && layout.contiguous_prefix().1 != layout.regions().len() {
-                return Err(
-                    "--sanitize cannot yet check RAM outside the one run of memory \
-                     that starts at address 0 (chip plus an abutting --fast); drop --slow/\
-                     --accel/--z3 or --sanitize"
-                        .to_string(),
-                );
-            }
             return Ok(layout);
         }
         (None, false) => MemoryLayout::default_for_address_bits(bits),
     };
-    Ok(if sanitize {
-        layout.contiguous_part()
-    } else {
-        layout
-    })
+    Ok(layout)
 }
 
 /// Checks that `ram_size` is an address space the configured CPU can
@@ -3680,16 +3661,19 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_drops_unshadowable_default_ram_and_refuses_explicit_requests_for_it() {
+    fn sanitize_keeps_the_whole_memory_map() {
+        // The shadow map covers every RAM segment, so --sanitize neither
+        // drops the default's slow/CPU-board RAM nor refuses it when
+        // asked for explicitly.
         const MIB: u32 = 1024 * 1024;
-        let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
-        assert_eq!(
-            regions(&opts),
-            [("chip", 0, 2 * MIB), ("fast", 0x20_0000, 8 * MIB)],
-            "the default's slow RAM is dropped rather than left unchecked"
-        );
-        let err = parse_args(args(&["--sanitize", "--slow", "512K", "prog"])).unwrap_err();
-        assert!(err.contains("--sanitize"), "{err}");
+        let plain = parse_args(args(&["prog"])).unwrap();
+        let sanitized = parse_args(args(&["--sanitize", "prog"])).unwrap();
+        assert_eq!(regions(&plain), regions(&sanitized));
+        assert!(regions(&sanitized).iter().any(|r| r.0 == "slow"));
+        let opts = parse_args(args(&["--sanitize", "--slow", "512K", "prog"])).unwrap();
+        assert!(regions(&opts).contains(&("slow", 0xC0_0000, MIB / 2)));
+        let opts = parse_args(args(&["--sanitize", "--cpu", "68020", "prog"])).unwrap();
+        assert!(regions(&opts).iter().any(|r| r.0 == "accel"));
     }
 
     // --- check_ram_fits ---
