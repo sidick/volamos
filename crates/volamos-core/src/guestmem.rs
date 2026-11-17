@@ -520,8 +520,11 @@ impl GuestHeap {
             } else {
                 r.base + MEMHEADER_PROLOGUE
             };
-            mem.write_u32(addr + MH_LOWER, lower);
-            mem.write_u32(addr + MH_UPPER, r.end().min(u64::from(u32::MAX)) as u32);
+            let upper = r.end().min(u64::from(u32::MAX)) as u32;
+            // A chip region the program image already fills has nothing
+            // left to manage: keep the range empty, never inverted.
+            mem.write_u32(addr + MH_LOWER, lower.min(upper));
+            mem.write_u32(addr + MH_UPPER, upper);
             mem.write_u32(addr + MH_FIRST, 0);
             mem.write_u32(addr + MH_FREE, 0);
             crate::execlist::add_tail_impl(mem, list_addr, addr);
@@ -535,8 +538,8 @@ impl GuestHeap {
     /// match the free list, if anything has changed since the last time.
     /// The chain is the region's free blocks in address order, each
     /// described by a `MemChunk` (`mc_Next`, `mc_Bytes`) written into the
-    /// block's own first 8 bytes, as real exec does; blocks too small for
-    /// one are left out, and `mh_Free` is the sum of the chunks (as on
+    /// block's own first 8 bytes, as real exec does, over the 8-aligned part
+    /// of each block (blocks too small for one are left out), and `mh_Free` is the sum of the chunks (as on
     /// Kickstart 3.1, where the two always agree).
     ///
     /// Lazy on purpose: callers invoke this where a guest could be about
@@ -549,26 +552,38 @@ impl GuestHeap {
         if self.memheaders.is_empty() || self.memlist_synced == self.generation {
             return;
         }
-        let Some(layout) = self.layout.clone() else {
+        let Some(layout) = &self.layout else {
             return;
         };
-        for slot in self.memheaders.clone() {
+        for slot in &self.memheaders {
             let region = layout.regions()[slot.region];
-            let mut chunks: Vec<(u32, u32)> = self
-                .free
-                .iter()
-                .filter(|b| region.contains(b.start) && b.size >= MEMCHUNK_SIZE)
-                .map(|b| (b.start, b.size))
-                .collect();
-            chunks.sort_unstable();
-            let total: u64 = chunks.iter().map(|&(_, sz)| u64::from(sz)).sum();
-            for (i, &(start, size)) in chunks.iter().enumerate() {
-                let next = chunks.get(i + 1).map_or(0, |&(n, _)| n);
+            // The free list is kept sorted by address and never merges
+            // across regions, so a region's blocks come out in order. Each
+            // chunk covers only the 8-aligned part of its block, as real
+            // exec's chunks are 8-aligned (a block too small for one, or
+            // whose aligned part is, is left out).
+            let mut next_chunk: Option<(u32, u32)> = None;
+            let mut first = 0u32;
+            let mut total = 0u64;
+            // Build back to front so each chunk can name its successor.
+            for b in self.free.iter().rev() {
+                if !region.contains(b.start) {
+                    continue;
+                }
+                let start = (b.start + 7) & !7;
+                let end = (b.start + b.size) & !7;
+                if end < start + MEMCHUNK_SIZE {
+                    continue;
+                }
+                let size = end - start;
                 mem.clear_fresh_block(start, MEMCHUNK_SIZE);
-                poke_u32(mem, start, next);
+                poke_u32(mem, start, next_chunk.map_or(0, |(n, _)| n));
                 poke_u32(mem, start + 4, size);
+                next_chunk = Some((start, size));
+                first = start;
+                total += u64::from(size);
             }
-            mem.write_u32(slot.addr + MH_FIRST, chunks.first().map_or(0, |&(s, _)| s));
+            mem.write_u32(slot.addr + MH_FIRST, first);
             mem.write_u32(slot.addr + MH_FREE, total.min(u64::from(u32::MAX)) as u32);
         }
         self.memlist_synced = self.generation;
@@ -1481,6 +1496,119 @@ mod layout_heap_tests {
         assert_eq!(h.capacity_matching(MEMF_CHIP), Some(u64::from(2 * MIB)));
         assert_eq!(h.capacity_matching(MEMF_FAST), Some(u64::from(12 * MIB)));
         assert_eq!(GuestHeap::new(0, 0x1000).capacity_matching(0), None);
+    }
+
+    /// Walks a region's `mh_First` chain in guest memory.
+    fn chain(mem: &FlatMemory, header: u32) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut c = mem.peek_u32(header + MH_FIRST);
+        while c != 0 {
+            out.push((c, mem.peek_u32(c + 4)));
+            c = mem.peek_u32(c);
+        }
+        out
+    }
+
+    fn memlist_heap() -> (GuestHeap, FlatMemory, u32) {
+        let layout = MemoryLayout::legacy_exact(4 * MIB);
+        let mut mem = FlatMemory::from_layout(&layout);
+        let mut h = GuestHeap::with_layout(layout, 0x4000, u32::MAX);
+        h.install_memlist(&mut mem, 0x100, 0x200);
+        h.sync_memlist(&mut mem);
+        // Region order is priority order: the accelerator header first.
+        let fast_header = mem.peek_u32(0x100); // lh_Head
+        (h, mem, fast_header)
+    }
+
+    #[test]
+    fn memlist_follows_the_free_list_and_only_rewrites_when_it_changed() {
+        let (mut h, mut mem, hdr) = memlist_heap();
+        let before = chain(&mem, hdr);
+        assert_eq!(before.len(), 1, "one free block: {before:?}");
+        let free_before = mem.peek_u32(hdr + MH_FREE);
+
+        // An allocation changes the free list; the header lags until the
+        // next sync (the documented laziness) and then follows it.
+        let a = h.alloc_for(&mut mem, 0x1000, 0x1000, 0).unwrap();
+        assert_eq!(mem.peek_u32(hdr + MH_FREE), free_before, "not yet");
+        h.sync_memlist(&mut mem);
+        assert_eq!(mem.peek_u32(hdr + MH_FREE), free_before - 0x1000);
+        assert_eq!(chain(&mem, hdr)[0].0, a + 0x1000);
+
+        // Nothing changed since: a second sync must not touch memory.
+        mem.poke_u8(a + 0x1000, 0xEE);
+        h.sync_memlist(&mut mem);
+        assert_eq!(mem.peek_u8(a + 0x1000), 0xEE, "clean sync is a no-op");
+
+        // Freeing makes a second chunk (the hole) and the sums still agree.
+        let b = h.alloc_for(&mut mem, 0x100, 0x100, 0).unwrap();
+        h.free(a).unwrap();
+        h.sync_memlist(&mut mem);
+        let c = chain(&mem, hdr);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(
+            c[0].0 < b && b < c[1].0,
+            "the live block sits between the chunks"
+        );
+        let sum: u32 = c.iter().map(|&(_, n)| n).sum();
+        assert_eq!(sum, mem.peek_u32(hdr + MH_FREE));
+    }
+
+    #[test]
+    fn memchunks_are_eight_byte_aligned_even_for_four_byte_blocks() {
+        let (mut h, mut mem, hdr) = memlist_heap();
+        // Host-internal allocations are only 4-aligned; leave odd holes.
+        let keep: Vec<u32> = (0..6)
+            .map(|_| h.alloc_for(&mut mem, 12, 12, 0).unwrap())
+            .collect();
+        for &k in keep.iter().step_by(2) {
+            h.free(k).unwrap();
+        }
+        h.sync_memlist(&mut mem);
+        for (start, size) in chain(&mem, hdr) {
+            assert_eq!(start % 8, 0, "chunk at {start:#x}");
+            assert_eq!(size % 8, 0, "chunk size {size:#x}");
+        }
+    }
+
+    #[test]
+    fn a_chip_region_the_program_fills_gets_an_empty_not_inverted_range() {
+        // Program/heap start beyond the chip region's end.
+        let layout = MemoryLayout::legacy_exact(0x4_0000);
+        let mut mem = FlatMemory::from_layout(&layout);
+        let mut h = GuestHeap::with_layout(layout, 0x8_0000, u32::MAX);
+        h.install_memlist(&mut mem, 0x100, 0x200);
+        h.sync_memlist(&mut mem);
+        let hdr = mem.peek_u32(0x100);
+        let lower = mem.peek_u32(hdr + MH_LOWER);
+        let upper = mem.peek_u32(hdr + MH_UPPER);
+        assert!(lower <= upper, "{lower:#x}..{upper:#x}");
+        assert_eq!(mem.peek_u32(hdr + MH_FREE), 0);
+    }
+
+    #[test]
+    fn reading_the_chunk_chain_is_not_a_sanitizer_violation() {
+        let layout = MemoryLayout::legacy_exact(4 * MIB);
+        let mut mem = FlatMemory::from_layout(&layout);
+        mem.enable_sanitizer();
+        let mut h = GuestHeap::with_layout(layout, 0x4000, u32::MAX);
+        h.set_quarantine_budget(0); // freed blocks return to the free list at once
+        h.install_memlist(&mut mem, 0x100, 0x200);
+        // Free a block so its bytes carry the Freed poison, then sync.
+        let a = h.alloc_for(&mut mem, 0x100, 0x100, 0).unwrap();
+        h.free(a).unwrap();
+        h.sync_memlist(&mut mem);
+        let hdr = mem.peek_u32(0x100);
+        // Walk the chain the way a guest does, through the checked path.
+        let mut c = AddressSpace::read_u32(&mem, hdr + MH_FIRST);
+        while c != 0 {
+            let _bytes = AddressSpace::read_u32(&mem, c + 4);
+            c = AddressSpace::read_u32(&mem, c);
+        }
+        assert!(
+            mem.shadow().unwrap().violations().is_empty(),
+            "walking MemList must not be reported"
+        );
     }
 
     #[test]
