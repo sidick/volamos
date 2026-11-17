@@ -115,10 +115,12 @@ anything that peeks the RTC at `$DC0000`, the Gayle/Gary registers around
 `$DA0000-$DEFFFF`, the custom chips at `$DFF000`, or the Kickstart ROM at
 `$F80000` — read and write addresses no RAM lives at.
 
-- **vamos** aborts the run when a guest touches the motherboard window
-  (an unmapped hardware access). An open amitools change (PR #277) would
-  instead make those reads return all ones (`0xFF`/`0xFFFF`/
-  `0xFFFFFFFF`) and ignore writes.
+- **vamos 0.8.1** aborts the run on the first such access —
+  `InvalidMemoryAccessError: Invalid Memory Access R(1): dc0003` — even
+  with `-H emu` or `-H ignore`, which only cover the `$DF0000` custom-chip
+  page. Since then amitools [PR #277](https://github.com/cnvogelg/amitools/pull/277)
+  (merged) makes those windows return all ones (`0xFF`/`0xFFFF`/
+  `0xFFFFFFFF`) and ignore writes, and the ROM window return 0.
 - **volamos** treats every address outside the [memory
   map](CLI-Reference.md#guest-memory-map)'s RAM regions as absent: reads
   return **0** and writes are dropped, on the interpreter and the JIT

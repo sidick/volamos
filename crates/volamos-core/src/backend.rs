@@ -1724,38 +1724,52 @@ mod tests {
 
     /// Issue #322, settled by the memory map (#332): addresses no RAM
     /// region covers -- the motherboard/CIA/RTC window, the custom-chip
-    /// page, and the ROM window -- read 0 and drop writes, on the
-    /// interpreter and through the JIT alike, and a probe's write is not
-    /// readable back. Measured on a real A1200 (Kickstart 3.1): the
-    /// unpopulated parts of `$DA0000-$DEFFFF` read 0, and a pattern
-    /// written there is not retained. (vamos's unmerged probe-window
-    /// change returns all ones instead, which that machine does not.)
+    /// page, the ROM window (reads *and* writes) and everything above the
+    /// highest region -- read 0 and drop writes at every access width,
+    /// and a probe's write is not readable back. Measured on a real
+    /// A1200 (Kickstart 3.1): the unpopulated parts of `$DA0000-$DEFFFF`
+    /// read 0 and a pattern written there is not retained. (amitools
+    /// #277, merged after vamos 0.8.1, returns all ones instead.)
+    ///
+    /// The accesses sit in a `DBRA` loop: the trace JIT only compiles
+    /// backward-branch loops, so straight-line code would never leave the
+    /// interpreter and the JIT leg would prove nothing.
     #[test]
     fn unmapped_device_and_rom_windows_read_zero_and_drop_writes() {
         use crate::memmap::MemoryLayout;
         let layout = MemoryLayout::default_for_address_bits(32);
-        let words: &[u16] = &[
+        let body: Vec<u16> = vec![
             0x33FC, 0x1234, 0x00DB, 0x0000, // MOVE.W #$1234,($DB0000).L
             0x3039, 0x00DB, 0x0000, // MOVE.W ($DB0000).L,D0 -- write not retained
-            0x2239, 0x00F8, 0x0000, // MOVE.L ($F80000).L,D1 -- ROM window
+            0x1A39, 0x00DB, 0x0003, // MOVE.B ($DB0003).L,D5 -- byte access
+            0x2239, 0x00F8, 0x0000, // MOVE.L ($F80000).L,D1 -- ROM window read
+            0x23FC, 0xDEAD, 0xBEEF, 0x00F8, 0x0000, // MOVE.L #$DEADBEEF,($F80000).L
+            0x2C39, 0x00F8, 0x0000, // MOVE.L ($F80000).L,D6 -- ROM write dropped
             0x3439, 0x00DF, 0xF002, // MOVE.W ($DFF002).L,D2 -- custom chip page
             0x23FC, 0xFFFF, 0xFFFF, 0x00DE, 0x0002, // MOVE.L #-1,($DE0002).L
             0x2639, 0x00DE, 0x0002, // MOVE.L ($DE0002).L,D3
-            0xA000, // A-line trap: stop here
+            0x23FC, 0x1111, 0x1111, 0x4000, 0x0000, // MOVE.L #$11111111,($40000000).L
+            0x2E39, 0x4000, 0x0000, // MOVE.L ($40000000).L,D7 -- above every region
         ];
+        let mut words: Vec<u16> = vec![0x7802]; // MOVEQ #2,D4: three passes
+        words.extend_from_slice(&body);
+        // DBRA D4 back to the first body word (displacement is relative
+        // to the word after the opcode).
+        let disp = -((body.len() as i32) * 2 + 2);
+        words.extend_from_slice(&[0x51CC, disp as i16 as u16, 0xA000]);
+
         let run = |jit: bool| {
             let mut mem = FlatMemory::from_layout(&layout);
-            load_words(&mut mem, TRAP_TABLE_END, words);
+            load_words(&mut mem, TRAP_TABLE_END, &words);
             let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
             cpu.set_jit(jit);
             cpu.set_pc(TRAP_TABLE_END);
             let reason = cpu.run(&mut mem);
-            (
-                reason,
-                (0..4)
-                    .map(|n| cpu.data_register(DataRegister(n)))
-                    .collect::<Vec<_>>(),
-            )
+            let regs: Vec<u32> = [0, 1, 2, 3, 5, 6, 7]
+                .into_iter()
+                .map(|n| cpu.data_register(DataRegister(n)))
+                .collect();
+            (reason, regs, cpu.data_register(DataRegister(4)) & 0xFFFF)
         };
         let interp = run(false);
         assert!(
@@ -1763,7 +1777,8 @@ mod tests {
             "ran to the trap: {:?}",
             interp.0
         );
-        assert_eq!(interp.1, [0, 0, 0, 0]);
+        assert_eq!(interp.1, [0; 7], "every read of unmapped space is 0");
+        assert_eq!(interp.2, 0xFFFF, "the loop ran to completion");
         assert_eq!(run(true), interp, "the JIT agrees with the interpreter");
     }
 

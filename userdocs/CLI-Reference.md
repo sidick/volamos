@@ -239,10 +239,12 @@ address bus of the selected CPU -- ask for a 32-bit address bus with --cpu
 ```
 
 Addresses outside every region — the device, CIA and custom-chip
-windows, the Kickstart ROM range and anything above the highest region —
-are unmapped: reads return 0 and writes are dropped, so a hardware probe
+windows, the Kickstart ROM range and (on a 32-bit CPU) anything above
+the highest region — are unmapped: reads return 0 and writes are dropped, so a hardware probe
 sees an empty bus (see [Differences from
 vamos](Differences-from-vamos.md#hardware-probes-of-unmapped-address-space)).
+A 68000/68010 has a 24-bit address bus, so there addresses above 16 MiB
+wrap to 24 bits instead of being unmapped.
 
 The guest stack lives at the top of the one run of RAM that starts at
 address 0 (chip plus an abutting `--fast`).
