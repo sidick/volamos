@@ -655,6 +655,19 @@ Superscalar dispatch is also what lets [`--cache`](#-cache) matter on
 the 68060 at all, since pairing needs both instructions to stream from
 the instruction cache.
 
+The same library also turns on the **branch cache** (`CACR.EBC`) and the
+store buffer (`CACR.ESB`); this was read off the real `68060.library`'s own
+init code rather than assumed. volamos starts `--cpu 68060` with both set
+too. `EBC` is the one that changes timing: a correctly predicted taken
+branch folds out of the instruction stream, so branchy code reports fewer
+cycles — on the loops used to check this, 3% to 14% fewer. Results are
+unchanged, and so is every other CPU model. A program can still switch the
+branch cache off itself with `movec` to `CACR`, which is honoured. (The
+library's `CacheControl()` patch only ever changes the instruction and data
+cache enables, so a `CacheControl()` call cannot turn it off.) As with the
+superscalar change, 68060 cycle counts from earlier volamos versions are
+higher on such code and are not comparable.
+
 ## `--cache`
 
 Models a direct-mapped instruction cache, sized by `--cpu` (256 bytes on
