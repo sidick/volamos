@@ -339,6 +339,27 @@ pub struct SegList {
     pub alloc_addrs: Vec<u32>,
 }
 
+/// Allocates the block for one hunk (`total` bytes, header included)
+/// from the kind of memory the hunk asks for ([`loader::HunkMemory`]), as
+/// real `LoadSeg` does with `AllocMem`. A "prefers fast" hunk falls back
+/// to any memory when there is no fast RAM; a chip hunk, or one with
+/// explicit extended attributes, does not fall back (the request fails,
+/// exactly as `AllocMem` would return `NULL`). Shared by every site that
+/// allocates hunks (`LoadSeg`, overlay nodes), so none can forget the
+/// flags.
+fn alloc_hunk(
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+    total: u32,
+    memory: loader::HunkMemory,
+) -> Result<u32, GuestHeapError> {
+    let wanted = crate::execmem::placement(memory.requirements());
+    match heap.alloc_for(mem, total, total, wanted) {
+        Err(_) if memory.is_preference() => heap.alloc_for(mem, total, total, 0),
+        other => other,
+    }
+}
+
 /// Allocates one [`GuestHeap`] block per hunk in `file`, writes each
 /// segment's header (`seg_length`/`next_seg`) and payload (code/data
 /// verbatim, `BSS` zero-filled), chains them via `next_seg`, and applies
@@ -385,17 +406,7 @@ pub(crate) fn build_seglist(
                 available: 0,
             });
         };
-        // Each hunk is allocated from the kind of memory it asks for
-        // (HUNKF_CHIP/HUNKF_FAST, or the extended MEMF_* attributes), as
-        // real LoadSeg does with AllocMem. A "prefers fast" hunk falls
-        // back to any memory when there is no fast RAM; a chip hunk does
-        // not fall back (a failed request fails the load, freeing what
-        // was allocated so far).
-        let wanted = crate::execmem::placement(hunk.memory.requirements());
-        let allocated = match heap.alloc_for(&mut *mem, total, total, wanted) {
-            Err(_) if hunk.memory.is_preference() => heap.alloc_for(&mut *mem, total, total, 0),
-            other => other,
-        };
+        let allocated = alloc_hunk(heap, &mut *mem, total, hunk.memory);
         match allocated {
             Ok(addr) => alloc_addrs.push(addr),
             Err(e) => {
@@ -785,7 +796,7 @@ impl DosState {
                 }
                 return Err(ERROR_NO_FREE_STORE);
             };
-            match heap.alloc(&mut *mem, total) {
+            match alloc_hunk(heap, &mut *mem, total, hunk.memory) {
                 Ok(addr) => alloc_addrs.push(addr),
                 Err(_) => {
                     for &addr in &alloc_addrs {
@@ -2748,6 +2759,40 @@ mod tests {
             .collect();
         // CPU-board RAM (any/fast) is 0x505; chip is 0x703.
         assert_eq!(attrs, [0x505, 0x703, 0x505]);
+    }
+
+    /// The shared hunk allocator (used by `LoadSeg` and by overlay nodes)
+    /// applies the flags and the fast-hunk fallback itself.
+    #[test]
+    fn alloc_hunk_applies_the_flags_and_the_fast_fallback() {
+        use loader::HunkMemory;
+        let (mut heap, mut mem) = layout_heap();
+        let kinds = [
+            (HunkMemory::Any, 0x505),
+            (HunkMemory::Chip, 0x703),
+            (HunkMemory::Fast, 0x505),
+            (HunkMemory::Attributes(crate::execmem::MEMF_CHIP), 0x703),
+        ];
+        for (memory, want) in kinds {
+            let a = alloc_hunk(&mut heap, &mut mem, 64, memory).unwrap();
+            assert_eq!(heap.attributes_at(a), Some(want), "{memory:?}");
+        }
+        // No fast RAM: "prefers fast" falls back, "must be fast" fails.
+        use crate::memmap::{MemoryLayout, MemoryRegion, RegionKind};
+        let chip_only =
+            MemoryLayout::new(vec![MemoryRegion::new(RegionKind::Chip, 0, 0x20_0000)]).unwrap();
+        let mut heap = GuestHeap::with_layout(chip_only.clone(), 0x4000, u32::MAX);
+        let mut mem = FlatMemory::from_layout(&chip_only);
+        assert!(alloc_hunk(&mut heap, &mut mem, 64, HunkMemory::Fast).is_ok());
+        assert!(
+            alloc_hunk(
+                &mut heap,
+                &mut mem,
+                64,
+                HunkMemory::Attributes(crate::execmem::MEMF_FAST)
+            )
+            .is_err()
+        );
     }
 
     /// The extended form names the `MEMF_*` attributes outright.

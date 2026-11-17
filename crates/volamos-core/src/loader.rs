@@ -1278,8 +1278,8 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
         };
         // Memory-flag bits (see HUNK_SIZE_FLAGS_MASK's doc) apply to
         // body type words too; both bits set means an extra longword of
-        // memory attributes follows the type word -- consume and ignore
-        // it (this runtime has one flat memory type).
+        // memory attributes follows the type word -- read it, it names the
+        // `MEMF_*` attributes outright (see HunkMemory::Attributes).
         let body_type = raw_body_type & !HUNK_SIZE_FLAGS_MASK;
         let mut extended_attributes = None;
         if raw_body_type & HUNK_SIZE_FLAGS_MASK == HUNK_SIZE_FLAGS_MASK
@@ -1287,12 +1287,15 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
         {
             extended_attributes = Some(r.read_u32()?);
         }
-        // The size table's flags win (that is what real LoadSeg
-        // allocates from); a body type word that carries flags the table
-        // lacks (some tools only set them there) fills in.
-        let memory = match table_flags[i] {
-            0 => HunkMemory::from_flag_bits(raw_body_type, extended_attributes),
-            flags => HunkMemory::from_flag_bits(flags, extended_attributes),
+        // Precedence: explicit extended attributes (both bits in the body
+        // type word plus the extra longword) are the most specific thing
+        // the file says and win; otherwise the size table's flags (what
+        // real LoadSeg allocates from); a body type word that carries
+        // flags the table lacks (some tools only set them there) fills in.
+        let memory = match (extended_attributes, table_flags[i]) {
+            (Some(attributes), _) => HunkMemory::Attributes(attributes),
+            (None, 0) => HunkMemory::from_flag_bits(raw_body_type, None),
+            (None, flags) => HunkMemory::from_flag_bits(flags, None),
         };
         let (kind, data) = match body_type {
             HUNK_CODE | HUNK_DATA => {
@@ -1575,13 +1578,13 @@ pub fn parse_overlay_node(bytes: &[u8], file_offset: usize) -> Result<OverlayNod
 /// normally has `0` (or, for same-hunk self-references, an intra-hunk
 /// offset) stored there; this loader does not assume which, it just adds.
 ///
+/// The entry point is defined as the load address of hunk 0.
 ///
 /// Memory flags ([`HunkMemory`]) are not acted on here: the program is
 /// laid out contiguously from `base` in low memory, which is chip RAM, so
 /// `HUNKF_CHIP` hunks are already where they must be, and the rest simply
 /// stay in chip too rather than moving to fast RAM. Programs loaded through
 /// the guest heap (`LoadSeg`, overlays) get the placement they ask for.
-/// The entry point is defined as the load address of hunk 0.
 pub fn load(
     file: &HunkFile,
     mem: &mut dyn AddressSpace,
@@ -2165,6 +2168,7 @@ mod tests {
             (CHIP, FAST, None),           // the table wins over the body
             (BOTH, BOTH, Some(0x1_0006)), // extended: MEMF_FAST|CHIP|CLEAR
             (BOTH, 0, None),              // both bits but no attributes: any
+            (CHIP, BOTH, Some(0x4)),      // explicit attributes beat a lone table bit
         ]))
         .unwrap();
         let memory: Vec<HunkMemory> = file.hunks.iter().map(|h| h.memory).collect();
@@ -2178,6 +2182,7 @@ mod tests {
                 HunkMemory::Chip,
                 HunkMemory::Attributes(0x1_0006),
                 HunkMemory::Any,
+                HunkMemory::Attributes(0x4),
             ]
         );
         // The flags never leak into the sizes or the content.

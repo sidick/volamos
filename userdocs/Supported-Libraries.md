@@ -119,20 +119,20 @@ Changelog.
   so two volumes on the same host disk show overlapping capacity. Where
   the host can't be asked (non-Unix), a fixed 100,000-block disk is
   reported instead.
-- `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists) place each hunk in the
-  kind of memory its size longword asks for: a `HUNKF_CHIP` hunk (data
+- `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
+  `SystemTagList`/`System`/`Execute` for tools that shell out to
+  another guest program.
+- Hunk memory flags: `LoadSeg` and overlay programs place each hunk in
+  the kind of memory its size longword asks for. A `HUNKF_CHIP` hunk (data
   for the custom chips) is in chip RAM, so `TypeOfMem` on it reports a
   chip address as it would on hardware; a `HUNKF_FAST` hunk prefers fast
   RAM and falls back to any memory when there is none; the extended form
-  names the `MEMF_*` attributes outright; an unflagged hunk takes any
-  memory, preferring fast RAM like `AllocMem(MEMF_ANY)`. A chip hunk that
-  does not fit what chip RAM has left fails the `LoadSeg` and frees what
-  it had allocated. The same applies to overlay programs. The program
-  you start from the command line is laid out in low memory, which is
-  chip RAM, whatever its flags say (so `HUNKF_FAST` hunks of the main
-  program load into chip RAM too). Also: `RunCommand`, and
-  `SystemTagList`/`System`/`Execute` for tools that shell out to
-  another guest program.
+  names the `MEMF_*` attributes outright (and, like `AllocMem`, fails when
+  they cannot be met); an unflagged hunk takes any memory, preferring fast
+  RAM like `AllocMem(MEMF_ANY)`. A hunk that does not fit fails the
+  `LoadSeg` and frees what it had allocated. The program you start from
+  the command line is laid out in low memory, which is chip RAM, whatever
+  its flags say, so its `HUNKF_FAST` hunks load into chip RAM too.
 - `CheckSignal`.
 - `CreateNewProc` — a real second task, cooperatively scheduled
   alongside the main one (see `exec.library`'s "Tasks and signals"
