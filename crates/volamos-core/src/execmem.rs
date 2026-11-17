@@ -9,7 +9,16 @@
 //! over the same flat [`GuestHeap`] the other allocators use -- see
 //! [`create_pool_handler`]).
 //!
-//! # Design: flat, no `MemHeader`/`MemChunk` emulation
+//! # Design: one allocator over typed regions, no `MemHeader`/`MemChunk` emulation
+//!
+//! Since issue #332 the one [`crate::guestmem::GuestHeap`] is built over a
+//! [`crate::memmap::MemoryLayout`]: its free blocks belong to chip, slow,
+//! Zorro or CPU-board *regions*, and the memory-kind bits of an
+//! `AllocMem` requirement pick among them like real exec picks a
+//! `MemHeader` (see the `MEMF_*` notes below). That is still a single
+//! arena shared with the runtime's own host-side allocations; what the
+//! guest cannot do is walk a `MemHeader`/`MemChunk` chain (`MemList` is
+//! empty, issue #318).
 //!
 //! Per `docs/plan.md`'s Phase 3 scope ("start flat, add `MemHeader`
 //! emulation only when a corpus binary trips on it"), this module does
@@ -112,48 +121,50 @@ use crate::lvos::exec::EXEC_LVOS;
 use crate::memory::AddressSpace;
 use crate::sanitize::PoisonReason;
 
-// --- MEMF_* flags (a subset of the real `<exec/memory.h>` bits; this
-// runtime is flat memory -- everything is simultaneously "chip" and
-// "fast" -- so only MEMF_CLEAR and the AvailMem-only MEMF_LARGEST change
-// behavior here. The others are accepted (never rejected -- flat memory
-// makes every one of them trivially satisfiable) purely so guest code
-// that passes them doesn't need special-casing, and so future handlers
-// have the real bit values on hand if a corpus binary needs them. ---
+// --- MEMF_* flags (a subset of the real `<exec/memory.h>` bits). Since
+// issue #332 the *kind-of-memory* bits (PUBLIC, CHIP, FAST, LOCAL,
+// 24BITDMA) are honoured: guest RAM is a set of regions, each with the
+// attribute word of the real `MemHeader` it models, and an allocation
+// only comes from a region whose attributes include every requested bit
+// (see `PLACEMENT_BITS` and `GuestHeap::alloc_for`). The behaviour bits
+// that change what a call does -- MEMF_CLEAR, and the AvailMem-only
+// MEMF_LARGEST/MEMF_TOTAL -- are handled here; MEMF_REVERSE and
+// MEMF_NO_EXPUNGE are still accepted and ignored. ---
 
-/// Requests memory from public (non-chip-specific) RAM. Flat memory: a
-/// no-op here (every allocation is equally "public").
+/// Requests memory from public RAM. Every region is public, so this
+/// never excludes one, but it is part of the kind-of-memory match.
 pub const MEMF_PUBLIC: u32 = 1 << 0;
-/// Requests chip RAM. Flat memory: accepted and ignored -- there is no
-/// separate chip/fast distinction to honor.
+/// Requests chip RAM: only the chip region satisfies it, and
+/// `MEMF_CHIP | MEMF_FAST` (no such memory) fails like real exec.
 pub const MEMF_CHIP: u32 = 1 << 1;
-/// Requests fast RAM. Flat memory: accepted and ignored, as [`MEMF_CHIP`].
+/// Requests fast RAM: any non-chip region (slow, Zorro II/III,
+/// CPU-board RAM). With no such region the allocation fails.
 pub const MEMF_FAST: u32 = 1 << 2;
-/// Requests memory local to the caller's own board (Zorro-era
-/// multiprocessing concept). Not meaningful in flat memory; accepted and
-/// ignored.
+/// Requests memory that survives a reset: chip RAM, slow RAM and
+/// CPU-board RAM have it, Zorro II/III expansion RAM does not
+/// (measured on Kickstart 3.1).
 pub const MEMF_LOCAL: u32 = 1 << 8;
-/// Requests memory from a "24-bit" (Zorro II autoconfig) address range.
-/// Not meaningful in flat memory; accepted and ignored.
+/// Requests memory a 24-bit DMA device can reach: regions wholly below
+/// 16 MiB.
 pub const MEMF_24BITDMA: u32 = 1 << 9;
-/// Requests the returned block be zeroed before use. The one `AllocMem`/
-/// `AllocVec` requirements flag this module actually honors.
+/// Requests the returned block be zeroed before use. Honoured by
+/// `AllocMem`/`AllocVec`/`AllocPooled`.
 pub const MEMF_CLEAR: u32 = 1 << 16;
 /// `AvailMem`-only: report the size of the single largest free block
-/// instead of the sum of all free bytes.
+/// instead of the sum of all free bytes. Wins over [`MEMF_TOTAL`] when
+/// both are given, as on real Kickstart 3.1.
 pub const MEMF_LARGEST: u32 = 1 << 17;
 /// Requests the allocator search the free list from the opposite end
 /// (used historically to reduce fragmentation between chip/fast pools).
-/// This runtime's single flat free list has no "other end" that matters;
-/// accepted and ignored.
+/// Accepted and ignored.
 pub const MEMF_REVERSE: u32 = 1 << 18;
-/// `AvailMem`-only historically ("total memory of this type", as opposed
-/// to free memory); not implemented as a distinct query here (this
-/// module has no notion of total-vs-free by memory type, since there's
-/// only one flat pool) -- accepted as a recognized bit but currently
-/// behaves the same as the plain (non-`MEMF_LARGEST`) `AvailMem` query.
+/// `AvailMem`-only: the whole size of the matching regions, free or not
+/// (an 8 MiB Zorro II board reports 8388608), instead of the free
+/// bytes. Needs a memory layout; a bare heap without one answers with
+/// the plain free-bytes query.
 pub const MEMF_TOTAL: u32 = 1 << 19;
-/// Requests physically contiguous memory suitable for hardware DMA. Flat
-/// memory: every allocation is already contiguous; accepted and ignored.
+/// "Do not expunge libraries to satisfy this request." No library is
+/// ever expunged by an allocation here; accepted and ignored.
 pub const MEMF_NO_EXPUNGE: u32 = 1 << 31;
 
 /// The `MEMF_*` bits of an `AllocMem`/`AvailMem` requirement that name a
@@ -1123,15 +1134,15 @@ fn cache_clear_e_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// most chip RAM an OCS/ECS machine has).
 const CHIP_RAM_END: u32 = 0x20_0000;
 
-/// `TypeOfMem` (LVO -534): `A1` = address, `D0` = attributes. Classifies
-/// by address like a real machine's memory map: `0..2 MiB` is chip RAM
-/// (`MEMF_PUBLIC | MEMF_CHIP`, including the reserved low region where
-/// real vectors and `ExecBase` live), `2 MiB` up to the end of guest RAM
-/// is fast RAM (`MEMF_PUBLIC | MEMF_FAST`), and anything past the end of
-/// RAM (so also the whole range if `--ram` is under 2 MiB) is `0`.
-/// `AllocMem` itself ignores `MEMF_CHIP`/`MEMF_FAST` (the heap is one
-/// flat range), so an allocation's answer depends only on where the
-/// heap placed it, not on the flags it was requested with.
+/// `TypeOfMem` (LVO -534): `A1` = address, `D0` = attributes. With a
+/// memory layout (every real run) this is the `mh_Attributes` of the
+/// region containing the address -- exactly what real exec reports (chip
+/// `0x703`, Zorro II fast `0x605`, ... see
+/// [`crate::memmap::MemoryRegion::attributes`]) -- and `0` outside every
+/// region. A bare heap has no layout and only exists in unit tests; it
+/// falls back to the old address-based guess (`0..2 MiB` is
+/// `MEMF_PUBLIC | MEMF_CHIP`, the rest of RAM `MEMF_PUBLIC | MEMF_FAST`,
+/// past RAM `0`) using [`CHIP_RAM_END`].
 fn type_of_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let addr = ctx.cpu.address_register(AddressRegister(1));
     // With a memory layout, the attributes of the region the address is
