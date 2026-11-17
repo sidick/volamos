@@ -108,6 +108,41 @@ program that drives its behaviour off directory transitions — the real
 `List` command uses it to decide when to print a new `Directory "..."`
 header — has nothing to work from.
 
+### Hardware probes of unmapped address space
+
+Programs that detect hardware — SysInfo-style tools, memory testers,
+anything that peeks the RTC at `$DC0000`, the Gayle/Gary registers around
+`$DA0000-$DEFFFF`, the custom chips at `$DFF000`, or the Kickstart ROM at
+`$F80000` — read and write addresses no RAM lives at.
+
+- **vamos** aborts the run when a guest touches the motherboard window
+  (an unmapped hardware access). An open amitools change (PR #277) would
+  instead make those reads return all ones (`0xFF`/`0xFFFF`/
+  `0xFFFFFFFF`) and ignore writes.
+- **volamos** treats every address outside the [memory
+  map](CLI-Reference.md#guest-memory-map)'s RAM regions as absent: reads
+  return **0** and writes are dropped, on the interpreter and the JIT
+  alike. Nothing aborts, and a pattern written to such an address is not
+  readable back.
+
+The all-ones default is not what a real machine does. On an A1200
+(Kickstart 3.1, checked under Copperline) the unpopulated parts of
+`$DA0000-$DEFFFF` — `$DA0000`, `$DB0000`, `$DD1000` — read **0**, and a
+word written to `$DB0000` read back `0001`, not the value written. So
+zeros are the closer match, and a probe that stores a pattern and reads
+it back correctly concludes "nothing here".
+
+What volamos does *not* model — because it is the answer of a particular
+chipset, ROM or board, not a property of an empty bus: the registers that
+*are* populated on a real machine (the Gayle/Gary ID bytes at
+`$DE0002`, the RTC nibbles at `$DC0000`, `DMACONR`/`VPOSR` at
+`$DFF002`/`$DFF006`) read 0 here, and the ROM window `$F80000-$FFFFFF`
+reads 0 rather than the Kickstart header (`$11144EF9` on 3.1), since
+there is no ROM image. With the legacy `--ram 16M` single-range layout
+those addresses are ordinary guest RAM again; use the default
+[memory map](CLI-Reference.md#guest-memory-map) for the real-hardware
+behaviour.
+
 ## Clock and file dates: local time, not UTC
 
 An Amiga has no notion of a time zone. Its battery clock, `DateStamp()`

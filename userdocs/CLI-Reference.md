@@ -238,6 +238,12 @@ address bus of the selected CPU -- ask for a 32-bit address bus with --cpu
 68020 (or any later model)
 ```
 
+Addresses outside every region — the device, CIA and custom-chip
+windows, the Kickstart ROM range and anything above the highest region —
+are unmapped: reads return 0 and writes are dropped, so a hardware probe
+sees an empty bus (see [Differences from
+vamos](Differences-from-vamos.md#hardware-probes-of-unmapped-address-space)).
+
 The guest stack lives at the top of the one run of RAM that starts at
 address 0 (chip plus an abutting `--fast`).
 

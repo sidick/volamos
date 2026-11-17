@@ -1722,6 +1722,51 @@ mod tests {
         assert_eq!(AddressSpace::read_u32(&mem, ACCEL), 7);
     }
 
+    /// Issue #322, settled by the memory map (#332): addresses no RAM
+    /// region covers -- the motherboard/CIA/RTC window, the custom-chip
+    /// page, and the ROM window -- read 0 and drop writes, on the
+    /// interpreter and through the JIT alike, and a probe's write is not
+    /// readable back. Measured on a real A1200 (Kickstart 3.1): the
+    /// unpopulated parts of `$DA0000-$DEFFFF` read 0, and a pattern
+    /// written there is not retained. (vamos's unmerged probe-window
+    /// change returns all ones instead, which that machine does not.)
+    #[test]
+    fn unmapped_device_and_rom_windows_read_zero_and_drop_writes() {
+        use crate::memmap::MemoryLayout;
+        let layout = MemoryLayout::default_for_address_bits(32);
+        let words: &[u16] = &[
+            0x33FC, 0x1234, 0x00DB, 0x0000, // MOVE.W #$1234,($DB0000).L
+            0x3039, 0x00DB, 0x0000, // MOVE.W ($DB0000).L,D0 -- write not retained
+            0x2239, 0x00F8, 0x0000, // MOVE.L ($F80000).L,D1 -- ROM window
+            0x3439, 0x00DF, 0xF002, // MOVE.W ($DFF002).L,D2 -- custom chip page
+            0x23FC, 0xFFFF, 0xFFFF, 0x00DE, 0x0002, // MOVE.L #-1,($DE0002).L
+            0x2639, 0x00DE, 0x0002, // MOVE.L ($DE0002).L,D3
+            0xA000, // A-line trap: stop here
+        ];
+        let run = |jit: bool| {
+            let mut mem = FlatMemory::from_layout(&layout);
+            load_words(&mut mem, TRAP_TABLE_END, words);
+            let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
+            cpu.set_jit(jit);
+            cpu.set_pc(TRAP_TABLE_END);
+            let reason = cpu.run(&mut mem);
+            (
+                reason,
+                (0..4)
+                    .map(|n| cpu.data_register(DataRegister(n)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let interp = run(false);
+        assert!(
+            matches!(interp.0, StopReason::Trap(_)),
+            "ran to the trap: {:?}",
+            interp.0
+        );
+        assert_eq!(interp.1, [0, 0, 0, 0]);
+        assert_eq!(run(true), interp, "the JIT agrees with the interpreter");
+    }
+
     /// Test: guest-CPU bus accesses are counted through the
     /// `m68k::AddressBus` impl, and volamos's *own* access to guest memory
     /// through `AddressSpace` is not.
