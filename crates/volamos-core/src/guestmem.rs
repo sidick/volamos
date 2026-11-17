@@ -413,6 +413,12 @@ impl GuestHeap {
         heap
     }
 
+    /// Whether this heap was built with a memory layout
+    /// ([`GuestHeap::with_layout`]).
+    pub fn has_layout(&self) -> bool {
+        self.layout.is_some()
+    }
+
     /// `mh_Attributes` of the region containing `addr` (what `TypeOfMem`
     /// reports), or `None` if there is no layout or `addr` is outside
     /// every region.
@@ -953,11 +959,14 @@ impl GuestHeap {
     /// [`GuestHeap::total_free`] counting only regions whose attributes
     /// include every bit of `required` (`AvailMem(MEMF_CHIP)` etc.).
     pub fn total_free_matching(&self, required: u32) -> u32 {
-        self.free
+        let total: u64 = self
+            .free
             .iter()
             .filter(|b| self.block_matches(b.start, required))
-            .map(|b| b.size)
-            .sum()
+            .map(|b| u64::from(b.size))
+            .sum();
+        // A guest sees a 32-bit count; more than 4 GiB free saturates.
+        total.min(u64::from(u32::MAX)) as u32
     }
 
     /// [`GuestHeap::largest_free`] over the matching regions only.

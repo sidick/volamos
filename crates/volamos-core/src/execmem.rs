@@ -1138,7 +1138,7 @@ fn type_of_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // layout, so those fall back to the address-based guess below.
     let attributes = if let Some(attrs) = ctx.heap.attributes_at(addr) {
         attrs
-    } else if ctx.heap.capacity_matching(0).is_some() || (addr as usize) >= ctx.mem.len() {
+    } else if ctx.heap.has_layout() || (addr as usize) >= ctx.mem.len() {
         // Outside every region of the layout (or, for a bare heap,
         // past the end of RAM).
         0

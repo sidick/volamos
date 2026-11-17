@@ -412,16 +412,8 @@ impl MemoryLayout {
     /// later per-CPU defaults replace.
     pub fn legacy_flat(total: u32) -> Self {
         let total = (total & !(REGION_GRANULE - 1)).max(REGION_GRANULE);
-        let chip = total.min(MAX_CHIP_SIZE);
-        let mut regions = vec![MemoryRegion::new(RegionKind::Chip, 0, chip)];
-        if total > chip {
-            regions.push(MemoryRegion::new(
-                RegionKind::Accelerator,
-                chip,
-                total - chip,
-            ));
-        }
-        Self::build(regions, false).expect("the legacy flat layout is valid by construction")
+        Self::build(Self::legacy_regions(total), false)
+            .expect("the legacy flat layout is valid by construction")
     }
 
     /// The layout every run had before #332, built from an exact byte
@@ -431,16 +423,35 @@ impl MemoryLayout {
     /// describe whatever size an existing caller already built its
     /// memory with (tests use sizes below one granule).
     pub fn legacy_exact(total: u32) -> Self {
+        Self {
+            regions: Self::legacy_regions(total),
+        }
+    }
+
+    /// Chip, then accelerator RAM up to `total`, split at the 24-bit
+    /// boundary: real exec gives the part below 16 MiB (which DMA can
+    /// reach) its own `MemHeader` with `MEMF_24BITDMA`, and one block
+    /// straddling the line would lose the bit for all of it.
+    fn legacy_regions(total: u32) -> Vec<MemoryRegion> {
+        const BOUNDARY: u32 = 0x100_0000;
         let chip = total.min(MAX_CHIP_SIZE);
         let mut regions = vec![MemoryRegion::new(RegionKind::Chip, 0, chip)];
         if total > chip {
+            let low_end = total.min(BOUNDARY);
             regions.push(MemoryRegion::new(
                 RegionKind::Accelerator,
                 chip,
-                total - chip,
+                low_end - chip,
             ));
+            if total > BOUNDARY {
+                regions.push(MemoryRegion::new(
+                    RegionKind::Accelerator,
+                    BOUNDARY,
+                    total - BOUNDARY,
+                ));
+            }
         }
-        Self { regions }
+        regions
     }
 
     /// Index into [`Self::regions`] of the region containing `addr`.
@@ -572,6 +583,7 @@ mod tests {
             l.regions()[1],
             r(RegionKind::Accelerator, 2 * MIB, 14 * MIB)
         );
+        assert_eq!(l.regions().len(), 2, "16 MiB is exactly the 24-bit space");
     }
 
     #[test]
@@ -617,6 +629,29 @@ mod tests {
         assert_eq!(l.regions().len(), 1, "all chip below 2 MiB");
         assert_eq!(l.region_index_at(0x2_0005), Some(0));
         assert_eq!(l.region_index_at(0x2_0006), None);
+    }
+
+    #[test]
+    fn legacy_layouts_split_accelerator_ram_at_the_24_bit_boundary() {
+        // Beyond 16 MiB, the part DMA can reach keeps MEMF_24BITDMA.
+        for l in [
+            MemoryLayout::legacy_flat(64 * MIB),
+            MemoryLayout::legacy_exact(64 * MIB),
+        ] {
+            assert_eq!(l.regions().len(), 3);
+            assert_eq!(
+                l.regions()[1],
+                r(RegionKind::Accelerator, 2 * MIB, 14 * MIB)
+            );
+            assert_eq!(
+                l.regions()[2],
+                r(RegionKind::Accelerator, 16 * MIB, 48 * MIB)
+            );
+            assert_eq!(l.regions()[1].attributes(), 0x705);
+            assert_eq!(l.regions()[2].attributes(), 0x505);
+            assert!(l.is_contiguous_from_zero());
+            assert_eq!(l.total_size(), 64 * u64::from(MIB));
+        }
     }
 
     #[test]
