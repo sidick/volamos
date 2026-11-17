@@ -1030,18 +1030,96 @@ impl FlatMemory {
     }
 
     /// One byte of RAM from any segment, `None` if unmapped.
+    #[inline]
     fn byte_at(&self, addr: u32) -> Option<u8> {
-        if let Some(b) = self.bytes.get(addr as usize) {
-            return Some(*b);
+        match self.bytes.get(addr as usize) {
+            Some(b) => Some(*b),
+            None => self.byte_at_cold(addr),
         }
+    }
+
+    /// [`Self::byte_at`] past the primary segment, out of line so the
+    /// hot path (every bus access) stays as small as it was before extra
+    /// segments existed.
+    #[cold]
+    #[inline(never)]
+    fn byte_at_cold(&self, addr: u32) -> Option<u8> {
         self.extra_slice(addr, 1).map(|s| s[0])
     }
 
+    #[inline]
     fn set_byte_at(&mut self, addr: u32, value: u8) {
-        if let Some(slot) = self.bytes.get_mut(addr as usize) {
-            *slot = value;
-        } else if let Some(s) = self.extra_slice_mut(addr, 1) {
+        match self.bytes.get_mut(addr as usize) {
+            Some(slot) => *slot = value,
+            None => self.set_byte_at_cold(addr, value),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_byte_at_cold(&mut self, addr: u32, value: u8) {
+        if let Some(s) = self.extra_slice_mut(addr, 1) {
             s[0] = value;
+        }
+    }
+
+    /// The accesses [`AddressSpace`]'s hot paths hand off when the span is
+    /// not wholly inside the primary segment: an extra segment, a span
+    /// straddling a gap or the top of a narrower bus, or unmapped space.
+    /// Out of line (`#[cold]`) so the generic `run_batch` instantiation
+    /// the `m68k` crate builds around this bus is not made bigger, and so
+    /// slower, by code ordinary loops never run.
+    #[cold]
+    #[inline(never)]
+    fn read_u16_cold(&self, addr: u32) -> u16 {
+        match self.extra_slice(addr, 2) {
+            Some(s) => u16::from_be_bytes(s.try_into().unwrap()),
+            None => {
+                let hi = u16::from(self.byte_at_offset(addr, 0).unwrap_or(0));
+                let lo = u16::from(self.byte_at_offset(addr, 1).unwrap_or(0));
+                (hi << 8) | lo
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_u16_cold(&mut self, addr: u32, value: u16) {
+        match self.extra_slice_mut(addr, 2) {
+            Some(s) => s.copy_from_slice(&value.to_be_bytes()),
+            None => {
+                self.set_byte_at_offset(addr, 0, (value >> 8) as u8);
+                self.set_byte_at_offset(addr, 1, value as u8);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_u32_cold(&self, addr: u32) -> u32 {
+        match self.extra_slice(addr, 4) {
+            Some(s) => u32::from_be_bytes(s.try_into().unwrap()),
+            None => {
+                let mut value = 0u32;
+                for i in 0..4u32 {
+                    let byte = self.byte_at_offset(addr, i).unwrap_or(0);
+                    value = (value << 8) | u32::from(byte);
+                }
+                value
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_u32_cold(&mut self, addr: u32, value: u32) {
+        match self.extra_slice_mut(addr, 4) {
+            Some(s) => s.copy_from_slice(&value.to_be_bytes()),
+            None => {
+                for (i, byte) in value.to_be_bytes().into_iter().enumerate() {
+                    self.set_byte_at_offset(addr, i as u32, byte);
+                }
+            }
         }
     }
 
@@ -1507,14 +1585,7 @@ impl AddressSpace for FlatMemory {
         let addr = addr as usize;
         match self.bytes.get(addr..addr + 2) {
             Some(slice) => u16::from_be_bytes(slice.try_into().unwrap()),
-            None => match self.extra_slice(addr as u32, 2) {
-                Some(s) => u16::from_be_bytes(s.try_into().unwrap()),
-                None => {
-                    let hi = u16::from(self.byte_at_offset(addr as u32, 0).unwrap_or(0));
-                    let lo = u16::from(self.byte_at_offset(addr as u32, 1).unwrap_or(0));
-                    (hi << 8) | lo
-                }
-            },
+            None => self.read_u16_cold(addr as u32),
         }
     }
 
@@ -1526,13 +1597,7 @@ impl AddressSpace for FlatMemory {
         let addr = addr as usize;
         match self.bytes.get_mut(addr..addr + 2) {
             Some(slice) => slice.copy_from_slice(&value.to_be_bytes()),
-            None => match self.extra_slice_mut(addr as u32, 2) {
-                Some(s) => s.copy_from_slice(&value.to_be_bytes()),
-                None => {
-                    self.set_byte_at_offset(addr as u32, 0, (value >> 8) as u8);
-                    self.set_byte_at_offset(addr as u32, 1, value as u8);
-                }
-            },
+            None => self.write_u16_cold(addr as u32, value),
         }
     }
 
@@ -1544,17 +1609,7 @@ impl AddressSpace for FlatMemory {
         let addr = addr as usize;
         match self.bytes.get(addr..addr + 4) {
             Some(slice) => u32::from_be_bytes(slice.try_into().unwrap()),
-            None => match self.extra_slice(addr as u32, 4) {
-                Some(s) => u32::from_be_bytes(s.try_into().unwrap()),
-                None => {
-                    let mut value = 0u32;
-                    for i in 0..4u32 {
-                        let byte = self.byte_at_offset(addr as u32, i).unwrap_or(0);
-                        value = (value << 8) | u32::from(byte);
-                    }
-                    value
-                }
-            },
+            None => self.read_u32_cold(addr as u32),
         }
     }
 
@@ -1566,14 +1621,7 @@ impl AddressSpace for FlatMemory {
         let addr = addr as usize;
         match self.bytes.get_mut(addr..addr + 4) {
             Some(slice) => slice.copy_from_slice(&value.to_be_bytes()),
-            None => match self.extra_slice_mut(addr as u32, 4) {
-                Some(s) => s.copy_from_slice(&value.to_be_bytes()),
-                None => {
-                    for (i, byte) in value.to_be_bytes().into_iter().enumerate() {
-                        self.set_byte_at_offset(addr as u32, i as u32, byte);
-                    }
-                }
-            },
+            None => self.write_u32_cold(addr as u32, value),
         }
     }
 
