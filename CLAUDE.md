@@ -166,6 +166,15 @@ Scope is the subsystem: `exec`, `dos`, `cli`, `backend`, `loader`,
 `sanitize`, `mathlibs`, `bsdsocket`, `docs`, `release`. Example:
 `fix(exec): queue ObtainSemaphore waiters on ss_WaitQueue`.
 
+`.claude/hooks/check-code-review.sh` refuses `gh pr create` until
+`/code-review` has been run and its valid findings addressed for the
+current `HEAD`: run the review, fix or answer each finding, commit, then
+record the reviewed commit with `git rev-parse HEAD >
+"$(git rev-parse --git-dir)/claude-code-review-head"` and retry. A
+commit made after the review makes the marker stale. A PR that needs no
+review (a typo, a dependency bump) can prefix the command with
+`CLAUDE_SKIP_CODE_REVIEW=1`.
+
 Keep each commit focused. PRs should explain the user-visible behavior or
 fix, link relevant issues, summarize notable changes, and list checks run.
 
