@@ -165,6 +165,14 @@ pub trait Cpu {
     /// Writes the status register.
     fn set_sr(&mut self, value: u16);
 
+    /// Reads FPIAR, the floating-point instruction address register: the
+    /// address of the last FPU instruction started. The 68040/68060 point
+    /// it at the faulting instruction when one raises an unimplemented-
+    /// instruction exception, which is how the 68040SP/68060SP find it
+    /// (the stacked PC is the *next* instruction), and how
+    /// [`crate::dispatch`] names the instruction in an unhandled trap.
+    fn fpiar(&self) -> u32;
+
     /// Delivers the real m68k hardware exception for a trap [`Cpu::step`]/
     /// [`Cpu::run`] just reported, other than [`TrapKind::ALine`] (this
     /// runtime's own library-call dispatch convention, always handled by

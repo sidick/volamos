@@ -2443,7 +2443,7 @@ fn build_nested_runtime(
     // install_fpu_disabled_060_decline_stub's doc for why this has to
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
-    install_fpu_disabled_060_decline_stub(&mut runtime, cpu_type, fpu);
+    install_fpu_disabled_060_decline_stub(&mut runtime, cpu_type, fpu, fpsp_emulate);
     // A nested System()/Execute() run is still the real CLI process --
     // see Runtime::enable_host_break_folding's doc (issue #210).
     runtime.enable_host_break_folding();
@@ -2552,7 +2552,7 @@ fn build_runtime_with_vfs(
     // install_fpu_disabled_060_decline_stub's doc for why this has to
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
-    install_fpu_disabled_060_decline_stub(&mut runtime, opts.cpu_type, opts.fpu);
+    install_fpu_disabled_060_decline_stub(&mut runtime, opts.cpu_type, opts.fpu, opts.fpsp_emulate);
     // Only the real CLI opts into folding a host SIGINT/SIGTERM into the
     // guest's SIGBREAKF_CTRL_C (issue #210) -- see
     // Runtime::enable_host_break_folding's doc for why this is opt-in

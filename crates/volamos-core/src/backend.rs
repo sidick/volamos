@@ -1004,6 +1004,10 @@ impl Cpu for M68kCpu {
         self.core.get_sr()
     }
 
+    fn fpiar(&self) -> u32 {
+        self.core.fpiar
+    }
+
     fn set_sr(&mut self, value: u16) {
         self.core.set_sr(value);
     }
