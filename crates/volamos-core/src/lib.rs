@@ -60,6 +60,7 @@ pub mod locale;
 pub mod lvos;
 pub mod m68kops;
 pub mod mathlibs;
+pub mod memmap;
 pub mod memory;
 pub mod sanitize;
 pub mod taskswitch;
