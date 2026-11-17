@@ -381,15 +381,27 @@ impl MemoryLayout {
         self.regions.last().map_or(0, MemoryRegion::end)
     }
 
+    /// `(end, count)` of the longest run of regions touching address 0
+    /// without gaps: the first `count` regions cover `[0, end)`. This
+    /// is what the memory backing keeps in its single primary `Vec`.
+    pub fn contiguous_prefix(&self) -> (u64, usize) {
+        let mut end = 0u64;
+        let mut count = 0;
+        for r in &self.regions {
+            if u64::from(r.base) != end {
+                break;
+            }
+            end = r.end();
+            count += 1;
+        }
+        (end, count)
+    }
+
     /// Whether the regions form one gap-free block starting at address
     /// 0 -- true of [`Self::legacy_flat`], and what lets the memory
     /// backing keep its single-`Vec` fast path.
     pub fn is_contiguous_from_zero(&self) -> bool {
-        self.regions[0].base == 0
-            && self
-                .regions
-                .windows(2)
-                .all(|p| p[0].end() == u64::from(p[1].base))
+        self.contiguous_prefix().1 == self.regions.len()
     }
 
     /// Fails if any region reaches beyond what an `address_bits`-wide

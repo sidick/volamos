@@ -250,15 +250,18 @@ impl AddressBus for FlatMemory {
     /// side effects, so the same contract as [`Self::fast_mem`] and the
     /// same gating (a sanitizer shadow map or a store port means every
     /// store must reach the bus, so no direct window at all). The crate
-    /// takes at most [`m68k::MAX_FAST_MEM_REGIONS`]; a segment beyond
-    /// that simply isn't windowed and is served by the bus methods,
-    /// which are always correct, just slower.
+    /// takes at most [`m68k::MAX_FAST_MEM_REGIONS`], so with more
+    /// segments than that the largest get the windows (the likeliest to
+    /// be hot); the rest are served by the bus methods, which are
+    /// always correct, just slower.
     fn fast_mem_regions(&mut self) -> [Option<m68k::FastMemRegion>; m68k::MAX_FAST_MEM_REGIONS] {
         let mut out = [None; m68k::MAX_FAST_MEM_REGIONS];
         if self.shadow().is_some() || self.has_store_ports() {
             return out;
         }
-        for (slot, (base, ptr, len)) in out.iter_mut().zip(self.extra_segments_mut()) {
+        let mut segments: Vec<_> = self.extra_segments_mut().collect();
+        segments.sort_by_key(|&(_, _, len)| std::cmp::Reverse(len));
+        for (slot, (base, ptr, len)) in out.iter_mut().zip(segments) {
             *slot = Some(m68k::FastMemRegion {
                 ptr,
                 base,

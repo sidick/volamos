@@ -74,7 +74,11 @@ pub trait StorePort {
 /// writes past the end of the backing store are silently ignored. This
 /// keeps the trait ergonomic for a CPU core's hot path; callers that need
 /// to detect bad guest addresses (e.g. to raise a bus error) should check
-/// bounds themselves via [`AddressSpace::len`] before accessing.
+/// bounds themselves via [`AddressSpace::len`] before accessing. (For a
+/// [`FlatMemory`] built from a split [`crate::memmap::MemoryLayout`],
+/// `len` is the size of the primary segment only -- the RAM contiguous
+/// from address 0 -- and [`FlatMemory::ranges`] lists all of it; issue
+/// #332.)
 pub trait AddressSpace {
     /// The size in bytes of this address space.
     fn len(&self) -> usize;
@@ -856,7 +860,7 @@ pub struct FlatMemory {
 impl std::fmt::Debug for FlatMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlatMemory")
-            .field("len", &self.bytes.len())
+            .field("ranges", &self.ranges())
             .field("sanitizer", &self.shadow.is_some())
             .field("store_ports", &self.ports.len())
             .field("icache_lines", &self.icache.as_ref().map(|c| c.lines.len()))
@@ -890,21 +894,9 @@ impl FlatMemory {
     /// regions that touches address 0 contiguously becomes the primary
     /// segment, every other region its own extra segment.
     pub fn from_layout(layout: &crate::memmap::MemoryLayout) -> Self {
-        let regions = layout.regions();
-        // Regions are sorted by base, the first is chip at 0 (checked
-        // by MemoryLayout::new), so the contiguous prefix is the
-        // longest run whose each region starts where the last ended.
-        let mut primary_end = 0u64;
-        let mut primary_regions = 0;
-        for r in regions {
-            if u64::from(r.base) != primary_end {
-                break;
-            }
-            primary_end = r.end();
-            primary_regions += 1;
-        }
+        let (primary_end, primary_regions) = layout.contiguous_prefix();
         let mut mem = Self::new(primary_end as usize);
-        mem.extra = regions[primary_regions..]
+        mem.extra = layout.regions()[primary_regions..]
             .iter()
             .map(|r| Segment {
                 base: r.base,
@@ -949,6 +941,19 @@ impl FlatMemory {
         let seg = self.extra.iter_mut().find(|s| s.contains_span(addr, len))?;
         let off = (addr - seg.base) as usize;
         Some(&mut seg.bytes[off..off + len])
+    }
+
+    /// One byte of RAM from any segment, `None` if unmapped. `addr + i`
+    /// past the top of the 32-bit space is unmapped, not a wrap back to
+    /// low memory (a stray pointer near -1 must not reach the vectors).
+    fn byte_at_offset(&self, addr: u32, i: u32) -> Option<u8> {
+        self.byte_at(addr.checked_add(i)?)
+    }
+
+    fn set_byte_at_offset(&mut self, addr: u32, i: u32, value: u8) {
+        if let Some(a) = addr.checked_add(i) {
+            self.set_byte_at(a, value);
+        }
     }
 
     /// One byte of RAM from any segment, `None` if unmapped.
@@ -1147,6 +1152,14 @@ impl FlatMemory {
     /// what forces the m68k crate's trace JIT off the raw-pointer fast
     /// path that would otherwise bypass every check installed here.
     pub fn enable_sanitizer(&mut self) {
+        // The shadow map is indexed by address from 0 and so covers the
+        // primary segment only (issue #332). Refuse a layout with extra
+        // segments rather than report "no violations" for RAM that was
+        // never checked; the allocator phase extends the map.
+        assert!(
+            self.extra.is_empty(),
+            "--sanitize does not yet cover non-contiguous RAM layouts (issue #332)"
+        );
         self.shadow = Some(Box::new(ShadowMap::new(self.bytes.len())));
     }
 
@@ -1399,8 +1412,8 @@ impl AddressSpace for FlatMemory {
             None => match self.extra_slice(addr as u32, 2) {
                 Some(s) => u16::from_be_bytes(s.try_into().unwrap()),
                 None => {
-                    let hi = u16::from(self.byte_at(addr as u32).unwrap_or(0));
-                    let lo = u16::from(self.byte_at((addr as u32).wrapping_add(1)).unwrap_or(0));
+                    let hi = u16::from(self.byte_at_offset(addr as u32, 0).unwrap_or(0));
+                    let lo = u16::from(self.byte_at_offset(addr as u32, 1).unwrap_or(0));
                     (hi << 8) | lo
                 }
             },
@@ -1417,8 +1430,8 @@ impl AddressSpace for FlatMemory {
             None => match self.extra_slice_mut(addr as u32, 2) {
                 Some(s) => s.copy_from_slice(&value.to_be_bytes()),
                 None => {
-                    self.set_byte_at(addr as u32, (value >> 8) as u8);
-                    self.set_byte_at((addr as u32).wrapping_add(1), value as u8);
+                    self.set_byte_at_offset(addr as u32, 0, (value >> 8) as u8);
+                    self.set_byte_at_offset(addr as u32, 1, value as u8);
                 }
             },
         }
@@ -1436,7 +1449,7 @@ impl AddressSpace for FlatMemory {
                 None => {
                     let mut value = 0u32;
                     for i in 0..4u32 {
-                        let byte = self.byte_at((addr as u32).wrapping_add(i)).unwrap_or(0);
+                        let byte = self.byte_at_offset(addr as u32, i).unwrap_or(0);
                         value = (value << 8) | u32::from(byte);
                     }
                     value
@@ -1456,7 +1469,7 @@ impl AddressSpace for FlatMemory {
                 Some(s) => s.copy_from_slice(&value.to_be_bytes()),
                 None => {
                     for (i, byte) in value.to_be_bytes().into_iter().enumerate() {
-                        self.set_byte_at((addr as u32).wrapping_add(i as u32), byte);
+                        self.set_byte_at_offset(addr as u32, i as u32, byte);
                     }
                 }
             },
@@ -1549,6 +1562,25 @@ mod layout_tests {
             assert_eq!(mem.read_u16(addr), 0, "{addr:#X}");
             assert_eq!(mem.read_u32(addr), 0, "{addr:#X}");
         }
+    }
+
+    #[test]
+    fn an_access_at_the_top_of_the_address_space_does_not_wrap_to_low_memory() {
+        let mut mem = FlatMemory::from_layout(&split_layout());
+        mem.write_u32(0, 0x1122_3344);
+        for addr in [0xFFFF_FFFEu32, 0xFFFF_FFFF] {
+            mem.write_u32(addr, 0xFFFF_FFFF);
+            mem.write_u16(addr, 0xFFFF);
+            assert_eq!(mem.read_u32(addr), 0, "{addr:#X}");
+            assert_eq!(mem.read_u16(addr), 0, "{addr:#X}");
+        }
+        assert_eq!(mem.read_u32(0), 0x1122_3344, "low memory untouched");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not yet cover non-contiguous")]
+    fn the_sanitizer_refuses_a_split_layout_instead_of_silently_covering_part_of_it() {
+        FlatMemory::from_layout(&split_layout()).enable_sanitizer();
     }
 
     #[test]
