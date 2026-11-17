@@ -17,8 +17,10 @@
 //! `AllocMem` requirement pick among them like real exec picks a
 //! `MemHeader` (see the `MEMF_*` notes below). That is still a single
 //! arena shared with the runtime's own host-side allocations; what the
-//! guest cannot do is walk a `MemHeader`/`MemChunk` chain (`MemList` is
-//! empty, issue #318).
+//! guest sees of that arena is a real `MemHeader` per region in
+//! `ExecBase.MemList`, with a `MemChunk` chain over its free blocks,
+//! kept up to date at `Forbid`/`Disable` (issue #318, see
+//! [`crate::guestmem::GuestHeap::sync_memlist`]).
 //!
 //! Per `docs/plan.md`'s Phase 3 scope ("start flat, add `MemHeader`
 //! emulation only when a corpus binary trips on it"), this module does

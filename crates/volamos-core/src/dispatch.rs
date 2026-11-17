@@ -319,7 +319,10 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     nodes -- see write_library_list_nodes). They
 ///                     used to sit at 0x1088, which is inside the
 ///                     struct ExecBase fields above
-/// 0x11C0 .. 0x11FC   headroom
+/// 0x11C0 .. 0x11EC   the chip region's MemHeader (32 bytes) and its name
+///                     ("chip memory"); ExecBase.MemList links it and the
+///                     other regions' headers (CHIP_MEMHEADER_ADDR)
+/// 0x11EC .. 0x11FC   headroom
 /// 0x11FC .. 0x1200   EXIT_STUB_ADDR (the last word of the region)
 /// ```
 ///
@@ -631,6 +634,26 @@ pub(crate) const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 /// 322 + 14 = 336. `OpenResource`/`AddResource`/`RemResource`
 /// (`crate::execlist`) keep a real, walkable list here.
 pub(crate) const EXEC_BASE_RESOURCELIST_OFFSET: u32 = 336;
+
+/// Byte offset of `ExecBase.MemList` from [`EXEC_LIBRARY_BASE`]: the
+/// `struct List` just before [`EXEC_BASE_RESOURCELIST_OFFSET`]
+/// (336 - 14). Holds one `MemHeader` per RAM region -- see
+/// [`crate::guestmem::GuestHeap::install_memlist`] -- so a guest can
+/// enumerate memory (issue #318).
+pub(crate) const EXEC_BASE_MEMLIST_OFFSET: u32 = 322;
+
+/// Byte offset of `ExecBase.MaxLocMem` from [`EXEC_LIBRARY_BASE`]:
+/// `LibNode` (34) + `SoftVer`/`LowMemChkSum` (4) + `ChkBase` (4) + the
+/// three capture vectors (12) + `SysStkUpper`/`SysStkLower` (8) = 62.
+/// The size of chip RAM (`0x200000` on Kickstart 3.1 with 2 MiB).
+pub(crate) const EXEC_BASE_MAXLOCMEM_OFFSET: u32 = 62;
+
+/// Where the chip region's `MemHeader` and name live: the free headroom
+/// at the end of the reserved region (see [`EXEC_LIBRARY_BASE`]'s
+/// memory map), 32 bytes of header then the 12-byte name, ending before
+/// [`EXIT_STUB_ADDR`]. Every other region keeps its header at its own
+/// base.
+pub(crate) const CHIP_MEMHEADER_ADDR: u32 = EXEC_LIBRARY_BASE + 0x2C0;
 
 /// Byte offset of `ExecBase.SemaphoreList` from [`EXEC_LIBRARY_BASE`] --
 /// same field-by-field derivation as [`EXEC_BASE_LIBLIST_OFFSET`],
@@ -3072,6 +3095,22 @@ impl<C: Cpu + 'static> Runtime<C> {
         // stack lives in), minus the stack region itself.
         let mut heap = GuestHeap::with_layout(layout, config.load_end, u32::MAX);
         heap.reserve_overlapping(stack_base, top);
+        // ExecBase.MemList: one MemHeader per region, so memory-
+        // enumerating programs see RAM (issue #318); MaxLocMem is the
+        // chip size, as on a real machine.
+        heap.install_memlist(
+            &mut mem,
+            EXEC_LIBRARY_BASE + EXEC_BASE_MEMLIST_OFFSET,
+            CHIP_MEMHEADER_ADDR,
+        );
+        heap.sync_memlist(&mut mem);
+        let chip_size = heap
+            .capacity_matching(crate::execmem::MEMF_CHIP)
+            .unwrap_or(0);
+        mem.write_u32(
+            EXEC_LIBRARY_BASE + EXEC_BASE_MAXLOCMEM_OFFSET,
+            chip_size.min(u64::from(u32::MAX)) as u32,
+        );
 
         // The entry stack frame, in real AmigaOS's `RunCommand`
         // layout (issues #178 and #279) -- ascending addresses:

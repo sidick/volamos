@@ -254,8 +254,21 @@ Changelog.
   plus `MEMF_LARGEST`), and `MEMF_TOTAL` reports the whole region size
   rather than the free part. The priorities and attribute words were
   measured on real Kickstart 3.1 (chip, slow, Zorro II and motherboard
-  RAM). `ExecBase.MemList` is still empty: a program that walks it sees
-  no memory.
+  RAM).
+
+  `ExecBase.MemList` holds one real `MemHeader` per region, highest
+  priority first — the names (`"chip memory"`, `"memory"`,
+  `"expansion memory"`), priorities, `mh_Attributes`, `mh_Lower`/
+  `mh_Upper`, and `mh_Free` — with the `mh_First` chain of `MemChunk`s
+  describing each region's free blocks (written into the free memory
+  itself, as exec does). So a program that enumerates memory sees the
+  RAM, and `ExecBase.MaxLocMem` is the chip size. The chain is brought
+  up to date when the program calls `Forbid()` or `Disable()` — the
+  idiom for walking the list — not on every allocation, so a guest that
+  walks it without either may see a slightly stale free count. Free
+  blocks smaller than a chunk (8 bytes) are left out of the chain and
+  `mh_Free`. `AddMemList`, adding or removing headers, and `AllocAbs`
+  are not modelled.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor` (enters
   the routine through a real exception frame — a 68010+ format-0

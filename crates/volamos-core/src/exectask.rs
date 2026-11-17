@@ -1874,6 +1874,10 @@ const SFB_SAR: u16 = 1 << 15;
 /// than this API-level runtime promises.
 fn forbid_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     ctx.tasks.enter_forbid();
+    // The idiom for walking `ExecBase.MemList` is Forbid()..Permit():
+    // bring the MemHeader chunk chains up to date first (a no-op unless
+    // the free list changed -- see `GuestHeap::sync_memlist`).
+    ctx.heap.sync_memlist(&mut *ctx.mem);
     Ok(())
 }
 
@@ -1937,7 +1941,10 @@ fn permit_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 /// guarantee. A guest that inspects the field directly instead of
 /// trusting `Disable`/`Enable`'s return contract is already relying on
 /// behavior this API-level runtime doesn't promise.
-fn disable_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+fn disable_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    // Disable() is the other way to freeze the system before walking
+    // `ExecBase.MemList`; see `forbid_handler`.
+    ctx.heap.sync_memlist(&mut *ctx.mem);
     Ok(())
 }
 

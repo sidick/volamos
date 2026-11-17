@@ -3962,6 +3962,139 @@ mod loaded_library_e2e {
         );
     }
 
+    /// One `MemHeader` as a guest sees it in `ExecBase.MemList`.
+    #[derive(Debug, PartialEq)]
+    struct SeenHeader {
+        name: String,
+        pri: i8,
+        attributes: u16,
+        lower: u32,
+        upper: u32,
+        free: u32,
+        chunks: Vec<(u32, u32)>,
+    }
+
+    /// Walks `ExecBase.MemList` in the guest memory of `rt`, following
+    /// `ln_Succ` and each header's `mh_First` chain, with the checks real
+    /// enumerating programs rely on.
+    fn walk_memlist(rt: &Runtime<M68kCpu>) -> Vec<SeenHeader> {
+        let mem = rt.memory();
+        let list = EXEC_LIBRARY_BASE + 322;
+        let mut out = Vec::new();
+        let mut node = mem.read_u32(list); // lh_Head
+        while mem.read_u32(node) != 0 {
+            assert_eq!(mem.read_u8(node + 8), 10, "ln_Type is NT_MEMORY");
+            let name =
+                String::from_utf8(crate::guestmem::read_c_string(mem, mem.read_u32(node + 10)))
+                    .unwrap();
+            let mut chunks = Vec::new();
+            let mut c = mem.read_u32(node + 16);
+            while c != 0 {
+                chunks.push((c, mem.read_u32(c + 4)));
+                c = mem.read_u32(c);
+                assert!(chunks.len() < 100_000, "chunk chain loops");
+            }
+            out.push(SeenHeader {
+                name,
+                pri: mem.read_u8(node + 9) as i8,
+                attributes: mem.read_u16(node + 14),
+                lower: mem.read_u32(node + 20),
+                upper: mem.read_u32(node + 24),
+                free: mem.read_u32(node + 28),
+                chunks,
+            });
+            node = mem.read_u32(node); // ln_Succ
+        }
+        out
+    }
+
+    /// `Forbid(); Permit();` after an optional `AllocMem(size, flags)`:
+    /// the idiom a memory-enumerating program uses, run in a 3 MiB
+    /// machine (chip 2 MiB + 1 MiB accelerator-class RAM).
+    fn memlist_after(alloc: Option<(u32, u32)>) -> Vec<SeenHeader> {
+        let mut words = Vec::new();
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        if let Some((size, flags)) = alloc {
+            words.extend([0x203C, (size >> 16) as u16, size as u16]); // move.l #size,d0
+            words.extend([0x223C, (flags >> 16) as u16, flags as u16]); // move.l #flags,d1
+            jsr(&mut words, 6, -198); // AllocMem
+        }
+        jsr(&mut words, 6, -132); // Forbid
+        jsr(&mut words, 6, -138); // Permit
+        words.push(RTS);
+        let (result, rt) = run_words_sized(0x30_0000, words, |_| {});
+        result.expect("run should succeed");
+        walk_memlist(&rt)
+    }
+
+    /// Issue #318: a program that enumerates `ExecBase.MemList` sees the
+    /// RAM, in real exec's shape -- highest priority first, real names
+    /// and attribute words, `mh_Lower`/`mh_Upper` bounds, and a `MemChunk`
+    /// chain whose sizes sum to `mh_Free` (the invariants measured on
+    /// Kickstart 3.1).
+    #[test]
+    fn mem_list_has_one_real_memheader_per_region() {
+        let headers = memlist_after(None);
+        let names: Vec<(&str, i8, u16)> = headers
+            .iter()
+            .map(|h| (h.name.as_str(), h.pri, h.attributes))
+            .collect();
+        // Chip 2 MiB + accelerator-class RAM wholly below 16 MiB.
+        assert_eq!(
+            names,
+            [("expansion memory", 30, 0x705), ("chip memory", -10, 0x703)]
+        );
+        let (fast, chip) = (&headers[0], &headers[1]);
+        assert_eq!((fast.lower, fast.upper), (0x20_0040, 0x30_0000));
+        assert_eq!(chip.upper, 0x20_0000);
+        assert!(
+            chip.lower >= 0x3204,
+            "chip RAM managed from past the program: {:#x}",
+            chip.lower
+        );
+        for h in &headers {
+            assert!(!h.chunks.is_empty(), "{h:?}");
+            let sum: u32 = h.chunks.iter().map(|&(_, n)| n).sum();
+            assert_eq!(h.free, sum, "mh_Free is the sum of the chunks ({})", h.name);
+            assert!(
+                h.chunks.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0),
+                "chunks ascend without overlapping: {h:?}"
+            );
+            assert!(
+                h.chunks
+                    .iter()
+                    .all(|&(a, n)| a >= h.lower && a + n <= h.upper)
+            );
+        }
+    }
+
+    /// The headers follow the free list: an allocation shrinks the right
+    /// region's `mh_Free` by (at least) its size, seen after the next
+    /// `Forbid`.
+    #[test]
+    fn mem_list_free_counts_follow_allocations() {
+        let before = memlist_after(None);
+        let after = memlist_after(Some((0x1000, crate::execmem::MEMF_CHIP)));
+        assert_eq!(
+            after[0].free, before[0].free,
+            "fast RAM untouched by a MEMF_CHIP block"
+        );
+        assert_eq!(before[1].free - after[1].free, 0x1000);
+        // The same request for fast RAM comes out of the other header.
+        let after = memlist_after(Some((0x1000, crate::execmem::MEMF_FAST)));
+        assert_eq!(before[0].free - after[0].free, 0x1000);
+        assert_eq!(after[1].free, before[1].free);
+    }
+
+    /// `ExecBase.MaxLocMem` is the size of chip RAM (`0x200000` on
+    /// Kickstart 3.1).
+    #[test]
+    fn max_loc_mem_is_the_chip_size() {
+        let (result, rt) = run_words_sized(0x30_0000, vec![RTS], |_| {});
+        result.expect("run should succeed");
+        assert_eq!(rt.memory().read_u32(EXEC_LIBRARY_BASE + 62), 0x20_0000);
+    }
+
     /// With RAM smaller than 2 MiB the chip range is capped at the end of RAM.
     #[test]
     fn type_of_mem_caps_chip_range_at_small_ram() {
