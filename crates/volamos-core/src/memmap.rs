@@ -35,6 +35,12 @@
 //! Chip's `$200000` upper bound is also the lower bound of every other
 //! kind, so "chip" and "everything else" can never overlap.
 //!
+//! Accelerator RAM is the one kind whose own window is wide (it decodes
+//! wherever the board says), so [`MemoryLayout::new`] additionally
+//! refuses any region that covers the reserved I/O, device and ROM
+//! ranges inside the 24-bit space (`$A00000-$BFFFFF` and
+//! `$D80000-$FFFFFF`): on a real machine those addresses are never RAM.
+//!
 //! # The 24-bit constraint
 //!
 //! [`MemoryLayout::check_address_bits`] rejects a layout with any byte
@@ -68,6 +74,11 @@ const SLOW_WINDOW: (u64, u64) = (0xC0_0000, 0xD8_0000);
 const ZORRO3_WINDOW: (u64, u64) = (0x1000_0000, 0x8000_0000);
 /// Lowest address an accelerator board's RAM may start at.
 const ACCELERATOR_MIN: u64 = 0x20_0000;
+/// Address ranges inside the 24-bit space that real machines never
+/// decode as RAM: Zorro II I/O and the CIAs (`$A00000-$BFFFFF`) and the
+/// motherboard devices, custom chips and ROM (`$D80000-$FFFFFF`).
+/// Slow RAM sits between them and is covered by its own window.
+const RESERVED_WINDOWS: [(u64, u64); 2] = [(0xA0_0000, 0xC0_0000), (0xD8_0000, 0x100_0000)];
 /// End (exclusive) of the 32-bit address space.
 const ADDRESS_SPACE_END: u64 = 0x1_0000_0000;
 
@@ -172,6 +183,13 @@ pub enum LayoutError {
     },
     /// Two regions sharing an address.
     Overlap { a: RegionKind, b: RegionKind },
+    /// A region covering addresses a real machine decodes as I/O,
+    /// motherboard devices or ROM, never RAM.
+    OverlapsReserved {
+        kind: RegionKind,
+        base: u32,
+        end: u64,
+    },
     /// A region extending past what the CPU's address bus can reach
     /// (see [`MemoryLayout::check_address_bits`]).
     BeyondAddressBus {
@@ -210,6 +228,12 @@ impl fmt::Display for LayoutError {
                 window.0,
                 window.1 - 1
             ),
+            LayoutError::OverlapsReserved { kind, base, end } => write!(
+                f,
+                "{} RAM at ${base:X}-${:X} covers addresses that are I/O, devices or ROM on a real machine",
+                kind.name(),
+                end - 1
+            ),
             LayoutError::Overlap { a, b } => {
                 write!(f, "{} and {} RAM regions overlap", a.name(), b.name())
             }
@@ -239,11 +263,22 @@ pub struct MemoryLayout {
 
 impl MemoryLayout {
     /// Validates and sorts `regions`.
-    pub fn new(mut regions: Vec<MemoryRegion>) -> Result<Self, LayoutError> {
+    pub fn new(regions: Vec<MemoryRegion>) -> Result<Self, LayoutError> {
+        Self::build(regions, true)
+    }
+
+    /// [`Self::new`], with `enforce_reserved` choosing whether regions
+    /// may cover the reserved I/O/device/ROM ranges. Only
+    /// [`Self::legacy_flat`] passes `false`.
+    fn build(mut regions: Vec<MemoryRegion>, enforce_reserved: bool) -> Result<Self, LayoutError> {
         if regions.is_empty() {
             return Err(LayoutError::Empty);
         }
         regions.sort_by_key(|r| (r.base, r.kind));
+
+        if regions[0].kind != RegionKind::Chip || regions[0].base != 0 {
+            return Err(LayoutError::MustStartWithChipAtZero);
+        }
 
         for r in &regions {
             if r.size == 0 {
@@ -265,19 +300,21 @@ impl MemoryLayout {
                     window,
                 });
             }
+            if enforce_reserved
+                && RESERVED_WINDOWS
+                    .iter()
+                    .any(|&(lo, hi)| u64::from(r.base) < hi && r.end() > lo)
+            {
+                return Err(LayoutError::OverlapsReserved {
+                    kind: r.kind,
+                    base: r.base,
+                    end: r.end(),
+                });
+            }
         }
 
-        let chips = regions
-            .iter()
-            .filter(|r| r.kind == RegionKind::Chip)
-            .count();
-        if regions[0].kind != RegionKind::Chip || regions[0].base != 0 {
-            return Err(LayoutError::MustStartWithChipAtZero);
-        }
-        if chips > 1 {
-            return Err(LayoutError::DuplicateChip);
-        }
-
+        // Overlap before the chip count, so two overlapping chip blocks
+        // are reported as an overlap rather than as "duplicate".
         for pair in regions.windows(2) {
             if pair[0].end() > u64::from(pair[1].base) {
                 return Err(LayoutError::Overlap {
@@ -285,6 +322,14 @@ impl MemoryLayout {
                     b: pair[1].kind,
                 });
             }
+        }
+        if regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::Chip)
+            .count()
+            > 1
+        {
+            return Err(LayoutError::DuplicateChip);
         }
         Ok(Self { regions })
     }
@@ -294,7 +339,14 @@ impl MemoryLayout {
     /// one contiguous block above it, labelled
     /// [`Accelerator`](RegionKind::Accelerator) -- see the module docs
     /// for why not `Fast`. `total` is rounded down to
-    /// [`REGION_GRANULE`] and clamped to at least one granule.
+    /// [`REGION_GRANULE`] and clamped to at least one granule, so a
+    /// caller sizing real memory from this layout must use
+    /// [`Self::total_size`], not the `total` it passed in.
+    ///
+    /// This is the one layout that knowingly covers the reserved
+    /// I/O/device/ROM ranges (a 16 MiB block does, by construction):
+    /// it is a compatibility layout, not a machine, and is what the
+    /// later per-CPU defaults replace.
     pub fn legacy_flat(total: u32) -> Self {
         let total = (total & !(REGION_GRANULE - 1)).max(REGION_GRANULE);
         let chip = total.min(MAX_CHIP_SIZE);
@@ -306,7 +358,7 @@ impl MemoryLayout {
                 total - chip,
             ));
         }
-        Self::new(regions).expect("the legacy flat layout is valid by construction")
+        Self::build(regions, false).expect("the legacy flat layout is valid by construction")
     }
 
     /// The regions, sorted by base address.
@@ -333,16 +385,20 @@ impl MemoryLayout {
     /// 0 -- true of [`Self::legacy_flat`], and what lets the memory
     /// backing keep its single-`Vec` fast path.
     pub fn is_contiguous_from_zero(&self) -> bool {
-        self.regions
-            .windows(2)
-            .all(|p| p[0].end() == u64::from(p[1].base))
+        self.regions[0].base == 0
+            && self
+                .regions
+                .windows(2)
+                .all(|p| p[0].end() == u64::from(p[1].base))
     }
 
     /// Fails if any region reaches beyond what an `address_bits`-wide
     /// bus can address (24 for a 68000/68010/EC 68020/EC 68030, 32
     /// otherwise).
     pub fn check_address_bits(&self, address_bits: u32) -> Result<(), LayoutError> {
-        let limit = 1u64 << address_bits.min(32);
+        // A bus is between 1 and 32 bits wide; report the width used.
+        let address_bits = address_bits.clamp(1, 32);
+        let limit = 1u64 << address_bits;
         match self.regions.iter().find(|r| r.end() > limit) {
             Some(r) => Err(LayoutError::BeyondAddressBus {
                 kind: r.kind,
@@ -512,6 +568,54 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn regions_covering_io_devices_or_rom_are_rejected() {
+        let chip = r(RegionKind::Chip, 0, 2 * MIB);
+        for (base, size) in [
+            (2 * MIB, 14 * MIB),  // the old flat 16 MiB block
+            (0xB0_0000, MIB),     // Zorro II I/O / CIA range
+            (0xF0_0000, MIB / 2), // ROM
+        ] {
+            assert!(
+                matches!(
+                    MemoryLayout::new(vec![chip, r(RegionKind::Accelerator, base, size)]),
+                    Err(LayoutError::OverlapsReserved { .. })
+                ),
+                "${base:X}+${size:X} must be refused"
+            );
+        }
+        // Accelerator RAM below the I/O range, or above 16 MiB, is fine.
+        MemoryLayout::new(vec![chip, r(RegionKind::Accelerator, 2 * MIB, 8 * MIB)]).unwrap();
+        MemoryLayout::new(vec![chip, r(RegionKind::Accelerator, 0x100_0000, 16 * MIB)]).unwrap();
+    }
+
+    #[test]
+    fn overlapping_chip_blocks_are_reported_as_an_overlap() {
+        assert_eq!(
+            MemoryLayout::new(vec![
+                r(RegionKind::Chip, 0, MIB),
+                r(RegionKind::Chip, MIB / 2, MIB / 2),
+            ]),
+            Err(LayoutError::Overlap {
+                a: RegionKind::Chip,
+                b: RegionKind::Chip
+            })
+        );
+    }
+
+    #[test]
+    fn address_bits_outside_one_to_thirty_two_are_clamped_and_reported_as_used() {
+        let l = MemoryLayout::legacy_flat(16 * MIB);
+        assert_eq!(l.check_address_bits(40), Ok(()));
+        assert!(matches!(
+            l.check_address_bits(0),
+            Err(LayoutError::BeyondAddressBus {
+                address_bits: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
