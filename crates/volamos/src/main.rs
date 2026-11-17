@@ -2079,6 +2079,18 @@ const SANITIZER_EXIT_CODE: i32 = 99;
 /// stderr diagnostic is the other half of the contract.
 const RUNTIME_ERROR_EXIT_CODE: u8 = 98;
 
+/// The guest's RAM for `layout`, wired to `cpu_type`'s address bus: a
+/// 68000/68010 ignores the top byte of every address, and so must the
+/// native library handlers that dereference guest pointers on the CPU's
+/// behalf (see `FlatMemory::set_address_mask`). Every place that builds
+/// guest memory goes through here, so the CPU's mask and the memory's
+/// cannot drift apart.
+fn new_guest_memory(layout: &volamos_core::memmap::MemoryLayout, cpu_type: CpuType) -> FlatMemory {
+    let mut mem = FlatMemory::from_layout(layout);
+    mem.set_address_mask(address_mask(cpu_type));
+    mem
+}
+
 /// Picks the guest memory map from the merged flags/config (issue
 /// #332): `--ram` alone keeps its original meaning (one chip + fast
 /// range of that total size, [`volamos_core::memmap::MemoryLayout::legacy_exact`]);
@@ -2377,8 +2389,7 @@ fn build_nested_runtime(
     let bytes = std::fs::read(host_path).ok()?;
     let hunk_file = loader::parse(&bytes).ok()?;
     let ram_size = layout.contiguous_prefix().0 as u32;
-    let mut mem = FlatMemory::from_layout(&layout);
-    mem.set_address_mask(address_mask(cpu_type));
+    let mut mem = new_guest_memory(&layout, cpu_type);
     // Right after construction, before `loader::load` populates it --
     // harmless either way (see `FlatMemory::enable_sanitizer`'s doc for
     // why the default `Valid` shadow state makes the ordering a
@@ -2667,10 +2678,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // runs simply report addresses without source locations.
     let mut loaded: Option<loader::LoadResult> = None;
     let mut runtime = if hunk_file.overlay.is_some() {
-        let mut mem = FlatMemory::from_layout(&opts.layout);
-        // A 68000/68010 ignores the top byte of every address, and so must
-        // the native library handlers dereferencing guest pointers.
-        mem.set_address_mask(address_mask(opts.cpu_type));
+        let mut mem = new_guest_memory(&opts.layout, opts.cpu_type);
         // Right after construction, before anything is loaded into it
         // -- harmless either way, see FlatMemory::enable_sanitizer's
         // doc on why the default Valid shadow state makes the ordering
@@ -2718,10 +2726,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             .map_err(|e| format!("couldn't LoadSeg '{}': IoErr {e}", opts.program))?;
         runtime
     } else {
-        let mut mem = FlatMemory::from_layout(&opts.layout);
-        // A 68000/68010 ignores the top byte of every address, and so must
-        // the native library handlers dereferencing guest pointers.
-        mem.set_address_mask(address_mask(opts.cpu_type));
+        let mut mem = new_guest_memory(&opts.layout, opts.cpu_type);
         if opts.sanitize.enabled {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
@@ -3621,6 +3626,24 @@ mod tests {
                 ("z3", 0x1000_0000, 32 * MIB)
             ]
         );
+    }
+
+    #[test]
+    fn guest_memory_carries_the_cpus_address_mask_on_every_construction_path() {
+        use volamos_core::AddressSpace;
+        use volamos_core::memmap::MemoryLayout;
+        let layout = MemoryLayout::legacy_exact(0x4_0000);
+        for (cpu, masked) in [
+            (CpuType::M68000, true),
+            (CpuType::M68010, true),
+            (CpuType::M68020, false),
+            (CpuType::M68040, false),
+        ] {
+            let mut mem = new_guest_memory(&layout, cpu);
+            mem.write_u32(0x1000, 0x1234_5678);
+            let seen = mem.read_u32(0xAB00_1000);
+            assert_eq!(seen == 0x1234_5678, masked, "{cpu:?}");
+        }
     }
 
     #[test]

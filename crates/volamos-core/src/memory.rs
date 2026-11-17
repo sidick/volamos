@@ -1004,12 +1004,24 @@ impl FlatMemory {
     /// One byte of RAM from any segment, `None` if unmapped. `addr + i`
     /// past the top of the 32-bit space is unmapped, not a wrap back to
     /// low memory (a stray pointer near -1 must not reach the vectors).
+    ///
+    /// With a narrower CPU bus (the 68000's 24 bits) the following bytes
+    /// wrap within the bus instead: a long at `$FFFFFF` continues at
+    /// `$000000`, as it does on the CPU.
+    fn offset_addr(&self, addr: u32, i: u32) -> Option<u32> {
+        if self.addr_mask == u32::MAX {
+            addr.checked_add(i)
+        } else {
+            Some(addr.wrapping_add(i) & self.addr_mask)
+        }
+    }
+
     fn byte_at_offset(&self, addr: u32, i: u32) -> Option<u8> {
-        self.byte_at(addr.checked_add(i)?)
+        self.byte_at(self.offset_addr(addr, i)?)
     }
 
     fn set_byte_at_offset(&mut self, addr: u32, i: u32, value: u8) {
-        if let Some(a) = addr.checked_add(i) {
+        if let Some(a) = self.offset_addr(addr, i) {
             self.set_byte_at(a, value);
         }
     }
@@ -1408,6 +1420,12 @@ impl AddressSpace for FlatMemory {
 
     fn is_mapped(&self, addr: u32, len: u32) -> bool {
         let addr = addr & self.addr_mask;
+        // A span that runs off the end of a narrower CPU bus continues at
+        // address 0 (see `offset_addr`): check the two halves.
+        let room = u64::from(self.addr_mask) + 1 - u64::from(addr);
+        if self.addr_mask != u32::MAX && u64::from(len) > room {
+            return self.is_mapped(addr, room as u32) && self.is_mapped(0, len - room as u32);
+        }
         // The primary segment first: the common case, and one compare.
         u64::from(addr) + u64::from(len) <= self.bytes.len() as u64
             || self
@@ -1601,6 +1619,39 @@ mod address_mask_tests {
         assert_eq!(mem.read_u16(0x1012), 0xBEEF);
         assert_eq!(mem.read_u32(0x1014), 0xCAFE_F00D);
         assert_eq!(mem.peek_u8(0x1018), 0x77);
+    }
+
+    #[test]
+    fn multi_byte_accesses_wrap_at_the_top_of_a_24_bit_bus() {
+        // 16 MiB of RAM: the last bytes of the bus are real memory.
+        let mut mem = FlatMemory::new(0x100_0000);
+        mem.set_address_mask(0x00FF_FFFF);
+        mem.write_u8(0, 0xAA);
+        mem.write_u8(1, 0xBB);
+        mem.write_u8(0xFF_FFFE, 0x11);
+        mem.write_u8(0xFF_FFFF, 0x22);
+        // A long at $FFFFFE continues at $000000, as on the CPU.
+        assert_eq!(mem.read_u32(0xFF_FFFE), 0x1122_AABB);
+        assert_eq!(mem.read_u16(0xFF_FFFF), 0x22AA);
+        mem.write_u32(0xFF_FFFE, 0xCAFE_BABE);
+        assert_eq!(mem.read_u8(0xFF_FFFE), 0xCA);
+        assert_eq!(mem.read_u8(0xFF_FFFF), 0xFE);
+        assert_eq!(mem.read_u8(0), 0xBA);
+        assert_eq!(mem.read_u8(1), 0xBE);
+        assert!(
+            mem.is_mapped(0xFF_FFFE, 4),
+            "the span wraps onto mapped RAM"
+        );
+        assert!(
+            mem.is_mapped(0xAB00_0000 | 0xFF_FFFF, 2),
+            "tagged and wrapping"
+        );
+        // The same long on a 32-bit bus does not wrap into low memory.
+        let mut flat = FlatMemory::new(0x100_0000);
+        flat.write_u8(0, 0xAA);
+        flat.write_u8(0xFF_FFFF, 0x22);
+        assert_eq!(flat.read_u16(0xFF_FFFF), 0x2200, "reads past the end are 0");
+        assert!(!flat.is_mapped(0xFF_FFFE, 4));
     }
 
     #[test]
