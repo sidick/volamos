@@ -97,9 +97,7 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser};
 
 use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END, address_mask, addressable_bytes};
-use volamos_core::dispatch::{
-    Runtime, StartConfig, TraceEvent, install_fpu_disabled_060_decline_stub,
-};
+use volamos_core::dispatch::{Runtime, StartConfig, TraceEvent, install_line_f_decline_stub};
 use volamos_core::exectask::install_host_break_handler;
 use volamos_core::loader::Location;
 use volamos_core::memory::{DcacheGeometry, FlatMemory, MemWaitCosts};
@@ -2479,10 +2477,10 @@ fn build_nested_runtime(
     // issue #167 (second half): a nested System()/Execute() run builds
     // its own independent CpuCore/FlatMemory, so it needs this pre-seed
     // exactly as much as the top-level run does -- see
-    // install_fpu_disabled_060_decline_stub's doc for why this has to
+    // install_line_f_decline_stub's doc for why this has to
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
-    install_fpu_disabled_060_decline_stub(&mut runtime, cpu_type, fpu);
+    install_line_f_decline_stub(&mut runtime, cpu_type, fpu, fpsp_emulate);
     // A nested System()/Execute() run is still the real CLI process --
     // see Runtime::enable_host_break_folding's doc (issue #210).
     runtime.enable_host_break_folding();
@@ -2588,10 +2586,10 @@ fn build_runtime_with_vfs(
     let mut runtime = Runtime::new(cpu, mem, config);
     // issue #167 (second half): both of run()'s loading strategies reach
     // Runtime::new through here, so one call covers them both -- see
-    // install_fpu_disabled_060_decline_stub's doc for why this has to
+    // install_line_f_decline_stub's doc for why this has to
     // run after Runtime::new (its own sentinel prefill would otherwise
     // clobber a write made beforehand).
-    install_fpu_disabled_060_decline_stub(&mut runtime, opts.cpu_type, opts.fpu);
+    install_line_f_decline_stub(&mut runtime, opts.cpu_type, opts.fpu, opts.fpsp_emulate);
     // Only the real CLI opts into folding a host SIGINT/SIGTERM into the
     // guest's SIGBREAKF_CTRL_C (issue #210) -- see
     // Runtime::enable_host_break_folding's doc for why this is opt-in
@@ -5032,7 +5030,7 @@ mod tests {
     /// runtime error to `-1`, which would make this fix unobservable at
     /// that boundary. [`build_nested_runtime`] factors out exactly the
     /// steps `run_nested_program` performs (including the
-    /// `install_fpu_disabled_060_decline_stub` call this test is about),
+    /// `install_line_f_decline_stub` call this test is about),
     /// so this exercises the real nested-run construction path, not a
     /// re-implementation of it.
     #[test]
@@ -5067,10 +5065,7 @@ mod tests {
 
         match result {
             Err(volamos_core::dispatch::RuntimeError::UnexpectedStop { reason, pc }) => {
-                assert_eq!(
-                    pc,
-                    volamos_core::dispatch::FPU_DISABLED_060_DECLINE_STUB_ADDR
-                );
+                assert_eq!(pc, volamos_core::dispatch::LINE_F_DECLINE_STUB_ADDR);
                 assert!(
                     reason.contains("Illegal"),
                     "expected an Illegal-instruction trap, got {reason:?}"
@@ -5078,7 +5073,7 @@ mod tests {
             }
             other => panic!(
                 "expected a clean UnexpectedStop (Illegal) trap at \
-                 FPU_DISABLED_060_DECLINE_STUB_ADDR, got {other:?}"
+                 LINE_F_DECLINE_STUB_ADDR, got {other:?}"
             ),
         }
     }

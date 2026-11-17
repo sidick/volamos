@@ -428,6 +428,18 @@ volamos --cpu 68060 --fpu --fpsp-emulate a-68040-fp-binary
 volamos --cpu 68040 --fpsp-emulate a-68040-fp-binary
 ```
 
+Without the flag, a guest that executes one of these instructions and
+hasn't installed its own Line-F handler stops with a message that names
+the instruction and what to do about it, instead of crashing somewhere
+unrelated:
+
+```text
+volamos: t: unexpected CPU stop at 0x00003304: unimplemented FPU instruction FSIN: the 68040/68060 leave it to their FPSP software package, which volamos only runs with --fpsp-emulate (...) -- re-run with --fpsp-emulate
+```
+
+A guest that installs its own handler at the Line-F vector (as
+`68040.library`'s FPSP does) still gets the real exception.
+
 On real hardware, that trap is exactly what lets AmigaOS's
 `68040.library`/`68060.library` install FPSP/ISP software-emulation
 handlers at boot (via `SetPatch`) — which is how an FP-targeted binary
