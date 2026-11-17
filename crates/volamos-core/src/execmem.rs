@@ -156,6 +156,20 @@ pub const MEMF_TOTAL: u32 = 1 << 19;
 /// memory: every allocation is already contiguous; accepted and ignored.
 pub const MEMF_NO_EXPUNGE: u32 = 1 << 31;
 
+/// The `MEMF_*` bits of an `AllocMem`/`AvailMem` requirement that name a
+/// *kind of memory* -- the ones a `MemHeader`'s `mh_Attributes` is
+/// matched against -- as opposed to behaviour flags (`MEMF_CLEAR`,
+/// `MEMF_LARGEST`, ...). Real exec skips every header that lacks any of
+/// them. [`crate::memmap::MEMF_KICK`] is in the set although no handler
+/// here ever passes it; it is matched like the rest.
+const PLACEMENT_BITS: u32 =
+    MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST | MEMF_LOCAL | MEMF_24BITDMA | crate::memmap::MEMF_KICK;
+
+/// The part of `requirements` that selects a memory region.
+fn placement(requirements: u32) -> u32 {
+    requirements & PLACEMENT_BITS
+}
+
 /// Size in bytes rounded to on every `AllocMem`/`FreeMem` request, and
 /// used as the `AllocVec`/`FreeVec` header size -- see the module docs.
 const MEMBLOCKSIZE: u32 = 8;
@@ -309,7 +323,7 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     // knows the unrounded number.
     match ctx
         .heap
-        .alloc_with_requested(&mut *ctx.mem, rounded, byte_size)
+        .alloc_for(&mut *ctx.mem, rounded, byte_size, placement(requirements))
     {
         Ok(addr) => {
             let cleared = requirements & MEMF_CLEAR != 0;
@@ -405,10 +419,22 @@ fn free_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 /// single largest contiguous free block.
 fn avail_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let attributes = ctx.cpu.data_register(DataRegister(1));
+    let kind = placement(attributes);
+    // Real exec sums (or, for MEMF_LARGEST, takes the maximum over)
+    // only the memory headers whose attributes include every requested
+    // bit; MEMF_TOTAL reports their whole size, not just the free part.
+    // MEMF_TOTAL without a memory layout (a bare heap) still behaves as
+    // the plain query, as before.
     let result = if attributes & MEMF_LARGEST != 0 {
-        ctx.heap.largest_free()
+        ctx.heap.largest_free_matching(kind)
+    } else if let Some(total) = ctx
+        .heap
+        .capacity_matching(kind)
+        .filter(|_| attributes & MEMF_TOTAL != 0)
+    {
+        total.min(u64::from(u32::MAX)) as u32
     } else {
-        ctx.heap.total_free()
+        ctx.heap.total_free_matching(kind)
     };
     ctx.cpu.set_data_register(DataRegister(0), result);
     Ok(())
@@ -429,7 +455,10 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 
     let user_rounded = round_up_8(byte_size);
     let total = user_rounded + ALLOCVEC_HEADER_SIZE;
-    match ctx.heap.alloc(&mut *ctx.mem, total) {
+    match ctx
+        .heap
+        .alloc_for(&mut *ctx.mem, total, total, placement(requirements))
+    {
         Ok(block) => {
             // Header: total block size (u32) followed by 4 bytes of
             // reserved padding (see the module docs).
@@ -873,7 +902,7 @@ fn alloc_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     let rounded = round_up_8(byte_size);
     match ctx
         .heap
-        .alloc_with_requested(&mut *ctx.mem, rounded, byte_size)
+        .alloc_for(&mut *ctx.mem, rounded, byte_size, placement(requirements))
     {
         Ok(addr) => {
             let cleared = requirements & MEMF_CLEAR != 0;
@@ -1103,7 +1132,15 @@ const CHIP_RAM_END: u32 = 0x20_0000;
 /// heap placed it, not on the flags it was requested with.
 fn type_of_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let addr = ctx.cpu.address_register(AddressRegister(1));
-    let attributes = if (addr as usize) >= ctx.mem.len() {
+    // With a memory layout, the attributes of the region the address is
+    // in -- exactly what real exec reports (the owning MemHeader's
+    // mh_Attributes) -- and 0 outside every region. A bare heap has no
+    // layout, so those fall back to the address-based guess below.
+    let attributes = if let Some(attrs) = ctx.heap.attributes_at(addr) {
+        attrs
+    } else if ctx.heap.capacity_matching(0).is_some() || (addr as usize) >= ctx.mem.len() {
+        // Outside every region of the layout (or, for a bare heap,
+        // past the end of RAM).
         0
     } else if addr < CHIP_RAM_END {
         MEMF_PUBLIC | MEMF_CHIP

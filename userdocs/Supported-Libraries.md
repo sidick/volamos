@@ -227,12 +227,23 @@ Changelog.
   `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
   `cia.resource`, ...) are modelled; `OpenResource` of one returns
   `NULL`.
-- `TypeOfMem`: addresses below 2 MiB (including the reserved low
-  region) report `MEMF_PUBLIC|MEMF_CHIP`; 2 MiB up to the end of guest
-  RAM reports `MEMF_PUBLIC|MEMF_FAST`; past the end of RAM (or the whole
-  range beyond a `--ram` smaller than 2 MiB) reports `0`. `AllocMem`
-  ignores the chip/fast flags, so an allocation's answer depends only
-  on where the heap placed it.
+- Memory regions: guest RAM is chip RAM for the first 2 MiB and fast
+  (accelerator-class) RAM above it, up to `--ram`. `AllocMem`/
+  `AllocVec`/`AllocPooled` honour the memory-kind flags the way real
+  exec does: a block is only taken from a region whose attributes
+  include *every* requested bit, highest priority first. So
+  `MEMF_CHIP` comes from chip RAM, `MEMF_FAST` from fast RAM,
+  no flags (`MEMF_ANY`) prefers fast and falls back to chip, and
+  `MEMF_CHIP|MEMF_FAST` (no such memory) or `MEMF_FAST` on a machine
+  with no RAM above 2 MiB returns `NULL`. `TypeOfMem` reports the
+  owning region's real attribute word — `0x703` for chip RAM
+  (public, chip, local, 24-bit DMA, kick) and `0x705` for the fast
+  block — and `0` outside RAM. `AvailMem` counts only the requested
+  kind (`MEMF_CHIP`, `MEMF_FAST`, plus `MEMF_LARGEST`), and
+  `MEMF_TOTAL` reports the whole region size rather than the free part.
+  The attribute words and priorities were measured on real Kickstart
+  3.1. Slow, Zorro II/III and CPU-board RAM regions exist in the
+  runtime but cannot be selected yet.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor` (enters
   the routine through a real exception frame — a 68010+ format-0

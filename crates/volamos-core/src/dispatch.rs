@@ -2355,6 +2355,14 @@ pub struct StartConfig {
     /// unlike `pr_CLI` itself, which must be non-`NULL`, see
     /// [`crate::exectask::PR_CLI_OFFSET`]'s doc).
     pub program_name: String,
+    /// The memory map the guest's RAM follows (issue #332): which
+    /// address ranges are chip, slow, fast, ... RAM, so `AllocMem`
+    /// requirements, `AvailMem` and `TypeOfMem` can tell them apart.
+    /// `None` (the default, and every call site that predates the
+    /// layout) derives the legacy layout from the memory's size: chip
+    /// RAM for the first 2 MiB and one accelerator-class block above it
+    /// ([`crate::memmap::MemoryLayout::legacy_exact`]).
+    pub memory_layout: Option<crate::memmap::MemoryLayout>,
 }
 
 impl Default for StartConfig {
@@ -2367,6 +2375,7 @@ impl Default for StartConfig {
             stack_size: DEFAULT_STACK_SIZE,
             attn_flags: 0,
             program_name: String::new(),
+            memory_layout: None,
         }
     }
 }
@@ -3054,7 +3063,11 @@ impl<C: Cpu + 'static> Runtime<C> {
         // Heap: from the loaded program's end (rounded up) to the base
         // of the reserved stack region, so it never overlaps either.
         let stack_base = top.saturating_sub(stack_size) & !3;
-        let mut heap = GuestHeap::new(config.load_end, stack_base);
+        let layout = config
+            .memory_layout
+            .clone()
+            .unwrap_or_else(|| crate::memmap::MemoryLayout::legacy_exact(mem.len() as u32));
+        let mut heap = GuestHeap::with_layout(layout, config.load_end, stack_base);
 
         // The entry stack frame, in real AmigaOS's `RunCommand`
         // layout (issues #178 and #279) -- ascending addresses:

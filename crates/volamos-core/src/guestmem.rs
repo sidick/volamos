@@ -343,6 +343,13 @@ pub struct GuestHeap {
     /// what makes it reachable from all three of `AllocMem`/`AllocVec`/
     /// `AllocPooled` without a new plumbing parameter.
     dirty_fill: Option<u8>,
+    /// The memory map this heap's range was carved from, if it was built
+    /// with [`GuestHeap::with_layout`]. Gives each free block a class
+    /// (chip, slow, fast, ...), which drives [`GuestHeap::alloc_for`]'s
+    /// placement and keeps free blocks from different regions from ever
+    /// coalescing. `None` (every plain [`GuestHeap::new`]) is one
+    /// anonymous range and behaves exactly as before the layout existed.
+    layout: Option<crate::memmap::MemoryLayout>,
 }
 
 impl GuestHeap {
@@ -378,6 +385,79 @@ impl GuestHeap {
             recently_freed: VecDeque::new(),
             next_free_serial: 0,
             dirty_fill: None,
+            layout: None,
+        }
+    }
+
+    /// Creates a heap managing the part of each region of `layout` that
+    /// lies inside `[start, end)`, one free block per region (never
+    /// merged across a region boundary, even where two regions abut).
+    /// `start` and `end` are rounded as in [`GuestHeap::new`]. This is
+    /// the heap a run with a real memory map uses: see
+    /// [`GuestHeap::alloc_for`] for how requirements pick a region.
+    pub fn with_layout(layout: crate::memmap::MemoryLayout, start: u32, end: u32) -> Self {
+        let mut heap = Self::new(0, 0);
+        let start = u64::from(align_up(start));
+        let end = u64::from(end & !3);
+        for r in layout.regions() {
+            let lo = start.max(u64::from(r.base));
+            let hi = end.min(r.end());
+            if hi > lo {
+                heap.free.push(FreeBlock {
+                    start: lo as u32,
+                    size: (hi - lo) as u32,
+                });
+            }
+        }
+        heap.layout = Some(layout);
+        heap
+    }
+
+    /// `mh_Attributes` of the region containing `addr` (what `TypeOfMem`
+    /// reports), or `None` if there is no layout or `addr` is outside
+    /// every region.
+    pub fn attributes_at(&self, addr: u32) -> Option<u32> {
+        let layout = self.layout.as_ref()?;
+        let i = layout.region_index_at(addr)?;
+        Some(layout.regions()[i].attributes())
+    }
+
+    /// Total bytes of RAM (free or not) in regions whose attributes
+    /// include every bit of `required`: `AvailMem(... | MEMF_TOTAL)`.
+    /// `None` without a layout.
+    pub fn capacity_matching(&self, required: u32) -> Option<u64> {
+        Some(self.layout.as_ref()?.total_capacity(required))
+    }
+
+    /// Whether the free block at `start` is in a region whose attributes
+    /// include every bit of `required`. Always true without a layout.
+    fn block_matches(&self, start: u32, required: u32) -> bool {
+        match &self.layout {
+            None => true,
+            Some(l) => l
+                .region_index_at(start)
+                .is_some_and(|i| l.regions()[i].attributes() & required == required),
+        }
+    }
+
+    /// Placement rank of the free block at `start`: higher is tried
+    /// first (the region's `MemHeader` priority; `0` without a layout).
+    fn block_priority(&self, start: u32) -> i8 {
+        self.layout
+            .as_ref()
+            .and_then(|l| {
+                l.region_index_at(start)
+                    .map(|i| l.regions()[i].kind.priority())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Whether `a` and `b` (a block start and another's) are in the
+    /// same region, i.e. whether adjacent free blocks may merge.
+    fn same_region(&self, a: u32, b: u32) -> bool {
+        match &self.layout {
+            None => true,
+            Some(l) => l.region_index_at(a) == l.region_index_at(b),
         }
     }
 
@@ -510,7 +590,29 @@ impl GuestHeap {
         size: u32,
         requested: u32,
     ) -> Result<u32, GuestHeapError> {
-        let (user_start, block_start, block_end) = self.alloc_untracked(size, requested)?;
+        self.alloc_for(mem, size, requested, 0)
+    }
+
+    /// [`GuestHeap::alloc_with_requested`] restricted to regions whose
+    /// attributes include every bit of `required` (`MEMF_CHIP`,
+    /// `MEMF_FAST`, `MEMF_24BITDMA`, `MEMF_LOCAL`, ...), as real
+    /// `AllocMem` selects a `MemHeader`: among the matching regions the
+    /// highest-priority one that has a fitting block wins (so with no
+    /// requirement fast RAM is preferred and chip is the fallback), and
+    /// within a region the lowest-addressed fitting block is used.
+    /// Requirements no region satisfies -- `MEMF_CHIP | MEMF_FAST`, or
+    /// `MEMF_FAST` on a chip-only machine -- fail with
+    /// [`GuestHeapError::OutOfMemory`], as real `AllocMem` returns NULL.
+    /// `required == 0` places as a plain heap without a layout always did.
+    pub fn alloc_for(
+        &mut self,
+        mem: &mut dyn AddressSpace,
+        size: u32,
+        requested: u32,
+        required: u32,
+    ) -> Result<u32, GuestHeapError> {
+        let (user_start, block_start, block_end) =
+            self.alloc_untracked(size, requested, required)?;
         mem.clear_fresh_block(block_start, block_end - block_start);
         Ok(user_start)
     }
@@ -531,6 +633,7 @@ impl GuestHeap {
         &mut self,
         size: u32,
         requested: u32,
+        required: u32,
     ) -> Result<(u32, u32, u32), GuestHeapError> {
         let aligned_size = align_up(size);
 
@@ -555,7 +658,7 @@ impl GuestHeap {
             .checked_mul(2)
             .and_then(|redzones| redzones.checked_add(aligned_size))
         else {
-            let available = self.free.iter().map(|b| b.size).max().unwrap_or(0);
+            let available = self.largest_free_matching(required);
             return Err(GuestHeapError::OutOfMemory {
                 requested: size,
                 available,
@@ -568,8 +671,21 @@ impl GuestHeap {
         // redzones -- a block that would only fit the user bytes alone
         // correctly fails here rather than handing out an unguarded
         // allocation.
-        let Some(idx) = self.free.iter().position(|b| b.size >= total_needed) else {
-            let available = self.free.iter().map(|b| b.size).max().unwrap_or(0);
+        //
+        // With a layout, the candidates are first narrowed to regions
+        // satisfying `required` and then ranked by region priority
+        // (highest first), lowest address breaking ties; `free` is kept
+        // sorted by address so `max_by_key`'s "last maximum" is made
+        // first-wins by comparing on the reversed index.
+        let Some(idx) = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.size >= total_needed && self.block_matches(b.start, required))
+            .max_by_key(|&(i, b)| (self.block_priority(b.start), std::cmp::Reverse(i)))
+            .map(|(i, _)| i)
+        else {
+            let available = self.largest_free_matching(required);
             return Err(GuestHeapError::OutOfMemory {
                 requested: size,
                 available,
@@ -707,7 +823,7 @@ impl GuestHeap {
         // Merge with the block to the left, if adjacent.
         let merge_left = insert_at > 0 && {
             let left = self.free[insert_at - 1];
-            left.start + left.size == block.start
+            left.start + left.size == block.start && self.same_region(left.start, block.start)
         };
         let left_idx = if merge_left {
             let left = self.free.remove(insert_at - 1);
@@ -724,7 +840,8 @@ impl GuestHeap {
         // have shifted by one if we removed a left neighbor above).
         if left_idx < self.free.len() {
             let right = self.free[left_idx];
-            if block.start + block.size == right.start {
+            if block.start + block.size == right.start && self.same_region(block.start, right.start)
+            {
                 block = FreeBlock {
                     start: block.start,
                     size: block.size + right.size,
@@ -831,6 +948,26 @@ impl GuestHeap {
     /// quarantined blocks -- see that method's doc for why.
     pub fn largest_free(&self) -> u32 {
         self.free.iter().map(|b| b.size).max().unwrap_or(0)
+    }
+
+    /// [`GuestHeap::total_free`] counting only regions whose attributes
+    /// include every bit of `required` (`AvailMem(MEMF_CHIP)` etc.).
+    pub fn total_free_matching(&self, required: u32) -> u32 {
+        self.free
+            .iter()
+            .filter(|b| self.block_matches(b.start, required))
+            .map(|b| b.size)
+            .sum()
+    }
+
+    /// [`GuestHeap::largest_free`] over the matching regions only.
+    pub fn largest_free_matching(&self, required: u32) -> u32 {
+        self.free
+            .iter()
+            .filter(|b| self.block_matches(b.start, required))
+            .map(|b| b.size)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The size of the live allocation starting at `addr`, if any --
@@ -950,8 +1087,150 @@ impl GuestHeap {
     }
 
     fn alloc_bare_req(&mut self, size: u32, requested: u32) -> Result<u32, GuestHeapError> {
-        self.alloc_untracked(size, requested)
+        self.alloc_untracked(size, requested, 0)
             .map(|(addr, _, _)| addr)
+    }
+}
+
+#[cfg(test)]
+mod layout_heap_tests {
+    use super::*;
+    use crate::execmem::{MEMF_24BITDMA, MEMF_CHIP, MEMF_FAST, MEMF_LOCAL};
+    use crate::memmap::{MemoryLayout, MemoryRegion, RegionKind};
+    use crate::memory::FlatMemory;
+
+    const MIB: u32 = 0x10_0000;
+    const MB_BASE: u32 = 0x0780_0000;
+
+    /// Chip 2 MiB, Zorro II fast 4 MiB, A4000-style CPU RAM 8 MiB.
+    fn a4000ish() -> MemoryLayout {
+        MemoryLayout::new(vec![
+            MemoryRegion::new(RegionKind::Chip, 0, 2 * MIB),
+            MemoryRegion::new(RegionKind::Fast, 2 * MIB, 4 * MIB),
+            MemoryRegion::new(RegionKind::Accelerator, MB_BASE, 8 * MIB),
+        ])
+        .unwrap()
+    }
+
+    fn heap() -> (GuestHeap, FlatMemory) {
+        (
+            GuestHeap::with_layout(a4000ish(), 0x4000, 0x8000_0000),
+            FlatMemory::from_layout(&a4000ish()),
+        )
+    }
+
+    #[test]
+    fn with_layout_makes_one_free_block_per_region_clipped_to_the_range() {
+        let (h, _) = heap();
+        assert_eq!(h.free_bytes(), (2 * MIB - 0x4000) + 4 * MIB + 8 * MIB);
+        assert_eq!(h.total_free_matching(MEMF_CHIP), 2 * MIB - 0x4000);
+        assert_eq!(h.total_free_matching(MEMF_FAST), 12 * MIB);
+        // A range that starts inside the second region drops the first.
+        let h = GuestHeap::with_layout(a4000ish(), 3 * MIB, 0x8000_0000);
+        assert_eq!(h.total_free_matching(MEMF_CHIP), 0);
+        assert_eq!(h.total_free_matching(MEMF_FAST), 3 * MIB + 8 * MIB);
+    }
+
+    #[test]
+    fn any_prefers_the_highest_priority_region_and_chip_stays_in_chip() {
+        let (mut h, mut mem) = heap();
+        // As measured on a real A4000: MEMF_ANY and MEMF_FAST land in
+        // the 32-bit CPU RAM (priority 30), MEMF_CHIP in chip.
+        let any = h.alloc_for(&mut mem, 64, 64, 0).unwrap();
+        let fast = h.alloc_for(&mut mem, 64, 64, MEMF_FAST).unwrap();
+        let chip = h.alloc_for(&mut mem, 64, 64, MEMF_CHIP).unwrap();
+        assert!((MB_BASE..MB_BASE + 8 * MIB).contains(&any));
+        assert!((MB_BASE..MB_BASE + 8 * MIB).contains(&fast));
+        assert!(chip < 2 * MIB);
+        assert_eq!(h.attributes_at(chip), Some(0x703));
+        assert_eq!(h.attributes_at(fast), Some(0x505));
+    }
+
+    #[test]
+    fn dma_and_local_requirements_skip_regions_without_the_bit() {
+        let (mut h, mut mem) = heap();
+        // Real A4000: FAST|24BITDMA skips the 32-bit RAM and lands in
+        // Zorro II fast RAM.
+        let z2 = h
+            .alloc_for(&mut mem, 64, 64, MEMF_FAST | MEMF_24BITDMA)
+            .unwrap();
+        assert!((2 * MIB..6 * MIB).contains(&z2));
+        assert_eq!(h.attributes_at(z2), Some(0x605));
+        // LOCAL excludes Zorro II (the 0x605 header has no LOCAL bit).
+        let local = h
+            .alloc_for(&mut mem, 64, 64, MEMF_FAST | MEMF_LOCAL)
+            .unwrap();
+        assert!(local >= MB_BASE);
+    }
+
+    #[test]
+    fn an_unsatisfiable_requirement_fails_like_alloc_mem_returning_null() {
+        let (mut h, mut mem) = heap();
+        // No header is both chip and fast.
+        assert!(matches!(
+            h.alloc_for(&mut mem, 64, 64, MEMF_CHIP | MEMF_FAST),
+            Err(GuestHeapError::OutOfMemory { available: 0, .. })
+        ));
+        // And fast on a chip-only machine.
+        let mut chip_only = GuestHeap::with_layout(
+            MemoryLayout::new(vec![MemoryRegion::new(RegionKind::Chip, 0, 2 * MIB)]).unwrap(),
+            0x4000,
+            2 * MIB,
+        );
+        assert!(chip_only.alloc_for(&mut mem, 64, 64, MEMF_FAST).is_err());
+        assert!(
+            chip_only.alloc_for(&mut mem, 64, 64, 0).is_ok(),
+            "ANY falls back to chip"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_preferred_region_falls_back_to_the_next_by_priority() {
+        let (mut h, mut mem) = heap();
+        // Fill the CPU RAM completely; ANY must now come from Zorro II.
+        let big = h
+            .alloc_for(&mut mem, 8 * MIB, 8 * MIB, MEMF_FAST | MEMF_LOCAL)
+            .unwrap();
+        assert_eq!(big, MB_BASE);
+        let next = h.alloc_for(&mut mem, 64, 64, 0).unwrap();
+        assert!((2 * MIB..6 * MIB).contains(&next), "{next:#X}");
+    }
+
+    #[test]
+    fn free_blocks_in_abutting_regions_never_merge() {
+        // The legacy layout's chip and accelerator regions touch at 2 MiB.
+        let layout = MemoryLayout::legacy_exact(4 * MIB);
+        let mut mem = FlatMemory::from_layout(&layout);
+        let mut h = GuestHeap::with_layout(layout, 0x4000, 4 * MIB);
+        let chip_free = h.total_free_matching(MEMF_CHIP);
+        // Take everything, then give it back: the two regions must come
+        // back as two blocks, not one 4 MiB block spanning both.
+        let c = h
+            .alloc_for(&mut mem, chip_free, chip_free, MEMF_CHIP)
+            .unwrap();
+        let f = h.alloc_for(&mut mem, 2 * MIB, 2 * MIB, MEMF_FAST).unwrap();
+        h.free(c).unwrap();
+        h.free(f).unwrap();
+        assert_eq!(h.largest_free_matching(MEMF_CHIP), chip_free);
+        assert_eq!(h.largest_free(), 2 * MIB);
+        assert_eq!(h.free.len(), 2);
+    }
+
+    #[test]
+    fn capacity_matching_counts_whole_regions_free_or_not() {
+        let (mut h, mut mem) = heap();
+        h.alloc_for(&mut mem, MIB, MIB, MEMF_CHIP).unwrap();
+        assert_eq!(h.capacity_matching(MEMF_CHIP), Some(u64::from(2 * MIB)));
+        assert_eq!(h.capacity_matching(MEMF_FAST), Some(u64::from(12 * MIB)));
+        assert_eq!(GuestHeap::new(0, 0x1000).capacity_matching(0), None);
+    }
+
+    #[test]
+    fn a_plain_heap_ignores_requirements_exactly_as_before() {
+        let mut mem = FlatMemory::new(0x2000);
+        let mut h = GuestHeap::new(0x100, 0x2000);
+        assert!(h.alloc_for(&mut mem, 16, 16, MEMF_CHIP | MEMF_FAST).is_ok());
+        assert_eq!(h.attributes_at(0x100), None);
     }
 }
 

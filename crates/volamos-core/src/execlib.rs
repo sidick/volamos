@@ -3875,9 +3875,12 @@ mod loaded_library_e2e {
 
     #[test]
     fn type_of_mem_classifies_chip_fast_and_out_of_range() {
-        use crate::execmem::{MEMF_CHIP, MEMF_FAST, MEMF_PUBLIC};
-        let chip = MEMF_PUBLIC | MEMF_CHIP;
-        let fast = MEMF_PUBLIC | MEMF_FAST;
+        // The owning region's mh_Attributes, as measured on real
+        // Kickstart 3.1: chip 0x703. The legacy layout's block above
+        // 2 MiB is accelerator-class RAM inside the 24-bit space, i.e.
+        // fast + local + 24-bit DMA (0x705).
+        let chip = 0x703;
+        let fast = 0x705;
         assert_eq!(type_of_mem(0), chip, "bottom of chip RAM");
         assert_eq!(type_of_mem(EXEC_LIBRARY_BASE), chip, "reserved region");
         assert_eq!(type_of_mem(DATA), chip, "64 KiB is below 2 MiB");
@@ -3888,12 +3891,82 @@ mod loaded_library_e2e {
         assert_eq!(type_of_mem(0xFFFF_FFF0), 0);
     }
 
+    /// `AllocMem(64, flags)` in a 3 MiB machine (chip 2 MiB + 1 MiB of
+    /// accelerator-class RAM): returns `AllocMem`'s own result, or with
+    /// `then_type_of` `TypeOfMem` of the block it returned.
+    fn alloc_mem_in_3mib(flags: u32, then_type_of: bool) -> u32 {
+        let mut words = vec![moveq(0, 64), 0x223C, (flags >> 16) as u16, flags as u16];
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -198); // AllocMem
+        if then_type_of {
+            words.push(0x2240); // movea.l d0,a1
+            jsr(&mut words, 6, -534); // TypeOfMem
+        }
+        words.push(RTS);
+        run_words_sized(0x30_0000, words, |_| {})
+            .0
+            .expect("run should succeed") as u32
+    }
+
+    fn avail_mem_in_3mib(attributes: u32) -> u32 {
+        let mut words = vec![0x223C, (attributes >> 16) as u16, attributes as u16];
+        movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        jsr(&mut words, 6, -216); // AvailMem
+        words.push(RTS);
+        run_words_sized(0x30_0000, words, |_| {})
+            .0
+            .expect("run should succeed") as u32
+    }
+
+    /// Issue #332: `AllocMem` honours `MEMF_CHIP`/`MEMF_FAST` and
+    /// `TypeOfMem` reports the region the block really came from
+    /// (previously every flag was ignored, so `MEMF_FAST` could read
+    /// back as chip). Expected values are what Kickstart 3.1 does on
+    /// real hardware.
+    #[test]
+    fn alloc_mem_flags_pick_the_region_and_type_of_mem_agrees() {
+        use crate::execmem::{MEMF_24BITDMA, MEMF_CHIP, MEMF_FAST};
+        assert_eq!(alloc_mem_in_3mib(MEMF_CHIP, true), 0x703);
+        assert_eq!(alloc_mem_in_3mib(MEMF_FAST, true), 0x705);
+        assert_eq!(alloc_mem_in_3mib(MEMF_FAST | MEMF_24BITDMA, true), 0x705);
+        // MEMF_ANY prefers fast RAM and falls back to chip.
+        assert_eq!(alloc_mem_in_3mib(0, true), 0x705);
+        // No header is both chip and fast: real AllocMem returns NULL.
+        assert_eq!(alloc_mem_in_3mib(MEMF_CHIP | MEMF_FAST, false), 0);
+        // And 2 MiB cannot be satisfied from the 1 MiB of fast RAM.
+        assert_eq!(
+            alloc_mem_in_3mib(MEMF_FAST, false) & 0xFFE0_0000,
+            0x20_0000,
+            "a small FAST block sits above 2 MiB"
+        );
+    }
+
+    #[test]
+    fn avail_mem_counts_only_the_requested_kind_of_memory() {
+        use crate::execmem::{MEMF_CHIP, MEMF_FAST, MEMF_LARGEST, MEMF_TOTAL};
+        const MEMF_ANY: u32 = 0;
+        let chip = avail_mem_in_3mib(MEMF_CHIP);
+        let fast = avail_mem_in_3mib(MEMF_FAST);
+        // Free chip + free fast is everything free.
+        assert_eq!(avail_mem_in_3mib(MEMF_ANY), chip + fast);
+        assert!(chip < 0x20_0000 && fast < 0x10_0000 && fast > 0x8_0000);
+        assert_eq!(avail_mem_in_3mib(MEMF_FAST | MEMF_LARGEST), fast);
+        // MEMF_TOTAL is whole-region size, free or not (as on a real
+        // machine: an 8 MiB Zorro II board reports 8388608).
+        assert_eq!(avail_mem_in_3mib(MEMF_CHIP | MEMF_TOTAL), 0x20_0000);
+        assert_eq!(avail_mem_in_3mib(MEMF_FAST | MEMF_TOTAL), 0x10_0000);
+        assert_eq!(
+            avail_mem_in_3mib(MEMF_CHIP | MEMF_FAST),
+            0,
+            "no such memory"
+        );
+    }
+
     /// With RAM smaller than 2 MiB the chip range is capped at the end of RAM.
     #[test]
     fn type_of_mem_caps_chip_range_at_small_ram() {
-        use crate::execmem::{MEMF_CHIP, MEMF_PUBLIC};
         let ram = 0x10_0000;
-        assert_eq!(type_of_mem_with_ram(ram, 0xF_FFFF), MEMF_PUBLIC | MEMF_CHIP);
+        assert_eq!(type_of_mem_with_ram(ram, 0xF_FFFF), 0x703);
         assert_eq!(type_of_mem_with_ram(ram, 0x10_0000), 0);
         assert_eq!(type_of_mem_with_ram(ram, 0x18_0000), 0);
     }

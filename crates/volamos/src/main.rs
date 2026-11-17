@@ -2226,6 +2226,7 @@ fn build_nested_runtime(
         stack_size,
         attn_flags: attn_flags_for(cpu_type, fpu),
         program_name: program_name_from_path(host_path),
+        memory_layout: None,
     };
     let mut cpu = M68kCpu::with_config(cpu_type, fpu);
     // The sanitizer's shadow-map checks only run through
@@ -2523,6 +2524,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             stack_size: opts.stack_size,
             attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
             program_name,
+            memory_layout: None,
         };
         let mut runtime = build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?;
         runtime
@@ -2574,6 +2576,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             stack_size: opts.stack_size,
             attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
             program_name,
+            memory_layout: None,
         };
         build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?
     };

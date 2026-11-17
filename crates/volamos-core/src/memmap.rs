@@ -130,6 +130,39 @@ impl RegionKind {
     }
 }
 
+/// `MEMF_KICK` (bit 10): memory a Kickstart-resident module may use.
+/// Not in the NDK 1.3 headers; the value (0x400) is what every real
+/// `MemHeader` below carries in `mh_Attributes`.
+pub const MEMF_KICK: u32 = 1 << 10;
+
+impl RegionKind {
+    /// The `ln_Pri` real exec gives this class's `MemHeader`: allocation
+    /// tries the highest priority first, so `MEMF_ANY` prefers
+    /// accelerator RAM, then Zorro II/III fast RAM, then slow, then chip.
+    ///
+    /// Chip (-10), slow (-5) and Zorro II fast (0) and the A4000-style
+    /// 32-bit CPU RAM (30, used for [`RegionKind::Accelerator`]) were
+    /// measured on Kickstart 3.1 r40.68 via Copperline; Zorro III is
+    /// assumed to match Zorro II (0) and is *not* hardware-verified.
+    pub fn priority(self) -> i8 {
+        match self {
+            RegionKind::Chip => -10,
+            RegionKind::Slow => -5,
+            RegionKind::Fast | RegionKind::Zorro3 => 0,
+            RegionKind::Accelerator => 30,
+        }
+    }
+
+    /// The `mh_Name` real exec gives this class's `MemHeader`.
+    pub fn header_name(self) -> &'static str {
+        match self {
+            RegionKind::Chip => "chip memory",
+            RegionKind::Slow => "memory",
+            RegionKind::Fast | RegionKind::Zorro3 | RegionKind::Accelerator => "expansion memory",
+        }
+    }
+}
+
 /// One contiguous block of RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -149,6 +182,36 @@ impl MemoryRegion {
     /// the top of the 32-bit space doesn't wrap.
     pub fn end(&self) -> u64 {
         u64::from(self.base) + u64::from(self.size)
+    }
+
+    /// The `mh_Attributes` real exec gives this region's `MemHeader`,
+    /// i.e. what `TypeOfMem` reports for an address in it and what an
+    /// `AllocMem` requirement has to be a subset of. Measured on
+    /// Kickstart 3.1 r40.68 (Copperline):
+    ///
+    /// | kind | attributes |
+    /// |---|---|
+    /// | chip | `0x703` public, chip, local, 24-bit DMA, kick |
+    /// | slow | `0x705` public, fast, local, 24-bit DMA, kick |
+    /// | Zorro II fast | `0x605` public, fast, 24-bit DMA, kick |
+    /// | 32-bit CPU RAM (A4000 motherboard) | `0x505` public, fast, local, kick |
+    ///
+    /// Accelerator RAM takes the last row, plus 24-bit DMA when it lies
+    /// wholly within the 24-bit space (as the legacy flat layout's does).
+    /// Zorro III is assumed to be Zorro II's without 24-bit DMA
+    /// (`0x405`); not hardware-verified.
+    pub fn attributes(&self) -> u32 {
+        use crate::execmem::{MEMF_24BITDMA, MEMF_CHIP, MEMF_FAST, MEMF_LOCAL, MEMF_PUBLIC};
+        let within_24_bits = self.end() <= 0x100_0000;
+        let dma = if within_24_bits { MEMF_24BITDMA } else { 0 };
+        let base = MEMF_PUBLIC | MEMF_KICK;
+        match self.kind {
+            RegionKind::Chip => base | MEMF_CHIP | MEMF_LOCAL | MEMF_24BITDMA,
+            RegionKind::Slow => base | MEMF_FAST | MEMF_LOCAL | MEMF_24BITDMA,
+            RegionKind::Fast => base | MEMF_FAST | MEMF_24BITDMA,
+            RegionKind::Accelerator => base | MEMF_FAST | MEMF_LOCAL | dma,
+            RegionKind::Zorro3 => base | MEMF_FAST,
+        }
     }
 
     /// Whether `addr` is inside this region.
@@ -361,6 +424,40 @@ impl MemoryLayout {
         Self::build(regions, false).expect("the legacy flat layout is valid by construction")
     }
 
+    /// The layout every run had before #332, built from an exact byte
+    /// count: chip RAM for the first 2 MiB (or all of `total`), one
+    /// contiguous accelerator-labelled block above. Unlike
+    /// [`Self::legacy_flat`] it neither rounds nor validates, so it can
+    /// describe whatever size an existing caller already built its
+    /// memory with (tests use sizes below one granule).
+    pub fn legacy_exact(total: u32) -> Self {
+        let chip = total.min(MAX_CHIP_SIZE);
+        let mut regions = vec![MemoryRegion::new(RegionKind::Chip, 0, chip)];
+        if total > chip {
+            regions.push(MemoryRegion::new(
+                RegionKind::Accelerator,
+                chip,
+                total - chip,
+            ));
+        }
+        Self { regions }
+    }
+
+    /// Index into [`Self::regions`] of the region containing `addr`.
+    pub fn region_index_at(&self, addr: u32) -> Option<usize> {
+        self.regions.iter().position(|r| r.contains(addr))
+    }
+
+    /// Total bytes of RAM in regions whose attributes include every bit
+    /// of `required` -- what `AvailMem(... | MEMF_TOTAL)` reports.
+    pub fn total_capacity(&self, required: u32) -> u64 {
+        self.regions
+            .iter()
+            .filter(|r| r.attributes() & required == required)
+            .map(|r| u64::from(r.size))
+            .sum()
+    }
+
     /// The regions, sorted by base address.
     pub fn regions(&self) -> &[MemoryRegion] {
         &self.regions
@@ -475,6 +572,51 @@ mod tests {
             l.regions()[1],
             r(RegionKind::Accelerator, 2 * MIB, 14 * MIB)
         );
+    }
+
+    #[test]
+    fn region_attributes_and_priorities_match_real_kickstart_headers() {
+        let chip = r(RegionKind::Chip, 0, 2 * MIB);
+        let slow = r(RegionKind::Slow, 0xC0_0000, MIB / 2);
+        let z2 = r(RegionKind::Fast, 2 * MIB, 8 * MIB);
+        let mb = r(RegionKind::Accelerator, 0x0780_0000, 8 * MIB);
+        // Measured with a probe walking SysBase->MemList on KS 3.1 r40.68.
+        assert_eq!(chip.attributes(), 0x703);
+        assert_eq!(slow.attributes(), 0x705);
+        assert_eq!(z2.attributes(), 0x605);
+        assert_eq!(mb.attributes(), 0x505);
+        assert_eq!(
+            [chip.kind, slow.kind, z2.kind, mb.kind].map(RegionKind::priority),
+            [-10, -5, 0, 30]
+        );
+        // Wholly inside the 24-bit space an accelerator gains 24-bit DMA.
+        let legacy = MemoryLayout::legacy_flat(16 * MIB);
+        assert_eq!(legacy.regions()[1].attributes(), 0x705);
+        assert_eq!(r(RegionKind::Zorro3, 0x1000_0000, MIB).attributes(), 0x405);
+    }
+
+    #[test]
+    fn total_capacity_sums_the_regions_with_every_required_bit() {
+        let l = MemoryLayout::new(vec![
+            r(RegionKind::Chip, 0, 2 * MIB),
+            r(RegionKind::Fast, 2 * MIB, 4 * MIB),
+            r(RegionKind::Accelerator, 0x0780_0000, 8 * MIB),
+        ])
+        .unwrap();
+        let (chip, fast) = (crate::execmem::MEMF_CHIP, crate::execmem::MEMF_FAST);
+        assert_eq!(l.total_capacity(chip), u64::from(2 * MIB));
+        assert_eq!(l.total_capacity(fast), u64::from(12 * MIB));
+        assert_eq!(l.total_capacity(0), u64::from(14 * MIB));
+        assert_eq!(l.total_capacity(chip | fast), 0, "no header has both");
+    }
+
+    #[test]
+    fn legacy_exact_does_not_round_or_validate() {
+        let l = MemoryLayout::legacy_exact(0x2_0000 + 6);
+        assert_eq!(l.total_size(), 0x2_0006);
+        assert_eq!(l.regions().len(), 1, "all chip below 2 MiB");
+        assert_eq!(l.region_index_at(0x2_0005), Some(0));
+        assert_eq!(l.region_index_at(0x2_0006), None);
     }
 
     #[test]
