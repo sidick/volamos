@@ -165,6 +165,15 @@ pub trait Cpu {
     /// Writes the status register.
     fn set_sr(&mut self, value: u16);
 
+    /// Tells the CPU that `CacheControl()` has just changed the exec-level
+    /// cache state to `exec_bits` (`CACRF_*`), so a model that has its own
+    /// cache-control register can keep it in step. The 68060's
+    /// 68060.library patches `CacheControl()` to write exactly the
+    /// instruction- and data-cache enables into `CACR`; a guest that then
+    /// reads `CACR` with `movec` must not see the opposite of what
+    /// `CacheControl()` reports. A backend with no such register ignores it.
+    fn note_cache_control(&mut self, _exec_bits: u32) {}
+
     /// Reads FPIAR, the floating-point instruction address register: the
     /// address of the last FPU instruction started. The 68040/68060 point
     /// it at the faulting instruction when one raises an unimplemented-

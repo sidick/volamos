@@ -1062,6 +1062,9 @@ fn cache_control_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     let old = ctx.mem.read_u32(CACHE_BITS_ADDR);
     let new = (old & !cache_mask) | (cache_bits & cache_mask);
     ctx.mem.write_u32(CACHE_BITS_ADDR, new);
+    // Keep the CPU's own cache-control register in step (the 060's CACR),
+    // as the real 68060.library's CacheControl() patch does.
+    ctx.cpu.note_cache_control(new);
 
     ctx.cpu.set_data_register(DataRegister(0), old);
     Ok(())
@@ -1983,6 +1986,33 @@ mod tests {
         words.extend_from_slice(&jsr_disp16_a6(-648)); // CacheControl(a6)
         words.push(RTS);
         words
+    }
+
+    #[test]
+    fn cache_control_reaches_the_68060s_cacr_so_movec_reads_back_what_it_reports() {
+        // CacheControl(0, EnableI|EnableD) switches both caches off; a
+        // guest that then reads CACR with `movec` (it runs in supervisor
+        // mode here) must not still see EIC/EDC set. D0 returns as the
+        // exit code, so it carries the whole register.
+        use m68k::core::cpu::{CACR_060_EBC, CACR_060_EDC, CACR_060_EIC};
+        let mut words = cache_control_program(0, 0x101);
+        words.pop(); // the trailing RTS
+        words.extend_from_slice(&[0x4E7A, 0x0002, RTS]); // movec cacr,d0 ; rts
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::with_config(m68k::CpuType::M68060, false),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: TRAP_TABLE_END + 0x400,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let cacr = rt.run(&mut Vec::new(), None).expect("run should succeed") as u32;
+        assert_eq!(cacr & (CACR_060_EIC | CACR_060_EDC), 0, "{cacr:#010x}");
+        assert_ne!(cacr & CACR_060_EBC, 0, "CacheControl must not touch EBC");
     }
 
     #[test]

@@ -1039,6 +1039,30 @@ impl Cpu for M68kCpu {
         self.core.fpiar
     }
 
+    /// Mirrors `CACRF_EnableI`/`CACRF_EnableD` onto the 68060's `EIC`/
+    /// `EDC`, the two bits the real 68060.library's `CacheControl()` patch
+    /// edits (its mask is `$80008000`; see the disassembly note in
+    /// [`M68kCpu::with_config`]). `EBC`/`ESB` are untouched, as there.
+    /// Other models keep no CACR image here.
+    fn note_cache_control(&mut self, exec_bits: u32) {
+        use m68k::core::cpu::{CACR_060_EDC, CACR_060_EIC};
+        if self.core.cpu_type != CpuType::M68060 {
+            return;
+        }
+        const CACRF_ENABLE_I: u32 = 1 << 0;
+        const CACRF_ENABLE_D: u32 = 1 << 8;
+        for (exec_bit, cacr_bit) in [
+            (CACRF_ENABLE_I, CACR_060_EIC),
+            (CACRF_ENABLE_D, CACR_060_EDC),
+        ] {
+            if exec_bits & exec_bit != 0 {
+                self.core.cacr |= cacr_bit;
+            } else {
+                self.core.cacr &= !cacr_bit;
+            }
+        }
+    }
+
     fn set_sr(&mut self, value: u16) {
         self.core.set_sr(value);
     }
@@ -2217,50 +2241,32 @@ mod tests {
     }
 
     /// A counted `subq.l #1,d0 ; bne.s` loop of `n` iterations then an
-    /// A-line stop, under `--clock-mhz`, with `clear_ebc` dropping the
-    /// branch cache the 060 starts with. Returns the emulated cycles.
-    fn branch_loop_cycles(cpu_type: CpuType, n: u32, clear_ebc: bool) -> u64 {
-        let words = [
+    /// A-line stop, under `--clock-mhz`, behind `prefix` (instructions run
+    /// first). `edit_cacr` adjusts the CPU's CACR before the run. Returns
+    /// `(emulated cycles, final CACR)`.
+    fn branch_loop_run(
+        cpu_type: CpuType,
+        n: u32,
+        prefix: &[u16],
+        edit_cacr: impl Fn(u32) -> u32,
+    ) -> (u64, u32) {
+        let mut words = prefix.to_vec();
+        words.extend_from_slice(&[
             0x203C,
             (n >> 16) as u16,
             n as u16, // move.l #n,d0
             0x5380,   // loop: subq.l #1,d0
             0x66FC,   // bne.s loop
             0xA000,
-        ];
+        ]);
         let mut mem = FlatMemory::new(0x4000);
         load_words(&mut mem, TRAP_TABLE_END, &words);
         let mut cpu = M68kCpu::with_config(cpu_type, false);
-        if clear_ebc {
-            cpu.core.cacr &= !m68k::core::cpu::CACR_060_EBC;
-        }
+        cpu.core.cacr = edit_cacr(cpu.core.cacr);
         cpu.set_pc(TRAP_TABLE_END);
         cpu.set_clock_mhz(Some(25.0));
         assert!(matches!(cpu.run(&mut mem), StopReason::Trap(_)));
-        cpu.emulated_cycles()
-    }
-
-    #[test]
-    fn a_guests_own_movec_to_cacr_switches_the_branch_cache_off() {
-        // The same loop, with and without `moveq #0,d1 ; movec d1,cacr`
-        // in front. Clearing CACR must make the loop cost more, i.e. the
-        // write reaches the crate and EBC goes away.
-        let loop_words = |prefix: &[u16]| {
-            let mut words = prefix.to_vec();
-            words.extend_from_slice(&[0x203C, 0x0000, 1000, 0x5380, 0x66FC, 0xA000]);
-            let mut mem = FlatMemory::new(0x4000);
-            load_words(&mut mem, TRAP_TABLE_END, &words);
-            let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
-            cpu.set_pc(TRAP_TABLE_END);
-            cpu.set_clock_mhz(Some(25.0));
-            assert!(matches!(cpu.run(&mut mem), StopReason::Trap(_)));
-            (cpu.emulated_cycles(), cpu.core.cacr)
-        };
-        let (plain, plain_cacr) = loop_words(&[]);
-        let (cleared, cleared_cacr) = loop_words(&[0x7200, 0x4E7B, 0x1002]); // moveq #0,d1 ; movec d1,cacr
-        assert_ne!(plain_cacr & m68k::core::cpu::CACR_060_EBC, 0);
-        assert_eq!(cleared_cacr & m68k::core::cpu::CACR_060_EBC, 0);
-        assert!(cleared > plain, "cleared {cleared} cycles vs {plain}");
+        (cpu.emulated_cycles(), cpu.core.cacr)
     }
 
     #[test]
@@ -2296,21 +2302,56 @@ mod tests {
     }
 
     #[test]
-    fn the_68060_branch_cache_makes_a_tight_loop_cheaper_and_can_be_switched_off() {
-        // EBC folds a correctly predicted taken branch out of the stream,
-        // so the loop costs fewer cycles than with the cache cleared --
-        // the way a guest's own `movec d0,cacr` would clear it.
-        let on = branch_loop_cycles(CpuType::M68060, 1000, false);
-        let off = branch_loop_cycles(CpuType::M68060, 1000, true);
+    fn the_68060_branch_cache_makes_a_tight_loop_cheaper_and_only_on_a_68060() {
+        use m68k::core::cpu::CACR_060_EBC;
+        // EBC folds a correctly predicted taken branch out of the stream.
+        let (on, _) = branch_loop_run(CpuType::M68060, 1000, &[], |c| c);
+        let (off, _) = branch_loop_run(CpuType::M68060, 1000, &[], |c| c & !CACR_060_EBC);
+        assert!(on < off, "branch cache on: {on} cycles, off: {off}");
+        // A 68040 ignores the bit: forcing it on must not change its timing
+        // (so a regression that gave the 040 branch-cache costs is caught).
+        let (plain, _) = branch_loop_run(CpuType::M68040, 1000, &[], |c| c);
+        let (forced, _) = branch_loop_run(CpuType::M68040, 1000, &[], |c| c | CACR_060_EBC);
+        assert_eq!(plain, forced);
+    }
+
+    #[test]
+    fn a_guests_own_movec_to_cacr_switches_the_branch_cache_off() {
+        use m68k::core::cpu::CACR_060_EBC;
+        // Same-shaped prefixes, differing only in the value written:
+        // `move.l #v,d1 ; movec d1,cacr`. Keeping EBC costs the same as
+        // the prefix-free loop plus two instructions; clearing it must
+        // cost clearly more, which the prefix alone cannot explain.
+        let write = |v: u32| [0x223C, (v >> 16) as u16, v as u16, 0x4E7B, 0x1002];
+        let (kept, kept_cacr) = branch_loop_run(CpuType::M68060, 1000, &write(CACR_060_EBC), |c| c);
+        let (cleared, cleared_cacr) = branch_loop_run(CpuType::M68060, 1000, &write(0), |c| c);
+        assert_ne!(kept_cacr & CACR_060_EBC, 0);
+        assert_eq!(cleared_cacr & CACR_060_EBC, 0);
         assert!(
-            on < off,
-            "branch cache on: {on} cycles, off: {off} -- EBC is not reaching the crate"
+            cleared > kept + 500,
+            "clearing EBC should add a large per-iteration cost: kept {kept}, cleared {cleared}"
         );
-        // And the 040 has no such register, so clearing it changes nothing.
-        assert_eq!(
-            branch_loop_cycles(CpuType::M68040, 1000, false),
-            branch_loop_cycles(CpuType::M68040, 1000, true)
-        );
+    }
+
+    #[test]
+    fn cache_control_keeps_the_68060s_cacr_enables_in_step() {
+        use m68k::core::cpu::{CACR_060_EBC, CACR_060_EDC, CACR_060_EIC, CACR_060_ESB};
+        let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
+        cpu.note_cache_control(0); // CacheControl(0, EnableI|EnableD)
+        assert_eq!(cpu.core.cacr & (CACR_060_EIC | CACR_060_EDC), 0);
+        // EBC and ESB are not CacheControl()'s to touch.
+        assert_ne!(cpu.core.cacr & (CACR_060_EBC | CACR_060_ESB), 0);
+        cpu.note_cache_control(1 << 0); // instruction cache only
+        assert_ne!(cpu.core.cacr & CACR_060_EIC, 0);
+        assert_eq!(cpu.core.cacr & CACR_060_EDC, 0);
+        cpu.note_cache_control(1 << 8); // data cache only
+        assert_eq!(cpu.core.cacr & CACR_060_EIC, 0);
+        assert_ne!(cpu.core.cacr & CACR_060_EDC, 0);
+        // Other models keep no such image.
+        let mut cpu = M68kCpu::with_config(CpuType::M68040, false);
+        let before = cpu.core.cacr;
+        cpu.note_cache_control(0);
+        assert_eq!(cpu.core.cacr, before);
     }
 
     #[test]

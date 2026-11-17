@@ -660,13 +660,17 @@ store buffer (`CACR.ESB`); this was read off the real `68060.library`'s own
 init code rather than assumed. volamos starts `--cpu 68060` with both set
 too. `EBC` is the one that changes timing: a correctly predicted taken
 branch folds out of the instruction stream, so branchy code reports fewer
-cycles — on the loops used to check this, 3% to 14% fewer. Results are
-unchanged, and so is every other CPU model. A program can still switch the
-branch cache off itself with `movec` to `CACR`, which is honoured. (The
-library's `CacheControl()` patch only ever changes the instruction and data
-cache enables, so a `CacheControl()` call cannot turn it off.) As with the
-superscalar change, 68060 cycle counts from earlier volamos versions are
-higher on such code and are not comparable.
+cycles — 3% to 14% fewer on four small compiled loops (integer ALU, memory,
+calls, and a branchy kernel) at 25 MHz, so treat that as indicative rather
+than typical. Results are unchanged, and so is every other CPU model. A
+`Supervisor()` routine can still switch the branch cache off with `movec` to
+`CACR` (the instruction is privileged), which is honoured. The library's
+`CacheControl()` patch only ever changes the instruction and data cache
+enables, so a `CacheControl()` call cannot turn it off; volamos mirrors those
+two enables into `CACR`, so reading it back with `movec` agrees with what
+`CacheControl()` reports. As with the superscalar change, 68060 cycle counts
+from earlier volamos versions are higher on such code and are not
+comparable.
 
 ## `--cache`
 
