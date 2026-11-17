@@ -442,17 +442,18 @@ fn supervisor_handler<C: Cpu + 'static>(
     // goes into the exception frame instead, for the routine's `RTE`.
     let sp = ctx.cpu.address_register(AddressRegister(7));
     let return_pc = ctx.mem.read_u32(sp);
-    ctx.cpu
-        .set_address_register(AddressRegister(7), sp.wrapping_add(4));
+    let caller_sp = sp.wrapping_add(4);
+    ctx.cpu.set_address_register(AddressRegister(7), caller_sp);
     ctx.cpu.push_exception_frame(ctx.mem, return_pc);
     // The post-dispatch `rts` enters the routine, on top of the frame.
     let sp = ctx.cpu.address_register(AddressRegister(7)).wrapping_sub(4);
     ctx.cpu.set_address_register(AddressRegister(7), sp);
     if let Some(shadow) = ctx.mem.shadow_mut() {
         shadow.update_stack_pointer(sp);
-        // The routine runs as supervisor code until its `RTE` lands on
-        // `return_pc`: see `ShadowMap::begin_supervisor`.
-        shadow.begin_supervisor(return_pc);
+        // The routine runs as supervisor code until its `RTE` pops the
+        // frame back to the caller's stack: see
+        // `ShadowMap::begin_supervisor`.
+        shadow.begin_supervisor(caller_sp);
     }
     ctx.mem.write_u32(sp, routine);
     Ok(())

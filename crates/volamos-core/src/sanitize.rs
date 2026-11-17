@@ -832,12 +832,13 @@ pub struct ShadowMap {
     /// it is reported -- the wild-pointer half (issue #72). Off by
     /// default; see [`Self::check_guest_access`].
     pub report_wild: bool,
-    /// Where the `Supervisor()` routine currently running returns to,
-    /// or `None` outside one (see [`Self::begin_supervisor`]). The
-    /// supervisor bit itself can't answer this: volamos runs every guest
-    /// in supervisor mode from reset (nothing drops it to user mode), so
-    /// SR says nothing about whether the program asked for it.
-    supervisor_until: Option<u32>,
+    /// One entry per `Supervisor()` routine currently running: the stack
+    /// pointer its `RTE` pops back to (see [`Self::begin_supervisor`]).
+    /// Empty outside one. The supervisor bit itself can't answer this:
+    /// volamos runs every guest in supervisor mode from reset (nothing
+    /// drops it to user mode), so SR says nothing about whether the
+    /// program asked for it.
+    supervisor_limits: Vec<u32>,
     /// Set for exactly the one bus read that fetches an exception
     /// vector (see [`Self::note_vector_fetch`]); that read is the CPU's,
     /// not a data access of the guest's.
@@ -937,7 +938,7 @@ impl ShadowMap {
             report_uninit: false,
             report_low_memory: false,
             report_wild: false,
-            supervisor_until: None,
+            supervisor_limits: Vec::new(),
             vector_fetch_pending: Cell::new(false),
             stack: None,
             call_stack: VecDeque::new(),
@@ -968,14 +969,20 @@ impl ShadowMap {
         self.movem_dummy_read.set(addr);
     }
 
-    /// Marks the start of a `Supervisor()` routine that `RTE`s to
-    /// `return_pc`: until the PC gets there, the guest is doing what only
-    /// supervisor code may legitimately do -- including owning the
-    /// vector table, so [`Self::check_guest_access`]'s low-memory check
-    /// stands down. Called by the `Supervisor` handler. One level only:
-    /// a routine that itself calls `Supervisor()` is not a thing.
-    pub(crate) fn begin_supervisor(&mut self, return_pc: u32) {
-        self.supervisor_until = Some(return_pc);
+    /// Marks the start of a `Supervisor()` routine whose `RTE` will pop
+    /// the stack back to `limit`: until the published stack pointer
+    /// reaches it, the guest is doing what only supervisor code may
+    /// legitimately do -- including owning the vector table, so
+    /// [`Self::check_guest_access`]'s low-memory check stands down.
+    /// Called by the `Supervisor` handler.
+    ///
+    /// Keyed on the stack pointer rather than the routine's return
+    /// address because the `RTE` pops its frame wherever it lands: a
+    /// routine may `RTE` somewhere else entirely (a `longjmp`-style
+    /// unwind), which a return-address test would never see, leaving the
+    /// check off for the rest of the run. Nested calls stack up.
+    pub(crate) fn begin_supervisor(&mut self, limit: u32) {
+        self.supervisor_limits.push(limit);
     }
 
     /// Marks the *next* bus read as the CPU fetching an exception
@@ -996,11 +1003,21 @@ impl ShadowMap {
     /// Whether every byte of `[addr, addr + size)` lies in a shadowed
     /// (i.e. RAM-backed) segment.
     fn is_mapped(&self, addr: u32, size: u8) -> bool {
-        (0..u32::from(size)).all(|i| {
-            let a = u64::from(addr) + u64::from(i);
+        let first = u64::from(addr);
+        let last = first + u64::from(size.max(1)) - 1;
+        // Common case: one segment holds the whole access.
+        if self
+            .segments
+            .iter()
+            .any(|seg| first >= u64::from(seg.base) && last < seg.end())
+        {
+            return true;
+        }
+        // Otherwise it can still straddle two adjacent segments.
+        (0..u64::from(size)).all(|i| {
             self.segments
                 .iter()
-                .any(|seg| a >= u64::from(seg.base) && a < seg.end())
+                .any(|seg| first + i >= u64::from(seg.base) && first + i < seg.end())
         })
     }
 
@@ -1060,6 +1077,12 @@ impl ShadowMap {
         if !self.report_low_memory && !self.report_wild {
             return;
         }
+        // The dummy reads a real 68000 makes (a MOVEM's word past its last
+        // register, a CLR's look at its destination) are the CPU's, not the
+        // program's: `check_read` excuses them, and so does this.
+        if !write && (self.clr_dummy_read_pending.get() || self.is_movem_dummy_read(addr)) {
+            return;
+        }
         let kind = if write {
             ViolationKind::InvalidWrite
         } else {
@@ -1076,7 +1099,7 @@ impl ShadowMap {
             return;
         }
         if self.report_low_memory
-            && self.supervisor_until.is_none()
+            && self.supervisor_limits.is_empty()
             && addr < LOW_MEMORY_GUARD_END
             && !(!write && addr == 4 && size == 4)
         {
@@ -1270,10 +1293,11 @@ impl ShadowMap {
     /// attribution" doc. Called once per instruction/batch by the CPU
     /// run loop.
     pub fn set_current_pc(&mut self, pc: u32) {
-        if self.supervisor_until == Some(pc) {
-            self.supervisor_until = None;
-        }
         self.current_pc = pc;
+        // A vector-fetch marker only ever covers the read inside the
+        // instruction that set it; if that read never reached the bus (a
+        // fault), it must not excuse a real access in the next one.
+        self.vector_fetch_pending.set(false);
     }
 
     /// The most recently published PC -- see [`Self::set_current_pc`].
@@ -1777,6 +1801,15 @@ impl ShadowMap {
     ///   comes back instead of staying silently off for the rest of the
     ///   run.
     pub fn update_stack_pointer(&mut self, sp: u32) {
+        // A `Supervisor()` routine is over once its `RTE` has popped the
+        // frame, wherever that `RTE` landed (see `begin_supervisor`).
+        while self
+            .supervisor_limits
+            .last()
+            .is_some_and(|&limit| sp >= limit)
+        {
+            self.supervisor_limits.pop();
+        }
         let Some(region) = self.stack else {
             return;
         };
@@ -3565,14 +3598,15 @@ mod tests {
     #[test]
     fn supervisor_routines_may_use_the_vector_table_until_they_return() {
         let mut shadow = access_shadow();
-        shadow.begin_supervisor(0x600);
+        shadow.update_stack_pointer(0x700);
+        shadow.begin_supervisor(0x780);
         shadow.check_guest_access(0x2C, 4, true); // installing a vector
-        shadow.set_current_pc(0x580); // still inside the routine
+        shadow.update_stack_pointer(0x700 - 8); // the routine pushes
         shadow.check_guest_access(0x2C, 4, false);
         assert_eq!(shadow.violation_count(), 0);
 
-        // The RTE lands on the return address: back to user code.
-        shadow.set_current_pc(0x600);
+        // The RTE pops the frame back to the limit: back to user code.
+        shadow.update_stack_pointer(0x780);
         shadow.check_guest_access(0x2C, 4, true);
         assert_eq!(shadow.violation_count(), 1);
     }
@@ -3580,7 +3614,7 @@ mod tests {
     #[test]
     fn a_supervisor_routine_does_not_excuse_a_wild_pointer() {
         let mut shadow = access_shadow();
-        shadow.begin_supervisor(0x600);
+        shadow.begin_supervisor(0x780);
         shadow.check_guest_access(0xAAAA_4444, 4, false);
         assert_eq!(shadow.violation_count(), 1);
     }
@@ -3703,5 +3737,64 @@ mod tests {
         shadow.check_read(8, 1);
         assert_eq!(shadow.violations()[0].site, None);
         assert!(!shadow.report().contains("NULL"));
+    }
+
+    #[test]
+    fn a_stale_vector_fetch_marker_does_not_outlive_its_instruction() {
+        // If the read the marker was set for never reaches the bus (a
+        // fault), the next instruction's first access is the guest's.
+        let mut shadow = access_shadow();
+        shadow.note_vector_fetch();
+        shadow.set_current_pc(0x504);
+        shadow.check_guest_access(0, 4, true);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn dummy_reads_are_excused_like_check_read_does() {
+        let shadow = access_shadow();
+        shadow.set_movem_dummy_read(Some(0x1000)); // just past the first region
+        shadow.check_guest_access(0x1000, 2, false);
+        shadow.set_movem_dummy_read(None);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // A CLR's look at its destination, but not its store.
+        shadow.set_clr_dummy_read_pending(true);
+        shadow.check_guest_access(0, 4, false);
+        assert_eq!(shadow.violation_count(), 0);
+        shadow.check_guest_access(0, 4, true);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn a_supervisor_routine_that_rtes_elsewhere_still_ends_its_exemption() {
+        // The routine ended by popping its frame (the SP reaching the
+        // limit), wherever the RTE went -- a return-address test would
+        // never see this and leave the check off for the rest of the run.
+        let mut shadow = access_shadow();
+        shadow.begin_supervisor(0x780);
+        shadow.update_stack_pointer(0x700);
+        shadow.check_guest_access(0x2C, 4, true);
+        assert_eq!(shadow.violation_count(), 0);
+        shadow.update_stack_pointer(0x780);
+        shadow.check_guest_access(0x2C, 4, true);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn nested_supervisor_routines_unwind_one_level_at_a_time() {
+        let mut shadow = access_shadow();
+        shadow.begin_supervisor(0x780); // outer
+        shadow.begin_supervisor(0x740); // inner, called from the outer
+        shadow.update_stack_pointer(0x740); // inner returns
+        shadow.check_guest_access(0x2C, 4, true);
+        assert_eq!(
+            shadow.violation_count(),
+            0,
+            "the outer routine is still running"
+        );
+        shadow.update_stack_pointer(0x780);
+        shadow.check_guest_access(0x2C, 4, true);
+        assert_eq!(shadow.violation_count(), 1);
     }
 }

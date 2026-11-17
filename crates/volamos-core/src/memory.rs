@@ -1226,6 +1226,18 @@ impl FlatMemory {
         }
     }
 
+    /// The sanitizer's check for one guest-CPU store, for the bus impl to
+    /// call *after* [`Self::intercept_store`] has declined it: a store a
+    /// [`StorePort`] claims (the `--uae-debug`/`--emu68-debug` hooks sit
+    /// at addresses no RAM backs) is a deliberate write to a device, not a
+    /// wild pointer.
+    #[inline]
+    pub(crate) fn check_guest_store(&self, address: u32, len: u32) {
+        if self.shadow.is_some() {
+            self.check_guest_access(address, len, true);
+        }
+    }
+
     /// See [`ShadowMap::note_vector_fetch`]; called by the bus impl's
     /// `ipl_release_sample`.
     pub(crate) fn note_vector_fetch(&self) {
@@ -1252,9 +1264,6 @@ impl FlatMemory {
         self.writes = self.writes.wrapping_add(1);
         if let Some(timing) = &mut self.mem_timing {
             timing.note_write(address, len);
-        }
-        if self.shadow.is_some() {
-            self.check_guest_access(address, len, true);
         }
     }
 

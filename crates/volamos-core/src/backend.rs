@@ -136,6 +136,7 @@ impl AddressBus for FlatMemory {
         if self.intercept_store(address, u32::from(value), StoreSize::Byte) {
             return;
         }
+        self.check_guest_store(address, 1);
         AddressSpace::write_u8(self, address, value);
     }
 
@@ -144,6 +145,7 @@ impl AddressBus for FlatMemory {
         if self.intercept_store(address, u32::from(value), StoreSize::Word) {
             return;
         }
+        self.check_guest_store(address, 2);
         AddressSpace::write_u16(self, address, value);
     }
 
@@ -152,6 +154,7 @@ impl AddressBus for FlatMemory {
         if self.intercept_store(address, value, StoreSize::Long) {
             return;
         }
+        self.check_guest_store(address, 4);
         AddressSpace::write_u32(self, address, value);
     }
 
@@ -1198,6 +1201,47 @@ mod tests {
         mem.peek_u16(0x10);
         mem.peek_u32(0x20);
         assert_eq!(mem.shadow().unwrap().violation_count(), 0);
+    }
+
+    #[test]
+    fn a_store_a_port_claims_is_not_a_wild_write() {
+        // --uae-debug / --emu68-debug put their hooks at addresses no RAM
+        // backs; a deliberate store to one is not a wild pointer.
+        struct DebugPort;
+        impl crate::memory::StorePort for DebugPort {
+            fn claims(&self, addr: u32) -> bool {
+                addr == 0xBF_FF00
+            }
+            fn store(&mut self, _: &dyn AddressSpace, _: u32, _: u32, _: crate::memory::StoreSize) {
+            }
+        }
+        let mut mem = access_checked_memory();
+        mem.add_store_port(Box::new(DebugPort));
+        AddressBus::write_byte(&mut mem, 0xBF_FF00, b'x');
+        assert_eq!(mem.shadow().unwrap().violation_count(), 0);
+        // The same store one byte over is nobody's, so it is reported.
+        AddressBus::write_byte(&mut mem, 0xBF_FF01, b'x');
+        assert_eq!(mem.shadow().unwrap().violation_count(), 1);
+    }
+
+    #[test]
+    fn a_movem_dummy_read_past_the_end_of_ram_is_not_a_wild_read() {
+        // A 68000 MOVEM <ea>,<list> reads one word past its last
+        // register and discards it; at the top of a RAM region that is
+        // past the end. 4 registers from (end - 16) end exactly there.
+        let (mut cpu, mut mem) = new_cpu_with_memory(TEST_MEM_SIZE);
+        mem.enable_sanitizer();
+        mem.shadow_mut().unwrap().report_wild = true;
+        let start = cpu.pc();
+        load_words(&mut mem, start, &[0x4CD8, 0x000F]); // movem.l (a0)+,d0-d3
+        cpu.set_address_register(AddressRegister(0), (TEST_MEM_SIZE - 16) as u32);
+        cpu.step(&mut mem);
+        assert_eq!(
+            mem.shadow().unwrap().violation_count(),
+            0,
+            "{:?}",
+            mem.shadow().unwrap().violations()
+        );
     }
 
     #[test]
