@@ -1069,6 +1069,10 @@ impl FlatMemory {
     /// Out of line (`#[cold]`) so the generic `run_batch` instantiation
     /// the `m68k` crate builds around this bus is not made bigger, and so
     /// slower, by code ordinary loops never run.
+    // One helper per width, deliberately *not* a single const-generic
+    // one: measured, sharing them cost the tight JIT loops 2-3% (the
+    // generic instantiation changed how the hot callers compile), which
+    // is exactly what moving this code out of line was meant to avoid.
     #[cold]
     #[inline(never)]
     fn read_u16_cold(&self, addr: u32) -> u16 {
@@ -1121,6 +1125,15 @@ impl FlatMemory {
                 }
             }
         }
+    }
+
+    /// [`Self::peek_u16`]/[`Self::peek_u32`] past the primary segment: the
+    /// bytes of a span wholly inside one extra segment, else 0.
+    #[cold]
+    #[inline(never)]
+    fn peek_cold<const N: usize>(&self, addr: u32) -> u32 {
+        self.extra_slice(addr, N)
+            .map_or(0, |s| s.iter().fold(0, |v, &b| (v << 8) | u32::from(b)))
     }
 
     /// Installs a [`StorePort`]; from now on guest CPU stores it claims
@@ -1246,9 +1259,7 @@ impl FlatMemory {
         let addr = addr & self.addr_mask;
         match self.bytes.get(addr as usize..addr as usize + 2) {
             Some(slice) => u16::from_be_bytes(slice.try_into().unwrap()),
-            None => self
-                .extra_slice(addr, 2)
-                .map_or(0, |s| u16::from_be_bytes(s.try_into().unwrap())),
+            None => self.peek_cold::<2>(addr) as u16,
         }
     }
 
@@ -1259,9 +1270,7 @@ impl FlatMemory {
         let addr = addr & self.addr_mask;
         match self.bytes.get(addr as usize..addr as usize + 4) {
             Some(slice) => u32::from_be_bytes(slice.try_into().unwrap()),
-            None => self
-                .extra_slice(addr, 4)
-                .map_or(0, |s| u32::from_be_bytes(s.try_into().unwrap())),
+            None => self.peek_cold::<4>(addr),
         }
     }
 
