@@ -115,6 +115,29 @@ pub(crate) fn local_offset_secs_at(_unix_secs: i64) -> i64 {
     0
 }
 
+/// `struct Locale`'s `loc_GMTOffset` for a host UTC offset in seconds:
+/// minutes **west** of Greenwich, so Tokyo (UTC+9) is `-540` and New York
+/// in winter (UTC-5) is `300`. The sign is the opposite of the usual
+/// "east is positive" convention -- `<libraries/locale.h>` documents the
+/// field as "minutes from GMT" and the C libraries (clib2, ixemul,
+/// libnix) add `loc_GMTOffset * 60` to the clock to get Unix time, which
+/// only works west-positive.
+pub(crate) fn gmt_offset_minutes_west(offset_secs_east: i64) -> i32 {
+    (-offset_secs_east / 60) as i32
+}
+
+/// `loc_GMTOffset` for the host's time zone *right now*, so it follows
+/// daylight saving exactly as the clock ([`now_as_datestamp`]) does --
+/// the pair has to agree, or a guest's `time()` is off by the difference
+/// (issue #298).
+pub(crate) fn current_gmt_offset_minutes_west() -> i32 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    gmt_offset_minutes_west(local_offset_secs_at(now))
+}
+
 /// Converts a host Unix timestamp to AmigaOS-epoch seconds *in the
 /// host's local time*, which is what an Amiga clock reads.
 ///
@@ -477,6 +500,29 @@ mod tests {
             (from_datestamp - i64::from(secs)).abs() <= 2,
             "DateStamp says {from_datestamp} s past the epoch, GetSysTime {secs}"
         );
+    }
+
+    #[test]
+    fn gmt_offset_is_minutes_west_so_east_of_greenwich_is_negative() {
+        // The examples from issue #298.
+        assert_eq!(gmt_offset_minutes_west(9 * 3600), -540, "Tokyo");
+        assert_eq!(gmt_offset_minutes_west(-5 * 3600), 300, "New York, winter");
+        assert_eq!(gmt_offset_minutes_west(-4 * 3600), 240, "New York, DST");
+        assert_eq!(gmt_offset_minutes_west(0), 0, "UTC");
+        // Half-hour zone (India, UTC+5:30).
+        assert_eq!(gmt_offset_minutes_west(5 * 3600 + 1800), -330);
+    }
+
+    #[test]
+    fn current_gmt_offset_agrees_with_the_clock_it_describes() {
+        // Local clock minus the offset is UTC: the relation libc relies on.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let local = now + local_offset_secs_at(now);
+        let utc = local + i64::from(current_gmt_offset_minutes_west()) * 60;
+        assert!((utc - now).abs() <= 1, "utc={utc} now={now}");
     }
 
     #[test]

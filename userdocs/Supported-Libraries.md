@@ -264,8 +264,12 @@ built-in default locale — the United States one, exactly what a real
 from real Kickstart 3.1 hardware): `"."` decimal point, `","`
 grouping, `$`/`USD` currency, US date and time formats, and so on.
 Programs built with libnix therefore get a working `setlocale(LC_ALL,
-"")`, so `strtod`/`sscanf("%lf")` parse `1.5` correctly. `loc_GMTOffset`
-is `0` for now.
+"")`, so `strtod`/`sscanf("%lf")` parse `1.5` correctly.
+`loc_GMTOffset` follows the host's time zone (minutes *west* of UTC, so
+`-540` in Tokyo and `300` in New York in winter, `240` under daylight
+saving), matching the host-local clock `DateStamp` reports. A guest's
+`time()` therefore equals the host's, and setting `TZ` on the host runs
+a program under another zone.
 
 ## intuition.library
 

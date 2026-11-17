@@ -55,11 +55,13 @@
 //! into `localeconv()` and the decimal point `printf`/`scanf` use, so a
 //! `NULL` there made `strtod("1.5")` stop at the `.` and return `1`.
 //!
-//! `loc_GMTOffset` is deliberately left `0` rather than the real default
-//! `-300` (US Eastern): this runtime's clock is the host's local time, so
-//! neither figure is right, and deriving it from the host is issue #298's
-//! job. `loc_Flags`/`loc_CodeSet` stay `0` ("always 0 for now" per the
-//! NDK header).
+//! `loc_GMTOffset` is not part of the measured default (real hardware's
+//! `-300` is just the US-Eastern default): it is the host's offset at the
+//! moment of the call, in minutes *west* of Greenwich, so it agrees with
+//! the host-local clock `DateStamp` reports. C libraries (clib2, ixemul,
+//! libnix) add `loc_GMTOffset * 60` to that clock to make Unix time, so
+//! a guest's `time()` matches the host's (issue #298). `loc_Flags` and
+//! `loc_CodeSet` stay `0` ("always 0 for now" per the NDK header).
 //!
 //! # `OpenCatalogA`/`GetCatalogStr`/`CloseCatalog`: always "use the built-in strings"
 //!
@@ -112,6 +114,7 @@ mod off {
     pub const LANGUAGE_NAME: u32 = 4;
     pub const PREF_LANGUAGES: u32 = 8;
     pub const COUNTRY_CODE: u32 = 56;
+    pub const GMT_OFFSET: u32 = 64;
     pub const TELEPHONE_CODE: u32 = 60;
     pub const MEASURING_SYSTEM: u32 = 68;
     pub const DATE_TIME_FORMAT: u32 = 72;
@@ -225,6 +228,11 @@ fn open_locale_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             _ => ctx.mem.write_u8(addr + field, value as u8),
         }
     }
+    // loc_GMTOffset follows the host's zone, as the clock does (#298).
+    ctx.mem.write_u32(
+        addr + off::GMT_OFFSET,
+        crate::dosdate::current_gmt_offset_minutes_west() as u32,
+    );
     ctx.cpu.set_data_register(DataRegister(0), addr);
     Ok(())
 }
@@ -650,10 +658,14 @@ mod tests {
         assert_eq!(mem.read_u32(addr + off::TELEPHONE_CODE), 1);
         assert_eq!(mem.read_u8(addr + off::MEASURING_SYSTEM), 1);
         assert_eq!(mem.read_u8(addr + off::MON_FRAC_DIGITS), 2);
-        // "always 0 for now" per the NDK header, and the GMT offset is #298's.
+        // "always 0 for now" per the NDK header.
         assert_eq!(mem.read_u32(addr + 48), 0, "loc_Flags");
         assert_eq!(mem.read_u32(addr + 52), 0, "loc_CodeSet");
-        assert_eq!(mem.read_u32(addr + 64), 0, "loc_GMTOffset");
+        assert_eq!(
+            mem.read_u32(addr + off::GMT_OFFSET) as i32,
+            crate::dosdate::current_gmt_offset_minutes_west(),
+            "loc_GMTOffset follows the host zone (#298)"
+        );
         // Every string pointer lands inside the one allocation (so a single
         // CloseLocale frees everything).
         let end = addr + LOCALE_STRUCT_SIZE + 512;
