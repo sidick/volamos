@@ -244,6 +244,30 @@ impl AddressBus for FlatMemory {
             len,
         })
     }
+
+    /// The extra RAM segments of a non-contiguous layout (issue #332),
+    /// as the JIT's additional direct-memory windows: plain RAM with no
+    /// side effects, so the same contract as [`Self::fast_mem`] and the
+    /// same gating (a sanitizer shadow map or a store port means every
+    /// store must reach the bus, so no direct window at all). The crate
+    /// takes at most [`m68k::MAX_FAST_MEM_REGIONS`]; a segment beyond
+    /// that simply isn't windowed and is served by the bus methods,
+    /// which are always correct, just slower.
+    fn fast_mem_regions(&mut self) -> [Option<m68k::FastMemRegion>; m68k::MAX_FAST_MEM_REGIONS] {
+        let mut out = [None; m68k::MAX_FAST_MEM_REGIONS];
+        if self.shadow().is_some() || self.has_store_ports() {
+            return out;
+        }
+        for (slot, (base, ptr, len)) in out.iter_mut().zip(self.extra_segments_mut()) {
+            *slot = Some(m68k::FastMemRegion {
+                ptr,
+                base,
+                len,
+                writable: true,
+            });
+        }
+        out
+    }
 }
 
 /// A [`Cpu`] implementation backed by the `m68k` crate's `CpuCore`.
@@ -1632,6 +1656,63 @@ mod tests {
             jit_cpu.data_register(DataRegister(0)),
         );
         assert_eq!(interp_cpu.pc(), jit_cpu.pc());
+    }
+
+    /// Test (issue #332): RAM in an extra, non-contiguous segment is
+    /// reachable from guest code on the interpreter and through the
+    /// JIT's additional direct-memory window, with identical results,
+    /// and an address in no segment reads 0 instead of faulting.
+    #[test]
+    fn extra_ram_segment_is_reachable_from_interpreter_and_jit_alike() {
+        use crate::memmap::{MemoryLayout, MemoryRegion, RegionKind};
+        const ACCEL: u32 = 0x0800_0000;
+        let layout = MemoryLayout::new(vec![
+            MemoryRegion::new(RegionKind::Chip, 0, 0x20_0000),
+            MemoryRegion::new(RegionKind::Accelerator, ACCEL, 0x10_0000),
+        ])
+        .unwrap();
+        let words: &[u16] = &[
+            0x7004, // MOVEQ #4,D0
+            0x23C0, 0x0800, 0x0000, // [loop] MOVE.L D0,($08000000).L
+            0x2239, 0x0800, 0x0000, // MOVE.L ($08000000).L,D1
+            0x51C8, 0xFFF2, // DBRA D0,loop
+            0x2439, 0x5000, 0x0000, // MOVE.L ($50000000).L,D2 -- unmapped
+            0xA000, // A-line trap: stop here
+        ];
+
+        let run = |jit: bool| {
+            let mut mem = FlatMemory::from_layout(&layout);
+            load_words(&mut mem, TRAP_TABLE_END, words);
+            let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
+            cpu.set_jit(jit);
+            cpu.set_pc(TRAP_TABLE_END);
+            let reason = cpu.run(&mut mem);
+            (
+                reason,
+                cpu.data_register(DataRegister(1)),
+                cpu.data_register(DataRegister(2)),
+                AddressSpace::read_u32(&mem, ACCEL),
+            )
+        };
+        let interp = run(false);
+        let jit = run(true);
+        assert_eq!(interp, jit, "interpreter and JIT must agree");
+        // The loop's last pass stores and reloads D0 = 0.
+        assert_eq!((interp.1, interp.2, interp.3), (0, 0, 0));
+
+        // A store the loop leaves behind proves the write landed: run
+        // once with D0 = 4 as the final value instead.
+        let mut mem = FlatMemory::from_layout(&layout);
+        load_words(
+            &mut mem,
+            TRAP_TABLE_END,
+            &[0x7007, 0x23C0, 0x0800, 0x0000, 0xA000],
+        );
+        let mut cpu = M68kCpu::with_config(CpuType::M68020, false);
+        cpu.set_jit(true);
+        cpu.set_pc(TRAP_TABLE_END);
+        cpu.run(&mut mem);
+        assert_eq!(AddressSpace::read_u32(&mem, ACCEL), 7);
     }
 
     /// Test: guest-CPU bus accesses are counted through the
