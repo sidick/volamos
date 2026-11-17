@@ -419,6 +419,15 @@ impl GuestHeap {
         self.layout.is_some()
     }
 
+    /// Whether `addr` is in RAM this heap can manage: always true for a
+    /// heap without a layout, otherwise inside one of its regions.
+    pub fn is_ram(&self, addr: u32) -> bool {
+        match &self.layout {
+            None => true,
+            Some(l) => l.region_index_at(addr).is_some(),
+        }
+    }
+
     /// `mh_Attributes` of the region containing `addr` (what `TypeOfMem`
     /// reports), or `None` if there is no layout or `addr` is outside
     /// every region.
@@ -767,6 +776,39 @@ impl GuestHeap {
             self.free.insert(idx, head);
         }
         true
+    }
+
+    /// Removes `[start, end)` from the free list wherever it overlaps
+    /// free blocks -- including a span crossing several of them (a
+    /// stack reaching across a region boundary). Unlike
+    /// [`GuestHeap::reserve_range`] it does not require the whole span
+    /// to be free or in one block; parts that are not free are simply
+    /// left as they are. Free blocks stay sorted and are never merged.
+    pub fn reserve_overlapping(&mut self, start: u32, end: u32) {
+        if end <= start {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.free.len() + 1);
+        for b in self.free.drain(..) {
+            let b_end = b.start + b.size;
+            if b_end <= start || b.start >= end {
+                out.push(b);
+                continue;
+            }
+            if b.start < start {
+                out.push(FreeBlock {
+                    start: b.start,
+                    size: start - b.start,
+                });
+            }
+            if b_end > end {
+                out.push(FreeBlock {
+                    start: end,
+                    size: b_end - end,
+                });
+            }
+        }
+        self.free = out;
     }
 
     /// Frees a block previously returned by [`GuestHeap::alloc`].
@@ -1232,6 +1274,21 @@ mod layout_heap_tests {
         assert_eq!(h.capacity_matching(MEMF_CHIP), Some(u64::from(2 * MIB)));
         assert_eq!(h.capacity_matching(MEMF_FAST), Some(u64::from(12 * MIB)));
         assert_eq!(GuestHeap::new(0, 0x1000).capacity_matching(0), None);
+    }
+
+    #[test]
+    fn reserve_overlapping_carves_a_span_across_region_boundaries() {
+        let layout = MemoryLayout::legacy_exact(4 * MIB);
+        let mut h = GuestHeap::with_layout(layout, 0x4000, 4 * MIB);
+        let before = h.free_bytes();
+        // A 192 KiB stack straddling the chip/accelerator boundary.
+        h.reserve_overlapping(2 * MIB - 0x1_0000, 2 * MIB + 0x2_0000);
+        assert_eq!(h.free_bytes(), before - 0x3_0000);
+        assert_eq!(h.free.len(), 2, "each region keeps its own block");
+        // Spans that miss every block, or are empty, change nothing.
+        h.reserve_overlapping(8 * MIB, 9 * MIB);
+        h.reserve_overlapping(0x9000, 0x9000);
+        assert_eq!(h.free_bytes(), before - 0x3_0000);
     }
 
     #[test]

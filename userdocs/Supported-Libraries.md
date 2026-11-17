@@ -227,23 +227,35 @@ Changelog.
   `ExecBase.ResourceList`. No built-in resources (`misc.resource`,
   `cia.resource`, ...) are modelled; `OpenResource` of one returns
   `NULL`.
-- Memory regions: guest RAM is chip RAM for the first 2 MiB and fast
-  (accelerator-class) RAM above it, up to `--ram`. `AllocMem`/
-  `AllocVec`/`AllocPooled` honour the memory-kind flags the way real
-  exec does: a block is only taken from a region whose attributes
-  include *every* requested bit, highest priority first. So
+- Memory regions: guest RAM is a set of regions at the addresses a real
+  Amiga has them, chosen by `--cpu` and resizable with `--chip`/`--fast`/
+  `--slow`/`--accel`/`--z3` (see the
+  [memory map](CLI-Reference.md#guest-memory-map)); addresses outside
+  every region are unmapped (reads give 0, writes are dropped).
+  `AllocMem`/`AllocVec`/`AllocPooled` honour the memory-kind flags the
+  way real exec does: a block is only taken from a region whose
+  attributes include *every* requested bit, highest priority first. So
   `MEMF_CHIP` comes from chip RAM, `MEMF_FAST` from fast RAM,
-  no flags (`MEMF_ANY`) prefers fast and falls back to chip, and
+  `MEMF_24BITDMA` skips RAM above the 24-bit space, no flags
+  (`MEMF_ANY`) prefers fast RAM and falls back to chip, and
   `MEMF_CHIP|MEMF_FAST` (no such memory) or `MEMF_FAST` on a machine
-  with no RAM above 2 MiB returns `NULL`. `TypeOfMem` reports the
-  owning region's real attribute word — `0x703` for chip RAM
-  (public, chip, local, 24-bit DMA, kick) and `0x705` for the fast
-  block — and `0` outside RAM. `AvailMem` counts only the requested
-  kind (`MEMF_CHIP`, `MEMF_FAST`, plus `MEMF_LARGEST`), and
-  `MEMF_TOTAL` reports the whole region size rather than the free part.
-  The attribute words and priorities were measured on real Kickstart
-  3.1. Slow, Zorro II/III and CPU-board RAM regions exist in the
-  runtime but cannot be selected yet.
+  with no fast RAM returns `NULL`. `TypeOfMem` reports the owning
+  region's real `mh_Attributes` word and `0` outside RAM:
+
+  | Region | Priority | `TypeOfMem` |
+  |---|---|---|
+  | chip | -10 | `0x703` |
+  | slow | -5 | `0x705` |
+  | Zorro II fast | 0 | `0x605` |
+  | CPU-board RAM | 30 | `0x505` (`0x705` below 16 MiB) |
+  | Zorro III | 0 | `0x405` (assumed, not hardware-checked) |
+
+  `AvailMem` counts only the requested kind (`MEMF_CHIP`, `MEMF_FAST`,
+  plus `MEMF_LARGEST`), and `MEMF_TOTAL` reports the whole region size
+  rather than the free part. The priorities and attribute words were
+  measured on real Kickstart 3.1 (chip, slow, Zorro II and motherboard
+  RAM). `ExecBase.MemList` is still empty: a program that walks it sees
+  no memory.
 - CPU-detection plumbing: `AttnFlags` (a real, guest-readable
   `ExecBase` field, not a call), `CacheControl`, `Supervisor` (enters
   the routine through a real exception frame — a 68010+ format-0

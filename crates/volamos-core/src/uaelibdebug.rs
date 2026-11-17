@@ -52,12 +52,18 @@ pub fn fits_in_ram(ram_len: usize) -> bool {
     u64::from(UAELIB_ADDRESS) + u64::from(UAELIB_STUB_SIZE) <= ram_len as u64
 }
 
-/// Reserves the stub's bytes out of `heap`. `Ok(false)` if `ram_len`
-/// doesn't reach them (nothing to do), `Err` if the program or stack
-/// already covers them.
-pub fn reserve(heap: &mut GuestHeap, ram_len: usize) -> Result<bool, String> {
-    if !fits_in_ram(ram_len) {
+/// Reserves the stub's bytes out of `heap`. `Ok(false)` if the stub's
+/// bytes aren't mapped (`mapped`: nothing to plant), `Ok(true)` with
+/// nothing to reserve if they are mapped but are not heap RAM (the
+/// `FlatMemory::map_segment` stub page a real memory map needs, since
+/// `$F0FF60` is ROM space there), `Err` if the program or stack already
+/// covers them.
+pub fn reserve(heap: &mut GuestHeap, mapped: bool) -> Result<bool, String> {
+    if !mapped {
         return Ok(false);
+    }
+    if !heap.is_ram(UAELIB_ADDRESS) {
+        return Ok(true);
     }
     if heap.reserve_range(UAELIB_ADDRESS, UAELIB_STUB_SIZE) {
         Ok(true)

@@ -64,6 +64,14 @@ pub(crate) struct Overrides {
     pub(crate) auto_assign_root: Option<PathBuf>,
     pub(crate) stack_size: Option<u32>,
     pub(crate) ram_size: Option<u32>,
+    /// Per-class RAM sizes (`--chip`/`--fast`/`--slow`/`--accel`/`--z3`,
+    /// `CHIP=`/`FAST=`/`SLOW=`/`ACCEL=`/`Z3=`); `None` leaves that class
+    /// at the CPU's default. See `volamos_core::memmap`.
+    pub(crate) chip_size: Option<u32>,
+    pub(crate) fast_size: Option<u32>,
+    pub(crate) slow_size: Option<u32>,
+    pub(crate) accel_size: Option<u32>,
+    pub(crate) z3_size: Option<u32>,
     pub(crate) cpu_type: Option<CpuType>,
     pub(crate) fpu: Option<bool>,
     pub(crate) jit: Option<bool>,
@@ -158,6 +166,19 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
             "RAM" => {
                 overrides.ram_size = Some(parse_byte_size("RAM", value).map_err(with_line)?);
             }
+            "CHIP" => {
+                overrides.chip_size = Some(parse_byte_size("CHIP", value).map_err(with_line)?)
+            }
+            "FAST" => {
+                overrides.fast_size = Some(parse_byte_size("FAST", value).map_err(with_line)?)
+            }
+            "SLOW" => {
+                overrides.slow_size = Some(parse_byte_size("SLOW", value).map_err(with_line)?)
+            }
+            "ACCEL" => {
+                overrides.accel_size = Some(parse_byte_size("ACCEL", value).map_err(with_line)?);
+            }
+            "Z3" => overrides.z3_size = Some(parse_byte_size("Z3", value).map_err(with_line)?),
             "CPU" => overrides.cpu_type = Some(parse_cpu_type(value).map_err(with_line)?),
             "FPU" => overrides.fpu = Some(parse_bool("FPU", value).map_err(with_line)?),
             "JIT" => overrides.jit = Some(parse_bool("JIT", value).map_err(with_line)?),
@@ -194,6 +215,11 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         auto_assign_root: higher.auto_assign_root.or(lower.auto_assign_root),
         stack_size: higher.stack_size.or(lower.stack_size),
         ram_size: higher.ram_size.or(lower.ram_size),
+        chip_size: higher.chip_size.or(lower.chip_size),
+        fast_size: higher.fast_size.or(lower.fast_size),
+        slow_size: higher.slow_size.or(lower.slow_size),
+        accel_size: higher.accel_size.or(lower.accel_size),
+        z3_size: higher.z3_size.or(lower.z3_size),
         cpu_type: higher.cpu_type.or(lower.cpu_type),
         fpu: higher.fpu.or(lower.fpu),
         jit: higher.jit.or(lower.jit),

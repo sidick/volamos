@@ -3,7 +3,8 @@
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
-        [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--cpu MODEL]
+        [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
+        [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
         [--emu68-debug] [--stack-report] [--net] <program> [args...]
@@ -197,21 +198,69 @@ at 0x2224, and there must be room for the stack plus at least 4096 bytes
 of guest heap after that -- increase --ram or decrease --stack
 ```
 
+## Guest memory map
+
+By default the guest's RAM follows the `--cpu`, like the machines that
+CPU shipped in:
+
+| `--cpu` | Chip (`$0`) | Zorro II fast (`$200000`) | Slow (`$C00000`) | CPU-board (`$08000000`) |
+|---|---|---|---|---|
+| `68000`, `68010` (24-bit bus) | 2 MiB | 8 MiB | 1.5 MiB | — |
+| `68020` and later (32-bit bus) | 2 MiB | 8 MiB | — | 64 MiB |
+
+The 24-bit machines get the most RAM a real 24-bit Amiga can address:
+the rest of the 16 MiB space is I/O, devices and ROM, so it is not RAM
+here either. `AllocMem` flags pick between the regions the way real
+Kickstart does (see [Supported Libraries](Supported-Libraries.md)).
+
+### `--chip SIZE`, `--fast SIZE`, `--slow SIZE`, `--accel SIZE`, `--z3 SIZE`
+
+Resize one class of RAM. Classes you do not name keep the `--cpu`'s
+default; a size of `0` removes a class. Same `SIZE` syntax as `--stack`
+(a byte count, optionally suffixed `K`/`M`):
+
+```sh
+volamos --fast 4M fixtures/hello                 # a smaller Zorro II board
+volamos --chip 512K --fast 0 --slow 512K prog    # an A500 with a trapdoor board
+volamos --cpu 68030 --z3 128M --accel 0 prog     # Zorro III RAM, no CPU-board RAM
+```
+
+Each class lives at its standard address and has a limit: chip up to
+2 MiB, `--fast` up to 8 MiB (the Zorro II window `$200000-$9FFFFF`),
+`--slow` up to 1.5 MiB, `--accel` up to 128 MiB, `--z3` up to the
+Zorro III window. Sizes are in 4 KiB units. A class the CPU's address
+bus cannot reach is refused:
+
+```
+$ volamos --z3 32M fixtures/hello
+volamos: invalid memory layout: z3 RAM ends at $11FFFFFF, beyond the 24-bit
+address bus of the selected CPU -- ask for a 32-bit address bus with --cpu
+68020 (or any later model)
+```
+
+The guest stack lives at the top of the one run of RAM that starts at
+address 0 (chip plus an abutting `--fast`).
+
+Under [`--sanitize`](#-sanitize) the memory map is limited to that same
+run: the default layout drops its slow/CPU-board RAM rather than leave
+it unchecked, and asking for them explicitly is an error.
+
 ## `--ram SIZE`
 
-Overrides the total guest address space — default 16 MiB (16777216
-bytes). Same `SIZE` syntax as `--stack`: a plain byte count, optionally
-suffixed `K`/`k` (KiB) or `M`/`m` (MiB):
+The older, single-range spelling of the memory map: total RAM as chip
+RAM for the first 2 MiB and one block of fast RAM above it, with no
+slow, Zorro or CPU-board regions. Same `SIZE` syntax as `--stack`.
+Without `--ram` the CPU's default memory map (above) is used. It cannot
+be combined with `--chip`/`--fast`/`--slow`/`--accel`/`--z3`.
 
 ```sh
 volamos --ram 4M fixtures/hello
 volamos --ram 8M --stack 1M fixtures/hello   # room for a much larger stack
 ```
 
-The default comfortably covers the tiny CLI binaries volamos currently
-targets, with plenty of headroom for a larger-than-default `--stack`.
-Raise it if a guest program needs more address space than that (e.g. a
-larger `--stack`, or a program that allocates a lot via `AllocMem`).
+Raise it if a guest program needs more address space than the default
+(e.g. a larger `--stack`, or a program that allocates a lot via
+`AllocMem`).
 
 **Above 16 MiB needs `--cpu 68020` or later.** A 68000 or 68010 has a
 24-bit address bus, so 16 MiB is all it can address at all. Since the
@@ -1099,23 +1148,24 @@ args:   dc.w    5                   ; %d  (2 bytes)
 
 ### What it does to the run
 
-- **Works at any `--ram`.** The port is intercepted on the CPU's store
-  path *before* any memory lookup, so it is there with `--ram 1M` (where
-  `0xBFFF00` isn't RAM at all) and with the default 16 MiB (where it
-  is). A claimed store never reaches memory.
+- **Works with any memory map.** The port is intercepted on the CPU's
+  store path *before* any memory lookup, so it is there whether or not
+  `0xBFFF00` is RAM (it is not, in the default memory map, where it is
+  CIA space; it is with `--ram 16M`). A claimed store never reaches
+  memory.
 - **The JIT is off.** The trace JIT writes guest memory through a raw
   pointer that would bypass the port, so `--uae-debug` forces
   `--no-jit` — silently overriding an explicit `--jit`, exactly as
   [`--sanitize`](#-sanitize) does. It can be combined with
   `--clock-mhz`.
 - **The 12 bytes are kept out of the guest heap.** When `0xBFFF00` lies
-  inside RAM, `AllocMem` and friends will never hand out an address in
-  `0xBFFF00..0xBFFF0C`, so `AvailMem` reports 12 bytes less (and
-  `MEMF_LARGEST` the larger of the two pieces on either side). If the
-  program image or the stack already covers that range (e.g. `--stack
-  8M` with the default RAM) the run refuses to start with an error
-  rather than corrupt memory — use a bigger `--ram` or a smaller
-  `--stack`.
+  inside RAM (a `--ram` of 12 MiB or more), `AllocMem` and friends
+  will never hand out an address in `0xBFFF00..0xBFFF0C`, so `AvailMem`
+  reports 12 bytes less (and `MEMF_LARGEST` the larger of the two pieces
+  on either side). If the program image or the stack already covers
+  that range (e.g. `--ram 16M --stack 8M`) the run refuses to start
+  with an error rather than corrupt memory — use a bigger `--ram` or a
+  smaller `--stack`.
 - **`--sanitize` is not bothered.** Stores to the port are legitimate
   device accesses and are never reported. Format strings and `%s`/`%b`
   arguments are read through the checked path, so passing a pointer to
@@ -1180,15 +1230,17 @@ msg:    dc.b    "reached stage 2",0
   — what "not supported" looks like to a program probing for UAE — and
   prints one `volamos: uae-debug: unsupported uaelib mode N ...` line
   to stderr, once per distinct mode, so the probe is visible.
-- **Needs `--ram` of at least 16 MiB** (the default). The trap lives at
-  `0xF0FF60`, a code address that has to be inside RAM. With a smaller
-  `--ram` a startup warning says the trap is inactive (the sprintf port
-  still works) and a `jsr` there fails like any jump outside memory.
-  Works on every `--cpu`, including the 24-bit 68000/68010.
+- **Works with any memory map.** The trap lives at `0xF0FF60`, a code
+  address that is ROM space on a UAE machine and so not RAM in the
+  default memory map; volamos maps its two bytes separately, so it is
+  there whatever the RAM sizes. (Before the memory map existed it needed
+  `--ram` of at least 16 MiB.) Works on every `--cpu`, including the
+  24-bit 68000/68010.
 - **Heap and stack.** The two bytes of the trap opcode are kept out of
   the guest heap; if the program image or the stack covers
-  `0xF0FF60` (e.g. `--stack 1M` or more with the default 16 MiB RAM)
-  the run refuses to start with an error.
+  `0xF0FF60` (only possible with a `--ram` of 16 MiB, where that
+  address is RAM; e.g. `--ram 16M --stack 1M`) the run refuses to
+  start with an error.
 - **JIT and `--sanitize`.** As above, the flag as a whole forces
   `--no-jit`. The trap's own opcode is never a `--sanitize` violation;
   the string is read through the checked path, so a pointer into freed

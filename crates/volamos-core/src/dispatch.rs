@@ -3067,7 +3067,11 @@ impl<C: Cpu + 'static> Runtime<C> {
             .memory_layout
             .clone()
             .unwrap_or_else(|| crate::memmap::MemoryLayout::legacy_exact(mem.len() as u32));
-        let mut heap = GuestHeap::with_layout(layout, config.load_end, stack_base);
+        // The heap spans every region of the layout above the loaded
+        // program (a layout can have RAM beyond the primary segment the
+        // stack lives in), minus the stack region itself.
+        let mut heap = GuestHeap::with_layout(layout, config.load_end, u32::MAX);
+        heap.reserve_overlapping(stack_base, top);
 
         // The entry stack frame, in real AmigaOS's `RunCommand`
         // layout (issues #178 and #279) -- ascending addresses:
@@ -3570,7 +3574,9 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// (and, for overlay programs, before `load_top_level_program`).
     pub fn reserve_uae_debug_port(&mut self) -> Result<(), String> {
         use crate::uaedebug::{DEBUG_SPRINTF_ADDRESS, DEBUG_SPRINTF_SIZE};
-        if u64::from(DEBUG_SPRINTF_ADDRESS) >= self.mem.len() as u64 {
+        if !self.heap.is_ram(DEBUG_SPRINTF_ADDRESS)
+            || u64::from(DEBUG_SPRINTF_ADDRESS) >= self.mem.len() as u64
+        {
             return Ok(());
         }
         if self
@@ -3600,7 +3606,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         sink: Box<dyn crate::uaedebug::DebugSink>,
     ) -> Result<bool, String> {
         use crate::uaelibdebug::{UAELIB_ADDRESS, handler, reserve};
-        if !reserve(&mut self.heap, self.mem.len())? {
+        let mapped = self
+            .mem
+            .is_mapped(UAELIB_ADDRESS, crate::uaelibdebug::UAELIB_STUB_SIZE);
+        if !reserve(&mut self.heap, mapped)? {
             return Ok(false);
         }
         self.table.register_fixed_slot_named(
@@ -3620,7 +3629,9 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// is already in use (the stack or program image covers it).
     pub fn reserve_emu68_debug_port(&mut self) -> Result<(), String> {
         use crate::emu68debug::EMU68_DEBUG_ADDRESS;
-        if u64::from(EMU68_DEBUG_ADDRESS) >= self.mem.len() as u64 {
+        if !self.heap.is_ram(EMU68_DEBUG_ADDRESS)
+            || u64::from(EMU68_DEBUG_ADDRESS) >= self.mem.len() as u64
+        {
             return Ok(());
         }
         if self.heap.reserve_range(EMU68_DEBUG_ADDRESS, 1) {

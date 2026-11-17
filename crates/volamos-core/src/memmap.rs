@@ -82,11 +82,62 @@ const RESERVED_WINDOWS: [(u64, u64); 2] = [(0xA0_0000, 0xC0_0000), (0xD8_0000, 0
 /// End (exclusive) of the 32-bit address space.
 const ADDRESS_SPACE_END: u64 = 0x1_0000_0000;
 
+/// Standard base address of each class of RAM, as used by
+/// [`MemoryLayout::from_sizes`].
+pub const FAST_BASE: u32 = 0x20_0000;
+pub const SLOW_BASE: u32 = 0xC0_0000;
+pub const ACCEL_BASE: u32 = 0x0800_0000;
+pub const ZORRO3_BASE: u32 = 0x1000_0000;
+
+/// Default slow RAM on a 24-bit machine: the whole `$C00000-$D7FFFF`
+/// window, 1.5 MiB.
+pub const DEFAULT_SLOW_24BIT: u32 = 0x18_0000;
+
 /// Granularity of a region's base and size. Real boards are far
 /// coarser (Zorro II boards come in 64 KiB multiples at least); 4 KiB
 /// keeps the layout expressible in whole pages without inventing a
 /// restriction no real machine needs to be tested against.
 pub const REGION_GRANULE: u32 = 0x1000;
+
+/// Per-class RAM sizes in bytes, 0 meaning "none"; see
+/// [`MemoryLayout::from_sizes`]. The default is the 32-bit CPU layout:
+/// 2 MiB chip, 8 MiB Zorro II fast, 64 MiB CPU-board RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionSizes {
+    pub chip: u32,
+    pub fast: u32,
+    pub slow: u32,
+    pub accel: u32,
+    pub z3: u32,
+}
+
+impl Default for RegionSizes {
+    fn default() -> Self {
+        Self {
+            chip: MAX_CHIP_SIZE,
+            fast: 8 * 0x10_0000,
+            slow: 0,
+            accel: 64 * 0x10_0000,
+            z3: 0,
+        }
+    }
+}
+
+impl RegionSizes {
+    /// The default sizes for a CPU whose address bus is `address_bits`
+    /// wide -- see [`MemoryLayout::default_for_address_bits`].
+    pub fn for_address_bits(address_bits: u32) -> Self {
+        if address_bits <= 24 {
+            Self {
+                slow: DEFAULT_SLOW_24BIT,
+                accel: 0,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
 
 /// A class of RAM, i.e. what an exec memory list would call it. See the
 /// module docs for each kind's address window.
@@ -454,6 +505,52 @@ impl MemoryLayout {
         regions
     }
 
+    /// The default memory map for a CPU whose address bus is
+    /// `address_bits` wide (issue #332), sized like the machines that
+    /// CPU shipped in:
+    ///
+    /// - **24-bit** (68000, 68010): 2 MiB chip, 8 MiB Zorro II fast RAM
+    ///   and 1.5 MiB of slow RAM -- the most RAM a 24-bit Amiga can
+    ///   address (`$000000-$9FFFFF` and `$C00000-$D7FFFF`; the rest of
+    ///   the 16 MiB space is I/O, devices and ROM).
+    /// - **32-bit** (68020 and up): the same chip and Zorro II fast
+    ///   RAM, plus 64 MiB of CPU-board RAM at `$08000000` instead of
+    ///   slow RAM.
+    pub fn default_for_address_bits(address_bits: u32) -> Self {
+        Self::from_sizes(RegionSizes::for_address_bits(address_bits))
+            .expect("the CPU default layouts are valid by construction")
+    }
+
+    /// Builds a layout from per-class sizes at each class's standard
+    /// base address (chip `$0`, Zorro II fast `$200000`, slow
+    /// `$C00000`, CPU-board RAM `$08000000`, Zorro III `$10000000`); a
+    /// size of 0 leaves that class out. This is what the `--chip`/
+    /// `--slow`/`--fast`/`--accel`/`--z3` flags describe.
+    pub fn from_sizes(sizes: RegionSizes) -> Result<Self, LayoutError> {
+        let mut regions = vec![MemoryRegion::new(RegionKind::Chip, 0, sizes.chip)];
+        for (kind, base, size) in [
+            (RegionKind::Fast, FAST_BASE, sizes.fast),
+            (RegionKind::Slow, SLOW_BASE, sizes.slow),
+            (RegionKind::Accelerator, ACCEL_BASE, sizes.accel),
+            (RegionKind::Zorro3, ZORRO3_BASE, sizes.z3),
+        ] {
+            if size != 0 {
+                regions.push(MemoryRegion::new(kind, base, size));
+            }
+        }
+        Self::new(regions)
+    }
+
+    /// The part of this layout that is one gap-free run from address 0:
+    /// what the sanitizer can shadow today (see
+    /// [`crate::memory::FlatMemory::enable_sanitizer`]).
+    pub fn contiguous_part(&self) -> MemoryLayout {
+        let (_, count) = self.contiguous_prefix();
+        MemoryLayout {
+            regions: self.regions[..count].to_vec(),
+        }
+    }
+
     /// Index into [`Self::regions`] of the region containing `addr`.
     pub fn region_index_at(&self, addr: u32) -> Option<usize> {
         self.regions.iter().position(|r| r.contains(addr))
@@ -652,6 +749,72 @@ mod tests {
             assert!(l.is_contiguous_from_zero());
             assert_eq!(l.total_size(), 64 * u64::from(MIB));
         }
+    }
+
+    #[test]
+    fn cpu_default_layouts_follow_the_address_bus() {
+        let l24 = MemoryLayout::default_for_address_bits(24);
+        assert_eq!(
+            l24.regions(),
+            &[
+                r(RegionKind::Chip, 0, 2 * MIB),
+                r(RegionKind::Fast, 0x20_0000, 8 * MIB),
+                r(RegionKind::Slow, 0xC0_0000, MIB + MIB / 2),
+            ]
+        );
+        assert_eq!(l24.check_address_bits(24), Ok(()));
+        // Chip + Zorro II touch: one zero-based run, slow is separate.
+        assert_eq!(l24.contiguous_prefix(), (10 * u64::from(MIB), 2));
+        assert_eq!(l24.total_size(), 11 * u64::from(MIB) + u64::from(MIB / 2));
+
+        let l32 = MemoryLayout::default_for_address_bits(32);
+        assert_eq!(
+            l32.regions(),
+            &[
+                r(RegionKind::Chip, 0, 2 * MIB),
+                r(RegionKind::Fast, 0x20_0000, 8 * MIB),
+                r(RegionKind::Accelerator, 0x0800_0000, 64 * MIB),
+            ]
+        );
+        assert!(l32.check_address_bits(24).is_err());
+    }
+
+    #[test]
+    fn from_sizes_places_each_class_at_its_standard_base_and_skips_zero() {
+        let l = MemoryLayout::from_sizes(RegionSizes {
+            chip: MIB,
+            fast: 0,
+            slow: MIB / 2,
+            accel: 16 * MIB,
+            z3: 128 * MIB,
+        })
+        .unwrap();
+        let bases: Vec<(RegionKind, u32)> = l.regions().iter().map(|r| (r.kind, r.base)).collect();
+        assert_eq!(
+            bases,
+            vec![
+                (RegionKind::Chip, 0),
+                (RegionKind::Slow, 0xC0_0000),
+                (RegionKind::Accelerator, 0x0800_0000),
+                (RegionKind::Zorro3, 0x1000_0000),
+            ]
+        );
+        // Oversized classes collide with their neighbour or window.
+        assert!(
+            MemoryLayout::from_sizes(RegionSizes {
+                accel: 192 * MIB, // runs into the Zorro III window
+                z3: MIB,
+                ..RegionSizes::default()
+            })
+            .is_err()
+        );
+        assert!(
+            MemoryLayout::from_sizes(RegionSizes {
+                fast: 9 * MIB, // past $9FFFFF
+                ..RegionSizes::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

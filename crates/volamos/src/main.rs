@@ -45,9 +45,19 @@
 //! [`volamos_core::dispatch::Runtime::new`], mirroring real AmigaOS's
 //! own stack-size clamp.
 //!
-//! `--ram SIZE` overrides the total guest address space (default
-//! [`DEFAULT_RAM_SIZE`], 16 MiB), same `K`/`M`-suffixed syntax as
-//! `--stack`. `--stack` must leave real room within it for the loaded
+//! The guest memory map (issue #332) follows the `--cpu` by default:
+//! 2 MiB chip + 8 MiB Zorro II fast + 1.5 MiB slow for a 24-bit
+//! 68000/68010, 2 MiB chip + 8 MiB fast + 64 MiB CPU-board RAM for a
+//! 32-bit CPU. `--chip`/`--fast`/`--slow`/`--accel`/`--z3` resize
+//! individual classes (0 removes one); [`resolve_memory_layout`] turns
+//! them into a [`volamos_core::memmap::MemoryLayout`].
+//!
+//! `--ram SIZE` is the older single-range spelling: total RAM as chip
+//! plus one block of fast RAM, same `K`/`M`-suffixed syntax as
+//! `--stack`, and cannot be mixed with the region flags. The stack
+//! lives at the top of the gap-free run of RAM from address 0 (the
+//! "primary segment": all of `--ram`'s range, or chip plus an abutting
+//! `--fast`). `--stack` must leave real room within it for the loaded
 //! program and the runtime's own guest heap -- [`run`]/
 //! [`run_nested_program`] check this upfront and fail with a clear
 //! error (rather than letting [`volamos_core::dispatch::Runtime::new`]
@@ -95,13 +105,6 @@ use volamos_core::loader::Location;
 use volamos_core::memory::{DcacheGeometry, FlatMemory, MemWaitCosts};
 use volamos_core::vfs::{Vfs, VfsConfig};
 use volamos_core::{DEFAULT_STACK_SIZE, LoadError, loader};
-
-/// Default guest address space size, overridable with `--ram`. 16 MiB
-/// comfortably covers the tiny CLI binaries this runtime currently
-/// targets (with plenty of headroom for a much larger `--stack` than
-/// the previous fixed 1 MiB ceiling allowed) while staying trivial for
-/// any modern host to allocate.
-const DEFAULT_RAM_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Minimum bytes of address space [`run`]/[`run_nested_program`]
 /// require to remain between the loaded program's end and the top of
@@ -188,6 +191,20 @@ impl InstrumentationOptions {
                 cpu_type,
                 Box::new(volamos_core::uaedebug::StderrSink),
             );
+            // The uaelib trap is an A-line opcode the guest jumps to at
+            // $F0FF60: ROM space on a UAE machine, so not RAM in a real
+            // memory map. Give it its two bytes of backing unless RAM
+            // already covers them (a large --ram).
+            if !volamos_core::AddressSpace::is_mapped(
+                &*mem,
+                volamos_core::uaelibdebug::UAELIB_ADDRESS,
+                volamos_core::uaelibdebug::UAELIB_STUB_SIZE,
+            ) {
+                mem.map_segment(
+                    volamos_core::uaelibdebug::UAELIB_ADDRESS,
+                    volamos_core::uaelibdebug::UAELIB_STUB_SIZE,
+                );
+            }
         }
         if self.emu68_debug {
             volamos_core::emu68debug::install(mem, Box::new(volamos_core::uaedebug::StderrSink));
@@ -273,7 +290,12 @@ struct Options {
     /// [`volamos_core::dispatch::LIBS_DIR_OVERRIDE_VOLUME`] when set.
     libs_dir: Option<PathBuf>,
     stack_size: u32,
+    /// Length of the primary RAM segment -- the gap-free run from address
+    /// 0, where the guest stack lives (the old `--ram` meaning).
     ram_size: u32,
+    /// The guest memory map (issue #332): `--ram` (legacy single range),
+    /// the `--chip`/`--fast`/... flags, or the `--cpu`'s default.
+    layout: volamos_core::memmap::MemoryLayout,
     cpu_type: CpuType,
     /// Set by [`resolve_cpu_and_fpu`] (issue #167) when an
     /// explicit `--cpu 68040 --no-fpu` (or `FPU=false` in a config
@@ -431,6 +453,12 @@ fn parse_assign_arg(s: &str) -> Result<(String, Vec<String>), String> {
 /// name).
 fn parse_stack_size_arg(s: &str) -> Result<u32, String> {
     parse_byte_size("--stack", s)
+}
+
+/// Region-size flavored wrapper around [`parse_byte_size`]: like it, but
+/// the flag name is derived from the value's own error context.
+fn parse_chip_size_arg(s: &str) -> Result<u32, String> {
+    parse_byte_size("memory size", s)
 }
 
 /// Thin `--ram`-flavored wrapper around [`parse_byte_size`]; see
@@ -623,18 +651,79 @@ struct Cli {
     )]
     stack: Option<u32>,
 
-    /// Total guest address space in bytes (default 16777216); same K/M suffix syntax as --stack
+    /// Total RAM as one chip+fast range (default: the CPU's layout, see --chip); K/M suffixes
     #[arg(
         long = "ram",
         value_name = "SIZE",
         value_parser = parse_ram_size_arg,
         help_heading = "Machine",
-        long_help = "Total guest address space in bytes (default 16777216); same K/M suffix \
-                      syntax as --stack. --stack must leave real room within this for the \
-                      loaded program and the runtime's own guest heap. Above 16M needs --cpu \
-                      68020 or later: a 68000/68010 cannot address more than that."
+        long_help = "Total RAM in bytes as one range: chip RAM for the first 2M and one block of \
+                      fast RAM above it; same K/M suffix syntax as --stack. Without --ram the \
+                      memory map follows the --cpu (see --chip, --fast, --slow, --accel, --z3). \
+                      --stack must leave real room within this for the loaded program and the \
+                      runtime's own guest heap. Above 16M needs --cpu 68020 or later: a \
+                      68000/68010 cannot address more than that. Cannot be combined with the \
+                      region flags."
     )]
     ram: Option<u32>,
+
+    /// Chip RAM size (default 2M); K/M suffixes. Unset classes keep the CPU's defaults
+    #[arg(
+        long = "chip",
+        value_name = "SIZE",
+        value_parser = parse_chip_size_arg,
+        help_heading = "Machine",
+        long_help = "Chip RAM size (default 2M, the most any ECS/AGA machine has), at address 0; \
+                      same K/M suffix syntax as --stack. Classes you don't name keep the \
+                      --cpu's default (24-bit CPUs: 8M --fast + 1.5M --slow; 32-bit CPUs: 8M \
+                      --fast + 64M --accel); a size of 0 removes a class. Cannot be combined \
+                      with --ram."
+    )]
+    chip: Option<u32>,
+
+    /// Zorro II fast RAM size (default 8M), at $200000; 0 removes it
+    #[arg(
+        long = "fast",
+        value_name = "SIZE",
+        value_parser = parse_chip_size_arg,
+        help_heading = "Machine",
+        long_help = "Zorro II fast RAM size (default 8M, at $200000-$9FFFFF, the most that window \
+                      holds); 0 removes it. See --chip."
+    )]
+    fast: Option<u32>,
+
+    /// Slow RAM size at $C00000 (default 1.5M on 24-bit CPUs, none on 32-bit); 0 removes it
+    #[arg(
+        long = "slow",
+        value_name = "SIZE",
+        value_parser = parse_chip_size_arg,
+        help_heading = "Machine",
+        long_help = "Slow (\"ranger\") RAM size at $C00000-$D7FFFF, up to 1.5M; default 1.5M for a \
+                      68000/68010, none for 32-bit CPUs. See --chip."
+    )]
+    slow: Option<u32>,
+
+    /// CPU-board RAM size at $08000000 (default 64M on 32-bit CPUs); 0 removes it
+    #[arg(
+        long = "accel",
+        value_name = "SIZE",
+        value_parser = parse_chip_size_arg,
+        help_heading = "Machine",
+        long_help = "Accelerator (CPU-board) RAM size at $08000000, up to 128M; default 64M for \
+                      68020 and later, none for a 68000/68010 (24-bit address bus). See --chip."
+    )]
+    accel: Option<u32>,
+
+    /// Zorro III RAM size at $10000000 (default none); 32-bit CPUs only
+    #[arg(
+        long = "z3",
+        value_name = "SIZE",
+        value_parser = parse_chip_size_arg,
+        help_heading = "Machine",
+        long_help = "Zorro III RAM size at $10000000-$7FFFFFFF (default none); needs a 32-bit \
+                      --cpu (68020 or later). See --chip."
+    )]
+    z3: Option<u32>,
 
     /// Emulated CPU (default 68000)
     #[arg(
@@ -1095,6 +1184,11 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         auto_assign_root: cli.auto_assign,
         stack_size: cli.stack,
         ram_size: cli.ram,
+        chip_size: cli.chip,
+        fast_size: cli.fast,
+        slow_size: cli.slow,
+        accel_size: cli.accel,
+        z3_size: cli.z3,
         cpu_type: cli.cpu,
         fpu,
         jit,
@@ -1710,9 +1804,11 @@ fn resolve(
     cli_jit: Option<bool>,
     program: String,
     guest_args: Vec<String>,
-) -> Options {
+) -> Result<Options, String> {
     let (cpu_type, fpu, cpu_fpu_substituted) =
         resolve_cpu_and_fpu(overrides.cpu_type, overrides.fpu);
+    let layout = resolve_memory_layout(&overrides, cpu_type, sanitize.enabled)?;
+    let ram_size = layout.contiguous_prefix().0 as u32;
     let jit = overrides.jit.unwrap_or(false);
     // See JitSource's doc: only matters when `jit` is actually `true`,
     // in which case it's either straight from this command line's own
@@ -1729,7 +1825,7 @@ fn resolve(
     } else {
         JitSource::ConfigFile
     };
-    Options {
+    Ok(Options {
         verbose: overrides.verbose.unwrap_or(false),
         snoop: overrides.snoop.unwrap_or(false),
         program,
@@ -1740,7 +1836,8 @@ fn resolve(
         auto_assign_root: overrides.auto_assign_root,
         libs_dir,
         stack_size: overrides.stack_size.unwrap_or(DEFAULT_STACK_SIZE),
-        ram_size: overrides.ram_size.unwrap_or(DEFAULT_RAM_SIZE),
+        ram_size,
+        layout,
         cpu_type,
         cpu_fpu_substituted,
         fpu,
@@ -1761,7 +1858,7 @@ fn resolve(
         // scope.
         lazy_volumes: overrides.lazy_volumes,
         ephemeral_dirs: overrides.ephemeral_dirs,
-    }
+    })
 }
 
 /// CLI-only argument parsing, ignoring `~/.volamos`/`.volamos` entirely.
@@ -1784,7 +1881,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         guest_args,
     ) = parse_args_raw(args)?;
     let cli_jit = overrides.jit;
-    Ok(resolve(
+    resolve(
         overrides,
         sanitize,
         clock_mhz,
@@ -1796,7 +1893,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         cli_jit,
         program,
         guest_args,
-    ))
+    )
 }
 
 /// Works out the initial guest current directory per the defaulting rule
@@ -1970,6 +2067,88 @@ const SANITIZER_EXIT_CODE: i32 = 99;
 /// alone can't be a proof, only a strong signal, which is why the
 /// stderr diagnostic is the other half of the contract.
 const RUNTIME_ERROR_EXIT_CODE: u8 = 98;
+
+/// Picks the guest memory map from the merged flags/config (issue
+/// #332): `--ram` alone keeps its original meaning (one chip + fast
+/// range of that total size, [`volamos_core::memmap::MemoryLayout::legacy_exact`]);
+/// any of `--chip`/`--fast`/`--slow`/`--accel`/`--z3` start from the
+/// `--cpu`'s default sizes and override the named classes; with neither,
+/// the CPU default. Mixing `--ram` with a region flag is an error, as
+/// is a layout the CPU's address bus cannot reach.
+///
+/// The sanitizer's shadow map covers one gap-free run of RAM from
+/// address 0 (see `FlatMemory::enable_sanitizer`), so under
+/// `--sanitize` the *default* layout drops the RAM beyond that run
+/// (slow/accelerator) rather than leave it unchecked, and an explicit
+/// layout that needs it is refused.
+fn resolve_memory_layout(
+    overrides: &config::Overrides,
+    cpu_type: CpuType,
+    sanitize: bool,
+) -> Result<volamos_core::memmap::MemoryLayout, String> {
+    use volamos_core::memmap::{MemoryLayout, RegionSizes};
+    let bits = if addressable_bytes(cpu_type) <= (1 << 24) {
+        24
+    } else {
+        32
+    };
+    let flags = [
+        ("--chip", overrides.chip_size),
+        ("--fast", overrides.fast_size),
+        ("--slow", overrides.slow_size),
+        ("--accel", overrides.accel_size),
+        ("--z3", overrides.z3_size),
+    ];
+    let explicit_regions = flags.iter().any(|(_, v)| v.is_some());
+    let layout = match (overrides.ram_size, explicit_regions) {
+        (Some(_), true) => {
+            let named: Vec<&str> = flags
+                .iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(n, _)| *n)
+                .collect();
+            return Err(format!(
+                "--ram (total RAM) cannot be combined with {}: use --ram alone, or size the \
+                 regions individually",
+                named.join("/")
+            ));
+        }
+        (Some(ram), false) => {
+            check_ram_addressable(ram, cpu_type)?;
+            return Ok(MemoryLayout::legacy_exact(ram));
+        }
+        (None, true) => {
+            let d = RegionSizes::for_address_bits(bits);
+            let sizes = RegionSizes {
+                chip: overrides.chip_size.unwrap_or(d.chip),
+                fast: overrides.fast_size.unwrap_or(d.fast),
+                slow: overrides.slow_size.unwrap_or(d.slow),
+                accel: overrides.accel_size.unwrap_or(d.accel),
+                z3: overrides.z3_size.unwrap_or(d.z3),
+            };
+            let layout = MemoryLayout::from_sizes(sizes)
+                .map_err(|e| format!("invalid memory layout: {e}"))?;
+            layout
+                .check_address_bits(bits)
+                .map_err(|e| format!("invalid memory layout: {e} -- ask for a 32-bit address bus with --cpu 68020 (or any later model)"))?;
+            if sanitize && layout.contiguous_prefix().1 != layout.regions().len() {
+                return Err(
+                    "--sanitize cannot yet check RAM outside the one run of memory \
+                     that starts at address 0 (chip plus an abutting --fast); drop --slow/\
+                     --accel/--z3 or --sanitize"
+                        .to_string(),
+                );
+            }
+            return Ok(layout);
+        }
+        (None, false) => MemoryLayout::default_for_address_bits(bits),
+    };
+    Ok(if sanitize {
+        layout.contiguous_part()
+    } else {
+        layout
+    })
+}
 
 /// Checks that `ram_size` is an address space the configured CPU can
 /// actually reach (issue #98).
@@ -2171,7 +2350,7 @@ fn build_nested_runtime(
     args: &[String],
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
-    ram_size: u32,
+    layout: volamos_core::memmap::MemoryLayout,
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
@@ -2186,7 +2365,8 @@ fn build_nested_runtime(
 ) -> Option<Runtime<M68kCpu>> {
     let bytes = std::fs::read(host_path).ok()?;
     let hunk_file = loader::parse(&bytes).ok()?;
-    let mut mem = FlatMemory::new(ram_size as usize);
+    let ram_size = layout.contiguous_prefix().0 as u32;
+    let mut mem = FlatMemory::from_layout(&layout);
     // Right after construction, before `loader::load` populates it --
     // harmless either way (see `FlatMemory::enable_sanitizer`'s doc for
     // why the default `Valid` shadow state makes the ordering a
@@ -2226,7 +2406,7 @@ fn build_nested_runtime(
         stack_size,
         attn_flags: attn_flags_for(cpu_type, fpu),
         program_name: program_name_from_path(host_path),
-        memory_layout: None,
+        memory_layout: Some(layout),
     };
     let mut cpu = M68kCpu::with_config(cpu_type, fpu);
     // The sanitizer's shadow-map checks only run through
@@ -2305,7 +2485,7 @@ fn run_nested_program(
     args: &[String],
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
-    ram_size: u32,
+    layout: volamos_core::memmap::MemoryLayout,
     cpu_type: CpuType,
     fpu: bool,
     jit: bool,
@@ -2323,7 +2503,7 @@ fn run_nested_program(
         args,
         vfs_config,
         stack_size,
-        ram_size,
+        layout,
         cpu_type,
         fpu,
         jit,
@@ -2414,7 +2594,17 @@ fn run(opts: &Options) -> Result<i32, String> {
     // --sanitize (matching the doc comments' own ordering) purely so
     // a run that somehow violates both reports the --jit conflict
     // first -- there's no other significance to the order.
-    check_ram_addressable(opts.ram_size, opts.cpu_type)?;
+    check_ram_addressable(
+        opts.layout.highest_end().min(u64::from(u32::MAX)) as u32,
+        opts.cpu_type,
+    )
+    .or_else(|e| {
+        if opts.layout.highest_end() <= addressable_bytes(opts.cpu_type) {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
     if opts.cpu_fpu_substituted {
         eprintln!(
             "volamos: --cpu 68040 --no-fpu: the full 68040 always has its on-die FPU on real \
@@ -2427,14 +2617,6 @@ fn run(opts: &Options) -> Result<i32, String> {
             "volamos: emu68-debug: the port at 0xDEADBEEF is inactive with --cpu {}: that CPU \
              masks addresses to 24 bits (use --cpu 68020 or later)",
             cpu_model_name(opts.cpu_type)
-        );
-    }
-    if opts.sanitize.uae_debug && !volamos_core::uaelibdebug::fits_in_ram(opts.ram_size as usize) {
-        eprintln!(
-            "volamos: uae-debug: the debug-log trap at {:#x} is inactive: --ram {} bytes does not \
-             reach it (the sprintf port still works; use --ram 16M or more)",
-            volamos_core::uaelibdebug::UAELIB_ADDRESS,
-            opts.ram_size
         );
     }
     check_clock_mhz_jit(opts.clock_mhz, opts.jit, opts.jit_source)?;
@@ -2484,7 +2666,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // runs simply report addresses without source locations.
     let mut loaded: Option<loader::LoadResult> = None;
     let mut runtime = if hunk_file.overlay.is_some() {
-        let mut mem = FlatMemory::new(opts.ram_size as usize);
+        let mut mem = FlatMemory::from_layout(&opts.layout);
         // Right after construction, before anything is loaded into it
         // -- harmless either way, see FlatMemory::enable_sanitizer's
         // doc on why the default Valid shadow state makes the ordering
@@ -2524,7 +2706,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             stack_size: opts.stack_size,
             attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
             program_name,
-            memory_layout: None,
+            memory_layout: Some(opts.layout.clone()),
         };
         let mut runtime = build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?;
         runtime
@@ -2532,7 +2714,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             .map_err(|e| format!("couldn't LoadSeg '{}': IoErr {e}", opts.program))?;
         runtime
     } else {
-        let mut mem = FlatMemory::new(opts.ram_size as usize);
+        let mut mem = FlatMemory::from_layout(&opts.layout);
         if opts.sanitize.enabled {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);
@@ -2576,7 +2758,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             stack_size: opts.stack_size,
             attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
             program_name,
-            memory_layout: None,
+            memory_layout: Some(opts.layout.clone()),
         };
         build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?
     };
@@ -2588,7 +2770,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // overlays the calling process in place instead, entirely within
     // volamos_core::dosseg::run_command_handler.
     let nested_stack_size = opts.stack_size;
-    let nested_ram_size = opts.ram_size;
+    let nested_layout = opts.layout.clone();
     let nested_cpu_type = opts.cpu_type;
     let nested_fpu = opts.fpu;
     let nested_jit = opts.jit;
@@ -2607,7 +2789,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             &req.args,
             vfs_config.clone(),
             nested_stack_size,
-            nested_ram_size,
+            nested_layout.clone(),
             nested_cpu_type,
             nested_fpu,
             nested_jit,
@@ -2965,7 +3147,7 @@ fn main() -> ExitCode {
         base
     };
 
-    let opts = resolve(
+    let opts = match resolve(
         merged,
         sanitize,
         clock_mhz,
@@ -2977,7 +3159,13 @@ fn main() -> ExitCode {
         cli_jit,
         program,
         guest_args,
-    );
+    ) {
+        Ok(opts) => opts,
+        Err(msg) => {
+            eprintln!("volamos: {msg}");
+            return ExitCode::from(RUNTIME_ERROR_EXIT_CODE);
+        }
+    };
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same
@@ -3358,17 +3546,119 @@ mod tests {
         assert!(err.contains("--ram"), "unexpected message: {err}");
     }
 
+    // --- memory layout (issue #332) ---
+
+    fn regions(opts: &Options) -> Vec<(&'static str, u32, u32)> {
+        opts.layout
+            .regions()
+            .iter()
+            .map(|r| (r.kind.name(), r.base, r.size))
+            .collect()
+    }
+
     #[test]
-    fn default_ram_size_used_when_flag_absent() {
+    fn default_layout_follows_the_cpus_address_bus() {
+        const MIB: u32 = 1024 * 1024;
+        // 24-bit: chip + Zorro II abut (primary segment), slow on its own.
         let opts = parse_args(args(&["prog"])).unwrap();
-        assert_eq!(opts.ram_size, DEFAULT_RAM_SIZE);
+        assert_eq!(
+            regions(&opts),
+            [
+                ("chip", 0, 2 * MIB),
+                ("fast", 0x20_0000, 8 * MIB),
+                ("slow", 0xC0_0000, MIB + MIB / 2)
+            ]
+        );
+        assert_eq!(
+            opts.ram_size,
+            10 * MIB,
+            "primary segment: where the stack lives"
+        );
+        // 32-bit: CPU-board RAM instead of slow RAM.
+        let opts = parse_args(args(&["--cpu", "68020", "prog"])).unwrap();
+        assert_eq!(
+            regions(&opts),
+            [
+                ("chip", 0, 2 * MIB),
+                ("fast", 0x20_0000, 8 * MIB),
+                ("accel", 0x0800_0000, 64 * MIB)
+            ]
+        );
+    }
+
+    #[test]
+    fn ram_flag_keeps_its_legacy_single_range_meaning() {
+        let opts = parse_args(args(&["--ram", "16M", "prog"])).unwrap();
+        assert_eq!(opts.ram_size, 16 * 1024 * 1024);
+        assert_eq!(opts.layout.regions().len(), 2, "chip + one block");
+        assert!(opts.layout.is_contiguous_from_zero());
+    }
+
+    #[test]
+    fn region_flags_override_only_the_classes_named() {
+        const MIB: u32 = 1024 * 1024;
+        let opts = parse_args(args(&["--fast", "4M", "--slow", "0", "prog"])).unwrap();
+        assert_eq!(
+            regions(&opts),
+            [("chip", 0, 2 * MIB), ("fast", 0x20_0000, 4 * MIB)]
+        );
+        let opts = parse_args(args(&[
+            "--cpu", "68030", "--z3", "32M", "--accel", "0", "prog",
+        ]))
+        .unwrap();
+        assert_eq!(
+            regions(&opts),
+            [
+                ("chip", 0, 2 * MIB),
+                ("fast", 0x20_0000, 8 * MIB),
+                ("z3", 0x1000_0000, 32 * MIB)
+            ]
+        );
+    }
+
+    #[test]
+    fn region_flags_and_ram_cannot_be_mixed() {
+        let err = parse_args(args(&["--ram", "8M", "--fast", "4M", "prog"])).unwrap_err();
+        assert!(err.contains("--ram") && err.contains("--fast"), "{err}");
+    }
+
+    #[test]
+    fn a_24_bit_cpu_refuses_ram_its_bus_cannot_reach() {
+        let err = parse_args(args(&["--z3", "32M", "prog"])).unwrap_err();
+        assert!(err.contains("24-bit address bus"), "{err}");
+        let err = parse_args(args(&["--accel", "16M", "prog"])).unwrap_err();
+        assert!(err.contains("24-bit address bus"), "{err}");
+        // The same on a 32-bit CPU is fine.
+        assert!(parse_args(args(&["--cpu", "68020", "--z3", "32M", "prog"])).is_ok());
+    }
+
+    #[test]
+    fn invalid_region_sizes_are_reported_not_clamped() {
+        // Past the Zorro II window ($9FFFFF).
+        let err = parse_args(args(&["--fast", "9M", "prog"])).unwrap_err();
+        assert!(err.contains("invalid memory layout"), "{err}");
+        let err = parse_args(args(&["--chip", "4M", "prog"])).unwrap_err();
+        assert!(err.contains("chip"), "{err}");
+    }
+
+    #[test]
+    fn sanitize_drops_unshadowable_default_ram_and_refuses_explicit_requests_for_it() {
+        const MIB: u32 = 1024 * 1024;
+        let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
+        assert_eq!(
+            regions(&opts),
+            [("chip", 0, 2 * MIB), ("fast", 0x20_0000, 8 * MIB)],
+            "the default's slow RAM is dropped rather than left unchecked"
+        );
+        let err = parse_args(args(&["--sanitize", "--slow", "512K", "prog"])).unwrap_err();
+        assert!(err.contains("--sanitize"), "{err}");
     }
 
     // --- check_ram_fits ---
 
     #[test]
     fn check_ram_fits_accepts_when_there_is_room() {
-        assert!(check_ram_fits(0x1000, 0x1000, DEFAULT_RAM_SIZE).is_ok());
+        assert!(check_ram_fits(0x1000, 0x1000, 16 * 1024 * 1024).is_ok());
     }
 
     #[test]
@@ -3384,16 +3674,17 @@ mod tests {
     }
 
     #[test]
-    fn the_default_ram_size_is_exactly_what_a_68000_can_address() {
-        // Issue #98: the two constants have to agree, or the default
-        // configuration is either broken or needlessly small. If a
-        // future `DEFAULT_RAM_SIZE` bump ever wants more, it has to come
-        // with a `--cpu` default change (or a clamp) as well.
-        assert_eq!(
-            u64::from(DEFAULT_RAM_SIZE),
-            addressable_bytes(CpuType::M68000)
-        );
-        assert!(check_ram_addressable(DEFAULT_RAM_SIZE, CpuType::M68000).is_ok());
+    fn the_24_bit_default_layout_fits_a_68000_bus_and_the_32_bit_one_does_not() {
+        // Issue #98/#332: the default layout has to be one the CPU can
+        // actually address, or the default configuration is broken.
+        let l24 = volamos_core::memmap::MemoryLayout::default_for_address_bits(24);
+        assert!(l24.check_address_bits(24).is_ok());
+        assert!(l24.highest_end() <= addressable_bytes(CpuType::M68000));
+        let l32 = volamos_core::memmap::MemoryLayout::default_for_address_bits(32);
+        assert!(l32.check_address_bits(24).is_err());
+        assert!(l32.highest_end() <= addressable_bytes(CpuType::M68020));
+        // --ram's legacy path still checks against the bus.
+        assert!(check_ram_addressable(16 * 1024 * 1024, CpuType::M68000).is_ok());
     }
 
     #[test]
@@ -3401,7 +3692,7 @@ mod tests {
         // One byte over is enough: the guest stack sits at the top of
         // the address space, so this is not a "close enough" situation.
         for cpu in [CpuType::M68000, CpuType::M68010] {
-            let err = check_ram_addressable(DEFAULT_RAM_SIZE + 1, cpu).unwrap_err();
+            let err = check_ram_addressable(16 * 1024 * 1024 + 1, cpu).unwrap_err();
             assert!(err.contains("24-bit address bus"), "{err}");
             assert!(err.contains(cpu_model_name(cpu)), "{err}");
             assert!(err.contains("--cpu 68020"), "{err}");
@@ -3847,6 +4138,11 @@ mod tests {
             "--auto-assign",
             "--stack",
             "--ram",
+            "--chip",
+            "--fast",
+            "--slow",
+            "--accel",
+            "--z3",
             "--cpu",
             "--clock-mhz",
             "--mem-wait",
@@ -4678,7 +4974,7 @@ mod tests {
             &[],
             None,
             DEFAULT_STACK_SIZE,
-            1 << 20, // 1 MiB -- comfortably more than this tiny program needs
+            volamos_core::memmap::MemoryLayout::legacy_exact(1 << 20), // 1 MiB -- comfortably more than this tiny program needs
             CpuType::M68060,
             false,
             false,
