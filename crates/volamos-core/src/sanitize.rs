@@ -798,6 +798,10 @@ impl ShadowMap {
     /// a lazily zeroed allocation: only the pages the guest's
     /// allocations and stack actually touch cost memory.
     pub fn with_ranges(ranges: &[(u32, u64)]) -> Self {
+        debug_assert!(
+            ranges.windows(2).all(|w| w[0].1 <= u64::from(w[1].0)),
+            "shadow ranges must be address-ordered and non-overlapping: {ranges:?}"
+        );
         Self {
             segments: ranges
                 .iter()
@@ -869,18 +873,20 @@ impl ShadowMap {
     /// segment. The first segment (guest RAM from address 0) is tried
     /// first: it holds the stack and, usually, everything a hot access
     /// touches.
+    #[inline]
     fn slot(&self, addr: u32) -> Option<&u8> {
+        // One compare per segment: `addr - base` wraps for an address
+        // below the segment, which is then far past its length.
         self.segments
             .iter()
-            .find(|s| addr >= s.base && u64::from(addr) < s.end())
-            .map(|s| &s.bytes[(addr - s.base) as usize])
+            .find_map(|s| s.bytes.get(addr.wrapping_sub(s.base) as usize))
     }
 
+    #[inline]
     fn slot_mut(&mut self, addr: u32) -> Option<&mut u8> {
         self.segments
             .iter_mut()
-            .find(|s| addr >= s.base && u64::from(addr) < s.end())
-            .map(|s| &mut s.bytes[(addr - s.base) as usize])
+            .find_map(|s| s.bytes.get_mut(addr.wrapping_sub(s.base) as usize))
     }
 
     /// Calls `f` on the shadow bytes of `[addr, addr + len)`, one slice

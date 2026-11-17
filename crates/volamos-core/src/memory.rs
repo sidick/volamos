@@ -942,9 +942,11 @@ impl FlatMemory {
     /// can execute or read -- the `--uae-debug` trap's A-line opcode at
     /// `$F0FF60`, which on a real UAE machine sits in ROM space. Returns
     /// `false` (mapping nothing) if it would overlap anything already
-    /// mapped. Call before the first [`Self::enable_sanitizer`] and
-    /// before creating a JIT window set; the new segment is plain RAM to
-    /// the CPU.
+    /// mapped. The new segment is plain memory to the CPU, but it is *not*
+    /// RAM as far as the sanitizer is concerned: a segment mapped after
+    /// [`Self::enable_sanitizer`] is never shadowed, so anything the guest
+    /// allocates from must be part of the layout the memory was built
+    /// from.
     pub fn map_segment(&mut self, base: u32, size: u32) -> bool {
         let end = u64::from(base) + u64::from(size);
         if size == 0 || end > 0x1_0000_0000 {
@@ -1229,12 +1231,18 @@ impl FlatMemory {
     pub fn enable_sanitizer(&mut self) {
         // One shadow segment per run of RAM (issue #332), so extra
         // segments -- slow, Zorro and CPU-board RAM -- are checked like
-        // the primary one. A segment mapped later (`map_segment`, the
-        // `--uae-debug` trap stub) is not RAM and stays unshadowed.
+        // the primary one. Built once, from the segments that exist now:
+        // a segment mapped later (`map_segment`, the `--uae-debug` trap
+        // stub) is not RAM and stays unshadowed, so RAM must be mapped
+        // *before* this is called. Each shadow segment is as large as the
+        // RAM it covers, committed lazily where the platform zero-fills
+        // pages on demand (as the RAM `Vec` itself is).
         let ranges: Vec<(u32, u64)> = self.ranges();
         self.shadow = Some(Box::new(ShadowMap::with_ranges(&ranges)));
     }
 
+    /// The installed [`ShadowMap`], if [`Self::enable_sanitizer`] was
+    /// called.
     pub fn shadow(&self) -> Option<&ShadowMap> {
         self.shadow.as_deref()
     }
