@@ -6,7 +6,8 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
         [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
-        [--sanitize-uninit] [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
+        [--sanitize-uninit] [--sanitize-lowmem] [--sanitize-wild]
+        [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
         [--emu68-debug] [--stack-report] [--net] <program> [args...]
 ```
 
@@ -927,6 +928,104 @@ initialized because something in it was written. `AllocMem` with
     archive reports nothing at all, and the real PhxAss assembler
     reports 6 sites — of which one instruction walking a table accounts
     for 568 of the 574 individual violations.
+
+## `--sanitize-lowmem`
+
+Adds reporting of **NULL-pointer and low-memory accesses** on top of
+`--sanitize`, which it implies: any data access the program makes into
+addresses `0`–`0x1FF`, where the 68000 keeps its exception vector table
+and where a NULL pointer (plus a small struct offset) lands. This is the
+bug class [Enforcer](https://aminet.net/package/util/moni/Enforcer)
+exists for, and the most common Amiga crash there is.
+
+```console
+$ volamos --sanitize-lowmem fixtures/accesstest null
+null: longword write through a NULL pointer, then read at +8
+sanitizer: 2 site(s), 3 violation(s):
+  invalid 2-byte write at 0x00000000 (NULL pointer or small offset from one) from PC 0x000032f6
+  invalid 2-byte write at 0x00000002 (NULL pointer or small offset from one) from PC 0x000032f6
+  invalid 4-byte read at 0x00000008 (NULL pointer or small offset from one) from PC 0x000032fa
+```
+
+(A 68000 splits that longword store into two word stores, hence the two
+2-byte entries at one PC; on a `--cpu 68020` or later it is a single
+4-byte one.)
+
+Run against Enforcer's own `LawBreaker` test program, it reports all
+three of its deliberate low-memory writes, with the source line:
+
+```console
+$ volamos --sanitize-lowmem LawBreaker
+volamos: Alert(0x35000000): AT_Recovery -- SubSysId=0x35 GeneralError=0x00 SpecificError=0x0000
+sanitizer: 3 site(s), 3 violation(s):
+  invalid 2-byte write at 0x00000000 (NULL pointer or small offset from one) from PC 0x00003274 (at lawbreaker.asm:149)
+  invalid 1-byte write at 0x00000101 (exception vector table) from PC 0x00003282 (at lawbreaker.asm:153)
+  invalid 4-byte write at 0x00000102 (exception vector table) from PC 0x0000328a (at lawbreaker.asm:155)
+```
+
+What is deliberately **not** reported:
+
+- The `move.l 4.w,a6` that starts every program: a *longword read* of
+  address 4 (`AbsExecBase`). A word read or any write there is still
+  reported.
+- Anything inside a `Supervisor()` routine, which owns the vector table
+  (installing a vector there is what supervisor code is for).
+- The CPU's own exception-vector fetch, and instruction fetches.
+- Anything volamos's own library code does: only the emulated CPU's
+  data accesses are checked.
+
+!!! note "Why it stops at `0x1FF`, and why it is a separate flag"
+    A real Amiga's vector table runs to `0x3FF`, but volamos keeps its
+    own structures from `0x200` up (`version.library`'s node, then
+    `dos.library`'s jump table), and a program legitimately reads those:
+    an earlier version that guarded all of `0`–`0x3FF` reported the stock
+    Workbench 3.1 `C:Version`. So only the part volamos leaves alone is
+    guarded. That still covers a NULL pointer plus any struct offset under
+    512 bytes.
+
+    It is opt-in, like `--sanitize-uninit`, so that turning on
+    `--sanitize` for heap bugs does not start reporting a new class of
+    thing on upgrade. Swept across ~200 real programs (the amitools test
+    corpus built with gcc, SAS/C and vbcc, on `--cpu 68000`, `68020` and
+    `68040`; SAS/C's `sc`, `grep` and `diff`; two dozen real Workbench 3.1
+    `C:` commands; PhxAss) it reported nothing except the one real
+    `ExecBase` gap it found, since fixed.
+
+## `--sanitize-wild`
+
+Adds reporting of **wild-pointer accesses** on top of `--sanitize`, which
+it implies: any data access to an address no memory backs. The access
+still behaves as it always has — a read gives 0 and a write is dropped —
+this only reports it, so a garbage pointer is diagnosed instead of
+quietly reading zeroes.
+
+```console
+$ volamos --cpu 68020 --sanitize-wild fixtures/accesstest wild
+wild: longword read through $AAAA4444
+sanitizer: 1 site(s), 1 violation(s):
+  invalid 4-byte read at 0xaaaa4444 (not backed by any memory) from PC 0x0000334a
+```
+
+The report says where the address landed, because they point at
+different bugs:
+
+| Address | Reported as |
+| --- | --- |
+| just past the end of a RAM region | `just past the end of RAM` |
+| `$BF0000-$BFFFFF`, `$DC0000-$DFFFFF` | `hardware register window; no custom chips here` |
+| `$E00000-$E7FFFF`, `$F80000-$FFFFFF` | `Kickstart ROM window; no ROM image here` |
+| `$E80000-$EFFFFF` | `Zorro AutoConfig window; no expansion boards here` |
+| anywhere else | `not backed by any memory` |
+
+The hardware classes are worth a line of their own: volamos models no
+custom chips, CIAs or ROM, so a program that reads `VHPOSR` for a random
+seed or polls a CIA register is doing something it cannot honour, and this
+tells you so instead of letting it read 0. On a `--cpu 68000` or `68010`
+the address shows with its top byte dropped, because that is the 24-bit
+bus the program actually ran on.
+
+A multi-byte access that runs off the end of RAM is reported once, at the
+first address that is not backed. Applies in supervisor routines too.
 
 ## `--sanitize-ignore-pc ADDR`
 

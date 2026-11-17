@@ -939,6 +939,34 @@ bytes; PhxAss: 90 longwords/360 bytes) differs, exactly as expected for
 re-run both builds plus the mode sweep above before trusting the
 result.
 
+## issue #71/#72 fixture: `accesstest`
+
+Source: `accesstest.s`; generator: `gen_accesstest.py` (same dual
+convention, `strmatch` dispatch idiom and `amiga_asm.py` assembler as
+`stacktest`). Added for `--sanitize-lowmem` (NULL / low-memory access) and
+`--sanitize-wild` (wild-pointer access), the two detectors for the bug class
+Enforcer exists to catch. Each mode prints a line, does exactly one thing,
+and exits `0`: noticing the bug is the sanitizer's job, not the guest's.
+
+| mode | what it does | `--sanitize-lowmem` | `--sanitize-wild` |
+|---|---|---|---|
+| `clean` | `move.l 4,d0` (the `AbsExecBase` idiom), then `lib_Version` out of `ExecBase` and `dos.library` | **nothing** -- the false-positive guard that matters most | **nothing** |
+| `null` | longword write through a NULL pointer, then a read at offset 8 of it | write at `0x0` and read at `0x8`, as `NULL pointer or small offset from one` | nothing |
+| `vector` | byte write at `$0101` | write at `0x101`, as `exception vector table` | nothing |
+| `abs4word` | **word** read at address 4 | read at `0x4` (only the *longword* read is the allowed idiom) | nothing |
+| `wild` | longword read through `$AAAA4444` | nothing | read, `not backed by any memory` (`0x00aa4444` on the default 68000's 24-bit bus, `0xaaaa4444` on `--cpu 68020` or later) |
+| `hardware` | word read of `VHPOSR` (`$DFF006`) | nothing | read, `hardware register window; no custom chips here` |
+
+On the default 68000 a `move.l` store through a displacement is two word
+bus cycles, so `null` shows two 2-byte writes (at `0x0` and `0x2`) at one PC;
+on a 68020 or later it is one 4-byte write.
+
+`accesstest.s` was assembled with the real PhxAss under volamos
+(`-V work:<dir> PhxAss work:accesstest.s`, as for the other fixtures). PhxAss
+optimises (840 bytes against the generator's 880), so the two binaries are not
+byte-identical, but every mode reports the same under both. Tested in
+`crates/volamos/tests/hello_cli.rs`.
+
 ## issue #58 fixture: `matchflags`
 
 Source: `matchflags.s`; generator: `gen_matchflags.py` (same dual

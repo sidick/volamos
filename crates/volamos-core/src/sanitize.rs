@@ -466,6 +466,97 @@ impl PoisonReason {
     }
 }
 
+/// Where a guest data access that was never backed by tracked memory
+/// landed (issues #71/#72), carried purely for diagnostics, like
+/// [`PoisonReason`]: it is what tells "you dereferenced NULL" apart from
+/// "you walked off the end of RAM" apart from "you poked a hardware
+/// register that this runtime doesn't have".
+///
+/// Unlike a [`PoisonReason`], none of these is ever stored in a shadow
+/// byte -- the accesses they describe are not against poisoned memory,
+/// they are against addresses with no memory (or, for the low-memory
+/// ones, memory that is the runtime's own). They are worked out from the
+/// address alone by [`ShadowMap::check_guest_access`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessSite {
+    /// The first page of the address space (`0..0x100`): the usual
+    /// signature of a NULL pointer, or a small offset from one (a field
+    /// of a struct that was never allocated).
+    NullPointer,
+    /// The rest of the guarded low memory (`0x100..`[`LOW_MEMORY_GUARD_END`]),
+    /// the 68000 exception vector table. On a real Amiga the CPU owns
+    /// this; user code has no business reading or writing it. (The one exception, the `AbsExecBase`
+    /// longword at address 4, is allowed.)
+    VectorTable,
+    /// A custom-chip, CIA, RTC or Gayle register window
+    /// (`$BF0000-$BFFFFF`, `$DC0000-$DFFFFF`). volamos models none of
+    /// those chips, so the access reads 0 / is dropped; a program
+    /// touching them is doing something this runtime cannot honour.
+    HardwareRegisters,
+    /// The Kickstart ROM or its extension window
+    /// (`$E00000-$E7FFFF`, `$F80000-$FFFFFF`): there is no ROM image.
+    KickstartRom,
+    /// The Zorro II AutoConfig window (`$E80000-$EFFFFF`).
+    ZorroAutoconfig,
+    /// Within 64 KiB after the end of a RAM region: the signature of an
+    /// off-by-one or a loop that ran on past a buffer at the top of
+    /// memory, rather than a garbage pointer.
+    PastEndOfRam,
+    /// Nowhere near any memory (a garbage pointer like `$AAAA4444`).
+    Unmapped,
+}
+
+impl AccessSite {
+    /// How far past the end of a RAM region an address still counts as
+    /// [`Self::PastEndOfRam`].
+    const PAST_END_SLACK: u64 = 0x1_0000;
+}
+
+impl fmt::Display for AccessSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AccessSite::NullPointer => "NULL pointer or small offset from one",
+            AccessSite::VectorTable => "exception vector table",
+            AccessSite::HardwareRegisters => "hardware register window; no custom chips here",
+            AccessSite::KickstartRom => "Kickstart ROM window; no ROM image here",
+            AccessSite::ZorroAutoconfig => "Zorro AutoConfig window; no expansion boards here",
+            AccessSite::PastEndOfRam => "just past the end of RAM",
+            AccessSite::Unmapped => "not backed by any memory",
+        })
+    }
+}
+
+/// End (exclusive) of the low memory guest data accesses are not allowed
+/// into: `0x000..0x200`, the part of the classic 68000 exception vector
+/// table (`0x000..0x400`) that volamos itself leaves alone.
+///
+/// It stops at [`crate::dispatch::VERSION_LIBRARY_BASE`] because that is
+/// where the runtime starts keeping things a guest legitimately reads:
+/// `version.library`'s node (`0x200`, whose `lib_Version`/`lib_IdString`
+/// `C:Version` reads -- this is how the first version of this check, which
+/// guarded all of `0..0x400`, turned out to report real Workbench
+/// software), and then `dos.library`'s jump table from `0x2CC` (see
+/// [`crate::dispatch::EXEC_LIBRARY_BASE`]'s "Reserved-region memory
+/// map"). Below it the runtime only keeps the vectors themselves, left
+/// zero for a guest handler, plus a cache-bits cell and two stub opcodes
+/// at `0xC0..0xC8` that no guest reads.
+///
+/// That still covers what the check is for: a NULL pointer plus any
+/// struct offset under 512 bytes, and LawBreaker's `$0000`/`$0101`/
+/// `$0102` writes. The cost is that a stray access at `0x200..0x400`
+/// goes unreported, which is the price of the runtime's own structures
+/// living there.
+pub const LOW_MEMORY_GUARD_END: u32 = 0x200;
+
+const _: () = assert!(
+    LOW_MEMORY_GUARD_END <= crate::dispatch::VERSION_LIBRARY_BASE,
+    "the low-memory guard must stay below the runtime's own structures"
+);
+
+/// Addresses below this are classed as [`AccessSite::NullPointer`]
+/// rather than [`AccessSite::VectorTable`].
+const NULL_PAGE_END: u32 = 0x100;
+
 /// What kind of bad access a [`Violation`] records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViolationKind {
@@ -516,6 +607,12 @@ pub struct Violation {
     /// [`ViolationKind::UninitRead`] (there's no "poison reason" for
     /// merely-uninitialized memory).
     pub reason: Option<PoisonReason>,
+    /// Where the access landed, for the accesses that were never
+    /// against shadowed memory at all: NULL/low-memory and wild-pointer
+    /// reports (issues #71/#72), which are [`ViolationKind::InvalidRead`]/
+    /// [`ViolationKind::InvalidWrite`] with this set and `reason` `None`.
+    /// `None` for every other violation.
+    pub site: Option<AccessSite>,
     /// For [`ViolationKind::ReturnAddressCorrupted`] only: the return
     /// address that [`ShadowMap::record_call`] recorded for this slot.
     /// `None` for every other kind.
@@ -565,6 +662,9 @@ impl fmt::Display for Violation {
             )?;
             if let Some(reason) = self.reason {
                 write!(f, " ({reason})")?;
+            }
+            if let Some(site) = self.site {
+                write!(f, " ({site})")?;
             }
         }
         write!(f, " from PC {pc:#010x}", pc = self.pc)?;
@@ -723,6 +823,25 @@ pub struct ShadowMap {
     /// Whether [`ViolationKind::UninitRead`] is reported at all. Off by
     /// default -- see [`ViolationKind::UninitRead`]'s doc.
     pub report_uninit: bool,
+    /// Whether a guest data access into the exception vector table
+    /// (`0..`[`LOW_MEMORY_GUARD_END`]) is reported -- the NULL-pointer
+    /// half of Enforcer's bug class (issue #71). Off by default; see
+    /// [`Self::check_guest_access`].
+    pub report_low_memory: bool,
+    /// Whether a guest data access to an address with no memory behind
+    /// it is reported -- the wild-pointer half (issue #72). Off by
+    /// default; see [`Self::check_guest_access`].
+    pub report_wild: bool,
+    /// Where the `Supervisor()` routine currently running returns to,
+    /// or `None` outside one (see [`Self::begin_supervisor`]). The
+    /// supervisor bit itself can't answer this: volamos runs every guest
+    /// in supervisor mode from reset (nothing drops it to user mode), so
+    /// SR says nothing about whether the program asked for it.
+    supervisor_until: Option<u32>,
+    /// Set for exactly the one bus read that fetches an exception
+    /// vector (see [`Self::note_vector_fetch`]); that read is the CPU's,
+    /// not a data access of the guest's.
+    vector_fetch_pending: Cell<bool>,
     /// The tracked stack region and last-seen SP, or `None` until
     /// [`Self::begin_stack_tracking`] is called -- see this module's
     /// "stack-pointer tracking" doc.
@@ -816,6 +935,10 @@ impl ShadowMap {
             suppressed: Cell::new(0),
             current_pc: 0,
             report_uninit: false,
+            report_low_memory: false,
+            report_wild: false,
+            supervisor_until: None,
+            vector_fetch_pending: Cell::new(false),
             stack: None,
             call_stack: VecDeque::new(),
             dropped_call_frames: 0,
@@ -843,6 +966,127 @@ impl ShadowMap {
     /// every instruction.
     pub(crate) fn set_movem_dummy_read(&self, addr: Option<u32>) {
         self.movem_dummy_read.set(addr);
+    }
+
+    /// Marks the start of a `Supervisor()` routine that `RTE`s to
+    /// `return_pc`: until the PC gets there, the guest is doing what only
+    /// supervisor code may legitimately do -- including owning the
+    /// vector table, so [`Self::check_guest_access`]'s low-memory check
+    /// stands down. Called by the `Supervisor` handler. One level only:
+    /// a routine that itself calls `Supervisor()` is not a thing.
+    pub(crate) fn begin_supervisor(&mut self, return_pc: u32) {
+        self.supervisor_until = Some(return_pc);
+    }
+
+    /// Marks the *next* bus read as the CPU fetching an exception
+    /// vector rather than the guest reading memory. The `m68k` crate
+    /// reads a vector with an ordinary `read_long` after setting the
+    /// supervisor bit and pushing the frame, so neither the published
+    /// supervisor state (which is that of the instruction that trapped)
+    /// nor the address tells the two apart -- but it calls
+    /// `AddressBus::ipl_release_sample` immediately before, and only
+    /// there (m68k 0.17.0, `jump_vector`), which is how the bus impl
+    /// knows. A guest-visible exception (an unimplemented FPU
+    /// instruction, say) would otherwise report a low-memory read at its
+    /// own vector.
+    pub(crate) fn note_vector_fetch(&self) {
+        self.vector_fetch_pending.set(true);
+    }
+
+    /// Whether every byte of `[addr, addr + size)` lies in a shadowed
+    /// (i.e. RAM-backed) segment.
+    fn is_mapped(&self, addr: u32, size: u8) -> bool {
+        (0..u32::from(size)).all(|i| {
+            let a = u64::from(addr) + u64::from(i);
+            self.segments
+                .iter()
+                .any(|seg| a >= u64::from(seg.base) && a < seg.end())
+        })
+    }
+
+    /// Classifies an address with no memory behind it.
+    fn classify_unmapped(&self, addr: u32) -> AccessSite {
+        match addr {
+            0xBF_0000..=0xBF_FFFF | 0xDC_0000..=0xDF_FFFF => AccessSite::HardwareRegisters,
+            0xE8_0000..=0xEF_FFFF => AccessSite::ZorroAutoconfig,
+            0xE0_0000..=0xE7_FFFF | 0xF8_0000..=0xFF_FFFF => AccessSite::KickstartRom,
+            _ if self.segments.iter().any(|seg| {
+                u64::from(addr) >= seg.end()
+                    && u64::from(addr) < seg.end() + AccessSite::PAST_END_SLACK
+            }) =>
+            {
+                AccessSite::PastEndOfRam
+            }
+            _ => AccessSite::Unmapped,
+        }
+    }
+
+    /// Checks one *guest* data access -- one the emulated CPU itself put
+    /// on the bus, not an instruction fetch and not a native library
+    /// handler's (those reach memory through [`crate::memory::
+    /// AddressSpace`], which never calls this) -- for the two bug classes
+    /// Enforcer exists to catch (issues #71 and #72):
+    ///
+    /// - **Low memory** (when [`Self::report_low_memory`] is on): any
+    ///   access overlapping `0..`[`LOW_MEMORY_GUARD_END`], the exception
+    ///   vector table, a NULL pointer's usual destination. Allowed: the
+    ///   `AbsExecBase` longword read at address 4 that every program
+    ///   starts with; anything in supervisor mode (which owns the
+    ///   table: inside a `Supervisor()` routine); and the CPU's own vector
+    ///   fetches.
+    /// - **Wild pointers** (when [`Self::report_wild`] is on): any access
+    ///   touching an address no RAM backs. The access itself stays total,
+    ///   as [`crate::memory::AddressSpace`] promises -- reads give 0,
+    ///   writes vanish -- this only reports it. Applies in supervisor
+    ///   mode too.
+    ///
+    /// Why this is not "poison the reserved region in the shadow map",
+    /// which is how the issues first framed it: the region is the
+    /// runtime's own, written constantly by handlers, and a shadow poison
+    /// would have to be lifted around every one. Keying on the access
+    /// *path* is exact instead -- only the guest CPU goes through the bus
+    /// impl -- and needs no per-byte state at all. Library bases and
+    /// `ExecBase` sit above the guarded range, so the fields a guest
+    /// legitimately reads there are never affected.
+    ///
+    /// A multi-byte access reports once, at its first offending byte,
+    /// like [`Self::check_read`].
+    pub(crate) fn check_guest_access(&self, addr: u32, size: u8, write: bool) {
+        // Consumed unconditionally, so a marker can never outlive the
+        // vector read it was set for.
+        if self.vector_fetch_pending.replace(false) {
+            return;
+        }
+        if !self.report_low_memory && !self.report_wild {
+            return;
+        }
+        let kind = if write {
+            ViolationKind::InvalidWrite
+        } else {
+            ViolationKind::InvalidRead
+        };
+        if self.report_wild && !self.is_mapped(addr, size) {
+            // Report at the first byte that is not mapped, so a
+            // straddling access names the address that actually failed.
+            let bad = (0..u32::from(size))
+                .map(|i| addr.wrapping_add(i))
+                .find(|&a| !self.is_mapped(a, 1))
+                .unwrap_or(addr);
+            self.record_with(bad, size, kind, None, Some(self.classify_unmapped(bad)));
+            return;
+        }
+        if self.report_low_memory
+            && self.supervisor_until.is_none()
+            && addr < LOW_MEMORY_GUARD_END
+            && !(!write && addr == 4 && size == 4)
+        {
+            let site = if addr < NULL_PAGE_END {
+                AccessSite::NullPointer
+            } else {
+                AccessSite::VectorTable
+            };
+            self.record_with(addr, size, kind, None, Some(site));
+        }
     }
 
     /// Whether `addr` is a byte of the `MOVEM` dummy word.
@@ -1026,6 +1270,9 @@ impl ShadowMap {
     /// attribution" doc. Called once per instruction/batch by the CPU
     /// run loop.
     pub fn set_current_pc(&mut self, pc: u32) {
+        if self.supervisor_until == Some(pc) {
+            self.supervisor_until = None;
+        }
         self.current_pc = pc;
     }
 
@@ -1074,6 +1321,19 @@ impl ShadowMap {
         kind: ViolationKind,
         reason: Option<PoisonReason>,
     ) -> bool {
+        self.record_with(addr, size, kind, reason, None)
+    }
+
+    /// [`Self::record`], optionally carrying the [`AccessSite`] of an
+    /// access that was never against shadowed memory (issues #71/#72).
+    fn record_with(
+        &self,
+        addr: u32,
+        size: u8,
+        kind: ViolationKind,
+        reason: Option<PoisonReason>,
+        site: Option<AccessSite>,
+    ) -> bool {
         let pc = self.current_pc;
         if self.ignored_pcs.contains(&pc) {
             return false;
@@ -1087,6 +1347,7 @@ impl ShadowMap {
                 size,
                 kind,
                 reason,
+                site,
                 expected_return_addr: None,
                 actual_return_addr: None,
                 hits: 1,
@@ -1117,6 +1378,7 @@ impl ShadowMap {
                 size: 4,
                 kind,
                 reason: None,
+                site: None,
                 expected_return_addr: Some(expected),
                 actual_return_addr: Some(actual),
                 hits: 1,
@@ -1883,7 +2145,10 @@ impl ShadowMap {
             for v in vs {
                 match clusters.iter_mut().find(|c| {
                     let first = c[0];
-                    first.kind == v.kind && first.size == v.size && first.reason == v.reason
+                    first.kind == v.kind
+                        && first.size == v.size
+                        && first.reason == v.reason
+                        && first.site == v.site
                 }) {
                     Some(c) => c.push(v),
                     None => clusters.push(vec![v]),
@@ -1906,6 +2171,7 @@ impl ShadowMap {
                             kind,
                             cluster[0].size,
                             cluster[0].reason,
+                            cluster[0].site,
                             count,
                             min_addr,
                             max_addr
@@ -1973,6 +2239,7 @@ fn describe_cluster(
     kind: ViolationKind,
     size: u8,
     reason: Option<PoisonReason>,
+    site: Option<AccessSite>,
     count: u64,
     min_addr: u32,
     max_addr: u32,
@@ -2004,6 +2271,9 @@ fn describe_cluster(
     let _ = write!(s, "{count} {access} {size}-byte {verb}");
     if let Some(reason) = reason {
         let _ = write!(s, " ({reason})");
+    }
+    if let Some(site) = site {
+        let _ = write!(s, " ({site})");
     }
     if min_addr == max_addr {
         let _ = write!(s, ", address {min_addr:#010x}");
@@ -3204,5 +3474,234 @@ mod tests {
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].kind, ViolationKind::InvalidRead);
         assert_eq!(v[0].addr, 0x8000_0104);
+    }
+
+    // --- guest low-memory / wild-pointer checks (issues #71, #72) ---
+
+    /// A shadow map over `0..0x1000` and `0x2000..0x3000`, both detectors
+    /// on, with a PC published so reports are attributable.
+    fn access_shadow() -> ShadowMap {
+        let mut shadow = ShadowMap::with_ranges(&[(0, 0x1000), (0x2000, 0x3000)]);
+        shadow.report_low_memory = true;
+        shadow.report_wild = true;
+        shadow.set_current_pc(0x500);
+        shadow
+    }
+
+    #[test]
+    fn guest_access_checks_are_off_unless_asked_for() {
+        let mut shadow = ShadowMap::with_ranges(&[(0, 0x1000)]);
+        shadow.check_guest_access(0, 4, true);
+        shadow.check_guest_access(0xAAAA_4444, 4, false);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // Each detector is independent of the other.
+        shadow.report_low_memory = true;
+        shadow.check_guest_access(0xAAAA_4444, 4, false);
+        assert_eq!(shadow.violation_count(), 0, "wild stays off");
+        shadow.check_guest_access(0, 4, true);
+        assert_eq!(shadow.violation_count(), 1);
+
+        let mut shadow = ShadowMap::with_ranges(&[(0, 0x1000)]);
+        shadow.report_wild = true;
+        shadow.check_guest_access(0, 4, true);
+        assert_eq!(shadow.violation_count(), 0, "low memory stays off");
+        shadow.check_guest_access(0xAAAA_4444, 4, false);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn low_memory_accesses_are_reported_with_null_and_vector_sites() {
+        let shadow = access_shadow();
+        shadow.check_guest_access(0, 2, true);
+        shadow.check_guest_access(8, 4, false);
+        shadow.check_guest_access(0x101, 1, true);
+        shadow.check_guest_access(LOW_MEMORY_GUARD_END - 1, 1, false);
+
+        let v = shadow.violations();
+        assert_eq!(v.len(), 4);
+        assert_eq!(
+            (v[0].kind, v[0].site),
+            (ViolationKind::InvalidWrite, Some(AccessSite::NullPointer))
+        );
+        assert_eq!(
+            (v[1].kind, v[1].site),
+            (ViolationKind::InvalidRead, Some(AccessSite::NullPointer))
+        );
+        assert_eq!(
+            (v[2].kind, v[2].site),
+            (ViolationKind::InvalidWrite, Some(AccessSite::VectorTable))
+        );
+        assert_eq!(
+            (v[3].kind, v[3].site),
+            (ViolationKind::InvalidRead, Some(AccessSite::VectorTable))
+        );
+        assert!(v.iter().all(|v| v.reason.is_none() && v.pc == 0x500));
+    }
+
+    #[test]
+    fn low_memory_guard_stops_where_the_runtimes_own_structures_begin() {
+        // version.library's node is at 0x200 and C:Version reads it (the
+        // regression this bound exists for).
+        let shadow = access_shadow();
+        shadow.check_guest_access(LOW_MEMORY_GUARD_END, 4, false);
+        shadow.check_guest_access(crate::dispatch::VERSION_LIBRARY_BASE + 20, 2, false);
+        shadow.check_guest_access(0x800, 4, false); // dos.library's base
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn the_abs_exec_base_longword_read_is_allowed_but_nothing_else_at_4() {
+        let shadow = access_shadow();
+        shadow.check_guest_access(4, 4, false); // move.l 4,a6
+        assert_eq!(shadow.violation_count(), 0);
+
+        shadow.check_guest_access(4, 2, false); // a word there is not the idiom
+        shadow.check_guest_access(4, 4, true); // and writing it is corruption
+        shadow.check_guest_access(6, 2, false);
+        assert_eq!(shadow.violation_count(), 3);
+    }
+
+    #[test]
+    fn supervisor_routines_may_use_the_vector_table_until_they_return() {
+        let mut shadow = access_shadow();
+        shadow.begin_supervisor(0x600);
+        shadow.check_guest_access(0x2C, 4, true); // installing a vector
+        shadow.set_current_pc(0x580); // still inside the routine
+        shadow.check_guest_access(0x2C, 4, false);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // The RTE lands on the return address: back to user code.
+        shadow.set_current_pc(0x600);
+        shadow.check_guest_access(0x2C, 4, true);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn a_supervisor_routine_does_not_excuse_a_wild_pointer() {
+        let mut shadow = access_shadow();
+        shadow.begin_supervisor(0x600);
+        shadow.check_guest_access(0xAAAA_4444, 4, false);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn the_cpus_own_vector_fetch_is_not_a_guest_access() {
+        let shadow = access_shadow();
+        shadow.note_vector_fetch();
+        shadow.check_guest_access(0x2C, 4, false);
+        assert_eq!(shadow.violation_count(), 0);
+
+        // It excuses exactly one read: the next access is the guest's.
+        shadow.check_guest_access(0x2C, 4, false);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn a_vector_fetch_marker_is_consumed_even_with_both_detectors_off() {
+        // Otherwise it would outlive the read it was set for and excuse a
+        // later real access once a detector is switched on.
+        let mut shadow = ShadowMap::with_ranges(&[(0, 0x1000)]);
+        shadow.note_vector_fetch();
+        shadow.check_guest_access(0x2C, 4, false);
+        shadow.report_low_memory = true;
+        shadow.check_guest_access(0x2C, 4, false);
+        assert_eq!(shadow.violation_count(), 1);
+    }
+
+    #[test]
+    fn wild_accesses_are_classified_by_where_they_land() {
+        let shadow = access_shadow();
+        let cases = [
+            (0xAAAA_4444, AccessSite::Unmapped),
+            (0x1000 + 0x10, AccessSite::PastEndOfRam), // just past the first region
+            (0x3000, AccessSite::PastEndOfRam),        // just past the second
+            (0xDFF006, AccessSite::HardwareRegisters), // VHPOSR
+            (0xBFE001, AccessSite::HardwareRegisters), // CIA-A
+            (0xDC0000, AccessSite::HardwareRegisters), // battclock
+            (0xF80000, AccessSite::KickstartRom),
+            (0xE00000, AccessSite::KickstartRom),
+            (0xE80000, AccessSite::ZorroAutoconfig),
+        ];
+        for (addr, site) in cases {
+            shadow.check_guest_access(addr, 2, false);
+            let v = shadow.violations();
+            let last = v.last().unwrap();
+            assert_eq!(last.addr, addr, "{addr:#x}");
+            assert_eq!(last.site, Some(site), "{addr:#x}");
+            assert_eq!(last.kind, ViolationKind::InvalidRead);
+        }
+    }
+
+    #[test]
+    fn the_gap_between_two_ram_regions_is_unmapped() {
+        let shadow = access_shadow();
+        shadow.check_guest_access(0x1800, 4, true);
+        let v = &shadow.violations()[0];
+        assert_eq!(v.kind, ViolationKind::InvalidWrite);
+        assert_eq!(v.site, Some(AccessSite::PastEndOfRam));
+    }
+
+    #[test]
+    fn an_access_straddling_the_end_of_ram_reports_once_at_the_first_bad_byte() {
+        let shadow = access_shadow();
+        shadow.check_guest_access(0x0FFE, 4, true); // 0xFFE,0xFFF mapped; 0x1000,0x1001 not
+        let v = shadow.violations();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].addr, 0x1000);
+        assert_eq!(v[0].size, 4);
+    }
+
+    #[test]
+    fn two_adjacent_ram_regions_do_not_make_a_straddling_access_wild() {
+        let mut shadow = ShadowMap::with_ranges(&[(0x1000, 0x2000), (0x2000, 0x3000)]);
+        shadow.report_wild = true;
+        shadow.check_guest_access(0x1FFE, 4, false);
+        assert_eq!(shadow.violation_count(), 0);
+    }
+
+    #[test]
+    fn access_site_reports_read_naturally_and_repeat_hits_are_counted() {
+        let shadow = access_shadow();
+        for _ in 0..3 {
+            shadow.check_guest_access(0xAAAA_4444, 4, false);
+        }
+        shadow.check_guest_access(0, 4, true);
+        let report = shadow.report();
+        assert!(
+            report.contains(
+                "invalid 4-byte read at 0xaaaa4444 (not backed by any memory) from PC 0x00000500 (3 hits)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "invalid 4-byte write at 0x00000000 (NULL pointer or small offset from one)"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn many_wild_accesses_from_one_pc_roll_up_with_their_site() {
+        let shadow = access_shadow();
+        for i in 0..6u32 {
+            shadow.check_guest_access(0xDFF000 + i * 2, 2, false);
+        }
+        let report = shadow.report();
+        assert!(
+            report.contains("6 invalid 2-byte reads (hardware register window; no custom chips here), addresses 0x00dff000-0x00dff00a"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn heap_violations_do_not_gain_a_site() {
+        // The new field is only for the two new classes.
+        let mut shadow = ShadowMap::new(16);
+        shadow.mark_unaddressable(8, 4, PoisonReason::Redzone);
+        shadow.check_read(8, 1);
+        assert_eq!(shadow.violations()[0].site, None);
+        assert!(!shadow.report().contains("NULL"));
     }
 }

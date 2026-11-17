@@ -58,6 +58,100 @@ fn sanitize_stacktest(mode: &str) -> String {
     sanitized_stderr(&format!("stacktest {mode}"), output)
 }
 
+/// Path to `fixtures/accesstest`, the NULL/low-memory/wild-pointer
+/// fixture (issues #71 and #72). See `fixtures/README.md` for its modes.
+const ACCESSTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/accesstest");
+
+/// Runs `fixtures/accesstest <mode>` with `flags` and returns its
+/// captured stderr (see [`sanitized_stderr`]).
+fn accesstest(flags: &[&str], mode: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .args(flags)
+        .arg(ACCESSTEST_PATH)
+        .arg(mode)
+        .output()
+        .expect("failed to run the volamos binary");
+    sanitized_stderr(&format!("accesstest {mode}"), output)
+}
+
+const ACCESS_FLAGS: [&str; 2] = ["--sanitize-lowmem", "--sanitize-wild"];
+
+#[test]
+fn sanitize_access_detectors_stay_silent_for_what_every_program_does() {
+    // The false-positive guard that matters most: the AbsExecBase read
+    // that opens every program, and reading version fields out of
+    // ExecBase and dos.library.
+    let stderr = accesstest(&ACCESS_FLAGS, "clean");
+    assert!(!stderr.contains("sanitizer:"), "{stderr}");
+}
+
+#[test]
+fn sanitize_lowmem_reports_a_null_pointer_write_and_read() {
+    let stderr = accesstest(&["--sanitize-lowmem"], "null");
+    assert!(
+        stderr.contains("write at 0x00000000 (NULL pointer or small offset from one)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("read at 0x00000008 (NULL pointer or small offset from one)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sanitize_lowmem_reports_the_vector_table_and_a_non_longword_read_at_4() {
+    let stderr = accesstest(&["--sanitize-lowmem"], "vector");
+    assert!(
+        stderr.contains("1-byte write at 0x00000101 (exception vector table)"),
+        "{stderr}"
+    );
+    let stderr = accesstest(&["--sanitize-lowmem"], "abs4word");
+    assert!(stderr.contains("2-byte read at 0x00000004"), "{stderr}");
+}
+
+#[test]
+fn sanitize_wild_reports_a_garbage_pointer_and_unmodelled_hardware() {
+    // The default CPU is a 68000, whose 24-bit bus drops the top byte.
+    let stderr = accesstest(&["--sanitize-wild"], "wild");
+    assert!(
+        stderr.contains("4-byte read at 0x00aa4444 (not backed by any memory)"),
+        "{stderr}"
+    );
+    let stderr = accesstest(&["--sanitize-wild"], "hardware");
+    assert!(
+        stderr.contains("2-byte read at 0x00dff006 (hardware register window"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sanitize_access_detectors_are_independent_and_off_by_default() {
+    // --sanitize alone reports neither class, nor does either detector
+    // report the other's.
+    for mode in ["null", "vector", "abs4word", "wild", "hardware"] {
+        let stderr = accesstest(&["--sanitize"], mode);
+        assert!(!stderr.contains("sanitizer:"), "{mode}: {stderr}");
+    }
+    assert!(!accesstest(&["--sanitize-wild"], "null").contains("sanitizer:"));
+    assert!(!accesstest(&["--sanitize-lowmem"], "wild").contains("sanitizer:"));
+}
+
+#[test]
+fn sanitize_access_detectors_do_not_change_what_the_guest_does() {
+    // A detector, not an enforcer: the run still completes and prints.
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .args(ACCESS_FLAGS)
+        .arg(ACCESSTEST_PATH)
+        .arg("wild")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("wild: longword read through $AAAA4444")
+    );
+}
+
 #[test]
 fn sanitize_reports_nothing_for_legitimate_stack_use() {
     // Three false-positive guards, and they matter more than the two

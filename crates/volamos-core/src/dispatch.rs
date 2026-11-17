@@ -322,7 +322,9 @@ pub const LVO_PUTSTR: i32 = -948;
 /// 0x11C0 .. 0x11EC   the chip region's MemHeader (32 bytes) and its name
 ///                     ("chip memory"); ExecBase.MemList links it and the
 ///                     other regions' headers (CHIP_MEMHEADER_ADDR)
-/// 0x11EC .. 0x11FC   headroom
+/// 0x11EC .. 0x11F0   RESMODULES_ARRAY_ADDR: ExecBase.ResModules' (empty)
+///                     array, a lone 0 terminator
+/// 0x11F0 .. 0x11FC   headroom
 /// 0x11FC .. 0x1200   EXIT_STUB_ADDR (the last word of the region)
 /// ```
 ///
@@ -647,6 +649,27 @@ pub(crate) const EXEC_BASE_MEMLIST_OFFSET: u32 = 322;
 /// three capture vectors (12) + `SysStkUpper`/`SysStkLower` (8) = 62.
 /// The size of chip RAM (`0x200000` on Kickstart 3.1 with 2 MiB).
 pub(crate) const EXEC_BASE_MAXLOCMEM_OFFSET: u32 = 62;
+
+/// Byte offset of `ExecBase.ResModules` from [`EXEC_LIBRARY_BASE`]:
+/// `MaxLocMem` (62) + 4, `DebugEntry`/`DebugData`/`AlertData`/`MaxExtMem`
+/// (16), `ChkSum` (2), `IntVects` (192), `ThisTask` (4), `IdleCount`/
+/// `DispCount` (8), `Quantum`/`Elapsed`/`SysFlags` (6), `IDNestCnt`/
+/// `TDNestCnt` (2) and `AttnFlags`/`AttnResched` (4) = 300.
+///
+/// A pointer to the array of `struct Resident` pointers the ROM found,
+/// ended by a 0 (a value with bit 31 set links to another array).
+/// Real programs walk it -- `C:Version` does, to look a module up by
+/// name before falling back to opening it -- so it must not be NULL:
+/// that made `--sanitize-lowmem` report a NULL read from a stock
+/// Workbench 3.1 command. volamos keeps no ROM modules to list, so it
+/// points at [`RESMODULES_ARRAY_ADDR`], an array holding only the
+/// terminator.
+pub(crate) const EXEC_BASE_RESMODULES_OFFSET: u32 = 300;
+
+/// The empty `ResModules` array: one zero longword (see
+/// [`EXEC_BASE_RESMODULES_OFFSET`]), in the headroom after the chip
+/// `MemHeader`.
+pub(crate) const RESMODULES_ARRAY_ADDR: u32 = EXEC_LIBRARY_BASE + 0x2EC;
 
 /// Where the chip region's `MemHeader` and name live: the free headroom
 /// at the end of the reserved region (see [`EXEC_LIBRARY_BASE`]'s
@@ -3111,6 +3134,13 @@ impl<C: Cpu + 'static> Runtime<C> {
             EXEC_LIBRARY_BASE + EXEC_BASE_MAXLOCMEM_OFFSET,
             chip_size.min(u64::from(u32::MAX)) as u32,
         );
+        // ExecBase.ResModules: an empty, terminated array rather than NULL,
+        // so a program walking it (C:Version does) ends cleanly.
+        mem.write_u32(RESMODULES_ARRAY_ADDR, 0);
+        mem.write_u32(
+            EXEC_LIBRARY_BASE + EXEC_BASE_RESMODULES_OFFSET,
+            RESMODULES_ARRAY_ADDR,
+        );
 
         // The entry stack frame, in real AmigaOS's `RunCommand`
         // layout (issues #178 and #279) -- ascending addresses:
@@ -4544,6 +4574,23 @@ mod tests {
                  FPU_DISABLED_060_DECLINE_STUB_ADDR, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn exec_base_res_modules_is_a_terminated_array_not_null() {
+        // C:Version walks ExecBase.ResModules (offset 300) with
+        // `move.l (a2)+,d0` until it reads 0. A NULL pointer there made a
+        // stock Workbench 3.1 command dereference address 0, which
+        // --sanitize-lowmem rightly reported. It must be a real array
+        // whose first entry is the terminator (volamos has no ROM
+        // modules to list).
+        let rt = runtime_with_program(&[0x4E75]);
+        let array = rt
+            .mem
+            .read_u32(EXEC_LIBRARY_BASE + EXEC_BASE_RESMODULES_OFFSET);
+        assert_eq!(array, RESMODULES_ARRAY_ADDR);
+        assert_ne!(array, 0, "ResModules must not be NULL");
+        assert_eq!(rt.mem.read_u32(array), 0, "the array must be terminated");
     }
 
     /// Guest address of vector 11's slot -- `m68k::core::exceptions::

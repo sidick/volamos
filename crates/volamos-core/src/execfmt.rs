@@ -450,6 +450,9 @@ fn supervisor_handler<C: Cpu + 'static>(
     ctx.cpu.set_address_register(AddressRegister(7), sp);
     if let Some(shadow) = ctx.mem.shadow_mut() {
         shadow.update_stack_pointer(sp);
+        // The routine runs as supervisor code until its `RTE` lands on
+        // `return_pc`: see `ShadowMap::begin_supervisor`.
+        shadow.begin_supervisor(return_pc);
     }
     ctx.mem.write_u32(sp, routine);
     Ok(())
@@ -757,6 +760,48 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn supervisor_routine_may_use_the_vector_table_but_the_caller_may_not_71() {
+        // Issue #71: with --sanitize-lowmem, a Supervisor() routine
+        // installing a vector (what supervisor code is for) is not a NULL
+        // dereference, and the exemption ends when its RTE lands back in
+        // the caller.
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let routine_idx = words.len();
+        words.push(move_imm_to_a(5)); // A5 = routine (patched)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-30)); // Supervisor(a6)
+        words.extend_from_slice(&[0x21C0, 0x002C]); // user code: move.l d0,($2C).w
+        words.push(RTS);
+
+        // The routine: moveq #7,d0 ; move.l d0,($2C).w ; rte
+        let routine_idx_words = words.len();
+        words.extend_from_slice(&[0x7007, 0x21C0, 0x002C, 0x4E73]);
+        let routine_addr = TRAP_TABLE_END + (routine_idx_words as u32) * 2;
+        words[routine_idx + 1] = (routine_addr >> 16) as u16;
+        words[routine_idx + 2] = routine_addr as u16;
+        let user_store_pc = TRAP_TABLE_END + ((routine_idx + 3 + 2) as u32) * 2;
+
+        let mut rt = runtime_with_program(&words);
+        {
+            let mem = rt.memory_mut();
+            mem.enable_sanitizer();
+            let shadow = mem.shadow_mut().unwrap();
+            shadow.report_low_memory = true;
+        }
+        rt.run(&mut Vec::new(), None).expect("run should succeed");
+
+        let violations = rt.memory().shadow().unwrap().violations();
+        // Only the caller's own store is reported -- the routine's is not.
+        // (A 68000 splits the longword into two word stores.)
+        assert!(!violations.is_empty(), "the caller's store went unreported");
+        assert!(
+            violations.iter().all(|v| v.pc == user_store_pc),
+            "only the caller's store should report, got {violations:?}"
+        );
     }
 
     #[test]

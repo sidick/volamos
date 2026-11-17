@@ -1206,6 +1206,32 @@ impl FlatMemory {
         if let Some(timing) = &mut self.mem_timing {
             timing.note_read(address, len);
         }
+        if self.shadow.is_some() {
+            self.check_guest_access(address, len, false);
+        }
+    }
+
+    /// Hands a guest-CPU data access to the sanitizer's NULL/wild-pointer
+    /// checks (issues #71/#72). Lives with [`Self::count_read`]/
+    /// [`Self::count_write`] because those are called from exactly the
+    /// places that mean "the emulated CPU put this on the bus" -- the
+    /// [`m68k::AddressBus`] impl's data accessors, never an instruction
+    /// fetch and never a native handler -- which is the distinction these
+    /// checks need. Out of line so the per-access cost with no sanitizer
+    /// is the one `is_some` test above.
+    #[inline(never)]
+    fn check_guest_access(&self, address: u32, len: u32, write: bool) {
+        if let Some(shadow) = &self.shadow {
+            shadow.check_guest_access(address, len as u8, write);
+        }
+    }
+
+    /// See [`ShadowMap::note_vector_fetch`]; called by the bus impl's
+    /// `ipl_release_sample`.
+    pub(crate) fn note_vector_fetch(&self) {
+        if let Some(shadow) = &self.shadow {
+            shadow.note_vector_fetch();
+        }
     }
 
     /// Records one guest-CPU bus read that the `--mem-wait` model must
@@ -1226,6 +1252,9 @@ impl FlatMemory {
         self.writes = self.writes.wrapping_add(1);
         if let Some(timing) = &mut self.mem_timing {
             timing.note_write(address, len);
+        }
+        if self.shadow.is_some() {
+            self.check_guest_access(address, len, true);
         }
     }
 

@@ -144,6 +144,13 @@ struct InstrumentationOptions {
     /// noisiest class in any sanitizer -- see `crate::sanitize`'s docs
     /// and issue #68.
     uninit: bool,
+    /// `--sanitize-lowmem` (issue #71): report guest data accesses into
+    /// the exception vector table -- NULL-pointer dereferences.
+    lowmem: bool,
+    /// `--sanitize-wild` (issue #72): report guest data accesses to
+    /// addresses no memory backs -- wild pointers, and reads or writes
+    /// of hardware registers volamos doesn't have.
+    wild: bool,
     /// `--sanitize-ignore-pc`: guest PCs whose violations are
     /// suppressed, for silencing a site that has already been triaged
     /// without needing a suppression file.
@@ -240,6 +247,8 @@ impl InstrumentationOptions {
             return;
         };
         shadow.report_uninit = self.uninit;
+        shadow.report_low_memory = self.lowmem;
+        shadow.report_wild = self.wild;
         for &pc in &self.ignore_pcs {
             shadow.ignore_pc(pc);
         }
@@ -936,6 +945,32 @@ struct Cli {
     )]
     sanitize_uninit: bool,
 
+    /// Additionally report NULL-pointer and low-memory accesses. Implies --sanitize
+    #[arg(
+        long = "sanitize-lowmem",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Additionally report guest data accesses into low memory (addresses 0 to \
+                      0x1FF, the exception vector table), the usual destination of a NULL \
+                      pointer, the way Enforcer does. Reading the AbsExecBase longword at address 4, supervisor \
+                      code and the CPU's own vector fetches are not reported. Implies \
+                      --sanitize."
+    )]
+    sanitize_lowmem: bool,
+
+    /// Additionally report wild-pointer accesses to unmapped addresses. Implies --sanitize
+    #[arg(
+        long = "sanitize-wild",
+        action = ArgAction::SetTrue,
+        help_heading = "Instrumentation",
+        long_help = "Additionally report guest data accesses to addresses no memory backs: a \
+                      garbage pointer, a loop that ran off the end of RAM, or a program poking \
+                      hardware registers (custom chips, CIAs, the Kickstart ROM) that volamos \
+                      doesn't model. The access still behaves as before (reads give 0, writes \
+                      are dropped); this only reports it. Implies --sanitize."
+    )]
+    sanitize_wild: bool,
+
     /// Suppress sanitizer violations reported at guest PC ADDR (repeatable)
     #[arg(
         long = "sanitize-ignore-pc",
@@ -1216,9 +1251,13 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
     } else {
         (cli.sanitize, false)
     };
+    // The same goes for the two access detectors.
+    let sanitize_enabled = sanitize_enabled || cli.sanitize_lowmem || cli.sanitize_wild;
     let sanitize = InstrumentationOptions {
         enabled: sanitize_enabled,
         uninit: sanitize_uninit,
+        lowmem: cli.sanitize_lowmem,
+        wild: cli.sanitize_wild,
         ignore_pcs: cli.sanitize_ignore_pc,
         dirty_heap: cli.dirty_heap,
         uae_debug: cli.uae_debug,
@@ -4385,6 +4424,18 @@ mod tests {
         let opts = parse_args(args(&["--sanitize-uninit", "prog"])).unwrap();
         assert!(opts.sanitize.enabled);
         assert!(opts.sanitize.uninit);
+    }
+
+    #[test]
+    fn sanitize_lowmem_and_wild_imply_sanitize_and_are_independent() {
+        let opts = parse_args(args(&["--sanitize", "prog"])).unwrap();
+        assert!(!opts.sanitize.lowmem && !opts.sanitize.wild);
+
+        let opts = parse_args(args(&["--sanitize-lowmem", "prog"])).unwrap();
+        assert!(opts.sanitize.enabled && opts.sanitize.lowmem && !opts.sanitize.wild);
+
+        let opts = parse_args(args(&["--sanitize-wild", "prog"])).unwrap();
+        assert!(opts.sanitize.enabled && opts.sanitize.wild && !opts.sanitize.lowmem);
     }
 
     #[test]
