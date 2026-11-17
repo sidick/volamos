@@ -737,7 +737,9 @@ impl M68kCpu {
 
         loop {
             let pc = self.pc();
-            if pc as usize >= AddressSpace::len(mem) {
+            // Two bytes: an opcode word. Mapped means in any RAM segment,
+            // not just below the primary one's length (issue #332).
+            if !AddressSpace::is_mapped(mem, pc, 2) {
                 return StopReason::PcOutOfBounds { pc };
             }
             let result = self.core.run_for_cycles(mem, CYCLE_BUDGET);
@@ -898,7 +900,9 @@ impl Cpu for M68kCpu {
 
         loop {
             let pc = self.pc();
-            if pc as usize >= AddressSpace::len(mem) {
+            // Two bytes: an opcode word. Mapped means in any RAM segment,
+            // not just below the primary one's length (issue #332).
+            if !AddressSpace::is_mapped(mem, pc, 2) {
                 return StopReason::PcOutOfBounds { pc };
             }
             // See `Cpu::step`'s matching comment -- same "publish before

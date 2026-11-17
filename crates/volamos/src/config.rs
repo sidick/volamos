@@ -64,6 +64,14 @@ pub(crate) struct Overrides {
     pub(crate) auto_assign_root: Option<PathBuf>,
     pub(crate) stack_size: Option<u32>,
     pub(crate) ram_size: Option<u32>,
+    /// Per-class RAM sizes (`--chip`/`--fast`/`--slow`/`--accel`/`--z3`,
+    /// `CHIP=`/`FAST=`/`SLOW=`/`ACCEL=`/`Z3=`); `None` leaves that class
+    /// at the CPU's default. See `volamos_core::memmap`.
+    pub(crate) chip_size: Option<u32>,
+    pub(crate) fast_size: Option<u32>,
+    pub(crate) slow_size: Option<u32>,
+    pub(crate) accel_size: Option<u32>,
+    pub(crate) z3_size: Option<u32>,
     pub(crate) cpu_type: Option<CpuType>,
     pub(crate) fpu: Option<bool>,
     pub(crate) jit: Option<bool>,
@@ -158,6 +166,19 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
             "RAM" => {
                 overrides.ram_size = Some(parse_byte_size("RAM", value).map_err(with_line)?);
             }
+            "CHIP" => {
+                overrides.chip_size = Some(parse_byte_size("CHIP", value).map_err(with_line)?)
+            }
+            "FAST" => {
+                overrides.fast_size = Some(parse_byte_size("FAST", value).map_err(with_line)?)
+            }
+            "SLOW" => {
+                overrides.slow_size = Some(parse_byte_size("SLOW", value).map_err(with_line)?)
+            }
+            "ACCEL" => {
+                overrides.accel_size = Some(parse_byte_size("ACCEL", value).map_err(with_line)?);
+            }
+            "Z3" => overrides.z3_size = Some(parse_byte_size("Z3", value).map_err(with_line)?),
             "CPU" => overrides.cpu_type = Some(parse_cpu_type(value).map_err(with_line)?),
             "FPU" => overrides.fpu = Some(parse_bool("FPU", value).map_err(with_line)?),
             "JIT" => overrides.jit = Some(parse_bool("JIT", value).map_err(with_line)?),
@@ -174,6 +195,21 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
     Ok(overrides)
 }
 
+impl Overrides {
+    /// Whether any of the per-class RAM sizes is set.
+    pub(crate) fn has_region_sizes(&self) -> bool {
+        [
+            self.chip_size,
+            self.fast_size,
+            self.slow_size,
+            self.accel_size,
+            self.z3_size,
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
+}
+
 /// Merges two layers, `higher` taking precedence over `lower`. For a
 /// singular field, `higher`'s value wins if set, else `lower`'s. For
 /// the repeatable `volumes`/`assigns` fields, both sources' entries are
@@ -184,7 +220,24 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
 /// mapping, while a `NAME:` present in only one layer is unaffected --
 /// exactly "override on conflict, otherwise both apply" without any
 /// special-casing here or in `volamos-core`.
+///
+/// The memory map has one exception to the plain field-by-field rule:
+/// see the `ram_size` comment in the body.
 pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
+    // Computed up front: the struct literal below moves fields out of
+    // `higher` one by one.
+    let higher_regions = higher.has_region_sizes();
+    let higher_ram = higher.ram_size.is_some();
+    // A region size from the lower source, dropped when the higher one
+    // chose the total-RAM spelling instead.
+    let layer_region = |h: Option<u32>, l: Option<u32>| -> Option<u32> {
+        if higher_ram && !higher_regions {
+            None
+        } else {
+            h.or(l)
+        }
+    };
+
     Overrides {
         verbose: higher.verbose.or(lower.verbose),
         snoop: higher.snoop.or(lower.snoop),
@@ -193,7 +246,23 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         cwd: higher.cwd.or(lower.cwd),
         auto_assign_root: higher.auto_assign_root.or(lower.auto_assign_root),
         stack_size: higher.stack_size.or(lower.stack_size),
-        ram_size: higher.ram_size.or(lower.ram_size),
+        // `--ram` (total RAM) and the per-class sizes are two spellings of
+        // one setting (the memory map) and may not be mixed. When they
+        // come from *different* sources the higher-precedence one
+        // replaces the lower's whole spelling -- a `--fast 4M` on the
+        // command line overrides a `RAM=16M` in `.volamos` rather than
+        // colliding with it -- so only a single source setting both is
+        // still an error (reported when the layout is resolved).
+        ram_size: if higher_regions && !higher_ram {
+            None
+        } else {
+            higher.ram_size.or(lower.ram_size)
+        },
+        chip_size: layer_region(higher.chip_size, lower.chip_size),
+        fast_size: layer_region(higher.fast_size, lower.fast_size),
+        slow_size: layer_region(higher.slow_size, lower.slow_size),
+        accel_size: layer_region(higher.accel_size, lower.accel_size),
+        z3_size: layer_region(higher.z3_size, lower.z3_size),
         cpu_type: higher.cpu_type.or(lower.cpu_type),
         fpu: higher.fpu.or(lower.fpu),
         jit: higher.jit.or(lower.jit),
@@ -504,6 +573,71 @@ mod tests {
         assert_eq!(overrides.fpu, Some(true));
         assert_eq!(overrides.verbose, Some(false));
         assert_eq!(overrides.snoop, Some(true));
+    }
+
+    #[test]
+    fn memory_map_keys_parse_with_size_suffixes() {
+        let overrides = parse("CHIP=1M\nFAST=4M\nSLOW=512K\nACCEL=16M\nZ3=128M\n").unwrap();
+        assert_eq!(overrides.chip_size, Some(1024 * 1024));
+        assert_eq!(overrides.fast_size, Some(4 * 1024 * 1024));
+        assert_eq!(overrides.slow_size, Some(512 * 1024));
+        assert_eq!(overrides.accel_size, Some(16 * 1024 * 1024));
+        assert_eq!(overrides.z3_size, Some(128 * 1024 * 1024));
+        assert!(overrides.has_region_sizes());
+        assert!(!Overrides::default().has_region_sizes());
+        // 0 is a legal size: it removes a class.
+        assert_eq!(parse("SLOW=0\n").unwrap().slow_size, Some(0));
+        let err = parse("FAST=12Q\n").unwrap_err();
+        assert!(err.contains("FAST") && err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn region_sizes_merge_per_class_higher_first() {
+        let higher = Overrides {
+            fast_size: Some(1),
+            ..Overrides::default()
+        };
+        let lower = Overrides {
+            fast_size: Some(2),
+            slow_size: Some(3),
+            z3_size: Some(4),
+            ..Overrides::default()
+        };
+        let merged = merge(higher, lower);
+        assert_eq!(merged.fast_size, Some(1), "higher wins per class");
+        assert_eq!(merged.slow_size, Some(3), "unset classes fall through");
+        assert_eq!(merged.z3_size, Some(4));
+    }
+
+    #[test]
+    fn a_higher_source_choosing_one_ram_spelling_replaces_the_lowers_other() {
+        let ram = Overrides {
+            ram_size: Some(16 * 1024 * 1024),
+            ..Overrides::default()
+        };
+        let regions = Overrides {
+            fast_size: Some(4 * 1024 * 1024),
+            ..Overrides::default()
+        };
+        // `--fast 4M` on the command line over `RAM=16M` in a config
+        // file: the command line wins outright, no conflict.
+        let merged = merge(regions.clone(), ram.clone());
+        assert_eq!(merged.ram_size, None);
+        assert_eq!(merged.fast_size, Some(4 * 1024 * 1024));
+        // And the other way round: `--ram 8M` over a config's `FAST=`.
+        let merged = merge(ram.clone(), regions.clone());
+        assert_eq!(merged.ram_size, Some(16 * 1024 * 1024));
+        assert!(!merged.has_region_sizes());
+        // A single source that sets both keeps both (an error later).
+        let both = merge(
+            Overrides {
+                ram_size: Some(1),
+                fast_size: Some(2),
+                ..Overrides::default()
+            },
+            Overrides::default(),
+        );
+        assert!(both.ram_size.is_some() && both.fast_size.is_some());
     }
 
     #[test]

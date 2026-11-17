@@ -83,6 +83,14 @@ pub trait AddressSpace {
     /// The size in bytes of this address space.
     fn len(&self) -> usize;
 
+    /// Whether every byte of `[addr, addr + len)` is backed by memory.
+    /// For the default single-range address space that is just "below
+    /// [`AddressSpace::len`]"; a [`FlatMemory`] with several segments
+    /// answers for all of them.
+    fn is_mapped(&self, addr: u32, len: u32) -> bool {
+        u64::from(addr) + u64::from(len) <= self.len() as u64
+    }
+
     /// Returns `true` if this address space has zero bytes.
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -906,6 +914,34 @@ impl FlatMemory {
         mem
     }
 
+    /// Maps an additional `size`-byte segment of memory at `base`, for
+    /// something that is not RAM in the layout but needs bytes the guest
+    /// can execute or read -- the `--uae-debug` trap's A-line opcode at
+    /// `$F0FF60`, which on a real UAE machine sits in ROM space. Returns
+    /// `false` (mapping nothing) if it would overlap anything already
+    /// mapped. Call before the first [`Self::enable_sanitizer`] and
+    /// before creating a JIT window set; the new segment is plain RAM to
+    /// the CPU.
+    pub fn map_segment(&mut self, base: u32, size: u32) -> bool {
+        let end = u64::from(base) + u64::from(size);
+        if size == 0 || end > 0x1_0000_0000 {
+            return false;
+        }
+        let overlaps = self
+            .ranges()
+            .iter()
+            .any(|&(b, e)| u64::from(base) < e && end > u64::from(b));
+        if overlaps {
+            return false;
+        }
+        self.extra.push(Segment {
+            base,
+            bytes: vec![0u8; size as usize],
+        });
+        self.extra.sort_by_key(|s| s.base);
+        true
+    }
+
     /// The `[base, end)` ranges of RAM, primary first, then extras in
     /// address order. `end` is a `u64` so a segment ending at the top
     /// of the 32-bit space doesn't wrap.
@@ -1344,6 +1380,15 @@ impl AddressSpace for FlatMemory {
         self.bytes.len()
     }
 
+    fn is_mapped(&self, addr: u32, len: u32) -> bool {
+        // The primary segment first: the common case, and one compare.
+        u64::from(addr) + u64::from(len) <= self.bytes.len() as u64
+            || self
+                .extra
+                .iter()
+                .any(|s| s.contains_span(addr, len as usize))
+    }
+
     fn invalidate_dcache(&mut self) {
         if let Some(timing) = &mut self.mem_timing {
             timing.invalidate_all();
@@ -1562,6 +1607,24 @@ mod layout_tests {
             assert_eq!(mem.read_u16(addr), 0, "{addr:#X}");
             assert_eq!(mem.read_u32(addr), 0, "{addr:#X}");
         }
+    }
+
+    #[test]
+    fn map_segment_adds_memory_unless_it_overlaps_and_is_mapped_sees_all_segments() {
+        let mut mem = FlatMemory::from_layout(&split_layout());
+        assert!(!mem.is_mapped(0xF0_FF60, 2));
+        assert!(mem.map_segment(0xF0_FF60, 2));
+        assert!(mem.is_mapped(0xF0_FF60, 2));
+        assert!(!mem.is_mapped(0xF0_FF60, 3), "one byte past the segment");
+        mem.write_u16(0xF0_FF60, 0xA055);
+        assert_eq!(mem.read_u16(0xF0_FF60), 0xA055);
+        // Overlaps with RAM or an earlier mapping are refused.
+        assert!(!mem.map_segment(0x1F_FFFF, 4));
+        assert!(!mem.map_segment(0xF0_FF61, 2));
+        assert!(!mem.map_segment(0xC0_0000, 0x1000));
+        assert!(!mem.map_segment(0, 0));
+        // The segments stay in address order for ranges().
+        assert!(mem.ranges().windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     #[test]

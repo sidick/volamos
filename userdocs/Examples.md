@@ -142,12 +142,15 @@ catches and the one class it can't see.
 
 Some programs (deep recursion, large buffers, a bigger toolchain
 pass) need more stack or address space than the defaults (64 KiB
-stack, 16 MiB total guest RAM). Both are configurable, and volamos
-fails cleanly rather than crashing if `--stack` doesn't actually fit
-inside `--ram`:
+stack, and a CPU-dependent amount of RAM: 11.5 MiB on a 68000, 74 MiB on
+a 68020 and later). Both are configurable, and volamos fails cleanly
+rather than crashing if `--stack` doesn't actually fit inside the RAM:
 
 ```sh
 volamos --stack 1M --ram 8M fixtures/hello
+
+# Or size the classes of RAM individually (see the memory map):
+volamos --cpu 68030 --fast 4M --accel 128M fixtures/hello
 
 # Past 16 MiB of RAM, ask for a 32-bit CPU too -- a 68000 cannot address
 # more than that, so volamos refuses the pairing rather than misbehaving.

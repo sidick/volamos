@@ -41,7 +41,8 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 | `CWD` | `--cwd` | |
 | `AUTO_ASSIGN` | `--auto-assign` | |
 | `STACK` | `--stack` | same `K`/`M`-suffixed `SIZE` syntax |
-| `RAM` | `--ram` | same `K`/`M`-suffixed `SIZE` syntax |
+| `RAM` | `--ram` | same `K`/`M`-suffixed `SIZE` syntax; cannot be combined with the region keys |
+| `CHIP`, `FAST`, `SLOW`, `ACCEL`, `Z3` | `--chip`, `--fast`, `--slow`, `--accel`, `--z3` | resize one class of RAM; see [the memory map](CLI-Reference.md#guest-memory-map). `RAM` and these are two spellings of one setting: a higher-precedence source using one spelling (e.g. `--fast 4M` on the command line) replaces the other spelling from a lower one (`RAM=16M` in a config file) instead of conflicting; setting both in the *same* source is an error |
 | `CPU` | `--cpu` | same model names |
 | `FPU` | `--fpu`/`--no-fpu` | `true`/`false` |
 | `JIT` | `--jit`/`--no-jit` | `true`/`false` |

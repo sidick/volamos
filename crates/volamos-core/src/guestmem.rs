@@ -401,7 +401,9 @@ impl GuestHeap {
         let end = u64::from(end & !3);
         for r in layout.regions() {
             let lo = start.max(u64::from(r.base));
-            let hi = end.min(r.end());
+            // Aligned down like `GuestHeap::new`'s end, so a region that
+            // ends on an odd address still yields 4-byte-aligned blocks.
+            let hi = end.min(r.end()) & !3;
             if hi > lo {
                 heap.free.push(FreeBlock {
                     start: lo as u32,
@@ -417,6 +419,15 @@ impl GuestHeap {
     /// ([`GuestHeap::with_layout`]).
     pub fn has_layout(&self) -> bool {
         self.layout.is_some()
+    }
+
+    /// Whether `addr` is in RAM this heap can manage: always true for a
+    /// heap without a layout, otherwise inside one of its regions.
+    pub fn is_ram(&self, addr: u32) -> bool {
+        match &self.layout {
+            None => true,
+            Some(l) => l.region_index_at(addr).is_some(),
+        }
     }
 
     /// `mh_Attributes` of the region containing `addr` (what `TypeOfMem`
@@ -454,6 +465,21 @@ impl GuestHeap {
             .and_then(|l| {
                 l.region_index_at(start)
                     .map(|i| l.regions()[i].kind.priority())
+            })
+            .unwrap_or(0)
+    }
+
+    /// The highest region priority among regions whose attributes include
+    /// every bit of `required` (`0` without a layout, or when none match).
+    fn best_priority_matching(&self, required: u32) -> i8 {
+        self.layout
+            .as_ref()
+            .and_then(|l| {
+                l.regions()
+                    .iter()
+                    .filter(|r| r.attributes() & required == required)
+                    .map(|r| r.kind.priority())
+                    .max()
             })
             .unwrap_or(0)
     }
@@ -678,19 +704,31 @@ impl GuestHeap {
         // correctly fails here rather than handing out an unguarded
         // allocation.
         //
-        // With a layout, the candidates are first narrowed to regions
-        // satisfying `required` and then ranked by region priority
-        // (highest first), lowest address breaking ties; `free` is kept
-        // sorted by address so `max_by_key`'s "last maximum" is made
-        // first-wins by comparing on the reversed index.
-        let Some(idx) = self
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.size >= total_needed && self.block_matches(b.start, required))
-            .max_by_key(|&(i, b)| (self.block_priority(b.start), std::cmp::Reverse(i)))
-            .map(|(i, _)| i)
-        else {
+        // With a layout, the candidates are narrowed to regions
+        // satisfying `required` and ranked by region priority (highest
+        // first), lowest address breaking ties. `free` is sorted by
+        // address, so the first fitting block of the best *possible*
+        // priority ends the scan: an allocation that finds room in the
+        // preferred region costs what plain first-fit always did, and
+        // only a full or absent preferred region makes it look further.
+        // Without a layout every block has priority 0 and this is
+        // exactly first-fit.
+        let best_possible = self.best_priority_matching(required);
+        let mut chosen: Option<(usize, i8)> = None;
+        for (i, b) in self.free.iter().enumerate() {
+            if b.size < total_needed || !self.block_matches(b.start, required) {
+                continue;
+            }
+            let prio = self.block_priority(b.start);
+            if prio >= best_possible {
+                chosen = Some((i, prio));
+                break;
+            }
+            if chosen.is_none_or(|(_, best)| prio > best) {
+                chosen = Some((i, prio));
+            }
+        }
+        let Some((idx, _)) = chosen else {
             let available = self.largest_free_matching(required);
             return Err(GuestHeapError::OutOfMemory {
                 requested: size,
@@ -767,6 +805,39 @@ impl GuestHeap {
             self.free.insert(idx, head);
         }
         true
+    }
+
+    /// Removes `[start, end)` from the free list wherever it overlaps
+    /// free blocks -- including a span crossing several of them (a
+    /// stack reaching across a region boundary). Unlike
+    /// [`GuestHeap::reserve_range`] it does not require the whole span
+    /// to be free or in one block; parts that are not free are simply
+    /// left as they are. Free blocks stay sorted and are never merged.
+    pub fn reserve_overlapping(&mut self, start: u32, end: u32) {
+        if end <= start {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.free.len() + 1);
+        for b in self.free.drain(..) {
+            let b_end = b.start + b.size;
+            if b_end <= start || b.start >= end {
+                out.push(b);
+                continue;
+            }
+            if b.start < start {
+                out.push(FreeBlock {
+                    start: b.start,
+                    size: start - b.start,
+                });
+            }
+            if b_end > end {
+                out.push(FreeBlock {
+                    start: end,
+                    size: b_end - end,
+                });
+            }
+        }
+        self.free = out;
     }
 
     /// Frees a block previously returned by [`GuestHeap::alloc`].
@@ -1232,6 +1303,49 @@ mod layout_heap_tests {
         assert_eq!(h.capacity_matching(MEMF_CHIP), Some(u64::from(2 * MIB)));
         assert_eq!(h.capacity_matching(MEMF_FAST), Some(u64::from(12 * MIB)));
         assert_eq!(GuestHeap::new(0, 0x1000).capacity_matching(0), None);
+    }
+
+    #[test]
+    fn a_region_ending_on_an_odd_address_gives_aligned_blocks() {
+        // legacy_exact doesn't round, so a total of 0x4_0006 ends mid-longword.
+        let layout = MemoryLayout::legacy_exact(0x4_0006);
+        let mut mem = FlatMemory::from_layout(&layout);
+        let mut h = GuestHeap::with_layout(layout, 0x4000, u32::MAX);
+        assert_eq!(h.free_bytes() % 4, 0);
+        let a = h.alloc_for(&mut mem, 8, 8, 0).unwrap();
+        assert_eq!(a % 4, 0);
+    }
+
+    #[test]
+    fn placement_scan_stops_at_the_first_fit_in_the_best_region() {
+        // A fragmented chip heap must not be searched when fast RAM has
+        // room: the allocation lands in fast RAM, lowest address first.
+        let (mut h, mut mem) = heap();
+        let mut keep = Vec::new();
+        for _ in 0..50 {
+            keep.push(h.alloc_for(&mut mem, 64, 64, MEMF_CHIP).unwrap());
+            let gap = h.alloc_for(&mut mem, 64, 64, MEMF_CHIP).unwrap();
+            h.free(gap).unwrap();
+        }
+        let a = h.alloc_for(&mut mem, 64, 64, 0).unwrap();
+        let b = h.alloc_for(&mut mem, 64, 64, 0).unwrap();
+        assert_eq!(a, MB_BASE, "first block of the top-priority region");
+        assert_eq!(b, MB_BASE + 64);
+    }
+
+    #[test]
+    fn reserve_overlapping_carves_a_span_across_region_boundaries() {
+        let layout = MemoryLayout::legacy_exact(4 * MIB);
+        let mut h = GuestHeap::with_layout(layout, 0x4000, 4 * MIB);
+        let before = h.free_bytes();
+        // A 192 KiB stack straddling the chip/accelerator boundary.
+        h.reserve_overlapping(2 * MIB - 0x1_0000, 2 * MIB + 0x2_0000);
+        assert_eq!(h.free_bytes(), before - 0x3_0000);
+        assert_eq!(h.free.len(), 2, "each region keeps its own block");
+        // Spans that miss every block, or are empty, change nothing.
+        h.reserve_overlapping(8 * MIB, 9 * MIB);
+        h.reserve_overlapping(0x9000, 0x9000);
+        assert_eq!(h.free_bytes(), before - 0x3_0000);
     }
 
     #[test]

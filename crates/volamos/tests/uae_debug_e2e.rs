@@ -204,7 +204,9 @@ fn port_stores_are_not_sanitizer_violations() {
 fn a_stack_that_covers_the_port_is_a_clear_error() {
     let dir = TempDir::new("stack");
     let prog = write_program(&dir, "prog");
-    let out = run(&prog, &["--uae-debug", "--stack", "8M"]);
+    // --ram 16M: the one-range layout where $BFFF00 is guest RAM (in the
+    // default memory map it is CIA space, so no stack can cover it).
+    let out = run(&prog, &["--uae-debug", "--ram", "16M", "--stack", "8M"]);
     assert_ne!(out.status.code(), Some(0));
     assert!(
         stderr_of(&out).contains("UAE debug port"),
@@ -273,7 +275,8 @@ fn a_stack_that_covers_the_uaelib_trap_is_a_clear_error() {
     // still clear of it, so this isolates the uaelib check.
     let dir = TempDir::new("uaelib-stack");
     let prog = write_uaelib_program(&dir, "prog");
-    let out = run(&prog, &["--uae-debug", "--stack", "1M"]);
+    // --ram 16M puts $F0FF60 in RAM, as in the pre-memory-map layout.
+    let out = run(&prog, &["--uae-debug", "--ram", "16M", "--stack", "1M"]);
     assert!(
         stderr_of(&out).contains("debug-log trap") && !stderr_of(&out).contains("DBG:"),
         "{}",
@@ -291,25 +294,21 @@ fn the_uaelib_trap_is_absent_without_the_flag() {
 }
 
 #[test]
-fn a_small_ram_warns_that_the_trap_is_inactive_but_keeps_the_sprintf_port() {
+fn a_small_ram_still_has_the_uaelib_trap_because_its_stub_is_mapped_on_its_own() {
+    // $F0FF60 is ROM space on a UAE machine, not RAM; the trap's two
+    // bytes get their own mapping, so no RAM size takes it away (it used
+    // to be inactive, with a warning, unless --ram reached it).
     let dir = TempDir::new("uaelib-ram");
     let uaelib = write_uaelib_program(&dir, "uaelib");
     let out = run(&uaelib, &["--uae-debug", "--ram", "1M"]);
     let err = stderr_of(&out);
-    assert!(
-        err.contains("debug-log trap") && err.contains("inactive"),
-        "{err}"
-    );
-    assert!(!err.contains("DBG:"), "{err}");
-    // The sprintf port needs no RAM; the warning is printed exactly once.
+    assert_eq!(err, "DBG: hi\n", "{err}");
+    assert_eq!(out.status.code(), Some(1), "calltrap's return value");
+    // The sprintf port needs no RAM either.
     let sprintf = write_program(&dir, "sprintf");
     let out = run(&sprintf, &["--uae-debug", "--ram", "1M"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("n=-2\n"));
-    assert_eq!(stderr_of(&out).matches("inactive").count(), 1);
-    // Enough RAM: no warning.
-    let out = run(&uaelib, &["--uae-debug"]);
-    assert!(!stderr_of(&out).contains("inactive"));
+    assert_eq!(stderr_of(&out), "n=-2\n");
 }
 
 #[test]
