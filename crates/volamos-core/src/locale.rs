@@ -30,26 +30,36 @@
 //! [`crate::utility::amiga_toupper`] directly rather than re-deriving
 //! the same case-mapping data a second time.
 //!
-//! # `OpenLocale`/`CloseLocale`: a real, but content-free, allocation
+//! # `OpenLocale`/`CloseLocale`: the built-in default locale
 //!
-//! `OpenLocale` allocates and zeroes a real, correctly-sized (168 bytes,
-//! `<libraries/locale.h>`'s `struct Locale`, field-by-field) block on
-//! the guest heap and returns it -- a genuine, non-`NULL` `Locale*` a
-//! caller can pass back into every other function here, and (since it's
-//! zeroed, not garbage) `loc_CodeSet` reads back as `0`, matching the
-//! real "always 0 for now" default even for guest code that reads the
-//! field directly instead of going through a library call. No field is
-//! otherwise populated (no locale name, no date/currency formatting
-//! strings) -- consistent with this module's "not a full locale/catalog
-//! system" scope; a caller that actually reads
-//! `loc_LocaleName`/`loc_DateFormat`/etc. rather than just passing the
-//! pointer through to `IsUpper`-family calls will see empty/`NULL`
-//! fields, not real values. `CloseLocale` frees it via the same
+//! `OpenLocale` allocates one block on the guest heap holding a real,
+//! correctly-sized (168 bytes, `<libraries/locale.h>`'s `struct Locale`,
+//! field-by-field) structure followed by a pool of the NUL-terminated
+//! strings it points at, and returns it -- a genuine, non-`NULL`
+//! `Locale*` a caller can pass back into every other function here.
+//! `CloseLocale` frees the whole block in one go via the same
 //! `GuestHeap` live-allocation check `crate::execmem`'s `FreeVec` uses
 //! (loud failure on an unknown/already-freed pointer, matching this
 //! runtime's established bug-catching posture); `CloseLocale(NULL)` is
 //! a documented-legal no-op, same convention as every other free-half-
 //! of-a-pair call in this runtime.
+//!
+//! Real `locale.library` never hands back unset string fields: with no
+//! `ENV:Sys/locale.prefs` it fills them from its built-in default, which
+//! is the **United States** locale (not a bare "english" one). The field
+//! values in [`DEFAULT_LOCALE`] are what a real Kickstart 3.1 r40.68 +
+//! Workbench 3.1.4 `locale.library` returned for `OpenLocale(NULL)` on
+//! an empty `ENV:`, dumped field-by-field from a guest program run under
+//! Copperline (issue #329). This matters beyond curiosity: libnix's
+//! startup does `setlocale(LC_ALL, "")`, which copies `loc_DecimalPoint`
+//! into `localeconv()` and the decimal point `printf`/`scanf` use, so a
+//! `NULL` there made `strtod("1.5")` stop at the `.` and return `1`.
+//!
+//! `loc_GMTOffset` is deliberately left `0` rather than the real default
+//! `-300` (US Eastern): this runtime's clock is the host's local time, so
+//! neither figure is right, and deriving it from the host is issue #298's
+//! job. `loc_Flags`/`loc_CodeSet` stay `0` ("always 0 for now" per the
+//! NDK header).
 //!
 //! # `OpenCatalogA`/`GetCatalogStr`/`CloseCatalog`: always "use the built-in strings"
 //!
@@ -96,25 +106,124 @@ use crate::utility::{amiga_tolower, amiga_toupper};
 /// `loc_MonNegativeCSPos`/`loc_Reserved3` (1 each, 4) = 168.
 const LOCALE_STRUCT_SIZE: u32 = 168;
 
+/// Byte offsets of `struct Locale`'s fields (`<libraries/locale.h>`).
+mod off {
+    pub const LOCALE_NAME: u32 = 0;
+    pub const LANGUAGE_NAME: u32 = 4;
+    pub const PREF_LANGUAGES: u32 = 8;
+    pub const COUNTRY_CODE: u32 = 56;
+    pub const TELEPHONE_CODE: u32 = 60;
+    pub const MEASURING_SYSTEM: u32 = 68;
+    pub const DATE_TIME_FORMAT: u32 = 72;
+    pub const DATE_FORMAT: u32 = 76;
+    pub const TIME_FORMAT: u32 = 80;
+    pub const SHORT_DATE_TIME_FORMAT: u32 = 84;
+    pub const SHORT_DATE_FORMAT: u32 = 88;
+    pub const SHORT_TIME_FORMAT: u32 = 92;
+    pub const DECIMAL_POINT: u32 = 96;
+    pub const GROUP_SEPARATOR: u32 = 100;
+    pub const FRAC_GROUP_SEPARATOR: u32 = 104;
+    pub const GROUPING: u32 = 108;
+    pub const FRAC_GROUPING: u32 = 112;
+    pub const MON_DECIMAL_POINT: u32 = 116;
+    pub const MON_GROUP_SEPARATOR: u32 = 120;
+    pub const MON_FRAC_GROUP_SEPARATOR: u32 = 124;
+    pub const MON_GROUPING: u32 = 128;
+    pub const MON_FRAC_GROUPING: u32 = 132;
+    pub const MON_FRAC_DIGITS: u32 = 136;
+    pub const MON_INT_FRAC_DIGITS: u32 = 137;
+    pub const MON_CS: u32 = 140;
+    pub const MON_SMALL_CS: u32 = 144;
+    pub const MON_INT_CS: u32 = 148;
+    pub const MON_POSITIVE_SIGN: u32 = 152;
+    pub const MON_POSITIVE_SIGN_POS: u32 = 157;
+    pub const MON_NEGATIVE_SIGN: u32 = 160;
+    pub const MON_NEGATIVE_SIGN_POS: u32 = 165;
+}
+
+/// The string-pointer fields of the built-in default locale, as
+/// `(field offset, bytes)`; each is stored NUL-terminated in the pool
+/// after the struct. Values measured from a real Kickstart 3.1 +
+/// `locale.library` (see the module docs). `loc_MonSmallCS` is the single
+/// Latin-1 byte `0xA2` (the cent sign).
+const DEFAULT_LOCALE_STRINGS: &[(u32, &[u8])] = &[
+    (off::LOCALE_NAME, b"united_states.country"),
+    (off::LANGUAGE_NAME, b"english.language"),
+    (off::PREF_LANGUAGES, b"english"),
+    (off::DATE_TIME_FORMAT, b"%A %B %e %Y %Q:%M %p"),
+    (off::DATE_FORMAT, b"%A %B %e %Y"),
+    (off::TIME_FORMAT, b"%Q:%M %p"),
+    (off::SHORT_DATE_TIME_FORMAT, b"%m/%d/%Y %Q:%M %p"),
+    (off::SHORT_DATE_FORMAT, b"%m/%d/%Y"),
+    (off::SHORT_TIME_FORMAT, b"%Q:%M %p"),
+    (off::DECIMAL_POINT, b"."),
+    (off::GROUP_SEPARATOR, b","),
+    (off::FRAC_GROUP_SEPARATOR, b","),
+    (off::GROUPING, b"\x03"),
+    (off::FRAC_GROUPING, b"\x03"),
+    (off::MON_DECIMAL_POINT, b"."),
+    (off::MON_GROUP_SEPARATOR, b","),
+    (off::MON_FRAC_GROUP_SEPARATOR, b","),
+    (off::MON_GROUPING, b"\x03"),
+    (off::MON_FRAC_GROUPING, b"\x03"),
+    (off::MON_CS, b"$"),
+    (off::MON_SMALL_CS, b"\xa2"),
+    (off::MON_INT_CS, b"USD"),
+    (off::MON_POSITIVE_SIGN, b""),
+    (off::MON_NEGATIVE_SIGN, b"-"),
+];
+
+/// The scalar (non-pointer) fields of the built-in default locale, as
+/// `(field offset, width in bytes, value)`.
+const DEFAULT_LOCALE_SCALARS: &[(u32, u8, u32)] = &[
+    // loc_CountryCode is the four ASCII bytes "USA\0".
+    (off::COUNTRY_CODE, 4, 0x5553_4100),
+    (off::TELEPHONE_CODE, 4, 1),
+    (off::MEASURING_SYSTEM, 1, 1), // MS_IMPERIAL
+    (off::MON_FRAC_DIGITS, 1, 2),
+    (off::MON_INT_FRAC_DIGITS, 1, 2),
+    (off::MON_POSITIVE_SIGN_POS, 1, 1),
+    (off::MON_NEGATIVE_SIGN_POS, 1, 1),
+];
+
 /// `OpenLocale` (`A0` = name `CString*`, ignored -- see the module docs;
 /// real `OpenLocale(NULL)` opens "the current default locale", and
 /// since every locale this runtime can ever produce *is* that default,
-/// a named lookup couldn't behave any differently). `D0` = a real,
-/// zeroed `struct Locale*`, never `NULL` (unlike real `OpenLocale`,
-/// which can fail -- this runtime has no preferences file to fail to
-/// read).
+/// a named lookup couldn't behave any differently). `D0` = a
+/// `struct Locale*` populated with the built-in default locale (module
+/// docs), never `NULL` (unlike real `OpenLocale`, which can fail -- this
+/// runtime has no preferences file to fail to read).
 fn open_locale_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let pool: u32 = DEFAULT_LOCALE_STRINGS
+        .iter()
+        .map(|(_, s)| s.len() as u32 + 1)
+        .sum();
     let addr = ctx
         .heap
-        .alloc(&mut *ctx.mem, LOCALE_STRUCT_SIZE)
+        .alloc(&mut *ctx.mem, LOCALE_STRUCT_SIZE + pool)
         .map_err(|e| DispatchError::HandlerFailed {
             library: "locale.library".to_string(),
             lvo: -156,
             handler_name: "OpenLocale".to_string(),
             message: format!("OpenLocale: guest heap allocation failed: {e}"),
         })?;
-    for i in 0..LOCALE_STRUCT_SIZE {
+    for i in 0..LOCALE_STRUCT_SIZE + pool {
         ctx.mem.write_u8(addr.wrapping_add(i), 0);
+    }
+    let mut next = addr + LOCALE_STRUCT_SIZE;
+    for &(field, bytes) in DEFAULT_LOCALE_STRINGS {
+        for (i, &b) in bytes.iter().enumerate() {
+            ctx.mem.write_u8(next + i as u32, b);
+        }
+        // The pool is already zeroed, so the terminating NUL is in place.
+        ctx.mem.write_u32(addr + field, next);
+        next += bytes.len() as u32 + 1;
+    }
+    for &(field, width, value) in DEFAULT_LOCALE_SCALARS {
+        match width {
+            4 => ctx.mem.write_u32(addr + field, value),
+            _ => ctx.mem.write_u8(addr + field, value as u8),
+        }
     }
     ctx.cpu.set_data_register(DataRegister(0), addr);
     Ok(())
@@ -499,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_open_locale_returns_a_real_zeroed_block() {
+    fn end_to_end_open_locale_returns_the_built_in_default_locale() {
         let mut words = Vec::new();
         words.push(move_imm_to_a(0)); // A0 = NULL
         words.push(0);
@@ -512,8 +621,45 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         let addr = code as u32;
         assert_ne!(addr, 0);
-        for i in 0..LOCALE_STRUCT_SIZE {
-            assert_eq!(rt.memory().read_u8(addr + i), 0);
+        let mem = rt.memory();
+        let cstr = |p: u32| -> Vec<u8> {
+            assert_ne!(p, 0, "string field must not be NULL");
+            (0..)
+                .map(|i| mem.read_u8(p + i))
+                .take_while(|&b| b != 0)
+                .collect()
+        };
+        let field = |off: u32| cstr(mem.read_u32(addr + off));
+        // Regression for #329: libnix's setlocale() copies this, and a NULL
+        // here made strtod("1.5") stop at the '.'.
+        assert_eq!(field(off::DECIMAL_POINT), b".");
+        assert_eq!(field(off::LOCALE_NAME), b"united_states.country");
+        assert_eq!(field(off::LANGUAGE_NAME), b"english.language");
+        assert_eq!(field(off::PREF_LANGUAGES), b"english");
+        assert_eq!(mem.read_u32(addr + off::PREF_LANGUAGES + 4), 0);
+        assert_eq!(field(off::GROUP_SEPARATOR), b",");
+        assert_eq!(field(off::GROUPING), [3]);
+        assert_eq!(field(off::DATE_TIME_FORMAT), b"%A %B %e %Y %Q:%M %p");
+        assert_eq!(field(off::SHORT_DATE_FORMAT), b"%m/%d/%Y");
+        assert_eq!(field(off::MON_CS), b"$");
+        assert_eq!(field(off::MON_SMALL_CS), [0xa2]);
+        assert_eq!(field(off::MON_INT_CS), b"USD");
+        assert_eq!(field(off::MON_POSITIVE_SIGN), b"");
+        assert_eq!(field(off::MON_NEGATIVE_SIGN), b"-");
+        assert_eq!(mem.read_u32(addr + off::COUNTRY_CODE), 0x5553_4100);
+        assert_eq!(mem.read_u32(addr + off::TELEPHONE_CODE), 1);
+        assert_eq!(mem.read_u8(addr + off::MEASURING_SYSTEM), 1);
+        assert_eq!(mem.read_u8(addr + off::MON_FRAC_DIGITS), 2);
+        // "always 0 for now" per the NDK header, and the GMT offset is #298's.
+        assert_eq!(mem.read_u32(addr + 48), 0, "loc_Flags");
+        assert_eq!(mem.read_u32(addr + 52), 0, "loc_CodeSet");
+        assert_eq!(mem.read_u32(addr + 64), 0, "loc_GMTOffset");
+        // Every string pointer lands inside the one allocation (so a single
+        // CloseLocale frees everything).
+        let end = addr + LOCALE_STRUCT_SIZE + 512;
+        for off in [off::DECIMAL_POINT, off::MON_NEGATIVE_SIGN, off::LOCALE_NAME] {
+            let p = mem.read_u32(addr + off);
+            assert!(p >= addr + LOCALE_STRUCT_SIZE && p < end);
         }
     }
 

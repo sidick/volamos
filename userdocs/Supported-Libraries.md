@@ -258,6 +258,15 @@ regardless of what `Locale*` is passed in — this is **not** a real
 multi-locale/catalog system (no `LC:`-directory scanning, no
 translated catalogs), matching `vamos`'s own scope for this library.
 
+`OpenLocale` returns a fully populated `struct Locale` holding the
+built-in default locale — the United States one, exactly what a real
+`locale.library` returns with no `ENV:Sys/locale.prefs` (values taken
+from real Kickstart 3.1 hardware): `"."` decimal point, `","`
+grouping, `$`/`USD` currency, US date and time formats, and so on.
+Programs built with libnix therefore get a working `setlocale(LC_ALL,
+"")`, so `strtod`/`sscanf("%lf")` parse `1.5` correctly. `loc_GMTOffset`
+is `0` for now.
+
 ## intuition.library
 
 Headless: real, inspectable `Screen`/`Window`/`RastPort` structures,
