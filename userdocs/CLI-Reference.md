@@ -244,7 +244,11 @@ the highest region — are unmapped: reads return 0 and writes are dropped, so a
 sees an empty bus (see [Differences from
 vamos](Differences-from-vamos.md#hardware-probes-of-unmapped-address-space)).
 A 68000/68010 has a 24-bit address bus, so there addresses above 16 MiB
-wrap to 24 bits instead of being unmapped.
+wrap to 24 bits instead of being unmapped — and the top byte of a pointer
+is ignored everywhere, including by volamos's native library calls: a
+pointer with stray high bits (a classic 68000 trick, or an uninitialised
+top byte) works for `PutStr` and the rest exactly as it does on a real
+machine. With a 32-bit `--cpu` the top byte is a real address bit.
 
 The guest stack lives at the top of the one run of RAM that starts at
 address 0 (chip plus an abutting `--fast`).

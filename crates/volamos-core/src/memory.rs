@@ -808,6 +808,10 @@ impl Segment {
 /// primary segment only; see their docs.
 pub struct FlatMemory {
     bytes: Vec<u8>,
+    /// ANDed into every address a host-side access uses; see
+    /// [`FlatMemory::set_address_mask`]. All ones (no masking) unless a
+    /// 24-bit CPU is emulated.
+    addr_mask: u32,
     /// RAM regions not contiguous with [`Self::bytes`], sorted by base,
     /// non-overlapping. Empty for the single-segment case.
     extra: Vec<Segment>,
@@ -883,6 +887,7 @@ impl FlatMemory {
     pub fn new(size: usize) -> Self {
         Self {
             bytes: vec![0u8; size],
+            addr_mask: u32::MAX,
             extra: Vec::new(),
             reads: 0,
             writes: 0,
@@ -896,6 +901,23 @@ impl FlatMemory {
             fetch_stall_frac: 0.0,
             fetch_stall_since_begin: 0,
         }
+    }
+
+    /// Sets the address mask of the emulated CPU's bus (issue #98's
+    /// follow-up in #332): `0x00FF_FFFF` for a 68000/68010, whose 24-bit
+    /// address bus ignores the top byte of every address, all ones for
+    /// the 32-bit CPUs. Guest code running on the CPU is masked by the
+    /// emulator itself, but this runtime's *native library handlers*
+    /// dereference guest pointers on the CPU's behalf, so without this a
+    /// pointer with stray high bits -- a classic 68000 trick, or just an
+    /// uninitialised top byte -- works for real `dos.library` code and
+    /// silently reads nothing here.
+    ///
+    /// Masks only memory accesses: a handler comparing a raw pointer
+    /// against a table (`FreeMem` on a tagged pointer) still sees the raw
+    /// value, as exec's own comparisons do on real hardware.
+    pub fn set_address_mask(&mut self, mask: u32) {
+        self.addr_mask = mask;
     }
 
     /// Builds RAM from a [`crate::memmap::MemoryLayout`]: the run of
@@ -1128,6 +1150,7 @@ impl FlatMemory {
     /// and, worse, healing `Uninit` bytes the guest has not actually
     /// written yet, which would mask real bugs.
     pub fn peek_u16(&self, addr: u32) -> u16 {
+        let addr = addr & self.addr_mask;
         match self.bytes.get(addr as usize..addr as usize + 2) {
             Some(slice) => u16::from_be_bytes(slice.try_into().unwrap()),
             None => self
@@ -1140,6 +1163,7 @@ impl FlatMemory {
     /// map -- see [`Self::peek_u16`] for why this exists and why it must
     /// not be used outside the sanitizer.
     pub fn peek_u32(&self, addr: u32) -> u32 {
+        let addr = addr & self.addr_mask;
         match self.bytes.get(addr as usize..addr as usize + 4) {
             Some(slice) => u32::from_be_bytes(slice.try_into().unwrap()),
             None => self
@@ -1156,6 +1180,7 @@ impl FlatMemory {
     /// all -- [`crate::sanitize::ShadowMap::copy_range`] is what gives
     /// the destination its correct final shadow state instead.
     pub fn peek_u8(&self, addr: u32) -> u8 {
+        let addr = addr & self.addr_mask;
         self.byte_at(addr).unwrap_or(0)
     }
 
@@ -1166,6 +1191,7 @@ impl FlatMemory {
     /// `Uninit` source byte must stay `Uninit` at the destination (see
     /// [`crate::sanitize::ShadowMap::copy_range`]'s doc).
     pub fn poke_u8(&mut self, addr: u32, value: u8) {
+        let addr = addr & self.addr_mask;
         self.set_byte_at(addr, value);
     }
 
@@ -1381,6 +1407,7 @@ impl AddressSpace for FlatMemory {
     }
 
     fn is_mapped(&self, addr: u32, len: u32) -> bool {
+        let addr = addr & self.addr_mask;
         // The primary segment first: the common case, and one compare.
         u64::from(addr) + u64::from(len) <= self.bytes.len() as u64
             || self
@@ -1402,6 +1429,7 @@ impl AddressSpace for FlatMemory {
     }
 
     fn read_u8(&self, addr: u32) -> u8 {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &self.shadow {
             shadow.check_read(addr, 1);
         }
@@ -1417,12 +1445,14 @@ impl AddressSpace for FlatMemory {
     }
 
     fn clear_fresh_block(&mut self, addr: u32, len: u32) {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &mut self.shadow {
             shadow.mark_valid(addr, len);
         }
     }
 
     fn write_u8(&mut self, addr: u32, value: u8) {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &mut self.shadow {
             shadow.check_write(addr, 1);
         }
@@ -1448,6 +1478,7 @@ impl AddressSpace for FlatMemory {
     // doc.
 
     fn read_u16(&self, addr: u32) -> u16 {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &self.shadow {
             shadow.check_read(addr, 2);
         }
@@ -1466,6 +1497,7 @@ impl AddressSpace for FlatMemory {
     }
 
     fn write_u16(&mut self, addr: u32, value: u16) {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &mut self.shadow {
             shadow.check_write(addr, 2);
         }
@@ -1483,6 +1515,7 @@ impl AddressSpace for FlatMemory {
     }
 
     fn read_u32(&self, addr: u32) -> u32 {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &self.shadow {
             shadow.check_read(addr, 4);
         }
@@ -1504,6 +1537,7 @@ impl AddressSpace for FlatMemory {
     }
 
     fn write_u32(&mut self, addr: u32, value: u32) {
+        let addr = addr & self.addr_mask;
         if let Some(shadow) = &mut self.shadow {
             shadow.check_write(addr, 4);
         }
@@ -1535,6 +1569,48 @@ impl AddressSpace for FlatMemory {
 
     fn shadow_mut(&mut self) -> Option<&mut ShadowMap> {
         self.shadow.as_deref_mut()
+    }
+}
+
+#[cfg(test)]
+mod address_mask_tests {
+    use super::*;
+
+    #[test]
+    fn a_24_bit_mask_aliases_the_top_byte_for_every_access_path() {
+        let mut mem = FlatMemory::new(0x2000);
+        mem.set_address_mask(0x00FF_FFFF);
+        mem.write_u32(0x1000, 0x1122_3344);
+        // The same bytes through addresses with stray top-byte bits.
+        for tag in [0x0100_0000u32, 0xAB00_0000, 0xFF00_0000] {
+            assert_eq!(mem.read_u32(tag | 0x1000), 0x1122_3344, "{tag:#X}");
+            assert_eq!(mem.read_u16(tag | 0x1002), 0x3344);
+            assert_eq!(mem.read_u8(tag | 0x1001), 0x22);
+            assert_eq!(mem.peek_u32(tag | 0x1000), 0x1122_3344);
+            assert_eq!(mem.peek_u16(tag | 0x1000), 0x1122);
+            assert_eq!(mem.peek_u8(tag | 0x1003), 0x44);
+            assert!(mem.is_mapped(tag | 0x1000, 4));
+            assert!(!mem.is_mapped(tag | 0x2000, 4), "still past the end of RAM");
+        }
+        // Writes through a tagged address land at the real one.
+        mem.write_u8(0xAB00_1010, 0x5A);
+        mem.write_u16(0xAB00_1012, 0xBEEF);
+        mem.write_u32(0xAB00_1014, 0xCAFE_F00D);
+        mem.poke_u8(0xAB00_1018, 0x77);
+        assert_eq!(mem.read_u8(0x1010), 0x5A);
+        assert_eq!(mem.read_u16(0x1012), 0xBEEF);
+        assert_eq!(mem.read_u32(0x1014), 0xCAFE_F00D);
+        assert_eq!(mem.peek_u8(0x1018), 0x77);
+    }
+
+    #[test]
+    fn without_a_mask_the_top_byte_is_a_real_address_bit() {
+        let mut mem = FlatMemory::new(0x2000);
+        mem.write_u32(0x1000, 0x1122_3344);
+        assert_eq!(mem.read_u32(0xAB00_1000), 0, "unmapped, not an alias");
+        mem.write_u8(0xAB00_1000, 0xFF);
+        assert_eq!(mem.read_u8(0x1000), 0x11, "and the write was dropped");
+        assert!(!mem.is_mapped(0xAB00_1000, 1));
     }
 }
 

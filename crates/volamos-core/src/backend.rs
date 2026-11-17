@@ -518,9 +518,18 @@ impl M68kCpu {
 /// should follow the crate's behavior rather than reject a
 /// configuration that demonstrably works today.
 pub fn addressable_bytes(cpu_type: CpuType) -> u64 {
+    u64::from(address_mask(cpu_type)) + 1
+}
+
+/// The bits of an address `cpu_type` puts on its bus: `0x00FF_FFFF` for
+/// the 24-bit models (68000, 68010), all ones for the 32-bit ones. Taken
+/// from the `m68k` crate like [`addressable_bytes`]; used to mask the
+/// addresses native library handlers dereference (see
+/// [`crate::memory::FlatMemory::set_address_mask`]).
+pub fn address_mask(cpu_type: CpuType) -> u32 {
     let mut core = CpuCore::new();
     core.set_cpu_type(cpu_type);
-    u64::from(core.address_mask) + 1
+    core.address_mask
 }
 
 /// Whether `cpu_type` performs a long store as two word bus cycles

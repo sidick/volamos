@@ -96,7 +96,7 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser};
 
-use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END, addressable_bytes};
+use volamos_core::backend::{CpuType, M68kCpu, TRAP_TABLE_END, address_mask, addressable_bytes};
 use volamos_core::dispatch::{
     Runtime, StartConfig, TraceEvent, install_fpu_disabled_060_decline_stub,
 };
@@ -2378,6 +2378,7 @@ fn build_nested_runtime(
     let hunk_file = loader::parse(&bytes).ok()?;
     let ram_size = layout.contiguous_prefix().0 as u32;
     let mut mem = FlatMemory::from_layout(&layout);
+    mem.set_address_mask(address_mask(cpu_type));
     // Right after construction, before `loader::load` populates it --
     // harmless either way (see `FlatMemory::enable_sanitizer`'s doc for
     // why the default `Valid` shadow state makes the ordering a
@@ -2667,6 +2668,9 @@ fn run(opts: &Options) -> Result<i32, String> {
     let mut loaded: Option<loader::LoadResult> = None;
     let mut runtime = if hunk_file.overlay.is_some() {
         let mut mem = FlatMemory::from_layout(&opts.layout);
+        // A 68000/68010 ignores the top byte of every address, and so must
+        // the native library handlers dereferencing guest pointers.
+        mem.set_address_mask(address_mask(opts.cpu_type));
         // Right after construction, before anything is loaded into it
         // -- harmless either way, see FlatMemory::enable_sanitizer's
         // doc on why the default Valid shadow state makes the ordering
@@ -2715,6 +2719,9 @@ fn run(opts: &Options) -> Result<i32, String> {
         runtime
     } else {
         let mut mem = FlatMemory::from_layout(&opts.layout);
+        // A 68000/68010 ignores the top byte of every address, and so must
+        // the native library handlers dereferencing guest pointers.
+        mem.set_address_mask(address_mask(opts.cpu_type));
         if opts.sanitize.enabled {
             mem.enable_sanitizer();
             opts.sanitize.apply(&mut mem);

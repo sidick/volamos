@@ -4410,6 +4410,48 @@ mod tests {
         )
     }
 
+    /// Runs `PutStr(string_addr | 0xAB000000)` on a 68000 (24-bit bus)
+    /// with the address mask `mask` set on guest memory, returning what
+    /// the program printed. The string lives in plain guest RAM.
+    fn put_str_through_tagged_pointer(mask: u32) -> String {
+        let string_addr = TRAP_TABLE_END + 0x80;
+        let tagged = string_addr | 0xAB00_0000;
+        let words = [
+            0x223C,
+            (tagged >> 16) as u16,
+            tagged as u16, // move.l #tagged,d1
+            0x4EAE,
+            0xFC4C, // jsr -948(a6)  (PutStr)
+            0x4E75, // rts
+        ];
+        let mut rt = runtime_with_program(&words);
+        let mem = rt.memory_mut();
+        mem.set_address_mask(mask);
+        for (i, b) in b"tagged ok\n\0".iter().enumerate() {
+            mem.write_u8(string_addr + i as u32, *b);
+        }
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Issue #98's follow-up (#332): a 68000/68010 ignores the top byte of
+    /// every address, so a pointer with stray high bits works for the real
+    /// `dos.library` running on it (checked on an A500, Kickstart 3.2:
+    /// `PutStr` of such a pointer prints the string). The native `PutStr`
+    /// dereferences the pointer for the CPU and must see the same address.
+    #[test]
+    fn a_24_bit_cpus_native_handlers_ignore_the_top_byte_of_a_guest_pointer() {
+        assert_eq!(put_str_through_tagged_pointer(0x00FF_FFFF), "tagged ok\n");
+    }
+
+    /// On a 32-bit CPU the top byte is a real address bit: the same pointer
+    /// is somewhere else entirely, and nothing is printed.
+    #[test]
+    fn a_32_bit_cpus_native_handlers_keep_the_top_byte() {
+        assert_eq!(put_str_through_tagged_pointer(u32::MAX), "");
+    }
+
     #[test]
     fn pr_return_addr_footer_survives_sanitizer_below_sp_poisoning() {
         // Issues #178 and #279: reading the pr_ReturnAddr entry frame
