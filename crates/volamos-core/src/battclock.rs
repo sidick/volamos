@@ -144,7 +144,7 @@ const BC_NAME_FIELD: u32 = BC_OFFSET_FIELD + 4;
 /// The private fields above have to stay inside the positive-offset
 /// room this base's chunk reserves -- past it sit
 /// [`crate::dispatch::EXIT_STUB_ADDR`] and
-/// [`crate::dispatch::FPU_DISABLED_060_DECLINE_STUB_ADDR`], the two
+/// [`crate::dispatch::LINE_F_DECLINE_STUB_ADDR`], the two
 /// end-anchored A-line stub words, and overwriting the first of those
 /// would stop the guest's outermost `rts` trapping at all, i.e. break
 /// program termination with no compile- or test-time signal. Adding a

@@ -795,12 +795,24 @@ pub const TASK_EXIT_STUB_ADDR: u32 = 0x00C6;
 /// = guest address `0x2C`) when the resolved CPU is `CpuType::M68060`
 /// with `fpu_present == false`, or a 68040/68060 whose FPU traps the
 /// instructions it leaves to software (no `--fpsp-emulate`, issue #217)
-/// -- see [`install_fpu_disabled_060_decline_stub`].
+/// -- see [`install_line_f_decline_stub`].
 ///
-/// # Why this exists (issue #167, second half)
+/// # Why this exists (issue #167, second half; widened by #217)
 ///
-/// For every CPU/FPU combination this runtime models *except* this one,
-/// an FPU-absence trap (an F-line opcode under `fpu_present == false`)
+/// The name says "Line-F" because the stub catches whatever the chip
+/// delivers through vector 11 on its own: the 68060's FPU-disabled
+/// exception (the original reason, below), and -- since #217 -- the
+/// unimplemented-FPU-instruction exception of a 68040/68060 whose FPU
+/// is on but has no `--fpsp-emulate`. Both are raised inside the `m68k`
+/// crate and jump straight through the slot, so without a stub a guest
+/// with no handler ran off through address 0 into the continuation
+/// stub. Because the slot is now non-zero on those CPUs, a *plain*
+/// Line-F opcode (a non-FPU coprocessor ID, a PMMU opcode) also arrives
+/// here instead of being declined as `FLine`; `describe_line_f_trap_at_decline_stub`
+/// rebuilds that report from the stacked frame so it isn't lost.
+///
+/// For every CPU/FPU combination this runtime models *except* those, an
+/// FPU-absence trap (an F-line opcode under `fpu_present == false`)
 /// surfaces through the `m68k` crate's host-interceptable
 /// `StepResult::FlineTrap`/`CycleBatchExit::FlineTrap` escape hatch --
 /// `Cpu::take_hardware_exception` (`crate::backend`) catches it there,
@@ -832,7 +844,7 @@ pub const TASK_EXIT_STUB_ADDR: u32 = 0x00C6;
 /// issue #167 describes, rather than anything that names the real cause.
 ///
 /// This stub mitigates that: [`Runtime::new`]'s caller (via
-/// [`install_fpu_disabled_060_decline_stub`], called from the CLI, which
+/// [`install_line_f_decline_stub`], called from the CLI, which
 /// -- like [`crate::backend`]'s own doc on why `attn_flags_for` lives in
 /// `main.rs` rather than here -- is where `CpuType`/`fpu_present` are
 /// already in scope, since `Runtime`/`StartConfig` otherwise don't know
@@ -865,9 +877,9 @@ pub const TASK_EXIT_STUB_ADDR: u32 = 0x00C6;
 /// end of the reserved region, immediately after [`EXIT_STUB_ADDR`]'s
 /// own 4-byte slot) -- see `TRAP_TABLE_SIZE`'s doc for the full growth
 /// history.
-pub const FPU_DISABLED_060_DECLINE_STUB_ADDR: u32 = TRAP_TABLE_END - 2;
+pub const LINE_F_DECLINE_STUB_ADDR: u32 = TRAP_TABLE_END - 2;
 
-/// Pre-seeds [`FPU_DISABLED_060_DECLINE_STUB_ADDR`]'s opcode and installs
+/// Pre-seeds [`LINE_F_DECLINE_STUB_ADDR`]'s opcode and installs
 /// its address into vector 11's slot (guest address `0x2C`), but only
 /// when `cpu_type == CpuType::M68060 && !fpu_present` (issue #167's
 /// second half), or for a 68040/68060 with an FPU and no
@@ -890,7 +902,7 @@ pub const FPU_DISABLED_060_DECLINE_STUB_ADDR: u32 = TRAP_TABLE_END - 2;
 /// the same reasoning [`crate::backend`]'s `attn_flags_for` doc gives
 /// for why the CLI computes `AttnFlags` itself -- this just has to be
 /// sequenced after construction instead of threaded through it.
-pub fn install_fpu_disabled_060_decline_stub<C: Cpu>(
+pub fn install_line_f_decline_stub<C: Cpu>(
     runtime: &mut Runtime<C>,
     cpu_type: crate::backend::CpuType,
     fpu_present: bool,
@@ -914,15 +926,15 @@ pub fn install_fpu_disabled_060_decline_stub<C: Cpu>(
     /// simplest opcode that surfaces cleanly through the existing
     /// `StepResult::IllegalInstruction`/`CycleBatchExit::
     /// IllegalInstruction` path with no new plumbing. See
-    /// [`FPU_DISABLED_060_DECLINE_STUB_ADDR`]'s doc.
+    /// [`LINE_F_DECLINE_STUB_ADDR`]'s doc.
     const ILLEGAL_OPCODE: u16 = 0x4AFC;
 
     runtime
         .mem
-        .write_u16(FPU_DISABLED_060_DECLINE_STUB_ADDR, ILLEGAL_OPCODE);
+        .write_u16(LINE_F_DECLINE_STUB_ADDR, ILLEGAL_OPCODE);
     runtime
         .mem
-        .write_u32(vector::LINE_1111 * 4, FPU_DISABLED_060_DECLINE_STUB_ADDR);
+        .write_u32(vector::LINE_1111 * 4, LINE_F_DECLINE_STUB_ADDR);
 }
 
 /// Mnemonic of an FP opmode (the low seven bits of a general FPU
@@ -963,42 +975,70 @@ fn unimplemented_fpu_opmode_name(opmode: u16) -> Option<&'static str> {
 }
 
 /// Explains an unhandled Line-F trap that stopped the run at
-/// [`FPU_DISABLED_060_DECLINE_STUB_ADDR`] (issue #217), or `None` when
-/// the frame on the stack isn't one this recognises.
+/// [`LINE_F_DECLINE_STUB_ADDR`], returning the report and the address of
+/// the instruction that trapped, or `None` when the frame on the stack
+/// isn't one this recognises (the generic `Illegal` report then stands).
 ///
-/// By the time the stub's `ILLEGAL` is reported, the 68040/68060's
-/// exception entry has already pushed its frame on the stack and jumped
-/// through vector 11 to the stub (nothing popped it). An unimplemented
-/// FPU instruction leaves the six-word format $2 frame (format/vector
-/// word `$202C` at SP+6, stacked PC the *next* instruction) and points
-/// FPIAR at the faulting instruction (m68k-rs `take_fp_format_2`;
-/// M68040UM 9.6.1, M68060UM 6.5.2): FPIAR is how the real
-/// 68040SP/68060SP finds the opcode, and so how this does. The
-/// FPU-disabled 060 exception is format $4 (`$402C`) and keeps the
+/// By the time the stub's `ILLEGAL` is reported, the exception entry has
+/// already pushed its frame on the stack and jumped through vector 11 to
+/// the stub (nothing popped it), so the frame says what trapped:
+///
+/// - Format $2, vector word `$202C`: an unimplemented FPU instruction on
+///   a 68040/68060 (issue #217). The stacked PC is the *next*
+///   instruction; FPIAR points at the faulting one (m68k-rs
+///   `take_fp_format_2`; M68040UM 9.6.1, M68060UM 6.5.2) -- it is how the
+///   real 68040SP/68060SP finds the opcode, and so how this does.
+/// - Format $0, vector word `$002C`: any other Line-F opcode (a
+///   non-FPU coprocessor ID, a PMMU opcode, a stray jump into data),
+///   which `Cpu::take_hardware_exception` would have declined as
+///   `FLine` at its real PC had the stub not made vector 11 non-zero.
+///   The crate rewinds the PC for these, so the stacked PC *is* the
+///   instruction, and the report is rebuilt to match that one.
+///
+/// The 060's FPU-disabled exception is format $4 (`$402C`) and keeps the
 /// generic stop report.
-fn describe_fpu_trap_at_decline_stub<C: Cpu>(cpu: &C, mem: &C::Memory) -> Option<String> {
+fn describe_line_f_trap_at_decline_stub<C: Cpu>(cpu: &C, mem: &C::Memory) -> Option<(String, u32)> {
     let sp = cpu.address_register(AddressRegister(7));
-    if mem.read_u16(sp.wrapping_add(6)) != 0x202C {
-        return None;
+    match mem.read_u16(sp.wrapping_add(6)) {
+        0x202C => {
+            let fpiar = cpu.fpiar();
+            let opcode = mem.read_u16(fpiar);
+            let ext = mem.read_u16(fpiar.wrapping_add(2));
+            // A coprocessor-ID-1 (FPU) general operation is 1111 001 000
+            // <ea> with the extension word's bits 15-13 = 000 (register
+            // to register) or 010 (memory to register) and the opmode in
+            // bits 6-0. FMOVECR (010, source specifier 111) reuses those
+            // low bits as a ROM-constant offset, so it must not be read
+            // as an opmode; it, packed decimal and unimplemented-EA
+            // cases have no opmode name, and the address alone locates
+            // them.
+            let general = opcode & 0xFFC0 == 0xF200
+                && match ext >> 13 {
+                    0 => true,
+                    2 => (ext >> 10) & 7 != 7,
+                    _ => false,
+                };
+            let name = general
+                .then(|| unimplemented_fpu_opmode_name(ext & 0x7F))
+                .flatten();
+            let what = name.map_or_else(String::new, |name| format!(" {name}"));
+            Some((
+                format!(
+                    "unimplemented FPU instruction{what}: the 68040/68060 leave it to their \
+                     FPSP software package, which volamos only runs with --fpsp-emulate \
+                     (without it the instruction traps, as on real hardware without \
+                     68040.library/68060.library) -- re-run with --fpsp-emulate"
+                ),
+                fpiar,
+            ))
+        }
+        0x002C => {
+            let pc = mem.read_u32(sp.wrapping_add(2));
+            let opcode = mem.read_u16(pc);
+            Some((format!("FLine {{ opcode: {opcode} }}"), pc))
+        }
+        _ => None,
     }
-    let fpiar = cpu.fpiar();
-    let opcode = mem.read_u16(fpiar);
-    let ext = mem.read_u16(fpiar.wrapping_add(2));
-    // A coprocessor-ID-1 (FPU) general operation is 1111 001 000 <ea>
-    // with the extension word's bits 15-13 = 000 (register to register)
-    // or 010 (memory to register) and the opmode in bits 6-0. Anything
-    // else (FMOVECR's ROM constants, packed-decimal and unimplemented-EA
-    // cases) has no opmode name; the address still locates it.
-    let name = (opcode & 0xFFC0 == 0xF200 && matches!(ext >> 13, 0 | 2))
-        .then(|| unimplemented_fpu_opmode_name(ext & 0x7F))
-        .flatten();
-    let what = name.map_or_else(String::new, |name| format!(" {name}"));
-    Some(format!(
-        "unimplemented FPU instruction{what} at {fpiar:#010x}: the 68040/68060 leave it to \
-         their FPSP software package, which volamos only runs with --fpsp-emulate (without \
-         it the instruction traps, as on real hardware without 68040.library/\
-         68060.library) -- re-run with --fpsp-emulate"
-    ))
 }
 
 /// Byte length of each library's `ln_Name` string, including its `NUL`
@@ -3984,15 +4024,12 @@ impl<C: Cpu + 'static> Runtime<C> {
                         if self.cpu.take_hardware_exception(&mut self.mem, info.kind) {
                             continue;
                         }
-                        let reason = if info.pc == FPU_DISABLED_060_DECLINE_STUB_ADDR {
-                            describe_fpu_trap_at_decline_stub(&self.cpu, &self.mem)
-                        } else {
-                            None
-                        };
-                        return Err(RuntimeError::UnexpectedStop {
-                            reason: reason.unwrap_or_else(|| format!("{:?}", info.kind)),
-                            pc: info.pc,
-                        });
+                        let described = (info.pc == LINE_F_DECLINE_STUB_ADDR)
+                            .then(|| describe_line_f_trap_at_decline_stub(&self.cpu, &self.mem))
+                            .flatten();
+                        let (reason, pc) =
+                            described.unwrap_or_else(|| (format!("{:?}", info.kind), info.pc));
+                        return Err(RuntimeError::UnexpectedStop { reason, pc });
                     };
 
                     // Fold in any pending host break (SIGINT/SIGTERM ->
@@ -4600,7 +4637,7 @@ mod tests {
         //
         // After the fix, this asserts the intended clean outcome
         // instead: an attributable `RuntimeError::UnexpectedStop` for an
-        // illegal instruction, from FPU_DISABLED_060_DECLINE_STUB_ADDR.
+        // illegal instruction, from LINE_F_DECLINE_STUB_ADDR.
         let mut mem = FlatMemory::new(0x2_0000);
         let entry = TRAP_TABLE_END;
         // A generic coprocessor-ID-1 F-line opcode -- same encoding
@@ -4619,14 +4656,14 @@ mod tests {
         );
         // The fix under test: pre-seed vector 11's slot, exactly as
         // main.rs now does at every real Runtime construction site.
-        install_fpu_disabled_060_decline_stub(&mut rt, CpuType::M68060, false, false);
+        install_line_f_decline_stub(&mut rt, CpuType::M68060, false, false);
 
         let mut out = Vec::new();
         let result = rt.run(&mut out, None);
 
         match result {
             Err(RuntimeError::UnexpectedStop { reason, pc }) => {
-                assert_eq!(pc, FPU_DISABLED_060_DECLINE_STUB_ADDR);
+                assert_eq!(pc, LINE_F_DECLINE_STUB_ADDR);
                 assert!(
                     reason.contains("Illegal"),
                     "expected an Illegal-instruction trap, got {reason:?}"
@@ -4634,14 +4671,14 @@ mod tests {
             }
             other => panic!(
                 "expected a clean UnexpectedStop (Illegal) trap at \
-                 FPU_DISABLED_060_DECLINE_STUB_ADDR, got {other:?}"
+                 LINE_F_DECLINE_STUB_ADDR, got {other:?}"
             ),
         }
     }
 
     /// Guest address of vector 11's slot -- `m68k::core::exceptions::
     /// vector::LINE_1111 * 4`, computed the same way
-    /// [`install_fpu_disabled_060_decline_stub`]/`Cpu::
+    /// [`install_line_f_decline_stub`]/`Cpu::
     /// take_hardware_exception` do, rather than hardcoded independently.
     fn vector_11_slot_addr() -> u32 {
         use m68k::core::exceptions::vector;
@@ -4649,7 +4686,7 @@ mod tests {
     }
 
     #[test]
-    fn install_fpu_disabled_060_decline_stub_is_a_no_op_for_every_other_combination() {
+    fn install_line_f_decline_stub_is_a_no_op_for_every_other_combination() {
         // issue #167 (second half), widened by #217: vector 11's slot
         // must stay genuinely zero for every cpu_type/fpu/fpsp_emulate
         // combination except the two the stub exists for (a 68060 with
@@ -4667,7 +4704,7 @@ mod tests {
             (CpuType::M68060, true, true),
         ] {
             let mut rt = runtime_with_program(&[0x4E71]); // NOP, never run
-            install_fpu_disabled_060_decline_stub(&mut rt, cpu_type, fpu, fpsp_emulate);
+            install_line_f_decline_stub(&mut rt, cpu_type, fpu, fpsp_emulate);
             assert_eq!(
                 rt.mem.read_u32(vector_11_slot_addr()),
                 0,
@@ -4679,8 +4716,8 @@ mod tests {
 
     /// Runs `words` as a guest on `cpu_type` with an FPU and no
     /// `--fpsp-emulate`, through the stub exactly as `main.rs` sets it
-    /// up, and returns the `UnexpectedStop` reason (issue #217).
-    fn unhandled_fpu_trap_reason(cpu_type: CpuType, words: &[u16]) -> String {
+    /// up, and returns the `UnexpectedStop` reason and pc (issue #217).
+    fn unhandled_fpu_trap_reason(cpu_type: CpuType, words: &[u16]) -> (String, u32) {
         let mut mem = FlatMemory::new(0x2_0000);
         let entry = TRAP_TABLE_END;
         load_words(&mut mem, entry, words);
@@ -4696,13 +4733,10 @@ mod tests {
                 ..StartConfig::default()
             },
         );
-        install_fpu_disabled_060_decline_stub(&mut rt, cpu_type, true, false);
+        install_line_f_decline_stub(&mut rt, cpu_type, true, false);
         match rt.run(&mut Vec::new(), None) {
-            Err(RuntimeError::UnexpectedStop { reason, pc }) => {
-                assert_eq!(pc, FPU_DISABLED_060_DECLINE_STUB_ADDR);
-                reason
-            }
-            other => panic!("expected an UnexpectedStop at the decline stub, got {other:?}"),
+            Err(RuntimeError::UnexpectedStop { reason, pc }) => (reason, pc),
+            other => panic!("expected an UnexpectedStop, got {other:?}"),
         }
     }
 
@@ -4714,12 +4748,9 @@ mod tests {
         // program entry or the stacked next-instruction PC.
         let entry = TRAP_TABLE_END;
         for cpu_type in [CpuType::M68040, CpuType::M68060] {
-            let reason = unhandled_fpu_trap_reason(cpu_type, &[0x4E71, 0xF200, 0x000E]); // fsin.x fp0,fp0
+            let (reason, pc) = unhandled_fpu_trap_reason(cpu_type, &[0x4E71, 0xF200, 0x000E]); // fsin.x fp0,fp0
             assert!(reason.contains("FSIN"), "{cpu_type:?}: {reason}");
-            assert!(
-                reason.contains(&format!("{:#010x}", entry + 2)),
-                "{cpu_type:?}: {reason}"
-            );
+            assert_eq!(pc, entry + 2, "{cpu_type:?}: reported pc");
             assert!(reason.contains("--fpsp-emulate"), "{cpu_type:?}: {reason}");
         }
     }
@@ -4730,8 +4761,78 @@ mod tests {
         // silicon (the m68k crate's fpu_040_traps_opmode vs
         // fpu_060_traps_opmode), so the same opcode traps on one and not
         // the other.
-        let reason = unhandled_fpu_trap_reason(CpuType::M68040, &[0xF200, 0x0003]); // fintrz.x fp0,fp0
+        let (reason, _) = unhandled_fpu_trap_reason(CpuType::M68040, &[0xF200, 0x0003]); // fintrz.x fp0,fp0
         assert!(reason.contains("FINTRZ"), "{reason}");
+    }
+
+    #[test]
+    fn guest_vector_11_handler_beats_the_stub_for_an_unimplemented_fpu_op_on_a_68040_217() {
+        // The stub is only a default: a guest that installs its own
+        // Line-F handler (what 68040.library's FPSP does) must get the
+        // exception, with the FPU trap's frame, not the diagnostic.
+        let entry = TRAP_TABLE_END;
+        let handler_addr = entry + 0x20;
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &[0xF200, 0x000E]); // fsin.x fp0,fp0
+        load_words(&mut mem, handler_addr, &[0x7042, 0x4AFC]); // moveq #$42,d0 ; illegal
+        let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
+        cpu.set_emulate_unimplemented_040(false);
+        let mut rt = Runtime::new(
+            cpu,
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x100,
+                ..StartConfig::default()
+            },
+        );
+        install_line_f_decline_stub(&mut rt, CpuType::M68040, true, false);
+        rt.mem.write_u32(vector_11_slot_addr(), handler_addr);
+        match rt.run(&mut Vec::new(), None) {
+            Err(RuntimeError::UnexpectedStop { pc, .. }) => assert_eq!(pc, handler_addr + 2),
+            other => panic!("expected a stop in the guest's own handler, got {other:?}"),
+        }
+        assert_eq!(rt.cpu.data_register(DataRegister(0)), 0x42);
+    }
+
+    #[test]
+    fn unhandled_fmovecr_is_not_misnamed_as_an_opmode_217() {
+        // FMOVECR's extension word carries a ROM offset in the bits an
+        // ordinary operation uses for its opmode: offset $0E would read
+        // as FSIN, $0C as FASIN, $30 as FSINCOS.
+        for offset in [0x0Cu16, 0x0E, 0x0F, 0x30] {
+            let (reason, pc) = unhandled_fpu_trap_reason(
+                CpuType::M68060,
+                &[0xF200, 0x5C00 | offset], // fmovecr #offset,fp0
+            );
+            assert!(
+                reason.starts_with("unimplemented FPU instruction:"),
+                "offset {offset:#x} was given a name: {reason}"
+            );
+            assert_eq!(pc, TRAP_TABLE_END);
+        }
+    }
+
+    #[test]
+    fn unhandled_memory_source_fsin_is_named_217() {
+        // Extension word bits 15-13 = 010: memory-to-register, source
+        // format extended, FSIN.
+        let (reason, _) = unhandled_fpu_trap_reason(CpuType::M68040, &[0xF210, 0x480E]); // fsin.x (a0),fp0
+        assert!(reason.contains("FSIN"), "{reason}");
+    }
+
+    #[test]
+    fn plain_line_f_trap_keeps_its_own_report_and_pc_on_a_68040_217() {
+        // The stub makes vector 11 non-zero, so a Line-F opcode that is
+        // *not* an FPU operation (coprocessor ID 0 here) no longer
+        // reaches Cpu::take_hardware_exception's "no handler" decline.
+        // It must still be reported as the FLine it is, at its own
+        // address, not as the stub's ILLEGAL.
+        for cpu_type in [CpuType::M68040, CpuType::M68060] {
+            let (reason, pc) = unhandled_fpu_trap_reason(cpu_type, &[0x4E71, 0xF000, 0x0000]);
+            assert_eq!(reason, "FLine { opcode: 61440 }", "{cpu_type:?}");
+            assert_eq!(pc, TRAP_TABLE_END + 2, "{cpu_type:?}");
+        }
     }
 
     #[test]
@@ -4775,7 +4876,7 @@ mod tests {
         let words = [0xF200, 0x0000];
         // A tiny "handler", placed well clear of the entry program: a
         // distinctive moveq #0x42,d0 then an ILLEGAL opcode of its own
-        // (at an address distinct from FPU_DISABLED_060_DECLINE_STUB_ADDR),
+        // (at an address distinct from LINE_F_DECLINE_STUB_ADDR),
         // so a successful run is observable both by D0's value and by
         // the trap's own pc differing from the decline stub's address.
         let handler_addr = entry + 0x20;
@@ -4796,7 +4897,7 @@ mod tests {
         );
         // First, the pre-seed this issue's fix installs (what every real
         // Runtime construction site does)...
-        install_fpu_disabled_060_decline_stub(&mut rt, CpuType::M68060, false, false);
+        install_line_f_decline_stub(&mut rt, CpuType::M68060, false, false);
         // ...then the guest's own real handler overwrites it, exactly as
         // an ordinary guest write would during startup/FPU-probing.
         rt.mem.write_u32(vector_11_slot_addr(), handler_addr);
@@ -4811,7 +4912,7 @@ mod tests {
                     handler_addr + 2,
                     "expected the trap to come from the guest's own handler, not the decline stub"
                 );
-                assert_ne!(pc, FPU_DISABLED_060_DECLINE_STUB_ADDR);
+                assert_ne!(pc, LINE_F_DECLINE_STUB_ADDR);
                 assert!(
                     reason.contains("Illegal"),
                     "expected an Illegal-instruction trap, got {reason:?}"

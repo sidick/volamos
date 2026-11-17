@@ -433,7 +433,7 @@ the instruction and what to do about it, instead of crashing somewhere
 unrelated:
 
 ```text
-volamos: t: unexpected CPU stop at 0x...: unimplemented FPU instruction FSIN at 0x00003304: the 68040/68060 leave it to their FPSP software package, which volamos only runs with --fpsp-emulate (...) -- re-run with --fpsp-emulate
+volamos: t: unexpected CPU stop at 0x00003304: unimplemented FPU instruction FSIN: the 68040/68060 leave it to their FPSP software package, which volamos only runs with --fpsp-emulate (...) -- re-run with --fpsp-emulate
 ```
 
 A guest that installs its own handler at the Line-F vector (as

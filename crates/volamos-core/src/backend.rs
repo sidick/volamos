@@ -90,10 +90,11 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// padding word, rounded up to keep [`TRAP_TABLE_END`] 4-byte aligned,
 /// which the heap-start rounding in `crate::dispatch::Runtime::new`'s
 /// own doc relies on -- no library involved at all) from `0x2C00` for
-/// [`crate::dispatch::FPU_DISABLED_060_DECLINE_STUB_ADDR`] (issue #167's
-/// second half): the fixed-address stub `--cpu 68060 --no-fpu` pre-seeds
-/// into vector 11's slot, so the `m68k` crate's internal 68060
-/// FPU-disabled exception delivery (which bypasses
+/// [`crate::dispatch::LINE_F_DECLINE_STUB_ADDR`] (issue #167's
+/// second half): the fixed-address stub pre-seeded into vector 11's slot
+/// for `--cpu 68060 --no-fpu` and (#217) for a 68040/68060 with an FPU
+/// and no `--fpsp-emulate`, so the `m68k` crate's internal 68060
+/// FPU-disabled and unimplemented-FPU-instruction exception delivery (which bypasses
 /// [`Cpu::take_hardware_exception`] entirely -- see that constant's doc
 /// for the full mechanism) lands on a clean trap instead of falling
 /// through the deliberately-zeroed exception-vector-table span into

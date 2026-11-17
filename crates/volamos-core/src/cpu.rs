@@ -171,7 +171,11 @@ pub trait Cpu {
     /// instruction exception, which is how the 68040SP/68060SP find it
     /// (the stacked PC is the *next* instruction), and how
     /// [`crate::dispatch`] names the instruction in an unhandled trap.
-    fn fpiar(&self) -> u32;
+    /// A backend with no such register reports 0, which just leaves the
+    /// instruction unnamed.
+    fn fpiar(&self) -> u32 {
+        0
+    }
 
     /// Delivers the real m68k hardware exception for a trap [`Cpu::step`]/
     /// [`Cpu::run`] just reported, other than [`TrapKind::ALine`] (this
