@@ -385,7 +385,18 @@ pub(crate) fn build_seglist(
                 available: 0,
             });
         };
-        match heap.alloc(&mut *mem, total) {
+        // Each hunk is allocated from the kind of memory it asks for
+        // (HUNKF_CHIP/HUNKF_FAST, or the extended MEMF_* attributes), as
+        // real LoadSeg does with AllocMem. A "prefers fast" hunk falls
+        // back to any memory when there is no fast RAM; a chip hunk does
+        // not fall back (a failed request fails the load, freeing what
+        // was allocated so far).
+        let wanted = crate::execmem::placement(hunk.memory.requirements());
+        let allocated = match heap.alloc_for(&mut *mem, total, total, wanted) {
+            Err(_) if hunk.memory.is_preference() => heap.alloc_for(&mut *mem, total, total, 0),
+            other => other,
+        };
+        match allocated {
             Ok(addr) => alloc_addrs.push(addr),
             Err(e) => {
                 // Unwind: free everything allocated so far for this
@@ -1593,6 +1604,7 @@ mod tests {
                 kind: loader::HunkKind::Bss,
                 data: Vec::new(),
                 reserved_size: u32::MAX as usize,
+                memory: loader::HunkMemory::Any,
                 relocs: Vec::new(),
                 debug_blocks: Vec::new(),
                 symbol_blocks: Vec::new(),
@@ -2679,5 +2691,112 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, -1);
+    }
+    // --- hunk memory flags (issue #332) ---
+
+    /// A file of one-longword `HUNK_DATA` hunks whose size-table words
+    /// carry `flags` (one per hunk).
+    fn file_with_hunk_flags(flags: &[u32]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut push = |v: u32| buf.extend_from_slice(&v.to_be_bytes());
+        push(0x3F3); // HUNK_HEADER
+        push(0);
+        push(flags.len() as u32);
+        push(0);
+        push(flags.len() as u32 - 1);
+        for f in flags {
+            push(f | 1);
+        }
+        for _ in flags {
+            push(0x3EA); // HUNK_DATA
+            push(1);
+            push(0xCAFE_F00D);
+            push(0x3F2); // HUNK_END
+        }
+        buf
+    }
+
+    fn layout_heap() -> (GuestHeap, FlatMemory) {
+        use crate::memmap::{MemoryLayout, MemoryRegion, RegionKind};
+        // Chip 2 MiB + 1 MiB of CPU-board RAM: MEMF_ANY prefers the latter.
+        let layout = MemoryLayout::new(vec![
+            MemoryRegion::new(RegionKind::Chip, 0, 0x20_0000),
+            MemoryRegion::new(RegionKind::Accelerator, 0x0800_0000, 0x10_0000),
+        ])
+        .unwrap();
+        (
+            GuestHeap::with_layout(layout.clone(), 0x4000, u32::MAX),
+            FlatMemory::from_layout(&layout),
+        )
+    }
+
+    /// Real `LoadSeg` allocates each hunk with the memory kind its flags
+    /// ask for: `HUNKF_CHIP` data must be chip RAM (a program that checks
+    /// `TypeOfMem` for DMA-able buffers sees what it would on hardware),
+    /// `HUNKF_FAST` and unflagged hunks take the preferred (fast) RAM.
+    #[test]
+    fn each_hunk_lands_in_the_memory_its_flags_ask_for() {
+        const CHIP: u32 = 0x4000_0000;
+        const FAST: u32 = 0x8000_0000;
+        let file = loader::parse(&file_with_hunk_flags(&[0, CHIP, FAST])).unwrap();
+        let (mut heap, mut mem) = layout_heap();
+        let seglist = build_seglist(&file, &mut heap, &mut mem).unwrap();
+        let attrs: Vec<u32> = seglist
+            .alloc_addrs
+            .iter()
+            .map(|&a| heap.attributes_at(a).unwrap())
+            .collect();
+        // CPU-board RAM (any/fast) is 0x505; chip is 0x703.
+        assert_eq!(attrs, [0x505, 0x703, 0x505]);
+    }
+
+    /// The extended form names the `MEMF_*` attributes outright.
+    #[test]
+    fn an_extended_hunk_flag_is_allocated_with_its_memf_attributes() {
+        let mut buf = file_with_hunk_flags(&[0xC000_0000]);
+        // Splice MEMF_CHIP|MEMF_CLEAR after the body's HUNK_DATA type word
+        // (and mark it as the extended form).
+        let at = buf
+            .windows(4)
+            .position(|w| w == 0x3EAu32.to_be_bytes())
+            .unwrap();
+        buf[at..at + 4].copy_from_slice(&(0xC000_0000u32 | 0x3EA).to_be_bytes());
+        buf.splice(at + 4..at + 4, (0x2u32 | 0x1_0000).to_be_bytes());
+        let file = loader::parse(&buf).unwrap();
+        let (mut heap, mut mem) = layout_heap();
+        let seglist = build_seglist(&file, &mut heap, &mut mem).unwrap();
+        assert_eq!(heap.attributes_at(seglist.alloc_addrs[0]), Some(0x703));
+    }
+
+    /// A fast hunk only *prefers* fast RAM: on a chip-only machine it
+    /// loads into chip, where a chip hunk with no chip RAM left fails the
+    /// whole load and leaks nothing.
+    #[test]
+    fn a_fast_hunk_falls_back_but_a_chip_hunk_does_not() {
+        use crate::memmap::{MemoryLayout, MemoryRegion, RegionKind};
+        const CHIP: u32 = 0x4000_0000;
+        const FAST: u32 = 0x8000_0000;
+        let chip_only =
+            MemoryLayout::new(vec![MemoryRegion::new(RegionKind::Chip, 0, 0x20_0000)]).unwrap();
+        let mut heap = GuestHeap::with_layout(chip_only.clone(), 0x4000, u32::MAX);
+        let mut mem = FlatMemory::from_layout(&chip_only);
+        let file = loader::parse(&file_with_hunk_flags(&[FAST])).unwrap();
+        let seglist = build_seglist(&file, &mut heap, &mut mem).unwrap();
+        assert_eq!(heap.attributes_at(seglist.alloc_addrs[0]), Some(0x703));
+
+        // A chip hunk too big for what chip RAM has left fails, and the
+        // segments allocated before it are freed again.
+        let free_before = heap.free_bytes();
+        let mut big = file_with_hunk_flags(&[0, CHIP]);
+        // Make the second hunk's table size 4 MiB (flags kept).
+        let size_at = 5 * 4 + 4; // header longs, then the first table entry
+        big[size_at..size_at + 4].copy_from_slice(&(CHIP | 0x10_0000).to_be_bytes());
+        let file = loader::parse(&big).unwrap();
+        assert!(build_seglist(&file, &mut heap, &mut mem).is_err());
+        assert_eq!(
+            heap.free_bytes(),
+            free_before,
+            "a failed LoadSeg leaks nothing"
+        );
     }
 }

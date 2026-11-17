@@ -179,7 +179,7 @@ const PLACEMENT_BITS: u32 =
     MEMF_PUBLIC | MEMF_CHIP | MEMF_FAST | MEMF_LOCAL | MEMF_24BITDMA | crate::memmap::MEMF_KICK;
 
 /// The part of `requirements` that selects a memory region.
-fn placement(requirements: u32) -> u32 {
+pub(crate) fn placement(requirements: u32) -> u32 {
     requirements & PLACEMENT_BITS
 }
 

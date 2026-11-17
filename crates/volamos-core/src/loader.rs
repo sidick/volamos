@@ -230,11 +230,13 @@ const HUNK_BREAK: u32 = 0x3F6;
 /// `HUNK_HEADER` **and** of a `HUNK_CODE`/`HUNK_DATA`/`HUNK_BSS` type
 /// longword in the file body (same encoding both places: bit 30 =
 /// chip, bit 31 = fast, both = an extra longword of memory attributes
-/// follows). We don't act on the flags (no chip/fast distinction in
-/// this emulator's flat address space) but we do need to mask them off
-/// to recover the real size/type -- found via the real `DiskSpeed` 4.2
-/// benchmark, whose data hunk is marked `MEMF_CHIP` (`0x400003EA`) for
-/// its trackdisk I/O buffers.
+/// follows). They are parsed into [`HunkMemory`] and honoured when a
+/// hunk is allocated from the guest heap ([`crate::dosseg::build_seglist`],
+/// i.e. `LoadSeg`/overlays); the top-level program is laid out
+/// contiguously in low (chip) memory regardless -- see [`load`]. They
+/// also have to be masked off to recover the real size/type -- found via
+/// the real `DiskSpeed` 4.2 benchmark, whose data hunk is marked
+/// `MEMF_CHIP` (`0x400003EA`) for its trackdisk I/O buffers.
 const HUNK_SIZE_FLAGS_MASK: u32 = 0xC000_0000;
 
 /// `HUNKB_ADVISORY` (NDK 3.2 `dos/doshunks.h`): set in a block type
@@ -387,6 +389,60 @@ pub struct Reloc32 {
     pub kind: RelocKind,
 }
 
+/// Which kind of memory a hunk asks to be loaded into: the
+/// `HUNKF_CHIP`/`HUNKF_FAST` bits of its size longword (bits 30 and 31;
+/// see [`HUNK_SIZE_FLAGS_MASK`]), or the full `MEMF_*` attributes of the
+/// extended form (both bits set, an extra longword follows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HunkMemory {
+    /// No flag: any memory (`MEMF_PUBLIC`); real exec then prefers fast
+    /// RAM and falls back to chip.
+    #[default]
+    Any,
+    /// `HUNKF_CHIP`: the hunk **must** be in chip RAM (data the custom
+    /// chips DMA from).
+    Chip,
+    /// `HUNKF_FAST`: the hunk **prefers** fast RAM, falling back to any
+    /// memory when there is none.
+    Fast,
+    /// Extended form: the `MEMF_*` attributes the file names.
+    Attributes(u32),
+}
+
+impl HunkMemory {
+    /// The `MEMF_*` requirement bits to allocate the hunk with (0 = any
+    /// memory). A hunk that is [`HunkMemory::Fast`] is only a
+    /// *preference*: see [`HunkMemory::is_preference`].
+    pub fn requirements(self) -> u32 {
+        match self {
+            HunkMemory::Any => 0,
+            HunkMemory::Chip => crate::execmem::MEMF_CHIP,
+            HunkMemory::Fast => crate::execmem::MEMF_FAST,
+            HunkMemory::Attributes(a) => a,
+        }
+    }
+
+    /// Whether the request may fall back to any memory when it cannot be
+    /// met (`HUNKF_FAST` "prefers" fast RAM; chip and explicit
+    /// attributes are requirements).
+    pub fn is_preference(self) -> bool {
+        matches!(self, HunkMemory::Fast)
+    }
+
+    /// Decodes the two flag bits of a size/type longword (`extended` is
+    /// the extra longword read when both are set, if there was one).
+    fn from_flag_bits(raw: u32, extended: Option<u32>) -> Self {
+        let chip = raw & 0x4000_0000 != 0;
+        let fast = raw & 0x8000_0000 != 0;
+        match (chip, fast) {
+            (false, false) => HunkMemory::Any,
+            (true, false) => HunkMemory::Chip,
+            (false, true) => HunkMemory::Fast,
+            (true, true) => extended.map_or(HunkMemory::Any, HunkMemory::Attributes),
+        }
+    }
+}
+
 /// One parsed hunk: its kind, content (empty for BSS), the size in bytes
 /// reserved for it (from the header's size table, with the memory-flag
 /// bits masked off), and any 32-bit relocations that apply to it.
@@ -399,6 +455,9 @@ pub struct Hunk {
     /// For `Code`/`Data` this is always `>= data.len()` (padded up to
     /// the header's declared size, normally equal).
     pub reserved_size: usize,
+    /// The kind of memory the hunk asks to be loaded into (see
+    /// [`HunkMemory`]).
+    pub memory: HunkMemory,
     /// 32-bit relocations that apply within this hunk.
     pub relocs: Vec<Reloc32>,
     /// Raw payload bytes of every `HUNK_DEBUG` block that appeared for
@@ -1178,10 +1237,15 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
         return Err(LoadError::UnexpectedEof);
     }
     let mut declared_sizes = Vec::with_capacity(n_sizes);
+    // The memory flags the size table carries, per hunk (real LoadSeg
+    // allocates from these). Both bits set means the extended form, whose
+    // attributes the hunk's own body type word supplies (see below).
+    let mut table_flags = Vec::with_capacity(n_sizes);
     for _ in 0..n_sizes {
         let raw = r.read_u32()?;
         let longwords = raw & !HUNK_SIZE_FLAGS_MASK;
         declared_sizes.push(longwords as usize * 4);
+        table_flags.push(raw & HUNK_SIZE_FLAGS_MASK);
     }
 
     let mut hunks = Vec::with_capacity(n_sizes);
@@ -1217,11 +1281,19 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
         // memory attributes follows the type word -- consume and ignore
         // it (this runtime has one flat memory type).
         let body_type = raw_body_type & !HUNK_SIZE_FLAGS_MASK;
+        let mut extended_attributes = None;
         if raw_body_type & HUNK_SIZE_FLAGS_MASK == HUNK_SIZE_FLAGS_MASK
             && matches!(body_type, HUNK_CODE | HUNK_DATA | HUNK_BSS)
         {
-            r.read_u32()?;
+            extended_attributes = Some(r.read_u32()?);
         }
+        // The size table's flags win (that is what real LoadSeg
+        // allocates from); a body type word that carries flags the table
+        // lacks (some tools only set them there) fills in.
+        let memory = match table_flags[i] {
+            0 => HunkMemory::from_flag_bits(raw_body_type, extended_attributes),
+            flags => HunkMemory::from_flag_bits(flags, extended_attributes),
+        };
         let (kind, data) = match body_type {
             HUNK_CODE | HUNK_DATA => {
                 let n_longwords = r.read_u32()? as usize;
@@ -1385,6 +1457,7 @@ fn parse_node(r: &mut Reader<'_>) -> Result<(HeaderInfo, Vec<Hunk>), LoadError> 
             kind,
             data,
             reserved_size,
+            memory,
             relocs,
             debug_blocks,
             symbol_blocks,
@@ -1502,6 +1575,12 @@ pub fn parse_overlay_node(bytes: &[u8], file_offset: usize) -> Result<OverlayNod
 /// normally has `0` (or, for same-hunk self-references, an intra-hunk
 /// offset) stored there; this loader does not assume which, it just adds.
 ///
+///
+/// Memory flags ([`HunkMemory`]) are not acted on here: the program is
+/// laid out contiguously from `base` in low memory, which is chip RAM, so
+/// `HUNKF_CHIP` hunks are already where they must be, and the rest simply
+/// stay in chip too rather than moving to fast RAM. Programs loaded through
+/// the guest heap (`LoadSeg`, overlays) get the placement they ask for.
 /// The entry point is defined as the load address of hunk 0.
 pub fn load(
     file: &HunkFile,
@@ -2043,6 +2122,86 @@ mod tests {
         assert_eq!(file.hunks[0].reserved_size, 4);
     }
 
+    /// The memory flags of an executable with one one-longword `HUNK_CODE`
+    /// hunk per entry of `hunks`: `(size-table flags, body type flags,
+    /// extended attributes)`. Both bits in the body type word mean an
+    /// extra longword of `MEMF_*` attributes follows it.
+    fn file_with_memory_flags(hunks: &[(u32, u32, Option<u32>)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, HUNK_HEADER);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, hunks.len() as u32);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, hunks.len() as u32 - 1);
+        for &(table, _, _) in hunks {
+            push_u32(&mut buf, table | 1);
+        }
+        for &(_, body, ext) in hunks {
+            push_u32(&mut buf, body | HUNK_CODE);
+            if let Some(attrs) = ext {
+                push_u32(&mut buf, attrs);
+            }
+            push_u32(&mut buf, 1);
+            push_u32(&mut buf, 0x4E71_4E71);
+            push_u32(&mut buf, HUNK_END);
+        }
+        buf
+    }
+
+    /// `HUNKF_CHIP` (bit 30) and `HUNKF_FAST` (bit 31) become a
+    /// `HunkMemory` per hunk: from the size table, from the body type word
+    /// when the table has none, and the extended form (both bits, an extra
+    /// longword of `MEMF_*` attributes).
+    #[test]
+    fn parses_hunk_memory_flags_in_every_form() {
+        const CHIP: u32 = 0x4000_0000;
+        const FAST: u32 = 0x8000_0000;
+        const BOTH: u32 = CHIP | FAST;
+        let file = parse(&file_with_memory_flags(&[
+            (0, 0, None),                 // no flags: any memory
+            (CHIP, 0, None),              // chip, from the size table
+            (FAST, 0, None),              // fast, from the size table
+            (0, CHIP, None),              // chip, from the body type word only
+            (CHIP, FAST, None),           // the table wins over the body
+            (BOTH, BOTH, Some(0x1_0006)), // extended: MEMF_FAST|CHIP|CLEAR
+            (BOTH, 0, None),              // both bits but no attributes: any
+        ]))
+        .unwrap();
+        let memory: Vec<HunkMemory> = file.hunks.iter().map(|h| h.memory).collect();
+        assert_eq!(
+            memory,
+            [
+                HunkMemory::Any,
+                HunkMemory::Chip,
+                HunkMemory::Fast,
+                HunkMemory::Chip,
+                HunkMemory::Chip,
+                HunkMemory::Attributes(0x1_0006),
+                HunkMemory::Any,
+            ]
+        );
+        // The flags never leak into the sizes or the content.
+        assert!(
+            file.hunks
+                .iter()
+                .all(|h| h.reserved_size == 4 && h.data.len() == 4)
+        );
+    }
+
+    #[test]
+    fn hunk_memory_requirements_and_fallback() {
+        use crate::execmem::{MEMF_CHIP, MEMF_FAST};
+        assert_eq!(HunkMemory::Any.requirements(), 0);
+        assert_eq!(HunkMemory::Chip.requirements(), MEMF_CHIP);
+        assert_eq!(HunkMemory::Fast.requirements(), MEMF_FAST);
+        assert_eq!(HunkMemory::Attributes(0x1_0004).requirements(), 0x1_0004);
+        // Only HUNKF_FAST is a preference that may fall back.
+        assert!(HunkMemory::Fast.is_preference());
+        assert!(!HunkMemory::Chip.is_preference());
+        assert!(!HunkMemory::Any.is_preference());
+        assert!(!HunkMemory::Attributes(MEMF_FAST).is_preference());
+    }
+
     #[test]
     fn skips_symbol_and_debug_hunks() {
         let mut buf = Vec::new();
@@ -2558,6 +2717,7 @@ mod tests {
             kind: HunkKind::Code,
             data: Vec::new(),
             reserved_size,
+            memory: HunkMemory::Any,
             relocs: Vec::new(),
             debug_blocks,
             symbol_blocks,
