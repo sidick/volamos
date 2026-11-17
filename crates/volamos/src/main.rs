@@ -455,10 +455,21 @@ fn parse_stack_size_arg(s: &str) -> Result<u32, String> {
     parse_byte_size("--stack", s)
 }
 
-/// Region-size flavored wrapper around [`parse_byte_size`]: like it, but
-/// the flag name is derived from the value's own error context.
-fn parse_chip_size_arg(s: &str) -> Result<u32, String> {
-    parse_byte_size("memory size", s)
+/// One `--chip`/`--fast`/`--slow`/`--accel`/`--z3` value parser each, so
+/// an error names the flag the user actually typed.
+macro_rules! region_size_parsers {
+    ($($name:ident => $flag:literal),* $(,)?) => {
+        $(fn $name(s: &str) -> Result<u32, String> {
+            parse_byte_size($flag, s)
+        })*
+    };
+}
+region_size_parsers! {
+    parse_chip_arg => "--chip",
+    parse_fast_arg => "--fast",
+    parse_slow_arg => "--slow",
+    parse_accel_arg => "--accel",
+    parse_z3_arg => "--z3",
 }
 
 /// Thin `--ram`-flavored wrapper around [`parse_byte_size`]; see
@@ -671,7 +682,7 @@ struct Cli {
     #[arg(
         long = "chip",
         value_name = "SIZE",
-        value_parser = parse_chip_size_arg,
+        value_parser = parse_chip_arg,
         help_heading = "Machine",
         long_help = "Chip RAM size (default 2M, the most any ECS/AGA machine has), at address 0; \
                       same K/M suffix syntax as --stack. Classes you don't name keep the \
@@ -685,7 +696,7 @@ struct Cli {
     #[arg(
         long = "fast",
         value_name = "SIZE",
-        value_parser = parse_chip_size_arg,
+        value_parser = parse_fast_arg,
         help_heading = "Machine",
         long_help = "Zorro II fast RAM size (default 8M, at $200000-$9FFFFF, the most that window \
                       holds); 0 removes it. See --chip."
@@ -696,7 +707,7 @@ struct Cli {
     #[arg(
         long = "slow",
         value_name = "SIZE",
-        value_parser = parse_chip_size_arg,
+        value_parser = parse_slow_arg,
         help_heading = "Machine",
         long_help = "Slow (\"ranger\") RAM size at $C00000-$D7FFFF, up to 1.5M; default 1.5M for a \
                       68000/68010, none for 32-bit CPUs. See --chip."
@@ -707,7 +718,7 @@ struct Cli {
     #[arg(
         long = "accel",
         value_name = "SIZE",
-        value_parser = parse_chip_size_arg,
+        value_parser = parse_accel_arg,
         help_heading = "Machine",
         long_help = "Accelerator (CPU-board) RAM size at $08000000, up to 128M; default 64M for \
                       68020 and later, none for a 68000/68010 (24-bit address bus). See --chip."
@@ -718,7 +729,7 @@ struct Cli {
     #[arg(
         long = "z3",
         value_name = "SIZE",
-        value_parser = parse_chip_size_arg,
+        value_parser = parse_z3_arg,
         help_heading = "Machine",
         long_help = "Zorro III RAM size at $10000000-$7FFFFFFF (default none); needs a 32-bit \
                       --cpu (68020 or later). See --chip."
@@ -2594,17 +2605,6 @@ fn run(opts: &Options) -> Result<i32, String> {
     // --sanitize (matching the doc comments' own ordering) purely so
     // a run that somehow violates both reports the --jit conflict
     // first -- there's no other significance to the order.
-    check_ram_addressable(
-        opts.layout.highest_end().min(u64::from(u32::MAX)) as u32,
-        opts.cpu_type,
-    )
-    .or_else(|e| {
-        if opts.layout.highest_end() <= addressable_bytes(opts.cpu_type) {
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })?;
     if opts.cpu_fpu_substituted {
         eprintln!(
             "volamos: --cpu 68040 --no-fpu: the full 68040 always has its on-die FPU on real \
@@ -3614,6 +3614,14 @@ mod tests {
                 ("z3", 0x1000_0000, 32 * MIB)
             ]
         );
+    }
+
+    #[test]
+    fn a_bad_region_size_names_the_flag_the_user_typed() {
+        for flag in ["--chip", "--fast", "--slow", "--accel", "--z3"] {
+            let err = parse_args(args(&[flag, "12Q", "prog"])).unwrap_err();
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
     }
 
     #[test]

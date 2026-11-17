@@ -662,8 +662,10 @@ fn alloc_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             // AllocMem(0) is NULL in this module -- see the handler doc.
             Err(())
         } else {
+            // Each entry's me_Reqs picks its memory kind, as AllocMem's
+            // requirements do (issue #332).
             ctx.heap
-                .alloc_with_requested(&mut *ctx.mem, rounded, length)
+                .alloc_for(&mut *ctx.mem, rounded, length, placement(reqs))
                 .map_err(|_| ())
         };
         let Ok(addr) = result else {
@@ -2529,6 +2531,28 @@ mod tests {
             ALLOCENTRY_FAILURE_BIT | MEMF_PUBLIC,
             "D0 must be the failed entry's requirements with bit 31 set"
         );
+    }
+
+    /// Issue #332: an entry's `me_Reqs` picks its memory kind like
+    /// `AllocMem`'s requirements. The 128 KiB test machine is all chip
+    /// RAM, so a `MEMF_FAST` entry has no memory to come from and the
+    /// whole call fails with that entry's requirements (it used to
+    /// succeed, ignoring the flag).
+    #[test]
+    fn alloc_entry_honours_each_entrys_memory_kind() {
+        let entries = [(0u32, 16u32), (MEMF_FAST, 16)];
+        let mut words = movea_exec_base_to_a6().to_vec();
+        let a0_idx = words.len();
+        words.push(move_imm_to_a(0));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-222)); // AllocEntry(a6)
+        words.push(RTS);
+
+        let (mut rt, _) = alloc_entry_program(words, a0_idx, &entries);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code as u32, ALLOCENTRY_FAILURE_BIT | MEMF_FAST);
     }
 
     #[test]
