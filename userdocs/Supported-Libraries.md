@@ -50,7 +50,10 @@ Changelog.
   `UnLockRecords` (always-succeeds stubs — this runtime models no real
   concurrency).
 - Pattern matching: `MatchFirst`/`MatchNext`/`MatchEnd`/`ParsePattern`/
-  `MatchPattern`(`NoCase`).
+  `MatchPattern`(`NoCase`). Matching is bounded (a work and nesting
+  limit per match): a pathological pattern or a huge input with a
+  nested repeat reports "no match" instead of hanging or crashing the
+  host.
 - Argument parsing: `ReadArgs`/`FreeArgs`/`FindArg` (the standard
   `ReadArgs` template syntax every real `C:` command uses, including
   keywords with any number of `=`-separated names and a host
@@ -208,7 +211,7 @@ Changelog.
   same block-and-retry dance and still fail loudly on contention.
 - I/O requests: `OpenDevice`/`CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/
   `CheckIO`/`AbortIO`, `CreateIORequest`/`DeleteIORequest`.
-- `Alert`, `RawDoFmt`.
+- `Alert`, `RawDoFmt` (a field width or precision is capped at 4096).
 - `SetFunction` — patches a single library jump-table entry with a real
   `JMP` to guest code and returns a function pointer standing in for
   whatever was there before (a synthesized stub for a host-handled
