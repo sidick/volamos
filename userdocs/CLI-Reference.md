@@ -38,7 +38,10 @@ Every flag below can also be given a default value in `~/.volamos`/
 volamos propagates the **guest program's own exit code** on a normal
 run — whatever it returned in `D0` at `rts`, same as running it on a
 real Amiga would produce as its process return code — `1` from a
-guest reaches your shell as `1`.
+guest reaches your shell as `1`. A process status is one byte, so a
+return code above 255 (or negative) is reduced to its low byte, except
+that a non-zero code whose low byte is zero (256, 512, …) becomes `255`
+rather than reading as success.
 
 volamos produces its own exit code only when the guest never ran to
 its own `rts`:

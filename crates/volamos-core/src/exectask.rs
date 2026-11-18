@@ -641,7 +641,71 @@ const fn signal_exit_code(signum: i32) -> i32 {
 #[cfg(unix)]
 extern "C" fn handle_host_break(_signum: i32) {
     if PENDING_HOST_BREAK.swap(true, Ordering::SeqCst) {
-        unsafe { _exit(signal_exit_code(SIGINT)) };
+        force_exit(SIGINT);
+    }
+}
+
+/// Write end of the pipe a forced exit goes through (see [`force_exit`]),
+/// or `-1` before [`install_host_break_handler`] has made it.
+#[cfg(unix)]
+static FORCE_EXIT_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Host directories to delete before a forced exit (the ephemeral `RAM:`/
+/// `T:` backing directories): see [`register_exit_cleanup_dirs`].
+static EXIT_CLEANUP_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Registers directories to remove if the process is forced to exit by a
+/// host signal (a second Ctrl-C, or `SIGTERM`). A normal exit deletes
+/// them itself, but the old forced path called `_exit` straight from the
+/// signal handler and left `$TMPDIR/volamos-ram-*` behind -- which, with
+/// `SA_RESTART` making a guest blocked in `recv`/`accept` ignore the
+/// first Ctrl-C, was the usual way out (issue #363).
+pub fn register_exit_cleanup_dirs(dirs: Vec<std::path::PathBuf>) {
+    *EXIT_CLEANUP_DIRS.lock().unwrap_or_else(|e| e.into_inner()) = dirs;
+}
+
+/// Terminates the process because of `signum`. Called from a signal
+/// handler, where only async-signal-safe calls are allowed -- deleting
+/// directories is not -- so when the cleanup thread exists this just
+/// writes the signal number to its pipe (`write(2)` is signal-safe) and
+/// returns; the thread removes the registered directories and `_exit`s.
+/// Without the thread (handlers never installed) it `_exit`s directly.
+#[cfg(unix)]
+fn force_exit(signum: i32) {
+    let fd = FORCE_EXIT_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = signum as u8;
+        let _ = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+        return;
+    }
+    unsafe { _exit(signal_exit_code(signum)) };
+}
+
+/// Starts the thread [`force_exit`] hands over to. Best effort: if the
+/// pipe or thread can't be made, [`force_exit`] keeps its direct `_exit`.
+#[cfg(unix)]
+fn start_force_exit_thread() {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let spawned = std::thread::Builder::new()
+        .name("volamos-force-exit".to_string())
+        .spawn(move || {
+            let mut byte = 0u8;
+            let n = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
+            let signum = if n == 1 { i32::from(byte) } else { SIGTERM };
+            let dirs =
+                std::mem::take(&mut *EXIT_CLEANUP_DIRS.lock().unwrap_or_else(|e| e.into_inner()));
+            for dir in dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            unsafe { _exit(signal_exit_code(signum)) };
+        });
+    if spawned.is_ok() {
+        FORCE_EXIT_FD.store(write_fd, Ordering::SeqCst);
     }
 }
 
@@ -651,7 +715,7 @@ extern "C" fn handle_host_break(_signum: i32) {
 /// docs' "Polling granularity, and forced termination" section.
 #[cfg(unix)]
 extern "C" fn handle_host_term(_signum: i32) {
-    unsafe { _exit(signal_exit_code(SIGTERM)) };
+    force_exit(SIGTERM);
 }
 
 /// Installs the host `SIGINT`/`SIGTERM` handlers (see the module docs'
@@ -664,6 +728,8 @@ extern "C" fn handle_host_term(_signum: i32) {
 /// own). Callers that actually want host-break delivery (i.e.
 /// `crates/volamos/src/main.rs`) call this explicitly, once, at startup.
 pub fn install_host_break_handler() {
+    #[cfg(unix)]
+    start_force_exit_thread();
     #[cfg(unix)]
     unsafe {
         signal(SIGINT, handle_host_break);

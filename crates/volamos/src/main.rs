@@ -1112,6 +1112,36 @@ fn value_flag_spellings() -> &'static [String] {
     })
 }
 
+/// For a grouped short-flag token (`-vV`, `-sa`, `-vVFOO:/tmp`): clap
+/// reads the cluster left to right, and the first flag that takes a
+/// value ends it -- the rest of the token is that value (`-VFOO:/tmp`),
+/// or, if it is the token's last character, the *next* token is
+/// (`-vV FOO:/tmp`). `Some(true)` means the next token is a value,
+/// `Some(false)` that the cluster is complete, `None` that `arg` isn't a
+/// short cluster at all (a plain `-V`, a long flag, a program name).
+/// Without this, `-vV FOO:/tmp prog` took `FOO:/tmp` for `<program>`
+/// and clap then reported the real `<program>` missing (issue #363).
+fn short_cluster_takes_next_token(arg: &str) -> Option<bool> {
+    let rest = arg.strip_prefix('-')?;
+    if rest.starts_with('-') || rest.chars().count() < 2 {
+        return None;
+    }
+    let value_shorts: Vec<char> = value_flag_spellings()
+        .iter()
+        .filter_map(|s| {
+            let s = s.strip_prefix('-')?;
+            (!s.starts_with('-') && s.chars().count() == 1).then(|| s.chars().next())?
+        })
+        .collect();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if value_shorts.contains(&c) {
+            return Some(chars.peek().is_none());
+        }
+    }
+    Some(false)
+}
+
 /// Splits `args` at the `<program>` boundary (requirement -- see the
 /// crate's module doc): the first token that isn't a recognized flag (or
 /// a value already consumed by one) ends option parsing; everything after
@@ -1166,6 +1196,13 @@ fn split_program_boundary(args: impl Iterator<Item = String>) -> (Vec<String>, V
             }
             continue;
         }
+        if let Some(takes_next) = short_cluster_takes_next_token(&arg) {
+            before.push(arg);
+            if takes_next && let Some(value) = iter.next() {
+                before.push(value);
+            }
+            continue;
+        }
         if arg.starts_with('-') {
             before.push(arg);
             continue;
@@ -1177,6 +1214,17 @@ fn split_program_boundary(args: impl Iterator<Item = String>) -> (Vec<String>, V
         return (before, iter.collect());
     }
     (before, Vec::new())
+}
+
+/// The host exit status for a guest return code. D0 is a full 32-bit
+/// register but a process status is one byte: the low byte, like a real
+/// shell -- except that a non-zero code whose low byte is zero (256, 512)
+/// must not read as success, so it becomes 255 (issue #363).
+fn host_exit_code(code: i32) -> i32 {
+    match code & 0xFF {
+        0 if code != 0 => 255,
+        low => low,
+    }
 }
 
 /// Thin wrapper so [`parse_cpu_type`] fits clap's `fn(&str) -> Result<T, E>`
@@ -2365,10 +2413,11 @@ fn check_ram_fits(load_end: u32, stack_size: u32, ram_size: u32) -> Result<(), S
     match required {
         Some(required) if required <= ram_size => Ok(()),
         _ => Err(format!(
-            "--stack {stack_size} is too large for --ram {ram_size}: the loaded program ends \
-             at {load_end:#x}, and there must be room for the stack plus at least \
-             {MIN_HEAP_HEADROOM} bytes of guest heap after that -- increase --ram or decrease \
-             --stack"
+            "--stack {stack_size} doesn't fit in the contiguous guest RAM at address 0 \
+             ({ram_size} bytes; its size comes from --ram, or --chip/--fast, or the default): \
+             the loaded program ends at {load_end:#x}, and there must be room for the stack \
+             plus at least {MIN_HEAP_HEADROOM} bytes of guest heap after that -- increase \
+             --ram or decrease --stack"
         )),
     }
 }
@@ -2696,6 +2745,11 @@ fn run(opts: &Options) -> Result<i32, String> {
     // runs simply report addresses without source locations.
     let mut loaded: Option<loader::LoadResult> = None;
     let mut runtime = if hunk_file.overlay.is_some() {
+        // The overlay path loads through the guest heap, not
+        // `loader::load`, so its stack was never checked against RAM at
+        // all: an oversized `--stack` panicked deep in heap setup instead
+        // of failing cleanly (issue #363).
+        check_ram_fits(TRAP_TABLE_END, opts.stack_size, opts.ram_size)?;
         let mut mem = new_guest_memory(&opts.layout, opts.cpu_type);
         // Right after construction, before anything is loaded into it
         // -- harmless either way, see FlatMemory::enable_sanitizer's
@@ -3206,6 +3260,7 @@ fn main() -> ExitCode {
     // call terminates the process immediately, skipping every pending
     // destructor on the stack, so relying on a scope guard's `Drop`
     // here wouldn't fire in time.
+    volamos_core::exectask::register_exit_cleanup_dirs(opts.ephemeral_dirs.clone());
     let result = run(&opts);
     for dir in &opts.ephemeral_dirs {
         let _ = std::fs::remove_dir_all(dir);
@@ -3213,11 +3268,7 @@ fn main() -> ExitCode {
 
     match result {
         Ok(code) => {
-            // Guest exit codes are conventionally small (AmigaOS process
-            // return codes fit a byte in practice), but D0 is a full
-            // 32-bit register; clamp to the host process exit code range
-            // the same way a real shell would (low byte).
-            std::process::exit(code);
+            std::process::exit(host_exit_code(code));
         }
         Err(msg) => {
             eprintln!("volamos: {msg}");
@@ -5074,5 +5125,35 @@ mod tests {
             }
             other => panic!("expected a clean UnexpectedStop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn grouped_short_flags_ending_in_a_value_flag_keep_program_363() {
+        let opts = parse_args(args(&["-vV", "FOO:/tmp", "prog", "-x"])).unwrap();
+        assert_eq!(opts.volumes, vec![("FOO".to_string(), "/tmp".into())]);
+        assert_eq!(opts.program, "prog");
+        assert_eq!(opts.guest_args, vec!["-x".to_string()]);
+
+        let opts = parse_args(args(&["-sa", "X:FOO:", "prog"])).unwrap();
+        assert_eq!(opts.program, "prog");
+        assert_eq!(opts.assigns.len(), 1);
+
+        // An attached value consumes nothing more.
+        let opts = parse_args(args(&["-vVBAR:/tmp", "prog"])).unwrap();
+        assert_eq!(opts.volumes, vec![("BAR".to_string(), "/tmp".into())]);
+        assert_eq!(opts.program, "prog");
+    }
+
+    #[test]
+    fn host_exit_code_never_turns_a_failing_guest_into_success_363() {
+        assert_eq!(host_exit_code(0), 0);
+        assert_eq!(host_exit_code(5), 5);
+        assert_eq!(host_exit_code(20), 20);
+        assert_eq!(host_exit_code(255), 255);
+        // 256 and 512 have a zero low byte: `exit(256)` is a host success.
+        assert_eq!(host_exit_code(256), 255);
+        assert_eq!(host_exit_code(512), 255);
+        assert_eq!(host_exit_code(-1), 255);
+        assert_eq!(host_exit_code(0x1_0000 + 7), 7);
     }
 }

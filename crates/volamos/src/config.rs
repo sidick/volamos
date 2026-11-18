@@ -485,7 +485,10 @@ pub(crate) fn built_in_defaults(volumes_dir: Option<PathBuf>) -> Overrides {
                 .assigns
                 .push((name.to_string(), vec![target.to_string()]));
         }
-        overrides.cwd = Some("SYS:".to_string());
+        // No `cwd` here: a default `cwd = "SYS:"` made the "first `-V`
+        // volume's root" rule in `default_cwd` unreachable, so `-V
+        // W:<dir> prog` started in the built-in `SYS:` instead of `W:`
+        // (issue #363). With no `-V` the first volume is `SYS:` anyway.
         overrides.lazy_volumes.push(LazyVolume {
             companions: vec![
                 sys_root.join("C"),
@@ -948,7 +951,10 @@ mod tests {
                 "missing/wrong target for {name}:"
             );
         }
-        assert_eq!(overrides.cwd, Some("SYS:".to_string()));
+        assert_eq!(
+            overrides.cwd, None,
+            "the defaults layer must leave the cwd to default_cwd (issue #363)"
+        );
 
         let sys_lazy = overrides
             .lazy_volumes
@@ -1032,5 +1038,19 @@ mod tests {
         let a = built_in_defaults(None);
         let b = built_in_defaults(None);
         assert_ne!(a.ephemeral_dirs[0], b.ephemeral_dirs[0]);
+    }
+
+    #[test]
+    fn built_in_defaults_do_not_override_the_first_user_volume_as_cwd_363() {
+        // `-V W:<dir> prog` must start in `W:`, which `default_cwd` picks
+        // as the first volume -- but only if the defaults layer leaves
+        // `cwd` unset and the user's volume stays ahead of `SYS:`.
+        let user = Overrides {
+            volumes: vec![("W".to_string(), PathBuf::from("/host/w"))],
+            ..Overrides::default()
+        };
+        let merged = merge(user, built_in_defaults(Some(PathBuf::from("/host/vols"))));
+        assert_eq!(merged.cwd, None);
+        assert_eq!(merged.volumes.first().map(|(n, _)| n.as_str()), Some("W"));
     }
 }
