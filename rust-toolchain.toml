@@ -1,0 +1,7 @@
+# The Rust toolchain CI and local builds use. Pinned rather than
+# `stable` so a new Rust release can't turn `clippy -D warnings` red (or
+# change codegen) on a commit nobody touched: bump it deliberately, in its
+# own PR. `.github/actions/rust-setup` reads `channel` from here.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

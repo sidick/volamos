@@ -27,7 +27,9 @@ neither has a shared expected output to diff against).
 
 A mismatch against an entry in KNOWN_DIVERGENCES prints as tracked
 (`KNOWN`) rather than failing the run -- see each entry's linked GitHub
-issue. This harness's job is to keep *finding* divergences, not to block
+issue -- but only while volamos's own output still equals the pinned
+expected `(stdout, exit code)` recorded with the entry: the divergence
+being tolerated is vamos's, not any change in volamos. This harness's job is to keep *finding* divergences, not to block
 on root-causing every one before it can run in CI; removing an entry
 here (because the underlying bug got fixed and the two sides now agree)
 is the "verified fixed" signal.
@@ -81,15 +83,21 @@ CORPUS = [
     ("runcmdtest", [], needs_test_volume_with_echoargs),
 ]
 
-# fixture name -> (reason, issue URL). See each issue for the open
-# root-cause question -- neither is assumed to be "volamos is right"
-# just because it's this project's own implementation.
+# fixture name -> (reason, issue URL, expected volamos (stdout, exit code)).
+# See each issue for the open root-cause question -- neither is assumed to
+# be "volamos is right" just because it's this project's own
+# implementation. The expected pair pins what *volamos* must print: a known
+# divergence from vamos is only tolerated while volamos still gives the
+# answer that was checked against real Kickstart. Without it any mismatch
+# on these fixtures -- a crash, garbage output, the wrong exit code -- was
+# reported as KNOWN and CI stayed green (issue #364).
 KNOWN_DIVERGENCES = {
     "exectest": (
         "CheckSignal after SetSignal(1<<5,1<<5) doesn't match under vamos -- "
         "confirmed via real Kickstart (Copperline) that volamos matches real "
         "hardware here; this is vamos's own divergence, not a volamos bug",
         "https://github.com/sidick/volamos/issues/6",
+        ("exec ok\n", 0),
     ),
     "echoargs": (
         "vamos doesn't add the real trailing space before the command-line "
@@ -97,11 +105,13 @@ KNOWN_DIVERGENCES = {
         "against real Kickstart 2.0/3.0/3.1 hardware (issue #63); vamos's own "
         "divergence, not a volamos bug",
         "https://github.com/sidick/volamos/issues/64",
+        ("foo bar \n", 0),
     ),
     "systest": (
         "same root cause as 'echoargs' above, via SystemTagList's nested "
         "process launch reusing the same command-line-buffer construction",
         "https://github.com/sidick/volamos/issues/64",
+        ("sys arg \nafter system\n", 42),
     ),
 }
 
@@ -156,8 +166,19 @@ def main() -> int:
         if vol_norm == vam_norm and vol_code == vam_code:
             results.append((fixture, "PASS", ""))
         elif fixture in KNOWN_DIVERGENCES:
-            reason, issue = KNOWN_DIVERGENCES[fixture]
-            results.append((fixture, "KNOWN", f"{reason} ({issue})"))
+            reason, issue, expected = KNOWN_DIVERGENCES[fixture]
+            if (vol_norm, vol_code) == expected:
+                results.append((fixture, "KNOWN", f"{reason} ({issue})"))
+            else:
+                # The tolerated divergence is vamos's. volamos itself
+                # drifting from its checked output is a real failure.
+                detail = (
+                    f"volamos no longer gives the checked output for this known "
+                    f"divergence ({issue})\n"
+                    f"  expected: stdout={expected[0]!r} exit={expected[1]}\n"
+                    f"  volamos:  stdout={vol_norm!r} exit={vol_code}"
+                )
+                results.append((fixture, "FAIL", detail))
         else:
             detail = (
                 f"volamos: stdout={vol_norm!r} exit={vol_code}\n"

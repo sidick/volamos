@@ -24,16 +24,29 @@ inputs:
 runs:
   using: composite
   steps:
+    # The version lives in rust-toolchain.toml (the single source for CI and
+    # local builds). The action's `stable` ref only picks the action's own
+    # revision; `toolchain` below is what actually gets installed.
+    - name: Read the pinned toolchain
+      id: pin
+      shell: bash
+      run: |
+        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        test -n "$channel" || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
     - name: Install Rust (no extra targets)
       if: inputs.targets == ''
       uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       with:
+        toolchain: ${{ steps.pin.outputs.channel }}
         components: ${{ inputs.components }}
 
     - name: Install Rust (with target)
       if: inputs.targets != ''
       uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       with:
+        toolchain: ${{ steps.pin.outputs.channel }}
         targets: ${{ inputs.targets }}
         components: ${{ inputs.components }}
 
