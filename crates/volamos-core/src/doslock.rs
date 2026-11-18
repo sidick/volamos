@@ -392,7 +392,10 @@ impl DosState {
         let host_path = vfs
             .resolve(name, ResolveMode::MustExist)
             .map_err(|e| map_vfs_error(&e))?;
-        let meta = std::fs::metadata(&host_path).map_err(|e| map_io_error(&e))?;
+        // symlink_metadata: deleting a soft link removes the link itself.
+        // `metadata` followed it, so a link to a directory took the
+        // `remove_dir` path and a dangling link reported NotFound.
+        let meta = std::fs::symlink_metadata(&host_path).map_err(|e| map_io_error(&e))?;
         if meta.is_dir() {
             if std::fs::read_dir(&host_path)
                 .map_err(|e| map_io_error(&e))?
@@ -782,7 +785,17 @@ impl DosState {
     /// else (including the object simply not existing).
     pub fn read_link(&self, lock_addr: u32, rel_path: &str) -> Result<Vec<u8>, i32> {
         let entry = self.locks.get(&lock_addr).ok_or(ERROR_INVALID_LOCK)?;
-        let target_path = entry.host_path.join(rel_path);
+        // `rel_path` is guest text: join it only as plain names under the
+        // lock's directory. `Path::join` with an absolute path discards
+        // the lock entirely, which let a guest read any host symlink's
+        // target (issue #358).
+        let mut target_path = entry.host_path.clone();
+        for comp in rel_path.split('/').filter(|c| !c.is_empty()) {
+            if comp.contains(':') || !crate::vfs::is_safe_component(comp) {
+                return Err(crate::dosfile::ERROR_OBJECT_NOT_FOUND);
+            }
+            target_path.push(comp);
+        }
         let meta = std::fs::symlink_metadata(&target_path).map_err(|e| map_io_error(&e))?;
         if !meta.file_type().is_symlink() {
             return Err(ERROR_OBJECT_WRONG_TYPE);
@@ -2695,6 +2708,65 @@ mod tests {
             .make_link_soft("SYS:link.txt", "SYS:orig.txt")
             .expect_err("soft links are unsupported on this build");
         assert_eq!(err, crate::dosfile::ERROR_ACTION_NOT_KNOWN);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn make_link_soft_cannot_point_above_the_volume_root_358() {
+        let tmp = TempDir::new("makelink-escape");
+        let vol = tmp.path().join("vol");
+        fs::create_dir_all(&vol).unwrap();
+        let mut dos = DosState::new(Some(vfs_over(&vol)));
+
+        assert!(dos.make_link_soft("SYS:esc", "SYS:..").is_err());
+        assert!(dos.make_link_soft("SYS:esc", "SYS:.").is_err());
+        assert!(
+            fs::symlink_metadata(vol.join("esc")).is_err(),
+            "no symlink may have been created"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_link_ignores_absolute_and_parent_relative_paths_358() {
+        let tmp = TempDir::new("readlink-escape");
+        let vol = tmp.path().join("vol");
+        fs::create_dir_all(&vol).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", tmp.path().join("outside")).unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs_over(&vol)));
+        let dir = addr_from_bptr(dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap());
+
+        let abs = tmp.path().join("outside");
+        for bad in [abs.to_str().unwrap(), "../outside", "..", "SYS:x"] {
+            assert_eq!(
+                dos.read_link(dir, bad).unwrap_err(),
+                crate::dosfile::ERROR_OBJECT_NOT_FOUND,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delete_file_removes_a_symlink_itself_358() {
+        let tmp = TempDir::new("delete-symlink");
+        fs::create_dir(tmp.path().join("realdir")).unwrap();
+        fs::write(tmp.path().join("realdir").join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("realdir"), tmp.path().join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), tmp.path().join("dangling"))
+            .unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+
+        dos.delete_file("SYS:dirlink").expect("link to a directory");
+        dos.delete_file("SYS:dangling").expect("dangling link");
+        assert!(fs::symlink_metadata(tmp.path().join("dirlink")).is_err());
+        assert!(fs::symlink_metadata(tmp.path().join("dangling")).is_err());
+        assert!(
+            tmp.path().join("realdir").join("f").exists(),
+            "the link's target must be untouched"
+        );
     }
 
     #[test]

@@ -42,6 +42,23 @@ const DOSFALSE: u32 = 0;
 /// system refuses to modify the file" (write-protected).
 const FIBF_WRITE: u32 = 1 << 2;
 
+/// Sets or clears write protection on `perms`. On Unix, clearing it
+/// restores only the *owner* write bit: `Permissions::set_readonly(false)`
+/// sets all three (`u+w,g+w,o+w`), so a file went from 644 to 666 -- and
+/// every real `C:Copy` ends with `SetProtection(dest, 0)` (issue #358).
+fn apply_write_protect(perms: &mut fs::Permissions, protect: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = perms.mode();
+        perms.set_mode(if protect { mode & !0o222 } else { mode | 0o200 });
+    }
+    #[cfg(not(unix))]
+    {
+        perms.set_readonly(protect);
+    }
+}
+
 /// `SetProtection`'s work on `name` (resolved like the library call's),
 /// shared with the `ACTION_SET_PROTECT` packet ([`crate::dospkt`]).
 pub(crate) fn set_protection(dos: &DosState, name: &str, mask: u32) -> Result<(), i32> {
@@ -55,7 +72,7 @@ pub(crate) fn set_protection(dos: &DosState, name: &str, mask: u32) -> Result<()
     let mut perms = fs::metadata(&host_path)
         .map_err(|e| map_io_error(&e))?
         .permissions();
-    perms.set_readonly(mask & FIBF_WRITE != 0);
+    apply_write_protect(&mut perms, mask & FIBF_WRITE != 0);
     fs::set_permissions(&host_path, perms).map_err(|e| map_io_error(&e))?;
 
     // read_or_host_date, not unwrap_or_default: creating a sidecar
@@ -265,6 +282,33 @@ mod tests {
 
         let meta = fs::metadata(tmp.path().join("f.txt")).unwrap();
         assert!(meta.permissions().readonly());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_protection_clear_write_bit_restores_only_the_owner_write_bit_358() {
+        // `set_readonly(false)` sets u+w,g+w,o+w, turning 644 into 666;
+        // every real `C:Copy` ends with SetProtection(dest, 0).
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("protect-mode-358");
+        let path = tmp.path().join("f.txt");
+        fs::write(&path, b"hi").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let code = run_set_protection(b"SYS:f.txt\0", 0, tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "group/other must not gain write");
+
+        let code = run_set_protection(b"SYS:f.txt\0", FIBF_WRITE, tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444);
+
+        let code = run_set_protection(b"SYS:f.txt\0", 0, tmp.path());
+        assert_eq!(code, DOSTRUE as i32);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "a protect/unprotect round trip is 644 again");
     }
 
     #[test]

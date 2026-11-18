@@ -106,6 +106,11 @@ subdirectories of one fallback root, without needing an explicit
 fallback. Without `--auto-assign` configured, referencing an unknown
 volume/assign name is a clean `IoErr()`, not a crash.
 
+The name must be a single plain directory name: one containing `/`,
+or equal to `.` or `..`, is refused, so a guest can't use
+`--auto-assign` to reach outside `<HOSTDIR>`. For the same reason a
+guest can't create a file, directory or soft link named `.` or `..`.
+
 ## Standard defaults
 
 Without any config at all, these names already resolve (issue #43):
