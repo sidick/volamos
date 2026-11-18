@@ -118,9 +118,10 @@ pub(crate) fn volume_for_task_id(dos: &DosState, task_id: u32) -> Option<String>
 
 /// Core of `LockDosList`: builds a header node plus one `DosList` entry
 /// per configured volume (if `flags & LDF_VOLUMES`), chained via
-/// `dol_Next`, and records every allocated address on `dos.dos_list_active`
-/// for `unlock_dos_list` to free. Returns the header's address (never
-/// fails -- see the module docs' locking model).
+/// `dol_Next`, and pushes every allocated address as one session on
+/// `dos.dos_list_active` for the matching `unlock_dos_list` to free.
+/// Returns the header's address, or `0` (with `ERROR_NO_FREE_STORE`) if
+/// the guest heap is exhausted -- see the module docs' locking model.
 fn lock_dos_list(
     heap: &mut GuestHeap,
     mem: &mut dyn AddressSpace,
@@ -144,6 +145,11 @@ fn lock_dos_list(
             for addr in allocated {
                 let _ = heap.free(addr);
             }
+            // Still a lock level as far as the guest is concerned: its
+            // cleanup path calls `UnLockDosList` regardless, and without an
+            // entry of its own that unlock would pop (and free) an *outer*
+            // session that is still in use.
+            dos.dos_list_active.push(Vec::new());
             dos.set_io_err(crate::dosfile::ERROR_NO_FREE_STORE);
             0
         }
@@ -251,6 +257,11 @@ fn next_dos_entry(mem: &dyn AddressSpace, dlist: u32, flags: u32) -> u32 {
 /// and, if `name` is `Some`, whose `dol_Name` case-insensitively equals
 /// it -- `None` matches any name of a matching type. `0` at the end of
 /// the list.
+///
+/// Measured on real Kickstart 3.1 (r40.68, Copperline): calling it again
+/// with its own result returns that same entry, as the autodoc's "Starts
+/// with the entry dlist" says (the autodoc's `while (dl = FindDosEntry(dl,
+/// ...))` example would not terminate on a match).
 fn find_dos_entry(mem: &dyn AddressSpace, dlist: u32, name: Option<&str>, flags: u32) -> u32 {
     let mut cur = dlist;
     // Bounded, like `next_dos_entry`.
@@ -334,8 +345,8 @@ fn find_dos_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
 }
 
 /// `UnLockDosList` (`D1` = flags, unused -- see the module docs' locking
-/// model). No return value. Frees every heap allocation the active
-/// `LockDosList` session made.
+/// model). No return value. Frees every heap allocation the most recent
+/// still-active `LockDosList` session made (the call nests).
 fn unlock_dos_list_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     unlock_dos_list(ctx.heap, ctx.dos);
     Ok(())
@@ -727,7 +738,11 @@ mod tests {
 
         assert_eq!(lock_dos_list(&mut heap, &mut mem, &mut dos, LDF_VOLUMES), 0);
         assert_eq!(dos.io_err(), crate::dosfile::ERROR_NO_FREE_STORE);
-        assert!(dos.dos_list_active.is_empty());
+        assert_eq!(
+            dos.dos_list_active,
+            vec![Vec::<u32>::new()],
+            "an empty lock level, so the guest's UnLockDosList has its own entry"
+        );
         assert_eq!(heap.total_free(), before, "the partial session was freed");
     }
 

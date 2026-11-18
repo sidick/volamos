@@ -79,8 +79,8 @@ fn free_device_proc(
 /// Core of `GetDeviceProc`: the lock `name` is relative to (see the
 /// comment in the body), locked ([`SHARED_LOCK`]) and wrapped in a
 /// heap-allocated `DevProc`. Returns
-/// `Ok(0)` (not `Err`) for the "no more matches" `prev != 0` case, per
-/// the module docs.
+/// `Err(ERROR_NO_MORE_ENTRIES)` for the "no more matches" `prev != 0`
+/// case, per the module docs.
 fn get_device_proc(
     heap: &mut GuestHeap,
     mem: &mut dyn AddressSpace,
@@ -90,7 +90,11 @@ fn get_device_proc(
 ) -> Result<u32, i32> {
     if prev != 0 {
         free_device_proc(heap, mem, dos, prev);
-        return Ok(0);
+        // The NDK autodoc: passing the previous DevProc back "will either
+        // return a modified devproc structure, or NULL (with
+        // ERROR_NO_MORE_ENTRIES in IoErr())". Multi-assign iteration isn't
+        // supported, so it is always the latter.
+        return Err(crate::doslock::ERROR_NO_MORE_ENTRIES);
     }
 
     // `dvp_Lock` is what the caller's packet names are relative to (RKRM:
@@ -155,14 +159,7 @@ fn get_device_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
 
     match get_device_proc(ctx.heap, ctx.mem, ctx.dos, &name, prev) {
-        Ok(addr) => {
-            // A previous DevProc passed back means "next directory of the
-            // assign": NULL with ERROR_NO_MORE_ENTRIES (NDK autodoc).
-            if prev != 0 {
-                ctx.dos.set_io_err(crate::doslock::ERROR_NO_MORE_ENTRIES);
-            }
-            ctx.cpu.set_data_register(DataRegister(0), addr);
-        }
+        Ok(addr) => ctx.cpu.set_data_register(DataRegister(0), addr),
         Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -323,8 +320,12 @@ mod tests {
         let lock_addr = addr_from_bptr(lock_bptr);
         assert!(dos.locks.contains_key(&lock_addr));
 
-        let second = get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:f.txt", first).unwrap();
-        assert_eq!(second, 0, "no multi-assign iteration -> end of matches");
+        let second = get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:f.txt", first);
+        assert_eq!(
+            second,
+            Err(crate::doslock::ERROR_NO_MORE_ENTRIES),
+            "no multi-assign iteration -> end of matches, with IoErr set"
+        );
         assert!(
             !dos.locks.contains_key(&lock_addr),
             "the previous DevProc's lock should have been released"

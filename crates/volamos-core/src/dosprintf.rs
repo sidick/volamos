@@ -121,8 +121,9 @@ fn writef_width(c: u8) -> usize {
 ///   `A` is 10 and `G` is 16).
 /// - `%I`/`%U` right-align a signed/unsigned decimal in a field of at
 ///   least `<w>` spaces and never truncate (`%I2` of 12345 is `12345`).
-///   `%O`/`%X` print the low `<w>` digits, zero-padded: `%X4` of 255 is
-///   `00FF` (uppercase), `%X2` of 0x1234 is `34`. `%N` is any length.
+///   `%O`/`%X` print the low `<w>` digits (at least one), zero-padded:
+///   `%X4` of 255 is `00FF` (uppercase), `%X2` of 0x1234 is `34`, `%X0`
+///   is `4`. `%N` is any length.
 ///
 /// Directive letters are matched case-insensitively: `%S`/`%T<w>` are
 /// confirmed against the real `Which` binary (which literally embeds
@@ -189,8 +190,11 @@ fn render_writef_format(mem: &dyn AddressSpace, fmt: &[u8], argv_ptr: u32) -> Ve
                     _ => format!("{v}"),
                 };
                 if matches!(kind, b'O' | b'X') {
-                    // Zero-padded, and cut to the low `width` digits.
-                    if width > 0 && digits.len() > width {
+                    // Zero-padded, and cut to the low `width` digits -- at
+                    // least one: `%X0` of 0x1234 prints `4` on real
+                    // Kickstart 3.1, the same as `%X1`.
+                    let width = width.max(1);
+                    if digits.len() > width {
                         digits = digits[digits.len() - width..].to_string();
                     }
                     if digits.len() < width {
@@ -419,6 +423,13 @@ mod tests {
             "X keeps the low digits"
         );
         assert_eq!(writef("%O2", &[0x1234]), "64");
+        assert_eq!(
+            writef("%X0|%N", &[0x1234, 43]),
+            "4|43",
+            "width 0 keeps one digit"
+        );
+        assert_eq!(writef("%O0|%N", &[0x1234, 43]), "4|43");
+        assert_eq!(writef("%X1", &[0x1234]), "4");
         assert_eq!(writef("%X8", &[0x1234_ABCD]), "1234ABCD");
         assert_eq!(writef("%XG", &[0x1234_ABCD]), "000000001234ABCD", "G = 16");
         assert_eq!(writef("%T2", &[0x2000]), "abcdef", "T is a minimum width");

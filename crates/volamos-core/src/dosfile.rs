@@ -1049,13 +1049,14 @@ impl DosState {
         if let Some(handle) = self.handles.remove(&addr) {
             if let HostHandle::Pipe { channel, end } = handle {
                 self.close_pipe(&channel, end);
+                // A task blocked mid-write on this handle left how far it
+                // got keyed by `(task, addr)`. The address is about to be
+                // freed and can be handed to a *new* pipe handle: the same
+                // task writing to that one would resume the stale count,
+                // skipping its first bytes yet reporting them written
+                // (issue #362). Only a pipe handle can have such an entry.
+                self.pipe_write_progress.retain(|&(_, a), _| a != addr);
             }
-            // A task blocked mid-write on this handle left how far it got
-            // keyed by `(task, addr)`. The address is about to be freed and
-            // can be handed to a *new* pipe handle: the same task writing
-            // to that one would resume the stale count, skipping its first
-            // bytes yet reporting them written (issue #362).
-            self.pipe_write_progress.retain(|&(_, a), _| a != addr);
             if !self.dos_object_filehandles.contains(&addr) {
                 let _ = heap.free(addr);
             }
