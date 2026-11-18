@@ -62,6 +62,18 @@ def needs_test_volume(tmpdir: Path) -> Path:
     return tmpdir / "test"
 
 
+def needs_test_volume_with_dir(tmpdir: Path) -> Path:
+    """`TEST:` containing a populated `dir/`, which `dirtest` locks and
+    lists. Without it `Lock("TEST:dir")` failed on both sides and the
+    fixture only compared two `ERR`s (issue #364)."""
+    test_dir = needs_test_volume(tmpdir)
+    (test_dir / "dir").mkdir()
+    for name in ("alpha.txt", "Beta.txt", "gamma"):
+        (test_dir / "dir" / name).write_text(name)
+    (test_dir / "dir" / "sub").mkdir()
+    return test_dir
+
+
 def needs_test_volume_with_echoargs(tmpdir: Path) -> Path:
     """Sets up a fresh `TEST:` host directory containing a copy of
     `fixtures/echoargs`, for fixtures that `System()`/`RunCommand()`
@@ -78,7 +90,7 @@ def needs_test_volume_with_echoargs(tmpdir: Path) -> Path:
 CORPUS = [
     ("echoargs", ["foo", "bar"], None),
     ("filetest", [], needs_test_volume),
-    ("dirtest", [], needs_test_volume),
+    ("dirtest", [], needs_test_volume_with_dir),
     ("exectest", [], None),
     ("systest", [], needs_test_volume_with_echoargs),
     ("runcmdtest", [], needs_test_volume_with_echoargs),
