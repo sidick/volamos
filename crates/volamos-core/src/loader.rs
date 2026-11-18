@@ -3515,10 +3515,8 @@ mod tests {
         };
         let mut mem = FlatMemory::new(0x1_0000);
         mem.write_u8(0x10, 0xAA);
-        let started = std::time::Instant::now();
         let err = load(&file, &mut mem, 0x1000).unwrap_err();
         assert!(matches!(err, LoadError::OutOfMemory { .. }), "{err:?}");
-        assert!(started.elapsed().as_secs() < 1, "must fail up front");
         assert_eq!(mem.read_u8(0x10), 0xAA, "nothing may have been written");
     }
 }

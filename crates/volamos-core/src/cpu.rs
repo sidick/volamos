@@ -131,7 +131,9 @@ pub trait Cpu {
     fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
         loop {
             let pc = self.pc();
-            if !mem.is_mapped(pc, 2) {
+            // One compare on the hot path; the full check only when it fails
+            // (a second RAM segment, a narrower bus wrapping past the end).
+            if pc as usize + 2 > mem.len() && !mem.is_mapped(pc, 2) {
                 return StopReason::PcOutOfBounds { pc };
             }
             match self.step(mem) {

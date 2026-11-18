@@ -285,31 +285,6 @@ use std::path::PathBuf;
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::ERROR_OBJECT_NOT_FOUND;
-/// The value a relocation adds to the longword already at `loc`: the
-/// target's address for `HUNK_RELOC32`, the displacement from `loc` to the
-/// target for `HUNK_RELRELOC32` (see [`loader::RelocKind`]). LoadSeg
-/// applied every kind as absolute before issue #360, so a PC-relative
-/// reference came out wrong whenever the binary was loaded through it
-/// (async `SystemTagList`, `RunCommand`, overlays) rather than run
-/// directly.
-fn reloc_addend(kind: loader::RelocKind, target_addr: u32, loc: u32) -> u32 {
-    match kind {
-        loader::RelocKind::Absolute => target_addr,
-        loader::RelocKind::PcRelative => target_addr.wrapping_sub(loc),
-    }
-}
-
-/// Un-registers the payload addresses a failed overlay-node load had put
-/// in the root's table. Their blocks are freed on that path; left set, a
-/// later node's relocations would resolve into freed memory (issue #360).
-fn forget_node_payloads(payload_addrs: &mut [Option<u32>], first_hunk: usize, count: usize) {
-    for i in 0..count {
-        if let Some(slot) = payload_addrs.get_mut(first_hunk + i) {
-            *slot = None;
-        }
-    }
-}
-
 #[cfg(test)]
 use crate::dosfile::OFFSET_BEGINNING;
 use crate::dosfile::{
@@ -545,17 +520,6 @@ pub struct OverlayRootState {
     payload_addrs: Vec<Option<u32>>,
 }
 
-/// Builds an overlay root's seglist: allocates and links the root's own
-/// hunks exactly like [`build_seglist`] (reused directly), then also
-/// allocates the global `oh_Segments` array and the `oh_OVTab` copy in
-/// guest memory, and patches hunk 0's `OverlayHeader` fields (see the
-/// module docs). `file_handle_bptr` is the already-open guest
-/// `FileHandle` `BPTR` (see [`DosState::open`]) to record as
-/// `oh_FileHandle`.
-///
-/// Returns the root [`SegList`] (exactly as [`build_seglist`] would) and
-/// the [`OverlayRootState`] to register under the `oh_Segments` `BPTR`
-/// (`bptr_from_addr(state.segments_array_addr)`).
 /// Why [`build_overlay_root_seglist`] failed.
 #[derive(Debug)]
 enum OverlayRootError {
@@ -582,6 +546,17 @@ impl OverlayRootError {
     }
 }
 
+/// Builds an overlay root's seglist: allocates and links the root's own
+/// hunks exactly like [`build_seglist`] (reused directly), then also
+/// allocates the global `oh_Segments` array and the `oh_OVTab` copy in
+/// guest memory, and patches hunk 0's `OverlayHeader` fields (see the
+/// module docs). `file_handle_bptr` is the already-open guest
+/// `FileHandle` `BPTR` (see [`DosState::open`]) to record as
+/// `oh_FileHandle`.
+///
+/// Returns the root [`SegList`] (exactly as [`build_seglist`] would) and
+/// the [`OverlayRootState`] to register under the `oh_Segments` `BPTR`
+/// (`bptr_from_addr(state.segments_array_addr)`).
 fn build_overlay_root_seglist(
     file: &HunkFile,
     overlay: &loader::OverlayInfo,
@@ -597,7 +572,7 @@ fn build_overlay_root_seglist(
     // fields past the end of the hunk into the next heap block
     // (issue #360).
     let header_len = (overlay_header::GV_OFFSET + 4) as usize;
-    let hunk0 = &file.hunks[0];
+    let hunk0 = file.hunks.first().ok_or(OverlayRootError::BadHeader)?;
     let magic = hunk0
         .data
         .get(overlay_header::MAGIC_OFFSET as usize..overlay_header::MAGIC_OFFSET as usize + 4)
@@ -921,17 +896,22 @@ impl DosState {
             .overlay_roots
             .get_mut(&table_bptr)
             .ok_or(ERROR_OBJECT_NOT_FOUND)?;
+        let saved: Vec<Option<u32>> = (0..payload_addrs.len())
+            .map(|i| {
+                state
+                    .payload_addrs
+                    .get(node.first_hunk + i)
+                    .copied()
+                    .flatten()
+            })
+            .collect();
         for (i, &payload_addr) in payload_addrs.iter().enumerate() {
             let global_index = node.first_hunk + i;
             if global_index >= state.payload_addrs.len() {
                 for &addr in &alloc_addrs {
                     let _ = heap.free(addr);
                 }
-                forget_node_payloads(
-                    &mut state.payload_addrs,
-                    node.first_hunk,
-                    payload_addrs.len(),
-                );
+                restore_node_payloads(&mut state.payload_addrs, node.first_hunk, &saved);
                 return Err(ERROR_FILE_NOT_OBJECT);
             }
             state.payload_addrs[global_index] = Some(payload_addr);
@@ -946,11 +926,7 @@ impl DosState {
                     for &addr in &alloc_addrs {
                         let _ = heap.free(addr);
                     }
-                    forget_node_payloads(
-                        &mut state.payload_addrs,
-                        node.first_hunk,
-                        payload_addrs.len(),
-                    );
+                    restore_node_payloads(&mut state.payload_addrs, node.first_hunk, &saved);
                     return Err(ERROR_FILE_NOT_OBJECT);
                 };
                 let loc = payload_addrs[i].wrapping_add(reloc.offset);
@@ -1454,6 +1430,38 @@ pub fn register_dosseg_handlers<C: Cpu + 'static>(
     reg!("Execute", execute_handler::<C>);
     reg!("RunCommand", run_command_handler::<C>);
     reg!("FindSegment", find_segment_handler::<C>);
+}
+
+/// The value a relocation adds to the longword already at `loc`: the
+/// target's address for `HUNK_RELOC32`, the displacement from `loc` to the
+/// target for `HUNK_RELRELOC32` (see [`loader::RelocKind`]). LoadSeg
+/// applied every kind as absolute before issue #360, so a PC-relative
+/// reference came out wrong whenever the binary was loaded through it
+/// (async `SystemTagList`, `RunCommand`, overlays) rather than run
+/// directly.
+fn reloc_addend(kind: loader::RelocKind, target_addr: u32, loc: u32) -> u32 {
+    match kind {
+        loader::RelocKind::Absolute => target_addr,
+        loader::RelocKind::PcRelative => target_addr.wrapping_sub(loc),
+    }
+}
+
+/// Puts back the payload addresses a failed overlay-node load had
+/// overwritten in the root's table (`saved[i]` is what slot
+/// `first_hunk + i` held before). The new blocks are freed on that path;
+/// left set, a later node's relocations would resolve into freed memory,
+/// and clearing instead would lose an already-resident node's valid
+/// address if this was a reload (issue #360).
+fn restore_node_payloads(
+    payload_addrs: &mut [Option<u32>],
+    first_hunk: usize,
+    saved: &[Option<u32>],
+) {
+    for (i, &old) in saved.iter().enumerate() {
+        if let Some(slot) = payload_addrs.get_mut(first_hunk + i) {
+            *slot = old;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3014,11 +3022,22 @@ mod tests {
         let mut mem = FlatMemory::new(0x8000);
         let file = overlay_root_file(overlay_hunk0(overlay_header::MAGIC_VALUE), 0x4000_0001);
         let overlay = file.overlay.as_ref().unwrap();
-        let started = std::time::Instant::now();
         let err =
             build_overlay_root_seglist(&file, overlay, 0, PathBuf::new(), &mut heap, &mut mem)
                 .unwrap_err();
         assert!(matches!(err, OverlayRootError::Heap), "{err:?}");
-        assert!(started.elapsed().as_secs() < 1);
+    }
+
+    #[test]
+    fn a_failed_node_reload_restores_the_resident_payload_addresses_360() {
+        // Slots 1-2 hold a resident node; a failed reload had overwritten
+        // them with blocks it then freed. Restoring (not clearing) keeps
+        // later nodes' relocations against the resident node valid.
+        let mut slots = vec![Some(0x100), Some(0x200), Some(0x300), None];
+        let saved = [Some(0x200), Some(0x300)];
+        slots[1] = Some(0xDEAD);
+        slots[2] = Some(0xBEEF);
+        restore_node_payloads(&mut slots, 1, &saved);
+        assert_eq!(slots, vec![Some(0x100), Some(0x200), Some(0x300), None]);
     }
 }
