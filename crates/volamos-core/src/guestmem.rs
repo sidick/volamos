@@ -1305,8 +1305,6 @@ fn align_up(value: u32) -> u32 {
     value.checked_add(3).map(|v| v & !3).unwrap_or(!3)
 }
 
-/// Reads a NUL-terminated string starting at `addr` out of guest memory.
-/// The terminator is not included in the returned bytes.
 /// Most nodes any host-side walk of a guest-owned list or chain visits
 /// before giving up. The structures are in guest memory, so a guest bug
 /// (adding a node twice makes `succ` point at itself; a `TAG_MORE` that
@@ -1328,6 +1326,8 @@ pub fn guest_range_mapped(mem: &dyn AddressSpace, addr: u32, len: u64) -> bool {
     }
 }
 
+/// Reads a NUL-terminated string starting at `addr` out of guest memory.
+/// The terminator is not included in the returned bytes.
 pub fn read_c_string(mem: &dyn AddressSpace, addr: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut a = addr;

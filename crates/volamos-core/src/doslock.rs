@@ -1160,11 +1160,11 @@ pub(crate) fn fill_fib(
     // host-mtime non-determinism.
     mem.write_u32(fib_addr.wrapping_add(FIB_DATE_OFFSET), meta.date.0 as u32);
     mem.write_u32(
-        fib_addr.wrapping_add(FIB_DATE_OFFSET) + 4,
+        fib_addr.wrapping_add(FIB_DATE_OFFSET).wrapping_add(4),
         meta.date.1 as u32,
     );
     mem.write_u32(
-        fib_addr.wrapping_add(FIB_DATE_OFFSET) + 8,
+        fib_addr.wrapping_add(FIB_DATE_OFFSET).wrapping_add(8),
         meta.date.2 as u32,
     );
     // fib_Comment: from the sidecar if present, else empty (TEXT

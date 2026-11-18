@@ -606,13 +606,18 @@ fn class_matches(c: u8, negate: bool, ranges: &[(u8, u8)], fold: bool) -> bool {
 /// the process, and ten `#?` then `b` against 30 `a`s took 18 s). Past
 /// either limit the match simply fails: the host stays up and answers in
 /// bounded time, at the price of a possible false "no match" for a
-/// pathological pattern or an enormous input with a nested repeat.
+/// pathological pattern or an enormous input with a nested repeat. A `~`
+/// never turns a spent budget into a match ([`EXHAUSTED`]).
 const MATCH_FUEL: u64 = 4_000_000;
 const MATCH_MAX_DEPTH: u32 = 1000;
 
 thread_local! {
     static FUEL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Set once either limit was hit during the current match. `~` must
+    /// not read the resulting `false` as "the inner pattern didn't
+    /// match" -- that would turn a spent budget into a positive match.
+    static EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Decrements the nesting depth on drop, so every exit from
@@ -623,11 +628,13 @@ impl DepthGuard {
     /// `None` when the work or depth limit is spent.
     fn enter() -> Option<Self> {
         if FUEL.get() == 0 {
+            EXHAUSTED.set(true);
             return None;
         }
         FUEL.set(FUEL.get() - 1);
         let depth = DEPTH.get();
         if depth >= MATCH_MAX_DEPTH {
+            EXHAUSTED.set(true);
             return None;
         }
         DEPTH.set(depth + 1);
@@ -673,7 +680,7 @@ fn match_node(node: &Node, input: &[u8], ii: usize, fold: bool, k: &dyn Fn(usize
             // Simplified whole-remainder scope -- see the module docs'
             // "~ scope" note.
             let inner_matches_rest = match_node(inner, input, ii, fold, &|j| j == input.len());
-            if inner_matches_rest {
+            if inner_matches_rest || EXHAUSTED.get() {
                 false
             } else {
                 k(input.len())
@@ -743,6 +750,7 @@ fn match_seq(
 pub(crate) fn full_match(node: &Node, input: &[u8], fold: bool) -> bool {
     FUEL.set(MATCH_FUEL);
     DEPTH.set(0);
+    EXHAUSTED.set(false);
     match_node(node, input, 0, fold, &|j| j == input.len())
 }
 
@@ -1103,5 +1111,14 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(!m("#?#?#?#?#?#?#?#?#?#?b", &"a".repeat(30), false));
         assert!(started.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn a_spent_match_budget_does_not_turn_a_negation_into_a_match_361() {
+        // The inner pattern does match the whole name, but the exponential
+        // search for it can exhaust the work limit first. `~` must then
+        // answer "no match", not read the failed search as "inner didn't
+        // match" and accept the name the pattern was meant to exclude.
+        assert!(!m("~(#?#?#?#?#?#?#?#?#?#?a)", &"a".repeat(30), false));
     }
 }

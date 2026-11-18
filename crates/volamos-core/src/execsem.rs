@@ -514,9 +514,13 @@ fn obtain_semaphore_list_handler<C: Cpu>(
 ) -> Result<(), DispatchError> {
     let list = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
-    let mut node = ctx.mem.read_u32(list + crate::execlist::LH_HEAD);
+    let mut node = ctx
+        .mem
+        .read_u32(list.wrapping_add(crate::execlist::LH_HEAD));
     for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
-        let succ = ctx.mem.read_u32(node + crate::execlist::LN_SUCC);
+        let succ = ctx
+            .mem
+            .read_u32(node.wrapping_add(crate::execlist::LN_SUCC));
         if succ == 0 {
             return Ok(());
         }
@@ -566,9 +570,13 @@ fn release_semaphore_list_handler<C: Cpu>(
 ) -> Result<(), DispatchError> {
     let list = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
-    let mut node = ctx.mem.read_u32(list + crate::execlist::LH_HEAD);
+    let mut node = ctx
+        .mem
+        .read_u32(list.wrapping_add(crate::execlist::LH_HEAD));
     for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
-        let succ = ctx.mem.read_u32(node + crate::execlist::LN_SUCC);
+        let succ = ctx
+            .mem
+            .read_u32(node.wrapping_add(crate::execlist::LN_SUCC));
         if succ == 0 {
             return Ok(());
         }

@@ -359,16 +359,16 @@ fn insert_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32, pred: u32) {
 /// the same priority) and before the first node with a strictly lower
 /// priority.
 pub(crate) fn enqueue_impl<M: AddressSpace>(mem: &mut M, list: u32, node: u32) {
-    let pri = mem.read_u8(node + LN_PRI) as i8;
+    let pri = mem.read_u8(node.wrapping_add(LN_PRI)) as i8;
     let mut next = mem.read_u32(list + LH_HEAD);
     // Bounded: a cyclic list (a node added twice) would never reach the
     // tail. Past the cap the node is inserted where the walk stopped.
     for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
-        let succ = mem.read_u32(next + LN_SUCC);
+        let succ = mem.read_u32(next.wrapping_add(LN_SUCC));
         if succ == 0 {
             break;
         }
-        let next_pri = mem.read_u8(next + LN_PRI) as i8;
+        let next_pri = mem.read_u8(next.wrapping_add(LN_PRI)) as i8;
         if pri > next_pri {
             break;
         }
@@ -387,11 +387,11 @@ pub(crate) fn find_name_impl<M: AddressSpace>(mem: &M, list: u32, name: &[u8]) -
     let mut node = mem.read_u32(list + LH_HEAD);
     // Bounded like `enqueue_impl`: a cyclic list reads as "not found".
     for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
-        let succ = mem.read_u32(node + LN_SUCC);
+        let succ = mem.read_u32(node.wrapping_add(LN_SUCC));
         if succ == 0 {
             return 0;
         }
-        let name_ptr = mem.read_u32(node + LN_NAME);
+        let name_ptr = mem.read_u32(node.wrapping_add(LN_NAME));
         if name_ptr != 0 && read_c_string(mem, name_ptr) == name {
             return node;
         }
