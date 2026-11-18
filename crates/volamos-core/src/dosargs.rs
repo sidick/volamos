@@ -1142,5 +1142,11 @@ mod tests {
         let (mut heap, mut mem, mut dos) = setup(&["a", "b"]);
         let err = call_read_args_err(&mut heap, &mut mem, &mut dos, "FROM/K,TO", 2);
         assert_eq!(err, ERROR_TOO_MANY_ARGS);
+        // ... the first bare arg goes to TO (FROM is keyword-only), so it
+        // is the *second* that is surplus.
+        let (mut heap, mut mem, mut dos) = setup(&["a"]);
+        let (_, array) = call_read_args(&mut heap, &mut mem, &mut dos, "FROM/K,TO", 2);
+        assert_eq!(slot_str(&mem, array, 0), None);
+        assert_eq!(slot_str(&mem, array, 1), Some(b"a".to_vec()));
     }
 }

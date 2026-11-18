@@ -96,6 +96,16 @@ Kickstart 3.2 alone drops the trailing space — a real, intentional
 AmigaOS version difference rather than a bug. volamos targets 3.1 first
 and follows 3.1 here.
 
+### `AllocVec()` stores its size and returns a 4-mod-8 pointer
+
+Real `AllocVec(n)` is `AllocMem(n + 4)` with `n + 4` stored in the
+longword before the returned pointer, which is therefore always 4 mod 8
+(`AllocVec` of 1, 5, 13 and 40 bytes leaves 5, 9, 17 and 44 at `ptr[-1]`
+on Kickstart 3.1 r40.68, measured under Copperline). volamos reproduces
+this. `vamos` returns an 8-aligned pointer with nothing stored before it,
+so a program that reads `ptr[-1]` to learn the size, or relies on the
+address, sees different values.
+
 ### `APF_DirChanged` during a `MatchFirst`/`MatchNext` scan
 
 `dos/dosasl.h` defines the flag as "`ap_Current->an_Lock` changed since
