@@ -167,9 +167,13 @@ Changelog.
   `Allocate`/`Deallocate` primitive over a real, coalescing
   `MemHeader`/`MemChunk` free list.
 - Lists and nodes: `AddHead`/`AddTail`/`Remove`/`RemHead`/`RemTail`/
-  `Insert`/`Enqueue`/`FindName`, plus minimal single-threaded message
-  ports (`CreateMsgPort`/`DeleteMsgPort`/`PutMsg`/`GetMsg`/`ReplyMsg`/
-  `WaitPort`).
+  `Insert`/`Enqueue`/`FindName`, plus message ports
+  (`CreateMsgPort`/`DeleteMsgPort`/`PutMsg`/`GetMsg`/`ReplyMsg`/
+  `WaitPort`). `CreateMsgPort` reserves a real signal bit; `PutMsg` and
+  `ReplyMsg` signal the port's task with it, and `WaitPort` on an empty
+  port blocks and switches to another task (a deadlock, with nothing
+  else runnable and no pending timer request, fails loudly instead of
+  hanging), so tasks started with `CreateNewProc` can pass messages.
 - Tasks and signals: `FindTask`/`SetSignal`/`SetExcept`/`Wait`/
   `Signal`/`AllocSignal`/`FreeSignal`/`Forbid`/`Permit`/`SetTaskPri`,
   including host `SIGINT`/`SIGTERM` delivered to the guest as
