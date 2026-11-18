@@ -6,7 +6,7 @@
 # statically by default, so no `--target`/cross-linker setup is needed:
 # each platform's build stage just compiles natively for itself, under
 # QEMU emulation when that platform isn't the host's own.
-FROM rust:alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 AS builder
+FROM rust:alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS builder
 
 ARG TARGETPLATFORM
 
