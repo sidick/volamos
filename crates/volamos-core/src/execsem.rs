@@ -374,8 +374,10 @@ fn release_and_hand_over<M: AddressSpace>(
         }
 
         crate::execlist::remove_impl(mem, request);
-        heap.free(request)
-            .expect("a queued SemaphoreRequest is a live heap block");
+        // Ours when ObtainSemaphore queued it. A guest-built request, or
+        // one whose memory was reused while it waited, isn't a live heap
+        // block: ignore that rather than panic the host (issue #359).
+        let _ = heap.free(request);
         mem.write_u32(sem + SS_OWNER, if shared { 0 } else { waiter });
         let nest = mem.read_u16(sem + SS_NEST_COUNT);
         mem.write_u16(sem + SS_NEST_COUNT, nest.wrapping_add(1));

@@ -1213,4 +1213,25 @@ mod tests {
 
         assert_eq!(tasks.take_reschedule_request(), None);
     }
+
+    #[test]
+    fn put_msg_to_a_blocked_waiters_port_wakes_it_359() {
+        // The core of issue #359: a task asleep in Wait/WaitPort on its
+        // port's signal bit must become Ready when another task PutMsgs.
+        let main = 0x1000;
+        let waiter = 0x2000;
+        let port = 0x3000;
+        let mut mem = FlatMemory::new(0x8000);
+        crate::execlist::init_msg_port_fields(&mut mem, port, waiter);
+        mem.write_u8(port + crate::execlist::MP_SIGBIT, 22);
+
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(waiter, zero_snapshot(), 0, 0x1000);
+        tasks.others.get_mut(&waiter).expect("spawned above").state =
+            TaskState::BlockedOnSignal { wait_mask: 1 << 22 };
+
+        crate::execlist::signal_port_task(&mut mem, &mut tasks, port);
+        assert_eq!(tasks.others[&waiter].state, TaskState::Ready);
+        assert_eq!(mem.read_u32(waiter + crate::exectask::TC_SIGRECVD), 1 << 22);
+    }
 }

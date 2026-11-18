@@ -1516,6 +1516,11 @@ fn alloc_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     match found {
         Some(bit) => {
             ctx.mem.write_u32(task + TC_SIGALLOC, alloc | (1 << bit));
+            // The autodoc: "The signal associated with the bit will be
+            // properly initialized (cleared)". A bit received after a
+            // FreeSignal must not satisfy the new owner's first Wait.
+            let recvd = ctx.mem.read_u32(task + TC_SIGRECVD);
+            ctx.mem.write_u32(task + TC_SIGRECVD, recvd & !(1 << bit));
             ctx.cpu.set_data_register(DataRegister(0), bit);
         }
         None => {
@@ -2428,18 +2433,11 @@ fn complete_timer_request<M: AddressSpace>(mem: &mut M, tasks: &mut TaskSchedule
         return;
     }
     crate::execlist::put_msg_impl(mem, reply_port, ioreq, crate::execlist::NT_REPLYMSG);
-
-    let sig_task = mem.read_u32(reply_port + crate::execlist::MP_SIGTASK);
-    if sig_task == 0 {
-        return;
-    }
-    let sig_bit = mem.read_u8(reply_port + crate::execlist::MP_SIGBIT);
-    let bit = 1u32 << sig_bit;
-    let recvd = mem.read_u32(sig_task + TC_SIGRECVD) | bit;
-    mem.write_u32(sig_task + TC_SIGRECVD, recvd);
-    if sig_task != tasks.current() {
-        tasks.wake_if_signal_matches(sig_task, recvd);
-    }
+    // Honours `mp_Flags` and range-checks `mp_SigBit`/`mp_SigTask`: the
+    // old inline version OR'd into whatever `mp_SigTask` held (a
+    // `PA_SOFTINT` port's is an `Interrupt*`) and shifted by an
+    // unchecked guest byte (issue #359).
+    crate::execlist::signal_port_task(mem, tasks, reply_port);
 }
 
 fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
@@ -3575,6 +3573,39 @@ mod tests {
             code, 31,
             "AllocSignal(-1) should hand out the highest free bit first"
         );
+    }
+
+    #[test]
+    fn alloc_signal_clears_a_stale_received_bit_359() {
+        // The autodoc: "The signal associated with the bit will be
+        // properly initialized (cleared)". A bit received after a
+        // FreeSignal must not satisfy the new owner's first Wait.
+        let _guard = lock_host_break();
+        let mut words = Vec::new();
+        words.push(move_imm_to_d(0)); // D0 = 1<<31 ...
+        words.push(0x8000);
+        words.push(0x0000);
+        words.push(move_imm_to_d(1)); // ... D1 = 1<<31
+        words.push(0x8000);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-306)); // SetSignal(1<<31, 1<<31)
+        words.push(move_imm_to_d(0)); // D0 = -1 (any bit: the highest, 31)
+        words.push(0xFFFF);
+        words.push(0xFFFF);
+        words.extend_from_slice(&jsr_disp16_a6(-330)); // AllocSignal(-1)
+        words.push(move_imm_to_d(0));
+        words.push(0);
+        words.push(0);
+        words.push(move_imm_to_d(1));
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-306)); // SetSignal(0, 0) -> current set
+        words.push(RTS);
+
+        let mut rt = exec_program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code, 0, "the stale bit 31 must be gone after AllocSignal");
     }
 
     /// Regression test for a real bug: a `BYTE` parameter like

@@ -69,50 +69,35 @@
 //! ```
 //!
 //! [`create_msg_port_handler`] allocates a 34-byte `MsgPort` off the guest
-//! heap and initializes it close to real `CreateMsgPort`, with one
-//! deliberate simplification: real `CreateMsgPort` calls `AllocSignal` to
-//! grab a real signal bit and stores the *current task*'s pointer in
-//! `mp_SigTask`, so `Wait()`/`Signal()` can actually wake the owning task
-//! up. This runtime doesn't call `AllocSignal` on the guest's behalf here
-//! (no signal bit is actually reserved for the port), and is
-//! single-threaded regardless (there's only ever the one fake current
-//! task -- see `crate::exectask`'s module docs, added in Phase 3 stage
-//! 5), so:
-//!
-//! - `mp_Flags` = [`PA_SIGNAL`] (`0`), matching real `CreateMsgPort`'s
-//!   default.
-//! - `mp_SigBit` = [`MSGPORT_SIGBIT_PLACEHOLDER`] (`0`), a fixed
-//!   placeholder rather than an actually-allocated signal bit -- nothing
-//!   in this runtime ever tests it, since [`GetMsg`] never blocks (see
-//!   below) and there's no `Wait`/`Signal` implementation to consult it.
-//! - `mp_SigTask` = [`HandlerContext::current_task`], the fake current
-//!   task's guest address (Phase 3 stage 5 added `FindTask`/`Wait`/
-//!   `Signal` -- see `crate::exectask`'s module docs). This is now the
-//!   real value a guest program would see from real `CreateMsgPort`;
-//!   it's still not meaningfully *actionable* here, since nothing in
-//!   this runtime ever calls `Wait`/`Signal` on a guest's behalf itself
-//!   -- a guest that reads `mp_SigTask` back just sees a consistent,
-//!   correct pointer.
+//! heap and initializes it like real `CreateMsgPort`: `mp_Flags` =
+//! [`PA_SIGNAL`] (`0`), `mp_SigTask` = [`HandlerContext::current_task`],
+//! and `mp_SigBit` = a real `AllocSignal(-1)` bit (the highest free one;
+//! `NULL` is returned if none is left, and `DeleteMsgPort` frees it).
+//! Ports initialised by [`init_msg_port_fields`] alone -- the embedded
+//! `pr_MsgPort` and Intuition's window ports -- carry
+//! [`MSGPORT_SIGBIT_PLACEHOLDER`] (`0`) instead, a bit that is never a
+//! genuine port bit (bits 0-15 are pre-allocated system bits), meaning
+//! "no real signal": nothing ever signals or waits on those.
 //!
 //! [`GetMsg`] (LVO -372) never blocks: it's a plain `RemHead` of
-//! `mp_MsgList`, returning `NULL` on an empty port instead of suspending
-//! the (nonexistent) calling task -- exactly matching real `GetMsg`'s own
-//! contract ("does NOT wait ... returns NULL if the port was empty"; the
-//! *blocking* wait is a separate call, [`WaitPort`]). [`WaitPort`] peeks
-//! the first message *without* dequeuing it (real `WaitPort`'s
-//! documented difference from `GetMsg`) when `mp_MsgList` is already
-//! non-empty; if it's empty, this single-tasking runtime has no other
-//! task that could ever `PutMsg` to unblock it, so -- same convention
-//! `crate::exectask`'s `Wait` already establishes for exec signals --
-//! it fails loudly instead of hanging the host process forever.
-//! [`PutMsg`] never signals anything (no task to signal). [`ReplyMsg`]
-//! follows the real contract precisely: if the message's `mn_ReplyPort`
-//! is non-`NULL`, it's queued there (as [`PutMsg`] would) with
-//! `ln_Type` set to [`NT_REPLYMSG`]; if `NULL`, real `ReplyMsg` still
-//! marks the message replied via `ln_Type` but has nowhere to deliver it
-//! (see the Autodoc's own "if message has no reply port... [it is] not
-//! sent anywhere" language) -- reproduced here identically, no delivery,
-//! type set only.
+//! `mp_MsgList`, returning `NULL` on an empty port -- real `GetMsg`'s own
+//! contract; the *blocking* wait is [`WaitPort`]. [`PutMsg`] and
+//! [`ReplyMsg`] queue the message and then [`signal_port_task`] the
+//! port's owner with `1 << mp_SigBit`, as real exec does, so a task
+//! asleep in `Wait` on the port's bit is woken by another task's message
+//! (issue #359; before `CreateNewProc` there was nobody to wake). A port
+//! made by [`create_msg_port_handler`] now owns a real `AllocSignal`'d
+//! bit (freed by `DeleteMsgPort`); the embedded `pr_MsgPort` and
+//! Intuition's window ports still carry the placeholder and are never
+//! signalled. [`WaitPort`] peeks the first message *without* dequeuing
+//! it; on an empty port it blocks the calling task on the port's bit
+//! like `Wait` does (running a pending timer request if nothing else is
+//! runnable), and fails loudly only on a true deadlock or a port with no
+//! real bit. [`ReplyMsg`] queues onto `mn_ReplyPort` with `ln_Type` =
+//! [`NT_REPLYMSG`], or, if that is `NULL`, only marks the message
+//! replied. Packet replies served host-side by
+//! [`crate::dospkt::handle_fs_packet`] don't signal: they're delivered
+//! synchronously, so nothing is ever waiting for them.
 //!
 //! # `AddPort`/`RemPort`/`FindPort`: no public port registry
 //!
@@ -215,11 +200,66 @@ pub const NT_REPLYMSG: u8 = 7;
 /// module docs).
 pub const PA_SIGNAL: u8 = 0;
 
+/// Mask of the `PF_ACTION` field in `mp_Flags` (`<exec/ports.h>`): the
+/// low two bits select [`PA_SIGNAL`] (0), `PA_SOFTINT` (1) or
+/// `PA_IGNORE` (2).
+pub const PF_ACTION: u8 = 3;
+
 /// Fixed placeholder written to `mp_SigBit` by [`create_msg_port_handler`]
 /// -- see the module docs' "Message ports: single-threaded
 /// simplifications" section for why this isn't a real allocated signal
 /// bit.
 pub const MSGPORT_SIGBIT_PLACEHOLDER: u8 = 0;
+
+/// What real `PutMsg` does after queueing: if the port's action is
+/// [`PA_SIGNAL`] and `mp_SigTask` is set, it `Signal`s that task with
+/// `1 << mp_SigBit`, which is what wakes a task blocked in `Wait` (or
+/// in [`WaitPort`]) on the port. `PA_SOFTINT` ports (where `mp_SigTask`
+/// is a `struct Interrupt*`, not a task) and `PA_IGNORE` ports are left
+/// alone.
+///
+/// Skips a port whose `mp_SigBit` is [`MSGPORT_SIGBIT_PLACEHOLDER`] --
+/// the embedded `pr_MsgPort` and Intuition's window ports carry no
+/// real allocated bit (bits 0-15 are pre-allocated system bits that
+/// `AllocSignal` never hands out, so bit 0 can never be a genuine port
+/// bit) -- and a task this runtime doesn't know about, so a stale or
+/// garbage `mp_SigTask` can't make the host write through it.
+///
+/// Before issue #359 `PutMsg`/`ReplyMsg` only queued, so a task
+/// waiting on a port's bit was never woken by another task's message.
+pub(crate) fn signal_port_task<M: AddressSpace + ?Sized>(
+    mem: &mut M,
+    tasks: &mut crate::taskswitch::TaskScheduler,
+    port: u32,
+) {
+    if mem.read_u8(port + MP_FLAGS) & PF_ACTION != PA_SIGNAL {
+        return;
+    }
+    let task = mem.read_u32(port + MP_SIGTASK);
+    let bit = mem.read_u8(port + MP_SIGBIT);
+    if task == 0 || bit == MSGPORT_SIGBIT_PLACEHOLDER || bit >= 32 {
+        return;
+    }
+    let current = tasks.current();
+    if task != current && !tasks.is_known(task) {
+        return;
+    }
+    let recvd = mem.read_u32(task + crate::exectask::TC_SIGRECVD) | (1u32 << bit);
+    mem.write_u32(task + crate::exectask::TC_SIGRECVD, recvd);
+    if task != current {
+        tasks.wake_if_signal_matches(task, recvd);
+    }
+}
+
+/// Reserves a real signal bit on `task` for a new port, exactly like
+/// real `CreateMsgPort`'s `AllocSignal(-1)` (same search order as
+/// `AllocSignal`: the highest free bit). `None` when every bit is taken.
+fn alloc_port_signal<M: AddressSpace + ?Sized>(mem: &mut M, task: u32) -> Option<u8> {
+    let alloc = mem.read_u32(task + crate::exectask::TC_SIGALLOC);
+    let bit = (0..32u8).rev().find(|&b| alloc & (1 << b) == 0)?;
+    mem.write_u32(task + crate::exectask::TC_SIGALLOC, alloc | (1 << bit));
+    Some(bit)
+}
 
 /// Initializes a `struct List`/`struct MinList` header at `list` as an
 /// empty list, exactly matching the real `NewList()` macro's sentinel
@@ -441,6 +481,7 @@ fn put_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
         return crate::dospkt::handle_fs_packet(ctx, message);
     }
     put_msg_impl(ctx.mem, port, message, NT_MESSAGE);
+    signal_port_task(ctx.mem, ctx.tasks, port);
     Ok(())
 }
 
@@ -462,21 +503,61 @@ fn get_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
 fn wait_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let port = ctx.cpu.address_register(AddressRegister(0));
     let list = port + MP_MSGLIST;
-    let node = ctx.mem.read_u32(list + LH_HEAD);
-    if ctx.mem.read_u32(node + LN_SUCC) != 0 {
-        ctx.cpu.set_data_register(DataRegister(0), node);
-        return Ok(());
-    }
+    ctx.timers.fire_due(ctx.mem, ctx.tasks);
 
-    Err(DispatchError::HandlerFailed {
-        library: "exec.library".to_string(),
-        lvo: -384,
-        handler_name: "WaitPort".to_string(),
-        message: format!(
-            "WaitPort({port:#010x}) would block forever: this is a single-tasking \
-             runtime with no other task that could ever PutMsg to this port"
-        ),
-    })
+    loop {
+        let node = ctx.mem.read_u32(list + LH_HEAD);
+        if ctx.mem.read_u32(node + LN_SUCC) != 0 {
+            ctx.cpu.set_data_register(DataRegister(0), node);
+            return Ok(());
+        }
+
+        let bit = ctx.mem.read_u8(port + MP_SIGBIT);
+        let fail = |message: String| DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -384,
+            handler_name: "WaitPort".to_string(),
+            message,
+        };
+        if bit == MSGPORT_SIGBIT_PLACEHOLDER || bit >= 32 {
+            // Nothing could ever signal this port, so blocking on it
+            // would be a permanent hang.
+            return Err(fail(format!(
+                "WaitPort({port:#010x}) on an empty port with no allocated signal bit \
+                 (mp_SigBit = {bit}): nothing could ever wake it"
+            )));
+        }
+
+        // Real WaitPort is `while (empty) Wait(1 << mp_SigBit)`, and
+        // `Wait` consumes the bit it returns on: a leftover bit from a
+        // message that's already been taken must not satisfy this wait.
+        let task = ctx.current_task;
+        let mask = 1u32 << bit;
+        let recvd = ctx.mem.read_u32(task + crate::exectask::TC_SIGRECVD);
+        ctx.mem
+            .write_u32(task + crate::exectask::TC_SIGRECVD, recvd & !mask);
+        ctx.mem.write_u32(task + crate::exectask::TC_SIGWAIT, mask);
+
+        // Block like `Wait` does: the wake re-traps into this call, which
+        // re-checks the list from the top.
+        if ctx
+            .tasks
+            .block_current_on_signal(ctx.cpu, ctx.mem, ctx.trap_pc, mask)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // No other task is runnable: a pending timer request may be the
+        // only thing left that can deliver a message (the timer.device
+        // reply-port idiom); otherwise this is a real deadlock.
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            ctx.mem.write_u32(task + crate::exectask::TC_SIGWAIT, 0);
+            return Err(fail(format!(
+                "WaitPort({port:#010x}) would deadlock: the port is empty, no other task \
+                 is runnable and no timer request is pending"
+            )));
+        }
+    }
 }
 
 fn reply_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -484,6 +565,7 @@ fn reply_msg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     let reply_port = ctx.mem.read_u32(message + MN_REPLYPORT);
     if reply_port != 0 {
         put_msg_impl(ctx.mem, reply_port, message, NT_REPLYMSG);
+        signal_port_task(ctx.mem, ctx.tasks, reply_port);
     } else {
         // No reply port: real ReplyMsg still marks the message as
         // replied but has nowhere to deliver it -- see the module docs.
@@ -508,6 +590,14 @@ fn create_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         }
     };
     init_msg_port_fields(ctx.mem, port, ctx.current_task);
+    // Real CreateMsgPort AllocSignal(-1)s a bit for the port (NULL when
+    // none is left) and a `Wait(1 << mp_SigBit)` depends on it.
+    let Some(bit) = alloc_port_signal(ctx.mem, ctx.current_task) else {
+        ctx.heap.free(port).expect("just-allocated MsgPort is live");
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    };
+    ctx.mem.write_u8(port + MP_SIGBIT, bit);
     // After the field initialisation, never before: those writes heal
     // shadow bytes, so poisoning first would flag this handler's own
     // setup. `false` because the block is initialised by the time we
@@ -546,6 +636,18 @@ fn delete_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     let port = ctx.cpu.address_register(AddressRegister(0));
     if port == 0 {
         return Ok(());
+    }
+    // FreeSignal the bit CreateMsgPort reserved (see there).
+    let sig_task = ctx.mem.read_u32(port + MP_SIGTASK);
+    let bit = ctx.mem.read_u8(port + MP_SIGBIT);
+    if sig_task != 0
+        && bit != MSGPORT_SIGBIT_PLACEHOLDER
+        && bit < 32
+        && (sig_task == ctx.current_task || ctx.tasks.is_known(sig_task))
+    {
+        let alloc = ctx.mem.read_u32(sig_task + crate::exectask::TC_SIGALLOC);
+        ctx.mem
+            .write_u32(sig_task + crate::exectask::TC_SIGALLOC, alloc & !(1 << bit));
     }
     crate::execmem::poison_freed_block(ctx, port);
     ctx.heap
@@ -1337,5 +1439,101 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0);
+    }
+
+    // --- PutMsg/ReplyMsg signalling and WaitPort blocking (issue #359) ---
+
+    const MAIN: u32 = 0x1000;
+    const OTHER: u32 = 0x2000;
+    const PORT: u32 = 0x3000;
+
+    fn port_mem(task: u32, bit: u8, flags: u8) -> FlatMemory {
+        let mut mem = FlatMemory::new(0x8000);
+        init_msg_port_fields(&mut mem, PORT, task);
+        mem.write_u8(PORT + MP_SIGBIT, bit);
+        mem.write_u8(PORT + MP_FLAGS, flags);
+        mem
+    }
+
+    fn recvd(mem: &FlatMemory, task: u32) -> u32 {
+        mem.read_u32(task + crate::exectask::TC_SIGRECVD)
+    }
+
+    #[test]
+    fn put_msg_signals_the_ports_task_with_its_sigbit_359() {
+        let mut mem = port_mem(MAIN, 20, PA_SIGNAL);
+        let mut tasks = crate::taskswitch::TaskScheduler::new(MAIN);
+        signal_port_task(&mut mem, &mut tasks, PORT);
+        assert_eq!(recvd(&mem, MAIN), 1 << 20);
+    }
+
+    #[test]
+    fn put_msg_to_a_port_owned_by_another_task_sets_that_tasks_bit_359() {
+        let mut mem = port_mem(OTHER, 17, PA_SIGNAL);
+        let mut tasks = crate::taskswitch::TaskScheduler::new(MAIN);
+        tasks.spawn_ready(
+            OTHER,
+            crate::cpu::RegisterSnapshot {
+                d: [0; 8],
+                a: [0; 8],
+                pc: 0,
+                sr: 0,
+            },
+            0,
+            0x1000,
+        );
+        signal_port_task(&mut mem, &mut tasks, PORT);
+        assert_eq!(recvd(&mem, OTHER), 1 << 17);
+        assert_eq!(recvd(&mem, MAIN), 0, "the sender's own bits are untouched");
+    }
+
+    #[test]
+    fn put_msg_does_not_signal_ignore_softint_placeholder_or_unknown_task_ports_359() {
+        for (task, bit, flags) in [
+            (MAIN, 20, 2),                         // PA_IGNORE
+            (MAIN, 20, 1),                         // PA_SOFTINT: mp_SigTask is an Interrupt*
+            (MAIN, MSGPORT_SIGBIT_PLACEHOLDER, 0), // no real bit
+            (MAIN, 0xFF, 0),                       // out of range, must not shift-panic
+            (0x4000, 20, 0),                       // a task the scheduler doesn't know
+            (0, 20, 0),                            // no task at all
+        ] {
+            let mut mem = port_mem(task, bit, flags);
+            let mut tasks = crate::taskswitch::TaskScheduler::new(MAIN);
+            signal_port_task(&mut mem, &mut tasks, PORT);
+            assert_eq!(
+                recvd(&mem, MAIN),
+                0,
+                "task={task:#x} bit={bit} flags={flags}"
+            );
+            assert_eq!(
+                recvd(&mem, 0x4000),
+                0,
+                "task={task:#x} bit={bit} flags={flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_msg_port_reserves_a_real_signal_bit_and_delete_frees_it_359() {
+        // AllocSignal(-1) is the highest free bit, so CreateMsgPort takes
+        // 31, a second port 30; deleting the first frees 31 again.
+        let mut mem = FlatMemory::new(0x10000);
+        let mut heap = crate::guestmem::GuestHeap::new(0x2000, 0x8000);
+        mem.write_u32(MAIN + crate::exectask::TC_SIGALLOC, 0xFFFF);
+        let mut a = 0;
+        let mut b = 0;
+        for slot in [&mut a, &mut b] {
+            let port = heap.alloc(&mut mem, MSGPORT_SIZE).unwrap();
+            init_msg_port_fields(&mut mem, port, MAIN);
+            let bit = alloc_port_signal(&mut mem, MAIN).unwrap();
+            mem.write_u8(port + MP_SIGBIT, bit);
+            *slot = port;
+        }
+        assert_eq!(mem.read_u8(a + MP_SIGBIT), 31);
+        assert_eq!(mem.read_u8(b + MP_SIGBIT), 30);
+        assert_eq!(
+            mem.read_u32(MAIN + crate::exectask::TC_SIGALLOC),
+            0xFFFF | 1 << 31 | 1 << 30
+        );
     }
 }
