@@ -264,13 +264,6 @@ pub fn map_vfs_error(err: &VfsError) -> i32 {
 /// host file for this access mode" decision, just with a different
 /// caller-supplied `FileHandle` to register the result into.
 fn open_host_file_for_mode(host_path: &std::path::Path, access_mode: i32) -> Result<File, i32> {
-    // A directory is not a file: real `Open` fails with
-    // `ERROR_OBJECT_WRONG_TYPE`, which is how programs tell the two apart.
-    // The read-only fallback below used to *succeed* on a Unix directory,
-    // handing back a handle whose every `Read` then failed (issue #362).
-    if host_path.is_dir() {
-        return Err(ERROR_OBJECT_WRONG_TYPE);
-    }
     if access_mode == MODE_NEWFILE {
         OpenOptions::new()
             .read(true)
@@ -292,6 +285,16 @@ fn open_host_file_for_mode(host_path: &std::path::Path, access_mode: i32) -> Res
         // case, which calls this with MODE_OLDFILE regardless of the
         // lock's access mode -- see that method's doc): read+write,
         // falling back to read-only.
+        //
+        // A directory is not a file: `Open(dir, MODE_OLDFILE)` fails with
+        // `ERROR_OBJECT_WRONG_TYPE`, which is how programs tell the two
+        // apart. The read-only fallback used to *succeed* on a Unix
+        // directory, handing back a handle whose every `Read` then failed
+        // (issue #362). The other modes already failed on the host
+        // (EISDIR) and are left as they were.
+        if host_path.is_dir() {
+            return Err(ERROR_OBJECT_WRONG_TYPE);
+        }
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -4473,12 +4476,9 @@ mod tests {
         let mut heap = GuestHeap::new(0x1000, 0x4000);
         let mut mem = FlatMemory::new(0x4000);
         let mut dos = DosState::new(Some(vfs_over(tmp.path())));
-        for mode in [MODE_OLDFILE, MODE_NEWFILE, MODE_READWRITE] {
-            assert_eq!(
-                dos.open(&mut heap, &mut mem, "SYS:d", mode),
-                Err(ERROR_OBJECT_WRONG_TYPE),
-                "mode {mode}"
-            );
-        }
+        assert_eq!(
+            dos.open(&mut heap, &mut mem, "SYS:d", MODE_OLDFILE),
+            Err(ERROR_OBJECT_WRONG_TYPE)
+        );
     }
 }

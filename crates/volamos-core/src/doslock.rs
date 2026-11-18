@@ -453,12 +453,13 @@ impl DosState {
         let new_path = if new_path == old_path {
             let typed = new_name
                 .rsplit(['/', ':'])
-                .next()
+                .find(|c| !c.is_empty())
                 .filter(|c| crate::vfs::is_safe_component(c))
                 .ok_or(crate::dosfile::ERROR_INVALID_COMPONENT_NAME)?;
             let renamed = old_path.with_file_name(typed);
             if renamed == old_path {
-                return Ok(()); // the same name: nothing to do
+                // Onto its own exact name: the target exists, as before.
+                return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
             }
             renamed
         } else if new_path.exists() {
@@ -3849,6 +3850,15 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["Foo".to_string()]);
+
+        // A trailing slash still names the last component; onto its own
+        // exact name the target exists, as it always did.
+        dos.rename("SYS:Foo", "SYS:foo/").expect("trailing slash");
+        assert_eq!(
+            dos.rename("SYS:foo", "SYS:foo"),
+            Err(crate::dosfile::ERROR_OBJECT_EXISTS)
+        );
+        dos.rename("SYS:foo", "SYS:Foo").unwrap();
 
         // Renaming onto a *different* existing file still fails.
         fs::write(tmp.path().join("Bar"), b"y").unwrap();

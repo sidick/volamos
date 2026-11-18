@@ -401,7 +401,13 @@ fn match_first(
                 .unwrap_or(0)
         };
         let display_name = anchor_display_name(&entry.amiga_path);
-        let achain_addr = alloc_achain(heap, mem)?;
+        let achain_addr = match alloc_achain(heap, mem) {
+            Ok(a) => a,
+            Err(e) => {
+                dos.unlock(heap, addr);
+                return Err(e);
+            }
+        };
         mem.write_u32(achain_addr + AN_LOCK_OFFSET, bptr);
         // The caller's own literal pattern text, verbatim -- a
         // non-wildcard `MatchFirst`'s `ap_Buf` is just `pat_str` itself
@@ -483,7 +489,13 @@ fn match_first(
         return Err(ERROR_NO_MORE_ENTRIES);
     }
 
-    let achain_addr = alloc_achain(heap, mem)?;
+    let achain_addr = match alloc_achain(heap, mem) {
+        Ok(a) => a,
+        Err(e) => {
+            dos.unlock(heap, addr);
+            return Err(e);
+        }
+    };
     mem.write_u32(achain_addr + AN_LOCK_OFFSET, bptr);
     let (name0, is_dir0) = entries[0].clone();
     let display_path0 = join_amiga(&display_dir_part, &name0);
@@ -697,7 +709,7 @@ fn match_next_inner(
     Ok(())
 }
 
-fn match_end(heap: &mut GuestHeap, dos: &mut DosState, ap_addr: u32) {
+fn match_end(heap: &mut GuestHeap, mem: &mut dyn AddressSpace, dos: &mut DosState, ap_addr: u32) {
     if let Some(state) = dos.anchor_states.remove(&ap_addr) {
         for level in state.levels {
             dos.unlock(heap, level.dir_lock_addr);
@@ -705,6 +717,11 @@ fn match_end(heap: &mut GuestHeap, dos: &mut DosState, ap_addr: u32) {
             // were never freed here at all (issue #362).
             let _ = heap.free(level.achain_addr);
         }
+        // Real MatchEnd clears the chain pointers it freed; left set, a
+        // guest looking at them (or calling MatchEnd twice) reads recycled
+        // heap memory.
+        mem.write_u32(ap_addr + AP_BASE_OFFSET, 0);
+        mem.write_u32(ap_addr + AP_LAST_OFFSET, 0);
     }
 }
 
@@ -760,7 +777,7 @@ fn match_next_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 /// `MatchEnd` (`D1` = `AnchorPath*`). No return value.
 fn match_end_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ap_addr = ctx.cpu.data_register(DataRegister(1));
-    match_end(ctx.heap, ctx.dos, ap_addr);
+    match_end(ctx.heap, ctx.mem, ctx.dos, ap_addr);
     Ok(())
 }
 
@@ -879,7 +896,7 @@ mod tests {
         let err = match_next(&mut heap, &mut mem, &mut dos, ap).unwrap_err();
         assert_eq!(err, ERROR_NO_MORE_ENTRIES);
 
-        match_end(&mut heap, &mut dos, ap);
+        match_end(&mut heap, &mut mem, &mut dos, ap);
         assert!(dos.locks.is_empty());
     }
 
@@ -916,7 +933,7 @@ mod tests {
         let err = match_next(&mut heap, &mut mem, &mut dos, ap).unwrap_err();
         assert_eq!(err, ERROR_NO_MORE_ENTRIES);
 
-        match_end(&mut heap, &mut dos, ap);
+        match_end(&mut heap, &mut mem, &mut dos, ap);
         assert!(dos.locks.is_empty());
     }
 
@@ -1116,7 +1133,7 @@ mod tests {
         let err = match_next(&mut heap, &mut mem, &mut dos, ap).unwrap_err();
         assert_eq!(err, ERROR_NO_MORE_ENTRIES);
 
-        match_end(&mut heap, &mut dos, ap);
+        match_end(&mut heap, &mut mem, &mut dos, ap);
         assert!(dos.locks.is_empty());
     }
 
@@ -1157,7 +1174,7 @@ mod tests {
         let err = match_next(&mut heap, &mut mem, &mut dos, ap).unwrap_err();
         assert_eq!(err, ERROR_NO_MORE_ENTRIES);
 
-        match_end(&mut heap, &mut dos, ap);
+        match_end(&mut heap, &mut mem, &mut dos, ap);
         assert!(dos.locks.is_empty(), "MatchEnd should unlock every level");
     }
 
@@ -1315,8 +1332,10 @@ mod tests {
             heap.size_of_live_alloc(base).is_some(),
             "live during the walk"
         );
-        match_end(&mut heap, &mut dos, ap);
+        match_end(&mut heap, &mut mem, &mut dos, ap);
         assert!(heap.size_of_live_alloc(base).is_none(), "freed by MatchEnd");
+        assert_eq!(mem.read_u32(ap + AP_BASE_OFFSET), 0, "no stale ap_Base");
+        assert_eq!(mem.read_u32(ap + AP_LAST_OFFSET), 0, "no stale ap_Last");
         assert!(dos.locks.is_empty());
 
         // MatchFirst failing with ERROR_BUFFER_OVERFLOW stores no scan
