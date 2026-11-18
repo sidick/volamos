@@ -50,6 +50,9 @@ fn apply_write_protect(perms: &mut fs::Permissions, protect: bool) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Lossy by design: a protect/unprotect round trip of a 664 file
+        // ends at 644. Remembering the original bits would need extra
+        // state, and widening to group/other write is the worse failure.
         let mode = perms.mode();
         perms.set_mode(if protect { mode & !0o222 } else { mode | 0o200 });
     }

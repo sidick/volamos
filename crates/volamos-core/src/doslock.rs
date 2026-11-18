@@ -406,7 +406,16 @@ impl DosState {
             }
             std::fs::remove_dir(&host_path).map_err(|e| map_io_error(&e))?;
         } else {
-            std::fs::remove_file(&host_path).map_err(|e| map_io_error(&e))?;
+            // A Windows directory symlink needs `remove_dir`, not `remove_file`.
+            std::fs::remove_file(&host_path)
+                .or_else(|e| {
+                    if meta.file_type().is_symlink() {
+                        std::fs::remove_dir(&host_path)
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(|e| map_io_error(&e))?;
         }
         let _ = std::fs::remove_file(dosmeta::sidecar_path(&host_path));
         Ok(())
@@ -789,12 +798,18 @@ impl DosState {
         // lock's directory. `Path::join` with an absolute path discards
         // the lock entirely, which let a guest read any host symlink's
         // target (issue #358).
+        // An empty component is the Amiga "parent" (a leading or doubled
+        // `/`), which this lookup doesn't support: refuse rather than
+        // silently reading the wrong directory.
         let mut target_path = entry.host_path.clone();
-        for comp in rel_path.split('/').filter(|c| !c.is_empty()) {
-            if comp.contains(':') || !crate::vfs::is_safe_component(comp) {
-                return Err(crate::dosfile::ERROR_OBJECT_NOT_FOUND);
-            }
-            target_path.push(comp);
+        for comp in rel_path.split('/') {
+            let found = if crate::vfs::is_safe_component(comp) {
+                crate::vfs::find_case_insensitive(&target_path, comp)
+                    .map_err(|e| crate::dosfile::map_vfs_error(&e))?
+            } else {
+                None
+            };
+            target_path.push(found.ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?);
         }
         let meta = std::fs::symlink_metadata(&target_path).map_err(|e| map_io_error(&e))?;
         if !meta.file_type().is_symlink() {

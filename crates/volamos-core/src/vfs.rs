@@ -810,7 +810,7 @@ pub(crate) fn is_safe_component(name: &str) -> bool {
     !(name.is_empty()
         || name == "."
         || name == ".."
-        || name.contains(['/', '\0'])
+        || name.contains(['/', ':', '\0'])
         || (cfg!(windows) && name.contains('\\')))
 }
 
@@ -862,6 +862,13 @@ fn resolve_named_components(
     for (i, name) in named.iter().enumerate() {
         let is_last = i == last_index;
         let must_exist = !is_last || last_must_exist;
+        // Checked up front, not only where a name is appended verbatim:
+        // the guarantee must not rest on `read_dir` never listing `..`.
+        if !is_safe_component(name) {
+            return Err(VfsError::InvalidPath {
+                reason: format!("'{name}' is not a valid file name: {original_path}"),
+            });
+        }
         match find_case_insensitive(&current, name)? {
             Some(matched_name) => {
                 current.push(&matched_name);
@@ -876,11 +883,6 @@ fn resolve_named_components(
                     // Last component of a ParentMustExist resolution,
                     // doesn't exist yet: append verbatim, preserving
                     // the caller's given case.
-                    if !is_safe_component(name) {
-                        return Err(VfsError::InvalidPath {
-                            reason: format!("'{name}' is not a valid file name: {original_path}"),
-                        });
-                    }
                     current.push(name);
                     matched.push(name.clone());
                     return Ok((current, matched));
@@ -907,7 +909,7 @@ fn resolve_named_components(
 /// (including if `dir` doesn't exist or isn't a directory: that's
 /// reported by the caller via a subsequent `NotADirectory`/`NotFound`,
 /// not here).
-fn find_case_insensitive(dir: &Path, name: &str) -> Result<Option<String>, VfsError> {
+pub(crate) fn find_case_insensitive(dir: &Path, name: &str) -> Result<Option<String>, VfsError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
