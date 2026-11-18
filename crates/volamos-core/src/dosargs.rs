@@ -340,6 +340,18 @@ fn parse_number(text: &[u8]) -> Result<i32, i32> {
         .ok_or(ERROR_BAD_NUMBER)
 }
 
+/// Whether a positional-eligible slot already holds a value, so a bare
+/// token must go to the next one. `/M` is never "full": it takes every
+/// further bare token.
+fn slot_is_filled(slot: &Slot, arg: &TemplateArg) -> bool {
+    match arg.kind {
+        ArgKind::Multi => false,
+        ArgKind::Number => slot.number.is_some(),
+        ArgKind::String | ArgKind::RestOfLine => slot.string.is_some(),
+        ArgKind::Switch | ArgKind::Toggle => true,
+    }
+}
+
 /// Runs the matching algorithm (module docs) over `reader` against
 /// `template`, returning one filled-in [`Slot`] per template keyword.
 fn match_args(reader: &mut Reader<'_>, template: &[TemplateArg]) -> Result<Vec<Slot>, i32> {
@@ -406,7 +418,17 @@ fn match_args(reader: &mut Reader<'_>, template: &[TemplateArg]) -> Result<Vec<S
                     continue;
                 }
 
-                // Positional fill.
+                // Positional fill: the next slot not already filled. A slot
+                // set by its keyword (`TO=x`) is skipped, not overwritten
+                // -- verified on real Kickstart 3.1 (r40.68) via
+                // Copperline: `FROM,TO,OPT` with `TO=x a b` gives
+                // FROM=a, TO=x, OPT=b, and `FROM/A,TO/A` with
+                // `a TO=b c` fails ERROR_TOO_MANY_ARGS (issue #362).
+                while cursor < positional.len()
+                    && slot_is_filled(&slots[positional[cursor]], &template[positional[cursor]])
+                {
+                    cursor += 1;
+                }
                 if cursor >= positional.len() {
                     return Err(ERROR_TOO_MANY_ARGS);
                 }
@@ -1082,5 +1104,43 @@ mod tests {
         // this must not panic even on syntax `ReadArgs` itself would
         // reject.
         assert_eq!(find_arg(b"DIR/Q", b"DIR"), -1);
+    }
+
+    /// Reads slot `i` of `array` as a C string, or `None` if it's NULL.
+    fn slot_str(mem: &FlatMemory, array: u32, i: u32) -> Option<Vec<u8>> {
+        let p = mem.read_u32(array + i * 4);
+        (p != 0).then(|| read_c_string(mem, p))
+    }
+
+    #[test]
+    fn a_bare_arg_skips_a_slot_already_filled_by_its_keyword_362() {
+        // Real Kickstart 3.1 (r40.68, measured via Copperline):
+        // `FROM,TO,OPT` with `TO=x a b` -> FROM=a, TO=x, OPT=b.
+        let (mut heap, mut mem, mut dos) = setup(&["TO=x", "a", "b"]);
+        let (_, array) = call_read_args(&mut heap, &mut mem, &mut dos, "FROM,TO,OPT", 3);
+        assert_eq!(slot_str(&mem, array, 0), Some(b"a".to_vec()));
+        assert_eq!(slot_str(&mem, array, 1), Some(b"x".to_vec()));
+        assert_eq!(slot_str(&mem, array, 2), Some(b"b".to_vec()));
+
+        // `FROM=x a b` -> FROM=x, TO=a, OPT=b (the keyword fills an
+        // earlier slot than the cursor).
+        let (mut heap, mut mem, mut dos) = setup(&["FROM=x", "a", "b"]);
+        let (_, array) = call_read_args(&mut heap, &mut mem, &mut dos, "FROM,TO,OPT", 3);
+        assert_eq!(slot_str(&mem, array, 0), Some(b"x".to_vec()));
+        assert_eq!(slot_str(&mem, array, 1), Some(b"a".to_vec()));
+        assert_eq!(slot_str(&mem, array, 2), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn a_surplus_bare_arg_after_a_keyword_filled_slot_is_too_many_args_362() {
+        // Real hardware: `FROM/A,TO/A` with `a TO=b c` fails 118; volamos
+        // used to overwrite TO with `c`.
+        let (mut heap, mut mem, mut dos) = setup(&["a", "TO=b", "c"]);
+        let err = call_read_args_err(&mut heap, &mut mem, &mut dos, "FROM/A,TO/A", 2);
+        assert_eq!(err, ERROR_TOO_MANY_ARGS);
+        // And a /K slot never takes a bare arg: `FROM/K,TO` with `a b`.
+        let (mut heap, mut mem, mut dos) = setup(&["a", "b"]);
+        let err = call_read_args_err(&mut heap, &mut mem, &mut dos, "FROM/K,TO", 2);
+        assert_eq!(err, ERROR_TOO_MANY_ARGS);
     }
 }

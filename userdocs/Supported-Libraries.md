@@ -61,7 +61,10 @@ Changelog.
 - Argument parsing: `ReadArgs`/`FreeArgs`/`FindArg` (the standard
   `ReadArgs` template syntax every real `C:` command uses, including
   keywords with any number of `=`-separated names and a host
-  `KEY=value` argument matching the keyword `KEY`); `ReadArgs(NULL)`
+  `KEY=value` argument matching the keyword `KEY`; a bare argument goes
+  to the next slot not already filled by its keyword, and a surplus one
+  is `ERROR_TOO_MANY_ARGS`, both checked against real Kickstart 3.1);
+  `ReadArgs(NULL)`
   reads the command line from the process's `Input()` buffer, the way
   `RunCommand` actually populates it.
 - Environment variables: `GetVar`/`SetVar`/`DeleteVar`, backed by a
@@ -165,7 +168,7 @@ Changelog.
   matching real ROM-resident behavior.
 - Memory: `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem`
   (`AllocMem` blocks sit on exec's 8-byte boundary, and `AllocVec` keeps
-  its size in the 4 bytes before the block, so its result is 4 mod 8 --
+  `byteSize + 4` in the 4 bytes before the block, so its result is 4 mod 8 --
   as on exec, and independent of the program's size), memory
   pools (`CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`),
   `AllocEntry`/`FreeEntry` (per-entry `MEMF_CLEAR` honoured; a partial
