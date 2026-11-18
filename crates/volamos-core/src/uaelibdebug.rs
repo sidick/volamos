@@ -101,7 +101,7 @@ pub fn handler<C: Cpu>(
 }
 
 fn log_string(mem: &dyn AddressSpace, ptr: u32, sink: &mut dyn DebugSink) -> u32 {
-    if u64::from(ptr) >= mem.len() as u64 {
+    if !mem.is_mapped(ptr, 1) {
         return 0;
     }
     let mut line = b"DBG: ".to_vec();

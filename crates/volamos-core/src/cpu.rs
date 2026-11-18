@@ -131,7 +131,7 @@ pub trait Cpu {
     fn run(&mut self, mem: &mut Self::Memory) -> StopReason {
         loop {
             let pc = self.pc();
-            if pc as usize >= mem.len() {
+            if !mem.is_mapped(pc, 2) {
                 return StopReason::PcOutOfBounds { pc };
             }
             match self.step(mem) {

@@ -295,6 +295,12 @@ pub enum LoadError {
     RelocOffsetOutOfRange { hunk_index: usize, offset: u32 },
     /// The file declares zero hunks.
     NoHunks,
+    /// The hunks' declared sizes together don't fit in the address space
+    /// from the load address (real LoadSeg fails with
+    /// `ERROR_NO_FREE_STORE`). Checked before anything is written: the
+    /// sizes come straight from the file, and a hunk may declare up to
+    /// 0x3FFFFFFF longwords.
+    OutOfMemory { needed: u64 },
 }
 
 impl std::fmt::Display for LoadError {
@@ -340,6 +346,10 @@ impl std::fmt::Display for LoadError {
                 "hunk {hunk_index}: HUNK_RELOC32 offset {offset:#x} is outside the hunk"
             ),
             LoadError::NoHunks => write!(f, "hunk file declares zero hunks"),
+            LoadError::OutOfMemory { needed } => write!(
+                f,
+                "the hunks need {needed} bytes, more than the guest address space holds"
+            ),
         }
     }
 }
@@ -1596,6 +1606,18 @@ pub fn load(
 
     // First pass: assign each hunk a load address, packing them
     // contiguously (4-byte aligned) starting at `base`.
+    //
+    // The total is summed in u64 and checked against the address space
+    // *before* any byte is written: a size table can declare 0x3FFFFFFF
+    // longwords per hunk, which used to wrap the end address past the RAM
+    // check and then zero-fill every declared byte (seconds per hunk).
+    let mut needed: u64 = 0;
+    for hunk in &file.hunks {
+        needed += (hunk.reserved_size as u64 + 3) & !3;
+    }
+    if needed > u64::from(u32::MAX) || !mem.is_mapped(base, needed as u32) {
+        return Err(LoadError::OutOfMemory { needed });
+    }
     let mut hunk_addrs = Vec::with_capacity(file.hunks.len());
     let mut cursor = base;
     for hunk in &file.hunks {
@@ -3468,5 +3490,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn load_refuses_hunks_that_cannot_fit_before_writing_anything_360() {
+        // A size table can declare 0x3FFFFFFF longwords per hunk. The sum
+        // used to wrap the end address past the RAM check and every
+        // declared byte was zero-filled (8 s for one such hunk).
+        let hunk = |kind, size| Hunk {
+            kind,
+            data: Vec::new(),
+            reserved_size: size,
+            memory: HunkMemory::Any,
+            relocs: Vec::new(),
+            debug_blocks: Vec::new(),
+            symbol_blocks: Vec::new(),
+        };
+        let file = HunkFile {
+            hunks: vec![
+                hunk(HunkKind::Code, 0),
+                hunk(HunkKind::Bss, 0x3FFF_FFC0 * 4),
+            ],
+            overlay: None,
+        };
+        let mut mem = FlatMemory::new(0x1_0000);
+        mem.write_u8(0x10, 0xAA);
+        let started = std::time::Instant::now();
+        let err = load(&file, &mut mem, 0x1000).unwrap_err();
+        assert!(matches!(err, LoadError::OutOfMemory { .. }), "{err:?}");
+        assert!(started.elapsed().as_secs() < 1, "must fail up front");
+        assert_eq!(mem.read_u8(0x10), 0xAA, "nothing may have been written");
     }
 }

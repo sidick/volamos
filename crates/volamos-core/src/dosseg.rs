@@ -285,6 +285,31 @@ use std::path::PathBuf;
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::ERROR_OBJECT_NOT_FOUND;
+/// The value a relocation adds to the longword already at `loc`: the
+/// target's address for `HUNK_RELOC32`, the displacement from `loc` to the
+/// target for `HUNK_RELRELOC32` (see [`loader::RelocKind`]). LoadSeg
+/// applied every kind as absolute before issue #360, so a PC-relative
+/// reference came out wrong whenever the binary was loaded through it
+/// (async `SystemTagList`, `RunCommand`, overlays) rather than run
+/// directly.
+fn reloc_addend(kind: loader::RelocKind, target_addr: u32, loc: u32) -> u32 {
+    match kind {
+        loader::RelocKind::Absolute => target_addr,
+        loader::RelocKind::PcRelative => target_addr.wrapping_sub(loc),
+    }
+}
+
+/// Un-registers the payload addresses a failed overlay-node load had put
+/// in the root's table. Their blocks are freed on that path; left set, a
+/// later node's relocations would resolve into freed memory (issue #360).
+fn forget_node_payloads(payload_addrs: &mut [Option<u32>], first_hunk: usize, count: usize) {
+    for i in 0..count {
+        if let Some(slot) = payload_addrs.get_mut(first_hunk + i) {
+            *slot = None;
+        }
+    }
+}
+
 #[cfg(test)]
 use crate::dosfile::OFFSET_BEGINNING;
 use crate::dosfile::{
@@ -468,7 +493,10 @@ pub(crate) fn build_seglist(
             let loc = payload_addrs[i].wrapping_add(reloc.offset);
             let target_addr = payload_addrs[reloc.target_hunk];
             let existing = mem.read_u32(loc);
-            mem.write_u32(loc, existing.wrapping_add(target_addr));
+            mem.write_u32(
+                loc,
+                existing.wrapping_add(reloc_addend(reloc.kind, target_addr, loc)),
+            );
         }
     }
 
@@ -528,6 +556,32 @@ pub struct OverlayRootState {
 /// Returns the root [`SegList`] (exactly as [`build_seglist`] would) and
 /// the [`OverlayRootState`] to register under the `oh_Segments` `BPTR`
 /// (`bptr_from_addr(state.segments_array_addr)`).
+/// Why [`build_overlay_root_seglist`] failed.
+#[derive(Debug)]
+enum OverlayRootError {
+    /// Hunk 0 is too small to hold an `OverlayHeader` or lacks its magic:
+    /// the file isn't a well-formed overlay executable
+    /// (`ERROR_FILE_NOT_OBJECT`).
+    BadHeader,
+    /// The guest heap couldn't satisfy an allocation (`ERROR_NO_FREE_STORE`).
+    Heap,
+}
+
+impl From<GuestHeapError> for OverlayRootError {
+    fn from(_: GuestHeapError) -> Self {
+        OverlayRootError::Heap
+    }
+}
+
+impl OverlayRootError {
+    fn dos_error(&self) -> i32 {
+        match self {
+            OverlayRootError::BadHeader => ERROR_FILE_NOT_OBJECT,
+            OverlayRootError::Heap => ERROR_NO_FREE_STORE,
+        }
+    }
+}
+
 fn build_overlay_root_seglist(
     file: &HunkFile,
     overlay: &loader::OverlayInfo,
@@ -535,7 +589,29 @@ fn build_overlay_root_seglist(
     host_path: PathBuf,
     heap: &mut GuestHeap,
     mem: &mut dyn AddressSpace,
-) -> Result<(SegList, OverlayRootState), GuestHeapError> {
+) -> Result<(SegList, OverlayRootState), OverlayRootError> {
+    // Validate hunk 0's OverlayHeader before allocating or writing
+    // anything: it is file content. A hunk 0 too small to hold the
+    // fields below, or without the 0x0000ABCD magic, used to hit a
+    // `debug_assert` (debug builds) or, in release, write the manager's
+    // fields past the end of the hunk into the next heap block
+    // (issue #360).
+    let header_len = (overlay_header::GV_OFFSET + 4) as usize;
+    let hunk0 = &file.hunks[0];
+    let magic = hunk0
+        .data
+        .get(overlay_header::MAGIC_OFFSET as usize..overlay_header::MAGIC_OFFSET as usize + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    if hunk0.reserved_size < header_len || magic != Some(overlay_header::MAGIC_VALUE) {
+        return Err(OverlayRootError::BadHeader);
+    }
+    // `total_hunks` is the header's `table_size`: unvalidated, and 4 bytes
+    // per hunk must fit a u32 (a plain `as u32 * 4` wrapped to a tiny
+    // allocation while the loop below still walked every hunk).
+    let total_hunks = overlay.total_hunks;
+    let Ok(segments_bytes) = u32::try_from(total_hunks as u64 * 4) else {
+        return Err(OverlayRootError::Heap);
+    };
     let seglist = build_seglist(file, heap, mem)?;
 
     let root_payload_addrs: Vec<u32> = seglist
@@ -554,7 +630,7 @@ fn build_overlay_root_seglist(
             for &addr in &seglist.alloc_addrs {
                 let _ = heap.free(addr);
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
     for (i, &word) in overlay.table.raw.iter().enumerate() {
@@ -563,7 +639,6 @@ fn build_overlay_root_seglist(
 
     // oh_Segments: one BPTR slot per hunk in the whole tree, zeroed for
     // not-yet-loaded overlay-node hunks, filled in for the root's own.
-    let segments_bytes = overlay.total_hunks as u32 * 4;
     let segments_addr = match heap.alloc(&mut *mem, segments_bytes.max(4)) {
         Ok(a) => a,
         Err(e) => {
@@ -571,7 +646,7 @@ fn build_overlay_root_seglist(
             for &addr in &seglist.alloc_addrs {
                 let _ = heap.free(addr);
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
     let mut payload_addrs: Vec<Option<u32>> = vec![None; overlay.total_hunks];
@@ -587,11 +662,6 @@ fn build_overlay_root_seglist(
     // Patch hunk 0's OverlayHeader. hunk 0 is always the root's entry
     // hunk (seglist.entry is its payload address).
     let hunk0_payload = seglist.entry;
-    debug_assert_eq!(
-        mem.read_u32(hunk0_payload.wrapping_add(overlay_header::MAGIC_OFFSET)),
-        overlay_header::MAGIC_VALUE,
-        "an overlay-root HunkFile's hunk 0 should always start with the 0x0000ABCD magic"
-    );
     mem.write_u32(
         hunk0_payload.wrapping_add(overlay_header::FILE_HANDLE_OFFSET),
         file_handle_bptr,
@@ -683,7 +753,7 @@ impl DosState {
                 heap,
                 mem,
             )
-            .map_err(|_| ERROR_NO_FREE_STORE)?;
+            .map_err(|e| e.dos_error())?;
             let segments_bptr = bptr_from_addr(state.segments_array_addr);
             self.overlay_roots.insert(segments_bptr, state);
             self.seglists
@@ -724,7 +794,7 @@ impl DosState {
                 heap,
                 mem,
             )
-            .map_err(|_| ERROR_NO_FREE_STORE)?;
+            .map_err(|e| e.dos_error())?;
             let segments_bptr = bptr_from_addr(state.segments_array_addr);
             self.overlay_roots.insert(segments_bptr, state);
             self.seglists
@@ -857,6 +927,11 @@ impl DosState {
                 for &addr in &alloc_addrs {
                     let _ = heap.free(addr);
                 }
+                forget_node_payloads(
+                    &mut state.payload_addrs,
+                    node.first_hunk,
+                    payload_addrs.len(),
+                );
                 return Err(ERROR_FILE_NOT_OBJECT);
             }
             state.payload_addrs[global_index] = Some(payload_addr);
@@ -871,11 +946,19 @@ impl DosState {
                     for &addr in &alloc_addrs {
                         let _ = heap.free(addr);
                     }
+                    forget_node_payloads(
+                        &mut state.payload_addrs,
+                        node.first_hunk,
+                        payload_addrs.len(),
+                    );
                     return Err(ERROR_FILE_NOT_OBJECT);
                 };
                 let loc = payload_addrs[i].wrapping_add(reloc.offset);
                 let existing = mem.read_u32(loc);
-                mem.write_u32(loc, existing.wrapping_add(target_addr));
+                mem.write_u32(
+                    loc,
+                    existing.wrapping_add(reloc_addend(reloc.kind, target_addr, loc)),
+                );
             }
         }
 
@@ -1135,7 +1218,13 @@ fn start_system_child<C: Cpu>(
     let inherit = |ctx: &HandlerContext<'_, C>, offset| ctx.mem.read_u32(parent + offset);
     let spec = crate::exectask::SpawnSpec {
         entry,
-        stack_size: ctx.mem.read_u32(parent + TC_SPUPPER) - ctx.mem.read_u32(parent + TC_SPLOWER),
+        // Guest-writable task fields: an inverted pair must not panic the
+        // host (debug) or wrap to a ~4 GiB stack request (release).
+        stack_size: ctx
+            .mem
+            .read_u32(parent + TC_SPUPPER)
+            .saturating_sub(ctx.mem.read_u32(parent + TC_SPLOWER))
+            .max(MIN_STACK_SIZE),
         name: program.to_string(),
         priority: ctx.mem.read_u8(parent + crate::execlist::LN_PRI) as i8,
         args: Some(format!("{rest}\n").into_bytes()),
@@ -1196,7 +1285,7 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // The arguments are copied into the Input() buffer below, so they
     // must lie inside guest memory: a length past it cannot be a real
     // argument string, and must not make the host allocate gigabytes.
-    if u64::from(param_ptr) + u64::from(param_len) > ctx.mem.len() as u64 {
+    if !ctx.mem.is_mapped(param_ptr, param_len) {
         ctx.dos.set_io_err(ERROR_LINE_TOO_LONG);
         ctx.cpu.set_data_register(DataRegister(0), (-1i32) as u32);
         return Ok(());
@@ -2843,5 +2932,93 @@ mod tests {
             free_before,
             "a failed LoadSeg leaks nothing"
         );
+    }
+
+    fn plain_hunk(kind: loader::HunkKind, data: Vec<u8>, size: usize) -> loader::Hunk {
+        loader::Hunk {
+            kind,
+            data,
+            reserved_size: size,
+            memory: loader::HunkMemory::Any,
+            relocs: Vec::new(),
+            debug_blocks: Vec::new(),
+            symbol_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_seglist_applies_a_pc_relative_reloc_as_a_displacement_360() {
+        // HUNK_RELRELOC32 patches the displacement from the patch site to
+        // the target, not the target's absolute address.
+        let mut code = plain_hunk(loader::HunkKind::Code, vec![0; 8], 8);
+        code.relocs.push(loader::Reloc32 {
+            offset: 0,
+            target_hunk: 1,
+            kind: loader::RelocKind::PcRelative,
+        });
+        code.relocs.push(loader::Reloc32 {
+            offset: 4,
+            target_hunk: 1,
+            kind: loader::RelocKind::Absolute,
+        });
+        let file = HunkFile {
+            hunks: vec![code, plain_hunk(loader::HunkKind::Bss, Vec::new(), 8)],
+            overlay: None,
+        };
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+
+        let seglist = build_seglist(&file, &mut heap, &mut mem).unwrap();
+        let payload0 = seglist.alloc_addrs[0] + SEG_HEADER_SIZE;
+        let payload1 = seglist.alloc_addrs[1] + SEG_HEADER_SIZE;
+        assert_eq!(mem.read_u32(payload0), payload1.wrapping_sub(payload0));
+        assert_eq!(mem.read_u32(payload0 + 4), payload1);
+    }
+
+    fn overlay_root_file(hunk0: Vec<u8>, total_hunks: usize) -> HunkFile {
+        let size = hunk0.len();
+        HunkFile {
+            hunks: vec![plain_hunk(loader::HunkKind::Code, hunk0, size)],
+            overlay: Some(loader::OverlayInfo {
+                table: loader::OverlayTable { raw: Vec::new() },
+                total_hunks,
+            }),
+        }
+    }
+
+    fn overlay_hunk0(magic: u32) -> Vec<u8> {
+        let mut v = vec![0u8; 0x18];
+        v[4..8].copy_from_slice(&magic.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn overlay_root_with_a_bad_header_is_refused_without_writing_360() {
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        for hunk0 in [overlay_hunk0(0x1234), vec![0u8; 8]] {
+            let file = overlay_root_file(hunk0, 2);
+            let overlay = file.overlay.as_ref().unwrap();
+            let err =
+                build_overlay_root_seglist(&file, overlay, 0, PathBuf::new(), &mut heap, &mut mem)
+                    .unwrap_err();
+            assert!(matches!(err, OverlayRootError::BadHeader), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn overlay_root_with_an_absurd_table_size_fails_cleanly_360() {
+        // table_size 0x40000001 made `total_hunks as u32 * 4` wrap to 4
+        // (a 4-byte allocation) while the loops walked a billion hunks.
+        let mut heap = GuestHeap::new(0x1000, 0x8000);
+        let mut mem = FlatMemory::new(0x8000);
+        let file = overlay_root_file(overlay_hunk0(overlay_header::MAGIC_VALUE), 0x4000_0001);
+        let overlay = file.overlay.as_ref().unwrap();
+        let started = std::time::Instant::now();
+        let err =
+            build_overlay_root_seglist(&file, overlay, 0, PathBuf::new(), &mut heap, &mut mem)
+                .unwrap_err();
+        assert!(matches!(err, OverlayRootError::Heap), "{err:?}");
+        assert!(started.elapsed().as_secs() < 1);
     }
 }
