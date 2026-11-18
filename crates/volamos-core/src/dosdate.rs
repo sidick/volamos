@@ -92,7 +92,11 @@ pub(crate) fn local_offset_secs_at(unix_secs: i64) -> i64 {
     // are owned here, and the pointer is valid for the call. The _r
     // form is used precisely because it needs no global buffer.
     unsafe {
-        let t = unix_secs as libc::time_t;
+        // `as _`, not `as libc::time_t`: naming the alias warns on musl
+        // targets (the Docker image's), where `libc` deprecates it ahead
+        // of musl 1.2's 64-bit `time_t`. `localtime_r`'s own signature
+        // fixes the type, whatever it is on the target.
+        let t = unix_secs as _;
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
             return 0;

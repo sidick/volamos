@@ -235,6 +235,17 @@ impl DosState {
         IoStep::Block(c.id)
     }
 
+    /// How many bytes the pipe behind `addr` has buffered (0 for anything
+    /// that is not a pipe handle).
+    pub(crate) fn pipe_buffered(&self, addr: u32) -> usize {
+        match self.handles.get(&addr) {
+            Some(HostHandle::Pipe { channel, .. }) => {
+                self.pipes.get(channel).map_or(0, |c| c.buf.len())
+            }
+            _ => 0,
+        }
+    }
+
     /// `Read` for callers that can't block (the buffered-stdio calls):
     /// a pipe with nothing to read fails instead of waiting.
     pub(crate) fn pipe_read_nonblocking(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, i32> {
@@ -373,9 +384,18 @@ pub(crate) fn write<C: Cpu>(
     };
     let task = ctx.current_task;
     loop {
+        let before = ctx.dos.pipe_buffered(addr);
         let step = ctx.dos.pipe_write(task, addr, data);
-        // Whatever went in is news to a reader waiting for data.
-        ctx.tasks.wake_pipe(pipe);
+        // Whatever went in is news to a reader waiting for data -- but
+        // only if something did. `wake_pipe` wakes every task blocked on
+        // the pipe, writers included, so waking after an attempt that
+        // buffered nothing let two blocked writers on one full pipe mark
+        // each other Ready forever: neither ever counted as blocked, no
+        // deadlock was reported and a lower-priority reader never ran
+        // (issue #362).
+        if ctx.dos.pipe_buffered(addr) > before {
+            ctx.tasks.wake_pipe(pipe);
+        }
         match step {
             IoStep::Done(result) => return Ok(Outcome::Done(result)),
             IoStep::Block(id) => match park_on_pipe(ctx, id, lvo, what)? {
@@ -1100,5 +1120,68 @@ mod tests {
                 "{name}: the call must block on the full pipe, then deliver all of its data"
             );
         }
+    }
+
+    #[test]
+    fn two_writers_blocked_on_one_full_pipe_do_not_wake_each_other_forever_362() {
+        // A failed write attempt used to call `wake_pipe` too, which wakes
+        // every task blocked on the pipe -- the other writer included.
+        // Two blocked writers then marked each other Ready in turn, so
+        // neither counted as blocked, nothing was reported as a deadlock
+        // and the (lower-priority) parent that would drain the pipe never
+        // ran: the host spun forever. Run on a thread with a deadline so a
+        // regression fails the test instead of hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The pipe is filled, a second child is started with the same
+            // code as the first, then the parent starts the first one,
+            // yields so both block writing, and drains the pipe.
+            let mut setup = Vec::new();
+            guest_write(&mut setup, BIG, BUFFER_SIZE as u32);
+            d_imm(&mut setup, 1, TAGS);
+            call(&mut setup, "CreateNewProc");
+            let mut child = Vec::new();
+            d_imm(&mut child, 1, HELLO);
+            call(&mut child, "PutStr");
+            let mut after = Vec::new();
+            guest_read(&mut after, BIG, BUFFER_SIZE as u32);
+            guest_read(&mut after, BUF, 64);
+            store_d0(&mut after, RES + 4);
+            let rt = run_stdio_case(StdioCase {
+                setup,
+                child,
+                after,
+                after_patches: Vec::new(),
+                data: Vec::new(),
+            });
+            let _ = tx.send(rt.memory().read_u32(RES + 4));
+        });
+        let n = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the writers must not livelock");
+        assert!(
+            n >= 5,
+            "the parent drained the pipe and read what a writer sent: {n}"
+        );
+    }
+
+    #[test]
+    fn closing_a_handle_forgets_a_blocked_writers_progress_362() {
+        // A writer blocked mid-write keeps `(task, addr) -> bytes done`.
+        // If the handle is closed and its address reused for a new pipe
+        // handle, the same task's next write must start from zero.
+        let (mut dos, w, _r) = fixture("PIPE:stale");
+        // Fill the pipe, then a write that only partly fits blocks with
+        // progress recorded.
+        done(dos.pipe_write(1, w, &vec![b'x'; BUFFER_SIZE])).unwrap();
+        assert!(blocks(dos.pipe_write(1, w, b"abc")));
+        assert!(dos.pipe_write_progress.contains_key(&(1, w)));
+
+        let mut heap = GuestHeap::new(0x1_0000, 0x1_8000);
+        dos.close(&mut heap, w);
+        assert!(
+            dos.pipe_write_progress.is_empty(),
+            "the closed handle's progress must not outlive it"
+        );
     }
 }

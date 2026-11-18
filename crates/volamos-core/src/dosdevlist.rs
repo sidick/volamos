@@ -23,16 +23,16 @@
 //! opaque handle; `UnLockDosList` takes no handle back, only the same
 //! `flags` used to lock (see the RKRM: the real implementation tracks
 //! the lock itself, not per-caller state). This runtime is
-//! single-threaded and never blocks, so there is at most one
-//! outstanding "session" at a time:
-//! [`crate::dosfile::DosState::dos_list_active`] holds every heap
-//! address `LockDosList` allocated (the header node, each `DosList`
-//! entry, and their `dol_Name` buffers), freed in one shot by
-//! `UnLockDosList`. A second `LockDosList` before the first is unlocked
-//! leaks the first session's allocations rather than blocking or
-//! erroring -- acceptable for the well-behaved lock/iterate/unlock
-//! pattern every real caller (including `Info`) uses, and not worth
-//! modeling proper reentrant/blocking semantics for.
+//! single-threaded and never blocks. Each `LockDosList` builds its own
+//! "session" -- the header node, each `DosList` entry and their
+//! `dol_Name` buffers -- pushed on
+//! [`crate::dosfile::DosState::dos_list_active`]; `UnLockDosList` pops
+//! and frees the most recent one. The call nests as the NDK autodoc says
+//! ("you can call it multiple times, and then must unlock it the same
+//! number of times"): a second lock no longer replaces (and leaks) the
+//! first, and the first's entries stay valid until it is unlocked
+//! itself. If the guest heap is exhausted `LockDosList` returns NULL with
+//! `ERROR_NO_FREE_STORE` rather than panicking.
 //!
 //! # `struct DosList` layout
 //!
@@ -118,9 +118,10 @@ pub(crate) fn volume_for_task_id(dos: &DosState, task_id: u32) -> Option<String>
 
 /// Core of `LockDosList`: builds a header node plus one `DosList` entry
 /// per configured volume (if `flags & LDF_VOLUMES`), chained via
-/// `dol_Next`, and records every allocated address on `dos.dos_list_active`
-/// for `unlock_dos_list` to free. Returns the header's address (never
-/// fails -- see the module docs' locking model).
+/// `dol_Next`, and pushes every allocated address as one session on
+/// `dos.dos_list_active` for the matching `unlock_dos_list` to free.
+/// Returns the header's address, or `0` (with `ERROR_NO_FREE_STORE`) if
+/// the guest heap is exhausted -- see the module docs' locking model.
 fn lock_dos_list(
     heap: &mut GuestHeap,
     mem: &mut dyn AddressSpace,
@@ -128,16 +129,51 @@ fn lock_dos_list(
     flags: u32,
 ) -> u32 {
     let mut allocated = Vec::new();
-    let header = heap
-        .alloc(&mut *mem, DOSLIST_SIZE)
-        .expect("LockDosList: heap exhausted allocating header");
+    match build_dos_list(heap, mem, dos, flags, &mut allocated) {
+        Some(header) => {
+            // One entry per `LockDosList`, popped by `UnLockDosList`: the
+            // call nests (NDK autodoc: "you can call it multiple times,
+            // and then must unlock it the same number of times").
+            dos.dos_list_active.push(allocated);
+            header
+        }
+        None => {
+            // Out of guest heap. Real LockDosList cannot fail (it waits for
+            // the list), so there is no real error code for this; hand back
+            // NULL with `ERROR_NO_FREE_STORE`, as `GetDeviceProc` does,
+            // instead of panicking the host (issue #362).
+            for addr in allocated {
+                let _ = heap.free(addr);
+            }
+            // Still a lock level as far as the guest is concerned: its
+            // cleanup path calls `UnLockDosList` regardless, and without an
+            // entry of its own that unlock would pop (and free) an *outer*
+            // session that is still in use.
+            dos.dos_list_active.push(Vec::new());
+            dos.set_io_err(crate::dosfile::ERROR_NO_FREE_STORE);
+            0
+        }
+    }
+}
+
+/// The body of [`lock_dos_list`]: pushes every allocation onto
+/// `allocated` as it is made, so a failure part-way can free them.
+/// `None` if the heap runs out.
+fn build_dos_list(
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+    dos: &mut DosState,
+    flags: u32,
+    allocated: &mut Vec<u32>,
+) -> Option<u32> {
+    let header = heap.alloc(&mut *mem, DOSLIST_SIZE).ok()?;
+    allocated.push(header);
     zero_doslist(mem, header);
     // DLT_PRIVATE, not a real entry type: this node is a scan starting
     // point only, and must never itself match a NextDosEntry/
     // FindDosEntry type filter (DLT_DEVICE is 0, i.e. what a zeroed
     // dol_Type would otherwise read as).
     mem.write_u32(header + DOL_TYPE_OFFSET, DLT_PRIVATE as u32);
-    allocated.push(header);
 
     let mut entries = Vec::new();
     if flags & LDF_VOLUMES != 0 {
@@ -147,9 +183,8 @@ fn lock_dos_list(
             .map(|vfs| vfs.volumes().iter().map(|(name, _)| name.clone()).collect())
             .unwrap_or_default();
         for name in volumes {
-            let addr = heap
-                .alloc(&mut *mem, DOSLIST_SIZE)
-                .expect("LockDosList: heap exhausted allocating a DosList entry");
+            let addr = heap.alloc(&mut *mem, DOSLIST_SIZE).ok()?;
+            allocated.push(addr);
             zero_doslist(mem, addr);
             mem.write_u32(addr + DOL_TYPE_OFFSET, DLT_VOLUME as u32);
             // Non-NULL, matching a real live volume -- see
@@ -162,15 +197,12 @@ fn lock_dos_list(
 
             let name_bytes = name.as_bytes();
             // +1 length byte, +1 NUL courtesy byte (see module docs).
-            let name_addr = heap
-                .alloc(&mut *mem, name_bytes.len() as u32 + 2)
-                .expect("LockDosList: heap exhausted allocating dol_Name");
+            let name_addr = heap.alloc(&mut *mem, name_bytes.len() as u32 + 2).ok()?;
+            allocated.push(name_addr);
             let written = write_bstr(mem, name_addr, name_bytes);
             mem.write_u8(name_addr + 1 + written as u32, 0);
             mem.write_u32(addr + DOL_NAME_OFFSET, bptr_from_addr(name_addr));
 
-            allocated.push(name_addr);
-            allocated.push(addr);
             entries.push(addr);
         }
     }
@@ -181,8 +213,7 @@ fn lock_dos_list(
         prev = entry;
     }
 
-    dos.dos_list_active = allocated;
-    header
+    Some(header)
 }
 
 /// Core of `NextDosEntry`: walks forward from `dlist` (a header or entry
@@ -192,12 +223,18 @@ fn next_dos_entry(mem: &dyn AddressSpace, dlist: u32, flags: u32) -> u32 {
     let mut next_bptr = if dlist == 0 {
         0
     } else {
-        mem.read_u32(dlist + DOL_NEXT_OFFSET)
+        mem.read_u32(dlist.wrapping_add(DOL_NEXT_OFFSET))
     };
 
-    while next_bptr != 0 {
+    // Bounded: `dlist` and every `dol_Next` come from guest memory, which
+    // can be cyclic (a stale pointer into reused heap, a hand-built list);
+    // the host must not spin on that (issue #362).
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
+        if next_bptr == 0 {
+            break;
+        }
         let addr = addr_from_bptr(next_bptr);
-        let dol_type = mem.read_u32(addr + DOL_TYPE_OFFSET) as i32;
+        let dol_type = mem.read_u32(addr.wrapping_add(DOL_TYPE_OFFSET)) as i32;
         let matches = match dol_type {
             DLT_VOLUME => flags & LDF_VOLUMES != 0,
             DLT_DEVICE => flags & LDF_DEVICES != 0,
@@ -207,20 +244,32 @@ fn next_dos_entry(mem: &dyn AddressSpace, dlist: u32, flags: u32) -> u32 {
         if matches {
             return addr;
         }
-        next_bptr = mem.read_u32(addr + DOL_NEXT_OFFSET);
+        next_bptr = mem.read_u32(addr.wrapping_add(DOL_NEXT_OFFSET));
     }
     0
 }
 
 /// Core of `FindDosEntry`: scans starting at (and *including*) `dlist`
-/// itself, returning the first entry whose `dol_Type` matches `flags`
+/// itself -- measured on real Kickstart 3.1 (r40.68, Copperline): calling
+/// it again with its own result returns that same entry, as the autodoc's
+/// "Starts with the entry dlist" says (the autodoc's `while (dl =
+/// FindDosEntry(dl, ...))` example would not terminate on a match), returning the first entry whose `dol_Type` matches `flags`
 /// and, if `name` is `Some`, whose `dol_Name` case-insensitively equals
 /// it -- `None` matches any name of a matching type. `0` at the end of
 /// the list.
+///
+/// Measured on real Kickstart 3.1 (r40.68, Copperline): calling it again
+/// with its own result returns that same entry, as the autodoc's "Starts
+/// with the entry dlist" says (the autodoc's `while (dl = FindDosEntry(dl,
+/// ...))` example would not terminate on a match).
 fn find_dos_entry(mem: &dyn AddressSpace, dlist: u32, name: Option<&str>, flags: u32) -> u32 {
     let mut cur = dlist;
-    while cur != 0 {
-        let dol_type = mem.read_u32(cur + DOL_TYPE_OFFSET) as i32;
+    // Bounded, like `next_dos_entry`.
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
+        if cur == 0 {
+            break;
+        }
+        let dol_type = mem.read_u32(cur.wrapping_add(DOL_TYPE_OFFSET)) as i32;
         let type_matches = match dol_type {
             DLT_VOLUME => flags & LDF_VOLUMES != 0,
             DLT_DEVICE => flags & LDF_DEVICES != 0,
@@ -231,7 +280,7 @@ fn find_dos_entry(mem: &dyn AddressSpace, dlist: u32, name: Option<&str>, flags:
             let name_matches = match name {
                 None => true,
                 Some(wanted) => {
-                    let name_bptr = mem.read_u32(cur + DOL_NAME_OFFSET);
+                    let name_bptr = mem.read_u32(cur.wrapping_add(DOL_NAME_OFFSET));
                     let entry_name = crate::guestmem::read_bstr(mem, addr_from_bptr(name_bptr));
                     entry_name.eq_ignore_ascii_case(wanted.as_bytes())
                 }
@@ -240,16 +289,19 @@ fn find_dos_entry(mem: &dyn AddressSpace, dlist: u32, name: Option<&str>, flags:
                 return cur;
             }
         }
-        cur = addr_from_bptr(mem.read_u32(cur + DOL_NEXT_OFFSET));
+        cur = addr_from_bptr(mem.read_u32(cur.wrapping_add(DOL_NEXT_OFFSET)));
     }
     0
 }
 
-/// Core of `UnLockDosList`: frees every heap allocation the active
-/// session made (see the module docs' locking model).
+/// Core of `UnLockDosList`: frees every heap allocation the most recent
+/// still-active session made (see the module docs' locking model). With
+/// no session active it does nothing.
 fn unlock_dos_list(heap: &mut GuestHeap, dos: &mut DosState) {
-    for addr in std::mem::take(&mut dos.dos_list_active) {
-        let _ = heap.free(addr);
+    if let Some(session) = dos.dos_list_active.pop() {
+        for addr in session {
+            let _ = heap.free(addr);
+        }
     }
 }
 
@@ -293,8 +345,8 @@ fn find_dos_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
 }
 
 /// `UnLockDosList` (`D1` = flags, unused -- see the module docs' locking
-/// model). No return value. Frees every heap allocation the active
-/// `LockDosList` session made.
+/// model). No return value. Frees every heap allocation the most recent
+/// still-active `LockDosList` session made (the call nests).
 fn unlock_dos_list_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     unlock_dos_list(ctx.heap, ctx.dos);
     Ok(())
@@ -638,5 +690,81 @@ mod tests {
         let entry_addr = code as u32;
         let name_bptr = rt.memory().read_u32(entry_addr + DOL_NAME_OFFSET);
         assert_eq!(read_bstr(rt.memory(), addr_from_bptr(name_bptr)), b"WORK");
+    }
+
+    #[test]
+    fn lock_dos_list_nests_and_each_unlock_frees_only_the_latest_362() {
+        // NDK autodoc: "you can call it multiple times, and then must
+        // unlock it the same number of times". A second lock used to
+        // replace (and leak) the first session, so the first unlock freed
+        // the second's entries while a lock level was still held.
+        let (mut heap, mut mem, mut dos) = setup(&["SYS", "WORK"]);
+        let before = heap.total_free();
+
+        let outer = lock_dos_list(&mut heap, &mut mem, &mut dos, LDF_VOLUMES);
+        let inner = lock_dos_list(&mut heap, &mut mem, &mut dos, LDF_VOLUMES);
+        assert_ne!(outer, inner);
+        assert_eq!(dos.dos_list_active.len(), 2);
+
+        unlock_dos_list(&mut heap, &mut dos);
+        assert_eq!(dos.dos_list_active.len(), 1, "one lock level still held");
+        assert_ne!(
+            next_dos_entry(&mem, outer, LDF_VOLUMES),
+            0,
+            "the outer session's entries are still valid"
+        );
+
+        unlock_dos_list(&mut heap, &mut dos);
+        assert!(dos.dos_list_active.is_empty());
+        assert_eq!(heap.total_free(), before, "nothing leaked");
+        unlock_dos_list(&mut heap, &mut dos); // an extra unlock is harmless
+    }
+
+    #[test]
+    fn lock_dos_list_returns_null_instead_of_panicking_when_the_heap_is_full_362() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let mut heap = GuestHeap::new(0x1000, 0x80); // room for ~one entry
+        let vfs = Vfs::new(VfsConfig {
+            volumes: ["A", "B", "C"]
+                .iter()
+                .map(|v| (v.to_string(), PathBuf::from("/tmp")))
+                .collect(),
+            cwd: "A:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut dos = DosState::new(Some(vfs));
+        let before = heap.total_free();
+
+        assert_eq!(lock_dos_list(&mut heap, &mut mem, &mut dos, LDF_VOLUMES), 0);
+        assert_eq!(dos.io_err(), crate::dosfile::ERROR_NO_FREE_STORE);
+        assert_eq!(
+            dos.dos_list_active,
+            vec![Vec::<u32>::new()],
+            "an empty lock level, so the guest's UnLockDosList has its own entry"
+        );
+        assert_eq!(heap.total_free(), before, "the partial session was freed");
+    }
+
+    #[test]
+    fn walks_over_a_cyclic_dos_list_terminate_362() {
+        let mut mem = FlatMemory::new(0x1000);
+        // One non-matching node whose dol_Next points at itself.
+        let node = 0x100u32;
+        mem.write_u32(node + DOL_TYPE_OFFSET, DLT_PRIVATE as u32);
+        mem.write_u32(node + DOL_NEXT_OFFSET, bptr_from_addr(node));
+        assert_eq!(next_dos_entry(&mem, node, LDF_VOLUMES), 0);
+        assert_eq!(find_dos_entry(&mem, node, Some("X"), LDF_VOLUMES), 0);
+    }
+
+    #[test]
+    fn find_dos_entry_starts_with_the_entry_it_is_given_362() {
+        // Measured on real Kickstart 3.1: FindDosEntry(entry, same name)
+        // returns `entry` itself, however many times it is called.
+        let (mut heap, mut mem, mut dos) = setup(&["SYS", "WORK"]);
+        let header = lock_dos_list(&mut heap, &mut mem, &mut dos, LDF_VOLUMES);
+        let first = find_dos_entry(&mem, header, Some("SYS"), LDF_VOLUMES);
+        assert_ne!(first, 0);
+        assert_eq!(find_dos_entry(&mem, first, Some("SYS"), LDF_VOLUMES), first);
     }
 }
