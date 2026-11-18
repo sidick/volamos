@@ -457,6 +457,9 @@ fn service_action<C: Cpu>(
         // RKRM packet-documentation.md, ACTION_READ (82): Arg1 =
         // fh_Arg1, Arg2 = buffer (APTR), Arg3 = length; Res1 = bytes
         // read (0 legal at EOF) or -1 + Res2 on error.
+        ACTION_READ if !crate::guestmem::guest_range_mapped(ctx.mem, arg2, u64::from(arg3)) => {
+            (RESULT_ERROR, crate::dosfile::ERROR_BAD_NUMBER as u32)
+        }
         ACTION_READ => {
             match match crate::dospipe::read(ctx, arg1, arg3 as usize, -1, "ACTION_READ")? {
                 crate::dospipe::Outcome::Done(result) => result,
@@ -476,6 +479,9 @@ fn service_action<C: Cpu>(
         // ACTION_WRITE (87): same shape; Res1 = bytes written or -1.
         // The Output() default handle write goes through ctx.out, same
         // as the Write LVO handler (see HostHandle::Stdout's doc).
+        ACTION_WRITE if !crate::guestmem::guest_range_mapped(ctx.mem, arg2, u64::from(arg3)) => {
+            (RESULT_ERROR, crate::dosfile::ERROR_BAD_NUMBER as u32)
+        }
         ACTION_WRITE => {
             let mut buf = vec![0u8; arg3 as usize];
             for (i, b) in buf.iter_mut().enumerate() {

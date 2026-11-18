@@ -1307,6 +1307,27 @@ fn align_up(value: u32) -> u32 {
 
 /// Reads a NUL-terminated string starting at `addr` out of guest memory.
 /// The terminator is not included in the returned bytes.
+/// Most nodes any host-side walk of a guest-owned list or chain visits
+/// before giving up. The structures are in guest memory, so a guest bug
+/// (adding a node twice makes `succ` point at itself; a `TAG_MORE` that
+/// points back) can make them cyclic, and the host must not spin forever
+/// on that (issue #361). Far beyond any real list.
+pub const MAX_GUEST_LIST_WALK: u32 = 1 << 20;
+
+/// Whether `[addr, addr + len)` is wholly backed by guest memory. A guest
+/// buffer length comes straight from a register, so handlers that copy it
+/// into a host `Vec` (`Write`, `FWrite`, `CopyMem`, ...) check this first:
+/// a length past the end of guest memory can't be a real buffer, and
+/// `vec![0; 0xFFFFFFFF]` plus a 4-billion-iteration loop is not a
+/// reasonable answer to it (issue #361). `len` is a `u64` so callers can
+/// pass a product like `size * count` unreduced.
+pub fn guest_range_mapped(mem: &dyn AddressSpace, addr: u32, len: u64) -> bool {
+    match u32::try_from(len) {
+        Ok(len) => len == 0 || mem.is_mapped(addr, len),
+        Err(_) => false,
+    }
+}
+
 pub fn read_c_string(mem: &dyn AddressSpace, addr: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut a = addr;
@@ -2270,5 +2291,15 @@ mod tests {
         assert!(!heap.reserve_range(a + 8, 16), "straddling the allocation");
         heap.free(a).unwrap();
         assert!(heap.reserve_range(a, 4));
+    }
+
+    #[test]
+    fn guest_range_mapped_rejects_lengths_past_guest_memory_361() {
+        let mem = crate::memory::FlatMemory::new(0x1000);
+        assert!(guest_range_mapped(&mem, 0x10, 0x100));
+        assert!(guest_range_mapped(&mem, 0xFFFF_0000, 0), "empty is fine");
+        assert!(!guest_range_mapped(&mem, 0x10, 0x1000));
+        assert!(!guest_range_mapped(&mem, 0x10, u64::from(u32::MAX)));
+        assert!(!guest_range_mapped(&mem, 0, 1 << 32), "wider than u32");
     }
 }

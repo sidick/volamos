@@ -1045,6 +1045,24 @@ fn copy_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     let source = ctx.cpu.address_register(AddressRegister(0));
     let dest = ctx.cpu.address_register(AddressRegister(1));
     let size = ctx.cpu.data_register(DataRegister(0));
+    if size == 0 {
+        return Ok(());
+    }
+    // A size past the end of guest memory can't be a real copy: fail
+    // loudly (it would be a bus error on hardware) instead of committing
+    // the host to a multi-gigabyte buffer and billions of peeks (#361).
+    if !crate::guestmem::guest_range_mapped(ctx.mem, source, u64::from(size))
+        || !crate::guestmem::guest_range_mapped(ctx.mem, dest, u64::from(size))
+    {
+        return Err(DispatchError::HandlerFailed {
+            library: "exec.library".to_string(),
+            lvo: -624,
+            handler_name: "CopyMem".to_string(),
+            message: format!(
+                "CopyMem({source:#010x}, {dest:#010x}, {size}): a range runs outside guest memory"
+            ),
+        });
+    }
 
     let mut buf = Vec::with_capacity(size as usize);
     for i in 0..size {
@@ -2810,5 +2828,21 @@ mod tests {
         let violation = &shadow.violations()[0];
         assert_eq!(violation.kind, crate::sanitize::ViolationKind::InvalidWrite);
         assert_eq!(violation.reason, Some(crate::sanitize::PoisonReason::Freed));
+    }
+
+    #[test]
+    fn copy_mem_with_a_length_outside_guest_memory_fails_loudly_361() {
+        // CopyMem(src, dst, 0xFFFFFFFF) used to reserve 4 GiB on the host
+        // and spin through billions of peeks.
+        let mut words = Vec::new();
+        words.extend_from_slice(&[move_imm_to_a(0), 0, 0x1000]);
+        words.extend_from_slice(&[move_imm_to_a(1), 0, 0x2000]);
+        words.extend_from_slice(&[move_imm_to_d(0), 0xFFFF, 0xFFFF]);
+        words.extend_from_slice(&jsr_disp16_a6(-624)); // CopyMem
+        words.push(RTS);
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let err = rt.run(&mut out, None).unwrap_err().to_string();
+        assert!(err.contains("outside guest memory"), "{err}");
     }
 }

@@ -165,7 +165,7 @@ impl DosState {
     ) -> Result<bool, i32> {
         // eac_Entries is (re)written every call; zero it first so every
         // early-error path leaves it consistent with "no entries".
-        mem.write_u32(control + EAC_ENTRIES_OFFSET, 0);
+        mem.write_u32(control.wrapping_add(EAC_ENTRIES_OFFSET), 0);
 
         if !(ED_NAME..=ED_OWNER).contains(&data_type) {
             return Err(ERROR_BAD_NUMBER);
@@ -176,7 +176,7 @@ impl DosState {
             return Err(ERROR_OBJECT_WRONG_TYPE);
         }
 
-        let match_ptr = mem.read_u32(control + EAC_MATCHSTRING_OFFSET);
+        let match_ptr = mem.read_u32(control.wrapping_add(EAC_MATCHSTRING_OFFSET));
         let pattern = if match_ptr != 0 {
             // A corrupt/undecodable tokenized buffer decodes to None;
             // full_match against a None pattern below matches nothing
@@ -190,7 +190,7 @@ impl DosState {
         let names = sorted_dir_entries(&host_path)?;
         let fixed_size = ED_DATA_SIZES[data_type as usize];
 
-        let mut index = mem.read_u32(control + EAC_LASTKEY_OFFSET) as usize;
+        let mut index = mem.read_u32(control.wrapping_add(EAC_LASTKEY_OFFSET)) as usize;
         let mut entries: u32 = 0;
         // u64 so a hostile buffer/size pair can't wrap the end bound.
         let mut pos = buffer as u64;
@@ -280,8 +280,8 @@ impl DosState {
             index += 1;
         }
 
-        mem.write_u32(control + EAC_ENTRIES_OFFSET, entries);
-        mem.write_u32(control + EAC_LASTKEY_OFFSET, index as u32);
+        mem.write_u32(control.wrapping_add(EAC_ENTRIES_OFFSET), entries);
+        mem.write_u32(control.wrapping_add(EAC_LASTKEY_OFFSET), index as u32);
         Ok(more)
     }
 
@@ -290,8 +290,8 @@ impl DosState {
     /// so this just resets `eac_Entries`/`eac_LastKey`, leaving the
     /// control block ready for a fresh scan.
     pub fn ex_all_end(&mut self, mem: &mut dyn AddressSpace, control: u32) {
-        mem.write_u32(control + EAC_ENTRIES_OFFSET, 0);
-        mem.write_u32(control + EAC_LASTKEY_OFFSET, 0);
+        mem.write_u32(control.wrapping_add(EAC_ENTRIES_OFFSET), 0);
+        mem.write_u32(control.wrapping_add(EAC_LASTKEY_OFFSET), 0);
     }
 }
 

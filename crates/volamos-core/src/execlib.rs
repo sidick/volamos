@@ -1138,7 +1138,8 @@ fn find_lib_node(
     pred: impl Fn(&dyn AddressSpace, u32) -> bool,
 ) -> Option<u32> {
     let mut node = mem.read_u32(LIBLIST_ADDR);
-    loop {
+    // Bounded: a library added to the list twice makes it cyclic.
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
         let succ = mem.read_u32(node);
         if succ == 0 {
             return None;
@@ -1148,6 +1149,7 @@ fn find_lib_node(
         }
         node = succ;
     }
+    None
 }
 
 /// The first `LibList` node whose `ln_Name` is `name` and whose address

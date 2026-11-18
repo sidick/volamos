@@ -54,6 +54,8 @@ pub const EBADF: i32 = 9;
 pub const EACCES: i32 = 13;
 pub const EFAULT: i32 = 14;
 pub const EINVAL: i32 = 22;
+/// `EMSGSIZE` (BSD value 40): a message too large to send.
+pub const EMSGSIZE: i32 = 40;
 pub const EMFILE: i32 = 24;
 pub const EAGAIN: i32 = 35;
 pub const EINPROGRESS: i32 = 36;
@@ -948,6 +950,14 @@ fn sendmsg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let mut buf = Vec::new();
     for (base, len) in read_iovecs(ctx.mem, msg_ptr) {
         let len = clamp_guest_len(ctx.mem, len) as u32;
+        // Each entry is clamped, but a garbage msghdr could still name
+        // millions of them: the total can't exceed guest memory either
+        // (recvmsg already bounds its sum the same way).
+        if buf.len() as u64 + u64::from(len) > ctx.mem.len() as u64 {
+            ctx.bsdsocket.set_errno(ctx.mem, EMSGSIZE);
+            ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+            return Ok(());
+        }
         for i in 0..len {
             buf.push(ctx.mem.read_u8(base.wrapping_add(i)));
         }
@@ -1551,10 +1561,18 @@ fn wait_select_poll<C: Cpu>(
         except: bool,
     }
     let mut interests: Vec<Interest> = Vec::new();
-    for fd in 0..nfds {
-        if !ctx.bsdsocket.sockets.contains_key(&fd) {
-            continue;
-        }
+    // Walk our own sockets, not `0..nfds`: `nfds` is a raw guest value
+    // (garbage in D0 meant up to 2^31 map lookups) and only fds we hold
+    // can be of interest anyway.
+    let mut candidate_fds: Vec<i32> = ctx
+        .bsdsocket
+        .sockets
+        .keys()
+        .copied()
+        .filter(|&fd| fd >= 0 && fd < nfds)
+        .collect();
+    candidate_fds.sort_unstable();
+    for fd in candidate_fds {
         let read = readfds_ptr != 0 && fd_set_test(ctx.mem, readfds_ptr, fd);
         let write = writefds_ptr != 0 && fd_set_test(ctx.mem, writefds_ptr, fd);
         let except = exceptfds_ptr != 0 && fd_set_test(ctx.mem, exceptfds_ptr, fd);
@@ -2378,6 +2396,11 @@ fn getprotobynumber_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
+/// Largest `namelen` `gethostname` will honour (more than `HOST_NAME_MAX`
+/// on any platform).
+#[cfg(unix)]
+const HOSTNAME_BUF_CAP: i32 = 1024;
+
 /// `gethostname(name, namelen)`. `D0` = `0` on success, or `-1` with
 /// `Errno()` set. A real host `libc::gethostname` call, truncated to
 /// fit `namelen` the same way a real kernel truncates it (real BSD
@@ -2394,6 +2417,11 @@ fn gethostname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         return Ok(());
     }
+    // The guest's length is a raw register: a real host name is at most
+    // a few hundred bytes, so never ask for (or fill) more than a
+    // generous cap -- `namelen` of 0x7FFFFFFF used to allocate 2 GiB and
+    // write every byte of the guest buffer (issue #361).
+    let namelen = namelen.min(HOSTNAME_BUF_CAP);
     let mut buf = vec![0u8; namelen as usize];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
     if rc != 0 {
@@ -2407,7 +2435,12 @@ fn gethostname_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // name is exactly namelen bytes with no room left for the NUL (some
     // platforms don't guarantee truncation leaves room for it).
     buf[namelen as usize - 1] = 0;
-    for (i, &b) in buf.iter().enumerate() {
+    // The name and its NUL, not the zero fill after it.
+    let used = buf
+        .iter()
+        .position(|&b| b == 0)
+        .map_or(buf.len(), |n| n + 1);
+    for (i, &b) in buf[..used].iter().enumerate() {
         ctx.mem.write_u8(name_ptr.wrapping_add(i as u32), b);
     }
     ctx.bsdsocket.set_errno(ctx.mem, 0);

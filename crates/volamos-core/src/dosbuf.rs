@@ -230,6 +230,11 @@ fn fread_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     let addr = addr_from_bptr(bptr);
 
     let total_wanted = (block_len as u64) * (block_count as u64);
+    if !crate::guestmem::guest_range_mapped(ctx.mem, buf_addr, total_wanted) {
+        ctx.dos.set_io_err(crate::dosfile::ERROR_BAD_NUMBER);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
     // What an earlier, blocked attempt already took from the pipe.
     let key = (ctx.current_task, addr);
     let mut data = ctx.dos.stdio_progress.remove(&key).unwrap_or_default();
@@ -270,6 +275,11 @@ fn fwrite_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let addr = addr_from_bptr(bptr);
 
     let total = (block_len as u64) * (block_count as u64);
+    if !crate::guestmem::guest_range_mapped(ctx.mem, buf_addr, total) {
+        ctx.dos.set_io_err(crate::dosfile::ERROR_BAD_NUMBER);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
     let mut buf = Vec::with_capacity(total as usize);
     for i in 0..total {
         buf.push(ctx.mem.read_u8(buf_addr.wrapping_add(i as u32)));
@@ -363,6 +373,11 @@ fn write_chars_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             return Ok(());
         }
     };
+    if !crate::guestmem::guest_range_mapped(ctx.mem, buf_addr, u64::from(len)) {
+        ctx.dos.set_io_err(crate::dosfile::ERROR_BAD_NUMBER);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
     let mut buf = Vec::with_capacity(len as usize);
     for i in 0..len {
         buf.push(ctx.mem.read_u8(buf_addr.wrapping_add(i)));

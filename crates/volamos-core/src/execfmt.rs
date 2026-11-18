@@ -152,6 +152,14 @@ struct Directive {
     ty: FmtType,
 }
 
+/// Largest field width / precision a format directive may ask for. Both
+/// come from guest text: an unchecked `width * 10 + digit` overflowed
+/// (`%99999999999999999999d` panicked a debug build and wrapped to a huge
+/// allocation in release), and even an in-range `%2000000000d` meant a
+/// 2 GB pad and ~2 billion `PutChProc` calls (issue #361). Nothing real
+/// prints a field this wide.
+const MAX_FIELD_WIDTH: usize = 4096;
+
 /// Parses one `%...` directive starting right after the `%` at
 /// `fmt[*pos]`, advancing `*pos` past it. `None` if `fmt[*pos]` isn't a
 /// recognized type character at all (treated as a literal `%` followed
@@ -168,7 +176,7 @@ fn parse_directive(fmt: &[u8], pos: &mut usize) -> Option<Directive> {
     let mut width = 0usize;
     while let Some(&c) = fmt.get(*pos) {
         if c.is_ascii_digit() {
-            width = width * 10 + (c - b'0') as usize;
+            width = (width * 10 + (c - b'0') as usize).min(MAX_FIELD_WIDTH);
             *pos += 1;
         } else {
             break;
@@ -181,7 +189,7 @@ fn parse_directive(fmt: &[u8], pos: &mut usize) -> Option<Directive> {
         let mut any = false;
         while let Some(&c) = fmt.get(*pos) {
             if c.is_ascii_digit() {
-                n = n * 10 + (c - b'0') as usize;
+                n = (n * 10 + (c - b'0') as usize).min(MAX_FIELD_WIDTH);
                 *pos += 1;
                 any = true;
             } else {
@@ -1004,5 +1012,16 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0x2000, "the routine ran with the S bit set");
+    }
+
+    #[test]
+    fn an_absurd_field_width_is_capped_not_overflowed_361() {
+        // `%99999999999999999999d` overflowed `width * 10 + digit` (debug
+        // panic, release wrap to a huge allocation).
+        let mem = FlatMemory::new(0x1000);
+        let (out, _) = render_format(&mem, b"%99999999999999999999d", 0);
+        assert_eq!(out.len(), MAX_FIELD_WIDTH);
+        let (out, _) = render_format(&mem, b"%2000000000d", 0);
+        assert_eq!(out.len(), MAX_FIELD_WIDTH);
     }
 }

@@ -173,7 +173,8 @@ pub(crate) fn amiga_toupper(c: u8) -> u8 {
 /// immediately -- this is what makes a `NULL` tag-list pointer a legal
 /// empty list (see the module docs).
 fn next_tag_item_impl<M: AddressSpace>(mem: &M, mut cur: u32) -> (u32, u32) {
-    loop {
+    // Bounded: a `TAG_MORE` that points back at itself never ends.
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
         if cur == 0 {
             return (0, 0);
         }
@@ -191,6 +192,7 @@ fn next_tag_item_impl<M: AddressSpace>(mem: &M, mut cur: u32) -> (u32, u32) {
             _ => return (cur, cur.wrapping_add(TAG_ITEM_SIZE)),
         }
     }
+    (0, 0)
 }
 
 /// Scans a tag list (starting at `list`) for the first `TagItem` whose
@@ -532,9 +534,9 @@ pub(crate) fn ymd_to_days(year: u32, month: u32, mday: u32) -> u32 {
 fn clock_data_to_seconds(cd: &ClockData) -> u32 {
     let days = ymd_to_days(cd.year as u32, cd.month as u32, cd.mday as u32);
     days.wrapping_mul(86400)
-        + (cd.hour as u32).wrapping_mul(3600)
-        + (cd.min as u32).wrapping_mul(60)
-        + cd.sec as u32
+        .wrapping_add((cd.hour as u32).wrapping_mul(3600))
+        .wrapping_add((cd.min as u32).wrapping_mul(60))
+        .wrapping_add(cd.sec as u32)
 }
 
 /// Converts a seconds-since-epoch count to a full `ClockData`, including
@@ -1686,5 +1688,14 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0, "zero divisor should not panic the host");
+    }
+
+    #[test]
+    fn a_tag_more_that_points_back_at_itself_ends_the_walk_361() {
+        let mut mem = FlatMemory::new(0x1000);
+        mem.write_u32(0x100, TAG_MORE);
+        mem.write_u32(0x104, 0x100);
+        assert_eq!(next_tag_item_impl(&mem, 0x100), (0, 0));
+        assert_eq!(find_tag_item_impl(&mem, 0x1234, 0x100), 0);
     }
 }

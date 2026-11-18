@@ -1128,8 +1128,11 @@ pub(crate) fn fill_fib(
     // written.
     let meta = dosmeta::read_or_host_date(host_path);
 
-    mem.write_u32(fib_addr + FIB_DISKKEY_OFFSET, 0);
-    mem.write_u32(fib_addr + FIB_DIRENTRYTYPE_OFFSET, entry_type as u32);
+    mem.write_u32(fib_addr.wrapping_add(FIB_DISKKEY_OFFSET), 0);
+    mem.write_u32(
+        fib_addr.wrapping_add(FIB_DIRENTRYTYPE_OFFSET),
+        entry_type as u32,
+    );
 
     let truncated_name: &str = {
         let mut end = name.len().min(FIB_FILENAME_MAX_CHARS);
@@ -1140,27 +1143,36 @@ pub(crate) fn fill_fib(
     };
     write_c_string(
         mem,
-        fib_addr + FIB_FILENAME_OFFSET,
+        fib_addr.wrapping_add(FIB_FILENAME_OFFSET),
         truncated_name.as_bytes(),
     );
 
-    mem.write_u32(fib_addr + FIB_PROTECTION_OFFSET, meta.prot);
-    mem.write_u32(fib_addr + FIB_ENTRYTYPE_OFFSET, entry_type as u32);
-    mem.write_u32(fib_addr + FIB_SIZE_OFFSET, size);
-    mem.write_u32(fib_addr + FIB_NUMBLOCKS_OFFSET, num_blocks);
+    mem.write_u32(fib_addr.wrapping_add(FIB_PROTECTION_OFFSET), meta.prot);
+    mem.write_u32(
+        fib_addr.wrapping_add(FIB_ENTRYTYPE_OFFSET),
+        entry_type as u32,
+    );
+    mem.write_u32(fib_addr.wrapping_add(FIB_SIZE_OFFSET), size);
+    mem.write_u32(fib_addr.wrapping_add(FIB_NUMBLOCKS_OFFSET), num_blocks);
     // fib_Date: from the sidecar if present, else the fixed AmigaOS
     // epoch -- see the module docs' "Examine/ExNext" section and
     // crate::dosmeta's own docs on why this doesn't reintroduce
     // host-mtime non-determinism.
-    mem.write_u32(fib_addr + FIB_DATE_OFFSET, meta.date.0 as u32);
-    mem.write_u32(fib_addr + FIB_DATE_OFFSET + 4, meta.date.1 as u32);
-    mem.write_u32(fib_addr + FIB_DATE_OFFSET + 8, meta.date.2 as u32);
+    mem.write_u32(fib_addr.wrapping_add(FIB_DATE_OFFSET), meta.date.0 as u32);
+    mem.write_u32(
+        fib_addr.wrapping_add(FIB_DATE_OFFSET) + 4,
+        meta.date.1 as u32,
+    );
+    mem.write_u32(
+        fib_addr.wrapping_add(FIB_DATE_OFFSET) + 8,
+        meta.date.2 as u32,
+    );
     // fib_Comment: from the sidecar if present, else empty (TEXT
     // fib_Comment[80], NDK dos/dos.h -- not a BSTR, same fix as
     // fib_FileName above).
     write_c_string(
         mem,
-        fib_addr + FIB_COMMENT_OFFSET,
+        fib_addr.wrapping_add(FIB_COMMENT_OFFSET),
         meta.comment.as_deref().unwrap_or(b""),
     );
 }

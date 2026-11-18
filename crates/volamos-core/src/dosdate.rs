@@ -355,7 +355,7 @@ fn compare_dates_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     // date2 against date1, not the other way round -- see the doc.
     let diff = match date2.0.cmp(&date1.0) {
         std::cmp::Ordering::Equal => match date2.1.cmp(&date1.1) {
-            std::cmp::Ordering::Equal => date2.2 - date1.2,
+            std::cmp::Ordering::Equal => date2.2.wrapping_sub(date1.2),
             other => other as i32,
         },
         other => other as i32,

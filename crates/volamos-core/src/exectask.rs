@@ -992,7 +992,9 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 
     let priority = match tag_data(ctx.mem, tags, NP_PRIORITY) {
         Some(pri) => pri as i8,
-        None => ctx.mem.read_u8(ctx.current_task + crate::execlist::LN_PRI) as i8,
+        None => ctx
+            .mem
+            .read_u8(ctx.current_task.wrapping_add(crate::execlist::LN_PRI)) as i8,
     };
 
     // NP_Arguments: copied, as real DOS does, and then the caller's own
@@ -1405,8 +1407,9 @@ fn find_task_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 fn set_task_pri_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let task = ctx.cpu.address_register(AddressRegister(1));
     let new_pri = ctx.cpu.data_register(DataRegister(0)) as u8;
-    let old_pri = ctx.mem.read_u8(task + crate::execlist::LN_PRI) as i8;
-    ctx.mem.write_u8(task + crate::execlist::LN_PRI, new_pri);
+    let old_pri = ctx.mem.read_u8(task.wrapping_add(crate::execlist::LN_PRI)) as i8;
+    ctx.mem
+        .write_u8(task.wrapping_add(crate::execlist::LN_PRI), new_pri);
     ctx.cpu
         .set_data_register(DataRegister(0), old_pri as i32 as u32);
     if task == ctx.current_task {

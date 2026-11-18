@@ -201,7 +201,7 @@ fn drain_step<C: Cpu + 'static>(
     };
 
     // Back to NT_INTERRUPT before the handler runs, as real exec does.
-    ctx.mem.write_u8(node + LN_TYPE, NT_INTERRUPT);
+    ctx.mem.write_u8(node.wrapping_add(LN_TYPE), NT_INTERRUPT);
     let data = ctx.mem.read_u32(node + IS_DATA);
     let code = ctx.mem.read_u32(node + IS_CODE); // non-NULL: checked at Cause time
     ctx.cpu.set_address_register(AddressRegister(1), data);
@@ -294,7 +294,7 @@ pub fn register_execint_handlers<C: Cpu + 'static>(
                 "Cause(NULL): no struct Interrupt to run".to_string(),
             ));
         }
-        if ctx.mem.read_u8(node + LN_TYPE) == NT_SOFTINT {
+        if ctx.mem.read_u8(node.wrapping_add(LN_TYPE)) == NT_SOFTINT {
             return Ok(()); // already pending; no nest count
         }
         // Validate everything before touching the node.
@@ -310,7 +310,7 @@ pub fn register_execint_handlers<C: Cpu + 'static>(
                  interrupts allow (real exec would index past its five SoftIntList queues)"
             )));
         };
-        ctx.mem.write_u8(node + LN_TYPE, NT_SOFTINT);
+        ctx.mem.write_u8(node.wrapping_add(LN_TYPE), NT_SOFTINT);
         let mut st = state.borrow_mut();
         st.queues[level].push_back(node);
         if st.saved.is_some() {

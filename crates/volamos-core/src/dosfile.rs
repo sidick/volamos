@@ -81,6 +81,9 @@ use crate::vfs::{ResolveMode, Vfs, VfsError};
 
 /// Not enough memory to complete the request.
 pub const ERROR_NO_FREE_STORE: i32 = 103;
+/// `ERROR_BAD_NUMBER`: a numeric argument is out of range -- here, a
+/// buffer length that doesn't fit in guest memory.
+pub const ERROR_BAD_NUMBER: i32 = 115;
 /// An object with that name is already in use (e.g. a lock preventing
 /// deletion). Not currently produced by any T10 handler, but part of the
 /// documented mapping surface.
@@ -1451,6 +1454,11 @@ fn read_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
     let buf_addr = ctx.cpu.data_register(DataRegister(2));
     let len = ctx.cpu.data_register(DataRegister(3)) as usize;
     let addr = addr_from_bptr(bptr);
+    if !crate::guestmem::guest_range_mapped(ctx.mem, buf_addr, len as u64) {
+        ctx.dos.set_io_err(ERROR_BAD_NUMBER);
+        ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
+        return Ok(());
+    }
     let result = match crate::dospipe::read(ctx, addr, len, -42, "Read")? {
         crate::dospipe::Outcome::Done(result) => result,
         crate::dospipe::Outcome::Switched => return Ok(()),
@@ -1479,6 +1487,13 @@ fn write_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     let buf_addr = ctx.cpu.data_register(DataRegister(2));
     let len = ctx.cpu.data_register(DataRegister(3)) as usize;
     let addr = addr_from_bptr(bptr);
+    // Real AmigaDOS returns -1 for a negative length; one that runs off
+    // the end of guest memory can't be a buffer either.
+    if !crate::guestmem::guest_range_mapped(ctx.mem, buf_addr, len as u64) {
+        ctx.dos.set_io_err(ERROR_BAD_NUMBER);
+        ctx.cpu.set_data_register(DataRegister(0), RESULT_ERROR);
+        return Ok(());
+    }
 
     let mut buf = vec![0u8; len];
     for (i, b) in buf.iter_mut().enumerate() {

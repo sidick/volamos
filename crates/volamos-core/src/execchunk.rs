@@ -221,17 +221,24 @@ fn allocate_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
     }
     let size = round_up_to_memchunk(requested);
 
-    if ctx.mem.read_u32(free_list + MH_FREE) < size {
+    if ctx.mem.read_u32(free_list.wrapping_add(MH_FREE)) < size {
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
     }
 
     let mut prev: u32 = 0;
-    let mut cur = ctx.mem.read_u32(free_list + MH_FIRST);
+    let mut cur = ctx.mem.read_u32(free_list.wrapping_add(MH_FIRST));
+    // Bounded: a cyclic free list (corrupted `mc_Next`) would otherwise
+    // hang the host (issue #361).
+    let mut steps = 0u32;
     while cur != 0 {
-        let bytes = ctx.mem.read_u32(cur + MC_BYTES);
+        steps += 1;
+        if steps > crate::guestmem::MAX_GUEST_LIST_WALK {
+            return Err(chunk_chain_error(-186, "Allocate", free_list));
+        }
+        let bytes = ctx.mem.read_u32(cur.wrapping_add(MC_BYTES));
         if bytes >= size {
-            let next = ctx.mem.read_u32(cur + MC_NEXT);
+            let next = ctx.mem.read_u32(cur.wrapping_add(MC_NEXT));
             let remaining = bytes - size;
             let link_target = if remaining == 0 {
                 // Exact fit: the whole chunk is consumed, unlink it.
@@ -239,7 +246,7 @@ fn allocate_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
             } else {
                 // Take the front of the chunk, shrink what's left and
                 // re-link the chain through it.
-                let leftover = cur + size;
+                let leftover = cur.wrapping_add(size);
                 // Exempt *before* writing: the leftover's header can
                 // land anywhere inside the chunk's old body, which an
                 // earlier Deallocate may have poisoned wholesale, and
@@ -250,18 +257,21 @@ fn allocate_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
                 // false positive. See the module doc's "Sanitizer
                 // interaction" section.
                 exempt_chunk_header(ctx, leftover);
-                ctx.mem.write_u32(leftover + MC_NEXT, next);
-                ctx.mem.write_u32(leftover + MC_BYTES, remaining);
+                ctx.mem.write_u32(leftover.wrapping_add(MC_NEXT), next);
+                ctx.mem
+                    .write_u32(leftover.wrapping_add(MC_BYTES), remaining);
                 leftover
             };
             if prev == 0 {
-                ctx.mem.write_u32(free_list + MH_FIRST, link_target);
+                ctx.mem
+                    .write_u32(free_list.wrapping_add(MH_FIRST), link_target);
             } else {
-                ctx.mem.write_u32(prev + MC_NEXT, link_target);
+                ctx.mem.write_u32(prev.wrapping_add(MC_NEXT), link_target);
             }
 
-            let free = ctx.mem.read_u32(free_list + MH_FREE);
-            ctx.mem.write_u32(free_list + MH_FREE, free - size);
+            let free = ctx.mem.read_u32(free_list.wrapping_add(MH_FREE));
+            ctx.mem
+                .write_u32(free_list.wrapping_add(MH_FREE), free.wrapping_sub(size));
             // After every chain write above, per `poison_allocated_chunk`'s
             // doc -- marks the whole returned range (including its own
             // former header bytes, whatever state they were in) Uninit.
@@ -270,7 +280,7 @@ fn allocate_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
             return Ok(());
         }
         prev = cur;
-        cur = ctx.mem.read_u32(cur + MC_NEXT);
+        cur = ctx.mem.read_u32(cur.wrapping_add(MC_NEXT));
     }
 
     // Walked the whole chain without finding a big-enough chunk (can
@@ -302,44 +312,54 @@ fn deallocate_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 
     // Walk to the address-ordered insertion point.
     let mut prev: u32 = 0;
-    let mut cur = ctx.mem.read_u32(free_list + MH_FIRST);
+    let mut cur = ctx.mem.read_u32(free_list.wrapping_add(MH_FIRST));
+    let mut steps = 0u32;
     while cur != 0 && cur < block {
+        steps += 1;
+        if steps > crate::guestmem::MAX_GUEST_LIST_WALK {
+            return Err(chunk_chain_error(-192, "Deallocate", free_list));
+        }
         prev = cur;
-        cur = ctx.mem.read_u32(cur + MC_NEXT);
+        cur = ctx.mem.read_u32(cur.wrapping_add(MC_NEXT));
     }
 
     // Try merging into the predecessor first (its end address exactly
     // meets the freed block's start).
-    let (node, mut node_bytes) = if prev != 0 && prev + ctx.mem.read_u32(prev + MC_BYTES) == block {
-        let merged = ctx.mem.read_u32(prev + MC_BYTES) + size;
-        ctx.mem.write_u32(prev + MC_BYTES, merged);
-        (prev, merged)
-    } else {
-        // No merge: link the freed block in as its own new chunk.
-        ctx.mem.write_u32(block + MC_NEXT, cur);
-        ctx.mem.write_u32(block + MC_BYTES, size);
-        if prev == 0 {
-            ctx.mem.write_u32(free_list + MH_FIRST, block);
+    let (node, mut node_bytes) =
+        if prev != 0 && prev.wrapping_add(ctx.mem.read_u32(prev.wrapping_add(MC_BYTES))) == block {
+            let merged = ctx
+                .mem
+                .read_u32(prev.wrapping_add(MC_BYTES))
+                .wrapping_add(size);
+            ctx.mem.write_u32(prev.wrapping_add(MC_BYTES), merged);
+            (prev, merged)
         } else {
-            ctx.mem.write_u32(prev + MC_NEXT, block);
-        }
-        (block, size)
-    };
+            // No merge: link the freed block in as its own new chunk.
+            ctx.mem.write_u32(block.wrapping_add(MC_NEXT), cur);
+            ctx.mem.write_u32(block.wrapping_add(MC_BYTES), size);
+            if prev == 0 {
+                ctx.mem.write_u32(free_list.wrapping_add(MH_FIRST), block);
+            } else {
+                ctx.mem.write_u32(prev.wrapping_add(MC_NEXT), block);
+            }
+            (block, size)
+        };
 
     // Try merging with the successor (its start address exactly meets
     // this node's end address) -- covers both the fresh-node and the
     // merged-into-predecessor cases, so up to three adjacent chunks
     // (prev, freed block, next) can collapse into one.
-    if cur != 0 && node + node_bytes == cur {
-        let cur_bytes = ctx.mem.read_u32(cur + MC_BYTES);
-        let cur_next = ctx.mem.read_u32(cur + MC_NEXT);
-        node_bytes += cur_bytes;
-        ctx.mem.write_u32(node + MC_BYTES, node_bytes);
-        ctx.mem.write_u32(node + MC_NEXT, cur_next);
+    if cur != 0 && node.wrapping_add(node_bytes) == cur {
+        let cur_bytes = ctx.mem.read_u32(cur.wrapping_add(MC_BYTES));
+        let cur_next = ctx.mem.read_u32(cur.wrapping_add(MC_NEXT));
+        node_bytes = node_bytes.wrapping_add(cur_bytes);
+        ctx.mem.write_u32(node.wrapping_add(MC_BYTES), node_bytes);
+        ctx.mem.write_u32(node.wrapping_add(MC_NEXT), cur_next);
     }
 
-    let free = ctx.mem.read_u32(free_list + MH_FREE);
-    ctx.mem.write_u32(free_list + MH_FREE, free + size);
+    let free = ctx.mem.read_u32(free_list.wrapping_add(MH_FREE));
+    ctx.mem
+        .write_u32(free_list.wrapping_add(MH_FREE), free.wrapping_add(size));
 
     // Issue #83 Tier 1: poison exactly the extent the caller just
     // handed back, after all the relinking above (never before -- a
@@ -357,6 +377,19 @@ fn deallocate_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
         exempt_chunk_header(ctx, block);
     }
     Ok(())
+}
+
+/// The error for a `MemHeader` free list that never ends (a corrupted
+/// `mc_Next`): fail loudly rather than spin the host forever.
+fn chunk_chain_error(lvo: i32, name: &str, free_list: u32) -> DispatchError {
+    DispatchError::HandlerFailed {
+        library: "exec.library".to_string(),
+        lvo,
+        handler_name: name.to_string(),
+        message: format!(
+            "{name}: the free list of MemHeader {free_list:#010x} never ends (cyclic?)"
+        ),
+    }
 }
 
 /// Registers this module's `exec.library` raw-chunk-allocator handlers,

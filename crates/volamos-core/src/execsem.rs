@@ -515,7 +515,7 @@ fn obtain_semaphore_list_handler<C: Cpu>(
     let list = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
     let mut node = ctx.mem.read_u32(list + crate::execlist::LH_HEAD);
-    loop {
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
         let succ = ctx.mem.read_u32(node + crate::execlist::LN_SUCC);
         if succ == 0 {
             return Ok(());
@@ -535,6 +535,22 @@ fn obtain_semaphore_list_handler<C: Cpu>(
         })?;
         node = succ;
     }
+    Err(semaphore_list_cycle_error(
+        -582,
+        "ObtainSemaphoreList",
+        list,
+    ))
+}
+
+/// The error for a semaphore list that never ends (a semaphore added to
+/// it twice): fail loudly rather than spin the host forever (issue #361).
+fn semaphore_list_cycle_error(lvo: i32, name: &str, list: u32) -> DispatchError {
+    DispatchError::HandlerFailed {
+        library: "exec.library".to_string(),
+        lvo,
+        handler_name: name.to_string(),
+        message: format!("{name}({list:#010x}): the list never reaches its tail (cyclic?)"),
+    }
 }
 
 /// `ReleaseSemaphoreList` (LVO -588): `A0` = `struct List*` of
@@ -551,7 +567,7 @@ fn release_semaphore_list_handler<C: Cpu>(
     let list = ctx.cpu.address_register(AddressRegister(0));
     let task = ctx.current_task;
     let mut node = ctx.mem.read_u32(list + crate::execlist::LH_HEAD);
-    loop {
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
         let succ = ctx.mem.read_u32(node + crate::execlist::LN_SUCC);
         if succ == 0 {
             return Ok(());
@@ -570,6 +586,11 @@ fn release_semaphore_list_handler<C: Cpu>(
         })?;
         node = succ;
     }
+    Err(semaphore_list_cycle_error(
+        -588,
+        "ReleaseSemaphoreList",
+        list,
+    ))
 }
 
 /// Registers this module's `exec.library` semaphore handlers, looked up
