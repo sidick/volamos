@@ -774,6 +774,9 @@ pub fn handle_fs_packet<C: Cpu>(
 
     let reply_port = ctx.mem.read_u32(pkt + DP_PORT);
     crate::execlist::put_msg_impl(ctx.mem, reply_port, msg, crate::execlist::NT_REPLYMSG);
+    // A DoPkt/SendPkt client may `Wait(1 << mp_SigBit)` on its reply port
+    // instead of `WaitPort`ing it.
+    crate::execlist::signal_port_task(ctx.mem, ctx.tasks, reply_port);
     Ok(())
 }
 

@@ -56,7 +56,7 @@
 //! (it's an `amiga.lib` macro, not a real library call), so this is the
 //! only place that logic needs to live.
 //!
-//! # Message ports: single-threaded simplifications
+//! # Message ports
 //!
 //! ```text
 //! struct MsgPort {                    struct Message {
@@ -96,8 +96,9 @@
 //! real bit. [`ReplyMsg`] queues onto `mn_ReplyPort` with `ln_Type` =
 //! [`NT_REPLYMSG`], or, if that is `NULL`, only marks the message
 //! replied. Packet replies served host-side by
-//! [`crate::dospkt::handle_fs_packet`] don't signal: they're delivered
-//! synchronously, so nothing is ever waiting for them.
+//! [`crate::dospkt::handle_fs_packet`] are queued synchronously and
+//! signal the reply port too, so a client may `Wait` on its bit as well
+//! as `WaitPort`.
 //!
 //! # `AddPort`/`RemPort`/`FindPort`: no public port registry
 //!
@@ -205,10 +206,11 @@ pub const PA_SIGNAL: u8 = 0;
 /// `PA_IGNORE` (2).
 pub const PF_ACTION: u8 = 3;
 
-/// Fixed placeholder written to `mp_SigBit` by [`create_msg_port_handler`]
-/// -- see the module docs' "Message ports: single-threaded
-/// simplifications" section for why this isn't a real allocated signal
-/// bit.
+/// Placeholder `mp_SigBit` that [`init_msg_port_fields`] writes: "no
+/// real signal bit". Ports made by [`create_msg_port_handler`] get a
+/// real `AllocSignal`'d bit instead; the embedded `pr_MsgPort` and
+/// Intuition's window ports keep this. See the module docs' message-port
+/// section.
 pub const MSGPORT_SIGBIT_PLACEHOLDER: u8 = 0;
 
 /// What real `PutMsg` does after queueing: if the port's action is
@@ -258,6 +260,9 @@ fn alloc_port_signal<M: AddressSpace + ?Sized>(mem: &mut M, task: u32) -> Option
     let alloc = mem.read_u32(task + crate::exectask::TC_SIGALLOC);
     let bit = (0..32u8).rev().find(|&b| alloc & (1 << b) == 0)?;
     mem.write_u32(task + crate::exectask::TC_SIGALLOC, alloc | (1 << bit));
+    // As AllocSignal: a freshly allocated signal starts out cleared.
+    let recvd = mem.read_u32(task + crate::exectask::TC_SIGRECVD);
+    mem.write_u32(task + crate::exectask::TC_SIGRECVD, recvd & !(1 << bit));
     Some(bit)
 }
 
@@ -508,6 +513,20 @@ fn wait_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     loop {
         let node = ctx.mem.read_u32(list + LH_HEAD);
         if ctx.mem.read_u32(node + LN_SUCC) != 0 {
+            // If we got here by being woken from our own block (the
+            // `tc_SigWait` we left), real `Wait` has consumed the port's
+            // bit and cleared `tc_SigWait` by now.
+            let task = ctx.current_task;
+            let bit = ctx.mem.read_u8(port + MP_SIGBIT);
+            if bit < 32
+                && bit != MSGPORT_SIGBIT_PLACEHOLDER
+                && ctx.mem.read_u32(task + crate::exectask::TC_SIGWAIT) == 1u32 << bit
+            {
+                let recvd = ctx.mem.read_u32(task + crate::exectask::TC_SIGRECVD);
+                ctx.mem
+                    .write_u32(task + crate::exectask::TC_SIGRECVD, recvd & !(1u32 << bit));
+                ctx.mem.write_u32(task + crate::exectask::TC_SIGWAIT, 0);
+            }
             ctx.cpu.set_data_register(DataRegister(0), node);
             return Ok(());
         }
@@ -637,17 +656,14 @@ fn delete_msg_port_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     if port == 0 {
         return Ok(());
     }
-    // FreeSignal the bit CreateMsgPort reserved (see there).
-    let sig_task = ctx.mem.read_u32(port + MP_SIGTASK);
+    // FreeSignal the bit CreateMsgPort reserved -- on the *calling* task,
+    // as real DeleteMsgPort does, not whatever `mp_SigTask` now says.
     let bit = ctx.mem.read_u8(port + MP_SIGBIT);
-    if sig_task != 0
-        && bit != MSGPORT_SIGBIT_PLACEHOLDER
-        && bit < 32
-        && (sig_task == ctx.current_task || ctx.tasks.is_known(sig_task))
-    {
-        let alloc = ctx.mem.read_u32(sig_task + crate::exectask::TC_SIGALLOC);
+    if bit != MSGPORT_SIGBIT_PLACEHOLDER && bit < 32 {
+        let task = ctx.current_task;
+        let alloc = ctx.mem.read_u32(task + crate::exectask::TC_SIGALLOC);
         ctx.mem
-            .write_u32(sig_task + crate::exectask::TC_SIGALLOC, alloc & !(1 << bit));
+            .write_u32(task + crate::exectask::TC_SIGALLOC, alloc & !(1 << bit));
     }
     crate::execmem::poison_freed_block(ctx, port);
     ctx.heap
@@ -1515,25 +1531,26 @@ mod tests {
 
     #[test]
     fn create_msg_port_reserves_a_real_signal_bit_and_delete_frees_it_359() {
-        // AllocSignal(-1) is the highest free bit, so CreateMsgPort takes
-        // 31, a second port 30; deleting the first frees 31 again.
-        let mut mem = FlatMemory::new(0x10000);
-        let mut heap = crate::guestmem::GuestHeap::new(0x2000, 0x8000);
-        mem.write_u32(MAIN + crate::exectask::TC_SIGALLOC, 0xFFFF);
-        let mut a = 0;
-        let mut b = 0;
-        for slot in [&mut a, &mut b] {
-            let port = heap.alloc(&mut mem, MSGPORT_SIZE).unwrap();
-            init_msg_port_fields(&mut mem, port, MAIN);
-            let bit = alloc_port_signal(&mut mem, MAIN).unwrap();
-            mem.write_u8(port + MP_SIGBIT, bit);
-            *slot = port;
-        }
-        assert_eq!(mem.read_u8(a + MP_SIGBIT), 31);
-        assert_eq!(mem.read_u8(b + MP_SIGBIT), 30);
-        assert_eq!(
-            mem.read_u32(MAIN + crate::exectask::TC_SIGALLOC),
-            0xFFFF | 1 << 31 | 1 << 30
-        );
+        // AllocSignal(-1) is the highest free bit. CreateMsgPort takes 31,
+        // so while the port lives the next AllocSignal gets 30; once
+        // DeleteMsgPort has freed it, 31 is the answer again.
+        let alloc_any = [0x203C, 0xFFFF, 0xFFFF]; // move.l #-1,d0
+        let mut live = Vec::new();
+        live.extend_from_slice(&jsr_disp16_a6(-666)); // CreateMsgPort
+        live.extend_from_slice(&alloc_any);
+        live.extend_from_slice(&jsr_disp16_a6(-330)); // AllocSignal(-1)
+        live.push(RTS);
+        let mut out = Vec::new();
+        assert_eq!(program(&live).run(&mut out, None).unwrap(), 30);
+
+        let mut deleted = Vec::new();
+        deleted.extend_from_slice(&jsr_disp16_a6(-666)); // CreateMsgPort
+        deleted.push(move_d0_to_a(0));
+        deleted.extend_from_slice(&jsr_disp16_a6(-672)); // DeleteMsgPort(a0)
+        deleted.extend_from_slice(&alloc_any);
+        deleted.extend_from_slice(&jsr_disp16_a6(-330)); // AllocSignal(-1)
+        deleted.push(RTS);
+        let mut out = Vec::new();
+        assert_eq!(program(&deleted).run(&mut out, None).unwrap(), 31);
     }
 }
