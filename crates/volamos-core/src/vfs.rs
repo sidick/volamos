@@ -633,7 +633,7 @@ impl Vfs {
             return Ok(join_components(&base, &named));
         }
         if let Some(root) = &self.config.auto_assign_root {
-            return Ok(root.join(name));
+            return auto_assign_dir(root, name);
         }
         Err(VfsError::UnknownVolume {
             name: name.to_string(),
@@ -759,7 +759,7 @@ impl Vfs {
             return Ok(result);
         }
         if let Some(root) = &self.config.auto_assign_root {
-            return Ok(vec![root.join(name)]);
+            return Ok(vec![auto_assign_dir(root, name)?]);
         }
         Err(VfsError::UnknownVolume {
             name: name.to_string(),
@@ -794,6 +794,36 @@ fn apply_parent_pops(
         }
     }
     Ok(stack)
+}
+
+/// Whether `name` may be used as one host path component taken from a
+/// guest-supplied Amiga path. Rejects the names that would let a guest
+/// leave the directory it is resolving under -- `.`, `..`, anything
+/// containing a path separator, and NUL -- since [`find_case_insensitive`]
+/// only ever matches names `read_dir` lists (which never includes `.`/
+/// `..`), but the append-verbatim branch of [`resolve_named_components`]
+/// and the auto-assign root join take the guest's spelling as-is. Without
+/// this, `MakeLink("SYS:esc", "SYS:..", TRUE)` created a host symlink to
+/// the volume's parent, and `--auto-assign` resolved `/etc:hosts` to
+/// `/etc/hosts` (issue #358).
+pub(crate) fn is_safe_component(name: &str) -> bool {
+    !(name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', ':', '\0'])
+        || (cfg!(windows) && name.contains('\\')))
+}
+
+/// The host directory an auto-assign name maps to under `root`, or
+/// [`VfsError::InvalidPath`] if `name` isn't a single plain component
+/// (see [`is_safe_component`]).
+fn auto_assign_dir(root: &Path, name: &str) -> Result<PathBuf, VfsError> {
+    if !is_safe_component(name) {
+        return Err(VfsError::InvalidPath {
+            reason: format!("auto-assign volume name '{name}' is not a plain directory name"),
+        });
+    }
+    Ok(root.join(name))
 }
 
 fn join_components(base: &Path, named: &[String]) -> PathBuf {
@@ -832,6 +862,13 @@ fn resolve_named_components(
     for (i, name) in named.iter().enumerate() {
         let is_last = i == last_index;
         let must_exist = !is_last || last_must_exist;
+        // Checked up front, not only where a name is appended verbatim:
+        // the guarantee must not rest on `read_dir` never listing `..`.
+        if !is_safe_component(name) {
+            return Err(VfsError::InvalidPath {
+                reason: format!("'{name}' is not a valid file name: {original_path}"),
+            });
+        }
         match find_case_insensitive(&current, name)? {
             Some(matched_name) => {
                 current.push(&matched_name);
@@ -872,7 +909,7 @@ fn resolve_named_components(
 /// (including if `dir` doesn't exist or isn't a directory: that's
 /// reported by the caller via a subsequent `NotADirectory`/`NotFound`,
 /// not here).
-fn find_case_insensitive(dir: &Path, name: &str) -> Result<Option<String>, VfsError> {
+pub(crate) fn find_case_insensitive(dir: &Path, name: &str) -> Result<Option<String>, VfsError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1102,6 +1139,49 @@ mod tests {
                 name: "NOPE".to_string()
             }
         );
+    }
+
+    #[test]
+    fn auto_assign_rejects_volume_names_that_leave_the_root_358() {
+        let tmp = TempDir::new("autoassign-escape");
+        let root = tmp.path().join("vols");
+        fs::create_dir_all(root.join("ok")).unwrap();
+        fs::write(root.join("ok").join("f.txt"), b"x").unwrap();
+        fs::write(tmp.path().join("secret.txt"), b"s").unwrap();
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), tmp.path().to_path_buf())],
+            auto_assign_root: Some(root.clone()),
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(vfs.resolve("ok:f.txt", ResolveMode::MustExist).is_ok());
+        for bad in ["..:secret.txt", ".:x", "a/b:x", "/etc:hosts"] {
+            assert!(
+                matches!(
+                    vfs.resolve(bad, ResolveMode::MustExist),
+                    Err(VfsError::InvalidPath { .. })
+                ),
+                "{bad} must be rejected, got {:?}",
+                vfs.resolve(bad, ResolveMode::MustExist)
+            );
+        }
+    }
+
+    #[test]
+    fn parent_must_exist_rejects_dot_dot_as_a_new_name_358() {
+        let tmp = TempDir::new("dotdot-new-name");
+        let vfs = simple_vfs(tmp.path());
+        for bad in ["SYS:..", "SYS:."] {
+            assert!(
+                matches!(
+                    vfs.resolve(bad, ResolveMode::ParentMustExist),
+                    Err(VfsError::InvalidPath { .. })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
