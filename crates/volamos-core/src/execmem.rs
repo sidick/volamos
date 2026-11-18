@@ -497,7 +497,7 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
                     ctx.mem.write_u8(user_ptr.wrapping_add(i), 0);
                 }
             } else {
-                // The *user* range only, deliberately not the 8-byte
+                // The *user* range only, deliberately not the 4-byte
                 // header written just above: that header is this
                 // runtime's own bookkeeping (`FreeVec` needs it), not
                 // memory the guest asked for, and poisoning it would

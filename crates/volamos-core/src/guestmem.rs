@@ -244,7 +244,10 @@ pub struct FreedAllocInfo {
 /// interest without reimplementing this module's rounding/redzone
 /// arithmetic:
 ///
-/// - Leading redzone: `[block_start, user_start)`.
+/// - Leading redzone: `[block_start, user_start)`. For an allocation made
+///   with [`GuestHeap::alloc_aligned_for`] this also holds the alignment
+///   gap (at most `align - 4` bytes), so it can be non-empty even with
+///   redzones off.
 /// - The caller's actual requested bytes: `[user_start, user_start +
 ///   requested_size)`.
 /// - Alignment slack (the gap between what was requested and the
@@ -253,9 +256,10 @@ pub struct FreedAllocInfo {
 /// - Trailing redzone: `[user_start + user_size, block_end)`.
 ///
 /// All four ranges are well-defined (possibly empty) regardless of
-/// whether redzones are enabled: with redzones off, `block_start ==
-/// user_start` and `block_end == user_start + user_size`, so both
-/// redzone ranges are empty and only the requested/slack split remains.
+/// whether redzones are enabled: with redzones off and the default
+/// 4-byte alignment, `block_start == user_start` and `block_end ==
+/// user_start + user_size`, so both redzone ranges are empty and only
+/// the requested/slack split remains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocExtent {
     /// The address `alloc`/`alloc_with_requested` returned.
@@ -870,7 +874,7 @@ impl GuestHeap {
         required: u32,
         align: u32,
     ) -> Result<(u32, u32, u32), GuestHeapError> {
-        debug_assert!(align == 4 || align == 8, "unsupported alignment {align}");
+        assert!(align == 4 || align == 8, "unsupported alignment {align}");
         let aligned_size = align_up(size);
 
         // Clamp `requested` to what was actually reserved. A caller that
