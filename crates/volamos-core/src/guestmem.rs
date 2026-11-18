@@ -1237,6 +1237,11 @@ impl GuestHeap {
     /// `AvailMem` (see `crate::execmem`) uses for its default (non-
     /// `MEMF_LARGEST`) query, so that module doesn't need to know
     /// `free_bytes` predates it.
+    /// How many allocations are currently live.
+    pub fn live_alloc_count(&self) -> usize {
+        self.live.len()
+    }
+
     pub fn total_free(&self) -> u32 {
         self.free_bytes()
     }

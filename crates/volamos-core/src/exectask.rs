@@ -1446,7 +1446,7 @@ fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     }
     if let Some(seglist) = ctx.dos.process_seglists.remove(&task) {
         ctx.dos
-            .unload_seg(ctx.heap, seglist)
+            .unload_seg(ctx.heap, ctx.mem, seglist)
             .unwrap_or_else(|e| panic!("exiting task's own seglist: {e}"));
     }
     ctx.heap

@@ -563,9 +563,9 @@ pub(crate) struct OverlayNodeInfo {
     /// The root's `oh_Segments` `BPTR`, the key of its
     /// [`DosState::overlay_roots`] entry.
     table_bptr: u32,
-    /// Global index of the node's first hunk, and how many it has.
+    /// Global index of the node's first hunk (it has one hunk per segment
+    /// of its seglist).
     first_hunk: usize,
-    count: usize,
 }
 
 /// Builds an overlay root's seglist: allocates and links the root's own
@@ -986,7 +986,6 @@ impl DosState {
             OverlayNodeInfo {
                 table_bptr,
                 first_hunk: node.first_hunk,
-                count: alloc_addrs.len(),
             },
         );
         self.seglists.insert(first_bptr, alloc_addrs);
@@ -998,7 +997,17 @@ impl DosState {
     /// (`Ok(())`). An unknown `bptr` is `Err` with a diagnostic message --
     /// see the module docs' "loud failure on an unknown seglist" section
     /// for why this is a bug-catching abort rather than a silent no-op.
-    pub fn unload_seg(&mut self, heap: &mut GuestHeap, bptr: u32) -> Result<(), String> {
+    ///
+    /// Everything is freed best-effort: a block that won't free is
+    /// reported (the first such error is returned) but doesn't stop the
+    /// rest, so an overlay root's table blocks and file handle are still
+    /// released.
+    pub fn unload_seg(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        bptr: u32,
+    ) -> Result<(), String> {
         if bptr == 0 {
             return Ok(());
         }
@@ -1008,18 +1017,32 @@ impl DosState {
                  returned by LoadSeg)"
             ));
         };
+        let mut first_err: Option<String> = None;
+        let mut free = |heap: &mut GuestHeap, addr: u32, what: &str| {
+            if let Err(e) = heap.free(addr) {
+                first_err.get_or_insert_with(|| {
+                    format!("UnLoadSeg: freeing {what} at {addr:#010x} (seglist {bptr:#010x}): {e}")
+                });
+            }
+        };
+
         // An overlay node being displaced: its hunks stop being valid
-        // relocation targets for nodes loaded later.
+        // relocation targets for nodes loaded later, and their slots in
+        // the guest-visible `oh_Segments` array stop naming them (only
+        // while a slot still holds this node's own BPTR -- the manager
+        // may already have rewritten it).
         if let Some(node) = self.overlay_nodes.remove(&bptr)
             && let Some(state) = self.overlay_roots.get_mut(&node.table_bptr)
         {
-            for slot in state
-                .payload_addrs
-                .iter_mut()
-                .skip(node.first_hunk)
-                .take(node.count)
-            {
-                *slot = None;
+            for (i, &alloc) in addrs.iter().enumerate() {
+                let global = node.first_hunk + i;
+                if let Some(slot) = state.payload_addrs.get_mut(global) {
+                    *slot = None;
+                }
+                let slot_addr = state.segments_array_addr.wrapping_add(global as u32 * 4);
+                if mem.read_u32(slot_addr) == bptr_from_addr(alloc.wrapping_add(NEXT_SEG_OFFSET)) {
+                    mem.write_u32(slot_addr, 0);
+                }
             }
         }
         // An overlay root: real UnLoadSeg recognises the 0xABCD magic and
@@ -1036,29 +1059,22 @@ impl DosState {
             for first in loaded {
                 self.overlay_nodes.remove(&first);
                 for addr in self.seglists.remove(&first).unwrap_or_default() {
-                    heap.free(addr).map_err(|e| {
-                        format!("UnLoadSeg: freeing overlay node segment {addr:#010x}: {e}")
-                    })?;
+                    free(heap, addr, "an overlay node segment");
                 }
             }
             if let Some(state) = self.overlay_roots.remove(&table_bptr) {
-                for addr in [state.segments_array_addr, state.ovtab_addr] {
-                    heap.free(addr).map_err(|e| {
-                        format!("UnLoadSeg: freeing overlay table block {addr:#010x}: {e}")
-                    })?;
-                }
+                free(heap, state.segments_array_addr, "the oh_Segments array");
+                free(heap, state.ovtab_addr, "the oh_OVTab copy");
                 self.close(heap, addr_from_bptr(state.file_handle_bptr));
             }
         }
         for addr in addrs {
-            heap.free(addr).map_err(|e| {
-                format!(
-                    "UnLoadSeg: heap corruption freeing segment at {addr:#010x} of seglist \
-                     {bptr:#010x}: {e}"
-                )
-            })?;
+            free(heap, addr, "a segment");
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Finds the program a command line names, the way the shell does: a
@@ -1166,7 +1182,7 @@ fn loadseg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
 /// docs.
 fn unloadseg_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
-    match ctx.dos.unload_seg(ctx.heap, bptr) {
+    match ctx.dos.unload_seg(ctx.heap, ctx.mem, bptr) {
         Ok(()) => {
             ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
             Ok(())
@@ -1298,7 +1314,7 @@ fn start_system_child<C: Cpu>(
         seglist,
     };
     if crate::exectask::spawn_process(ctx, spec).is_none() {
-        let _ = ctx.dos.unload_seg(ctx.heap, seglist);
+        let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist);
         return Err(ERROR_NO_FREE_STORE);
     }
     Ok(())
@@ -1925,7 +1941,7 @@ mod tests {
         assert_ne!(bptr, 0);
         assert!(heap.free_bytes() < free_before);
 
-        dos.unload_seg(&mut heap, bptr)
+        dos.unload_seg(&mut heap, &mut mem, bptr)
             .expect("UnLoadSeg of a live seglist should succeed");
         assert_eq!(
             heap.free_bytes(),
@@ -2026,16 +2042,18 @@ mod tests {
     #[test]
     fn unload_seg_of_zero_is_a_no_op() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x4000);
         let mut dos = DosState::new(None);
-        dos.unload_seg(&mut heap, 0)
+        dos.unload_seg(&mut heap, &mut mem, 0)
             .expect("UnLoadSeg(0) is a no-op");
     }
 
     #[test]
     fn unload_seg_of_unknown_bptr_fails_loudly() {
         let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x4000);
         let mut dos = DosState::new(None);
-        let err = dos.unload_seg(&mut heap, 0x1234).unwrap_err();
+        let err = dos.unload_seg(&mut heap, &mut mem, 0x1234).unwrap_err();
         assert!(err.contains("0x00001234") || err.to_lowercase().contains("seglist"));
     }
 
@@ -3185,14 +3203,25 @@ mod tests {
         );
         assert!(dos.seglists.contains_key(&node), "the node is a seglist");
         assert!(dos.overlay_roots[&segments_bptr].payload_addrs[1].is_some());
+        let slot = addr_from_bptr(segments_bptr) + 4;
+        assert_eq!(mem.read_u32(slot), node, "oh_Segments[1] names the node");
 
-        dos.unload_seg(&mut heap, node).expect("the node unloads");
+        dos.unload_seg(&mut heap, &mut mem, node)
+            .expect("the node unloads");
         assert!(!dos.seglists.contains_key(&node));
         assert!(
             dos.overlay_roots[&segments_bptr].payload_addrs[1].is_none(),
             "its hunk is no longer a relocation target"
         );
-        assert!(dos.unload_seg(&mut heap, node).is_err(), "no double unload");
+        assert_eq!(
+            mem.read_u32(slot),
+            0,
+            "and oh_Segments[1] no longer names it"
+        );
+        assert!(
+            dos.unload_seg(&mut heap, &mut mem, node).is_err(),
+            "no double unload"
+        );
 
         // ... and the node can be loaded again.
         let again = load_node(
@@ -3230,7 +3259,8 @@ mod tests {
         owned.extend(dos.seglists[&root].clone());
         owned.extend(dos.seglists[&node].clone());
 
-        dos.unload_seg(&mut heap, root).expect("the root unloads");
+        dos.unload_seg(&mut heap, &mut mem, root)
+            .expect("the root unloads");
 
         assert!(dos.seglists.is_empty(), "root and node seglists gone");
         assert!(dos.overlay_roots.is_empty());
@@ -3243,11 +3273,12 @@ mod tests {
         for addr in owned {
             assert!(heap.size_of_live_alloc(addr).is_none(), "{addr:#x} leaked");
         }
-        let live: Vec<u32> = (0x1000u32..0x9000)
-            .step_by(4)
-            .filter(|&a| heap.size_of_live_alloc(a).is_some())
-            .collect();
         let port = dos.fs_port_addr(&mut heap, &mut mem).unwrap();
-        assert_eq!(live, vec![port], "only the shared filesystem port remains");
+        assert!(heap.size_of_live_alloc(port).is_some());
+        assert_eq!(
+            heap.live_alloc_count(),
+            1,
+            "only the shared filesystem port remains"
+        );
     }
 }

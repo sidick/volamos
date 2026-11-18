@@ -704,7 +704,7 @@ pub fn begin_open<C: Cpu>(
     };
 
     let Some(resident_addr) = find_resident(ctx.mem, seglist_bptr) else {
-        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist_bptr);
         return Ok(LoadAttempt::StructuralFailure(
             "no struct Resident (romtag) found -- not a loadable library".to_string(),
         ));
@@ -712,7 +712,7 @@ pub fn begin_open<C: Cpu>(
     let resident = read_resident(ctx.mem, resident_addr);
 
     if resident.node_type != NT_LIBRARY {
-        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist_bptr);
         return Ok(LoadAttempt::StructuralFailure(format!(
             "Resident's node type is {} ({}), not NT_LIBRARY ({NT_LIBRARY}) -- opening a \
              .device via OpenLibrary is a caller bug",
@@ -733,7 +733,7 @@ pub fn begin_open<C: Cpu>(
     let vectors = match read_vectors(ctx.mem, autoinit.vectors) {
         Ok(v) => v,
         Err(e) => {
-            let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+            let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist_bptr);
             return Ok(LoadAttempt::StructuralFailure(e));
         }
     };
@@ -748,7 +748,7 @@ pub fn begin_open<C: Cpu>(
     ) {
         Ok(m) => m,
         Err(e) => {
-            let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+            let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist_bptr);
             return Ok(LoadAttempt::StructuralFailure(e.to_string()));
         }
     };
@@ -828,7 +828,7 @@ fn after_init<C: Cpu>(
         // that *didn't* free its own base (like this runtime's own
         // `testlib_initfail` fixture) gets the block reclaimed here
         // instead, so neither style of failing library leaks.
-        let _ = ctx.dos.unload_seg(ctx.heap, pending.seglist_bptr);
+        let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, pending.seglist_bptr);
         if let Some(alloc_addr) = pending.alloc_addr {
             let _ = ctx.heap.free(alloc_addr);
         }
@@ -1096,7 +1096,7 @@ fn finish_close<C: Cpu>(
     ctx.registry.unregister_loaded(name);
 
     ctx.dos
-        .unload_seg(ctx.heap, seglist_bptr)
+        .unload_seg(ctx.heap, ctx.mem, seglist_bptr)
         .map_err(|e| DispatchError::HandlerFailed {
             library: name.to_string(),
             lvo: -12,
@@ -1182,7 +1182,7 @@ fn begin_direct_init<C: Cpu>(
     requested_version: u32,
 ) -> Result<LoadAttempt, DispatchError> {
     if resident.init_ptr == 0 {
-        let _ = ctx.dos.unload_seg(ctx.heap, seglist_bptr);
+        let _ = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist_bptr);
         return Ok(LoadAttempt::StructuralFailure(
             "Resident isn't RTF_AUTOINIT and its RT_INIT is NULL -- nothing to run".to_string(),
         ));
@@ -1322,7 +1322,7 @@ fn rem_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
                 crate::execlist::remove_impl(ctx.mem, base);
             }
             ctx.registry.unregister_loaded(&name);
-            ctx.dos.unload_seg(ctx.heap, seglist).map_err(|e| {
+            ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist).map_err(|e| {
                 handler_failed(
                     -402,
                     "RemLibrary",
