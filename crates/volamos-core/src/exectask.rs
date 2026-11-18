@@ -1192,7 +1192,11 @@ pub(crate) fn spawn_process<C: Cpu>(
         // from everything else this runtime assumes would be a
         // needless, confusing special case for no benefit.
         sr: ctx.cpu.sr(),
-        fpu: None,
+        // A reset FPU (FPCR 0: round to nearest, no exceptions enabled),
+        // not whatever the spawning task left in the registers: `None`
+        // would make the child's first restore skip the FPU and inherit
+        // the parent's rounding mode and FP0-FP7 (issue #359).
+        fpu: Some(crate::cpu::FpuState::default()),
     };
     ctx.tasks.spawn_ready(task, snapshot, stack_block, sp_upper);
     Some(task)
