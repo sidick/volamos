@@ -49,6 +49,10 @@ Changelog.
   this covers), `LockRecord`/`LockRecords`/`UnLockRecord`/
   `UnLockRecords` (always-succeeds stubs — this runtime models no real
   concurrency).
+- File comments and `Open` on directories: `SetComment` refuses a comment
+  longer than 79 characters (`ERROR_COMMENT_TOO_BIG`, the size of
+  `fib_Comment`), and `Open` of a directory fails with
+  `ERROR_OBJECT_WRONG_TYPE`, as on AmigaOS.
 - Pattern matching: `MatchFirst`/`MatchNext`/`MatchEnd`/`ParsePattern`/
   `MatchPattern`(`NoCase`). Matching is bounded (a work and nesting
   limit per match): a pathological pattern or a huge input with a

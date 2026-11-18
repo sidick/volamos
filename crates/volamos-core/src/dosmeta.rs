@@ -162,7 +162,17 @@ fn flags_to_prot(flags: &[u8]) -> u32 {
 }
 
 fn format_timestamp(days: i32, minute: i32, tick: i32) -> String {
-    let (year, month, mday) = days_to_ymd(days.max(0) as u32);
+    // `SetFileDate` takes a guest `DateStamp` verbatim. Out-of-range
+    // fields (a minute of 6000, a year past 9999) made the line longer
+    // than `parse_timestamp`'s fixed 22 bytes, so the whole sidecar --
+    // protection bits and comment included -- read back as corrupt
+    // (issue #362). Clamp to what a `DateStamp` can mean and the format
+    // can hold: minutes 0..1440, ticks 0..3000, years up to 9999.
+    let max_days = ymd_to_days(9999, 12, 31) as i32;
+    let days = days.clamp(0, max_days);
+    let minute = minute.clamp(0, 24 * 60 - 1);
+    let tick = tick.clamp(0, 60 * 50 - 1);
+    let (year, month, mday) = days_to_ymd(days as u32);
     let hour = minute / 60;
     let min = minute % 60;
     let sec = tick / 50;
@@ -411,5 +421,31 @@ mod tests {
         assert_eq!(d.prot, 0);
         assert_eq!(d.date, (0, 0, 0));
         assert_eq!(d.comment, None);
+    }
+
+    #[test]
+    fn out_of_range_dates_do_not_make_the_sidecar_unreadable_362() {
+        // A DateStamp with a minute of 6000 or a year past 9999 produced a
+        // line the exact-length parser rejected, silently losing the
+        // protection bits and comment with it.
+        let tmp = TempDir::new("odd-dates");
+        let target = tmp.path().join("f.txt");
+        std::fs::write(&target, b"x").unwrap();
+        for date in [
+            (10, 6000, 0),
+            (10, -5, 99_999),
+            (4_000_000, 0, 0),
+            (-3, 0, 0),
+        ] {
+            let meta = Meta {
+                prot: 0x15,
+                date,
+                comment: Some(b"keep me".to_vec()),
+            };
+            write_sidecar(&target, &meta).unwrap();
+            let back = read_sidecar(&target).expect("sidecar must still parse");
+            assert_eq!(back.comment, Some(b"keep me".to_vec()), "{date:?}");
+            assert_eq!(back.prot, 0x15, "{date:?}");
+        }
     }
 }

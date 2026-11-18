@@ -36,7 +36,10 @@ An Amiga path is `[Vol:]component[/component...]`:
   volume root fails like a missing object — the root has no parent
   (verified against a real FFS partition in
   [amitools PR #7](https://github.com/AmigaPorts/amitools/pull/7)'s
-  writeup). Paths reported back to the guest (`NameFromLock()` and
+  writeup). The root of an *assign* is not a volume root: with `C:`
+  assigned to `SYS:C`, `C:/` is `SYS:` (and `ParentDir()` of a lock on
+  `C:` is a lock on `SYS:`); only climbing above the real volume root
+  fails. Paths reported back to the guest (`NameFromLock()` and
   friends) are canonical: parent steps collapsed, and the volume/assign
   name in its configured spelling.
 

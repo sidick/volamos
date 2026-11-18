@@ -501,8 +501,50 @@ impl Vfs {
 
         let vol_name = self.leading_name(&parsed, amiga_path)?;
         let components = self.effective_components(&parsed)?;
-        let targets = self.assign_targets(&vol_name, 0)?;
-        let named = apply_parent_pops(&components, amiga_path)?;
+        self.resolve_chain(&vol_name, &components, amiga_path, mode, 0)
+    }
+
+    /// The tail of [`Self::resolve_with_amiga_path`]: resolves `components`
+    /// under the volume or assign `vol_name`.
+    ///
+    /// A path that steps up (`/`) past the root of an *assign* does not
+    /// fail the way it does at a volume root: an assign `C: -> SYS:C` has
+    /// `SYS:` above it, so `C:/` is `SYS:` and `Lock("/")` from a cwd of
+    /// `C:` works. When the pops underflow, the path is therefore re-rooted
+    /// at each of the assign's targets (their own components then absorb
+    /// the extra pops) and resolved again, recursing through nested
+    /// assigns; only popping past a real volume root is `NotFound`
+    /// (issue #362).
+    fn resolve_chain(
+        &self,
+        vol_name: &str,
+        components: &[Component],
+        amiga_path: &str,
+        mode: ResolveMode,
+        depth: usize,
+    ) -> Result<Resolved, VfsError> {
+        let named = match apply_parent_pops(components, amiga_path) {
+            Ok(named) => named,
+            Err(not_found @ VfsError::NotFound { .. })
+                if self.is_assign_name(vol_name) && depth <= MAX_ASSIGN_DEPTH =>
+            {
+                let targets = self.lookup_assign(vol_name).unwrap_or_default();
+                let mut last_err = not_found;
+                for target in &targets {
+                    let target_parsed = parse_path(target)?;
+                    let target_vol = self.leading_name(&target_parsed, target)?;
+                    let mut combined = target_parsed.components;
+                    combined.extend(components.iter().cloned());
+                    match self.resolve_chain(&target_vol, &combined, amiga_path, mode, depth + 1) {
+                        Ok(resolved) => return Ok(resolved),
+                        Err(e) => last_err = e,
+                    }
+                }
+                return Err(last_err);
+            }
+            Err(e) => return Err(e),
+        };
+        let targets = self.assign_targets(vol_name, 0)?;
 
         let (host_path, matched) = match mode {
             ResolveMode::MustExist => {
@@ -535,6 +577,12 @@ impl Vfs {
             host_path,
             amiga_path: format!("{vol_name}:{}", matched.join("/")),
         })
+    }
+
+    /// Whether `name` is an assign (and not a volume): something with a
+    /// directory above it that `/` can reach.
+    pub fn is_assign_name(&self, name: &str) -> bool {
+        self.lookup_volume(name).is_none() && self.lookup_assign(name).is_some()
     }
 
     /// Determine the leading volume/assign name for a parsed path,
@@ -1862,6 +1910,44 @@ mod tests {
         assert!(
             !default_sys.exists(),
             "the shadowed default entry must never be created"
+        );
+    }
+
+    #[test]
+    fn stepping_up_from_an_assign_root_reaches_the_directory_above_its_target_362() {
+        // C: -> SYS:C. `C:/` is SYS:, `C:/S` is SYS:S, and a cwd of `C:`
+        // with `/` goes up too; only popping past the *volume* root fails.
+        let tmp = TempDir::new("assign-parent");
+        tmp.mkdir("C");
+        tmp.mkdir("S");
+        let mut vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), tmp.path().to_path_buf())],
+            assigns: vec![("C".to_string(), vec!["SYS:C".to_string()])],
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let up = vfs
+            .resolve_with_amiga_path("C:/", ResolveMode::MustExist)
+            .unwrap();
+        assert_eq!(up.host_path, tmp.path());
+        assert_eq!(up.amiga_path, "SYS:");
+        let sibling = vfs.resolve("C://S", ResolveMode::MustExist);
+        assert!(sibling.is_err(), "C://S would be above SYS:'s root");
+        assert_eq!(
+            vfs.resolve("C:/S", ResolveMode::MustExist).unwrap(),
+            tmp.path().join("S")
+        );
+        assert!(matches!(
+            vfs.resolve("SYS:/", ResolveMode::MustExist),
+            Err(VfsError::NotFound { .. })
+        ));
+
+        vfs.set_cwd("C:").unwrap();
+        assert_eq!(
+            vfs.resolve("/", ResolveMode::MustExist).unwrap(),
+            tmp.path()
         );
     }
 }

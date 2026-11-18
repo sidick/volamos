@@ -446,9 +446,26 @@ impl DosState {
         let new_path = vfs
             .resolve(new_name, ResolveMode::ParentMustExist)
             .map_err(|e| map_vfs_error(&e))?;
-        if new_path.exists() {
+        // `new_name` resolves case-insensitively, so renaming `foo` to `Foo`
+        // finds `foo` itself: that is a case change of the same object (it
+        // works on a real FFS), not an existing target. Rename it to the
+        // spelling the guest typed.
+        let new_path = if new_path == old_path {
+            let typed = new_name
+                .rsplit(['/', ':'])
+                .next()
+                .filter(|c| crate::vfs::is_safe_component(c))
+                .ok_or(crate::dosfile::ERROR_INVALID_COMPONENT_NAME)?;
+            let renamed = old_path.with_file_name(typed);
+            if renamed == old_path {
+                return Ok(()); // the same name: nothing to do
+            }
+            renamed
+        } else if new_path.exists() {
             return Err(crate::dosfile::ERROR_OBJECT_EXISTS);
-        }
+        } else {
+            new_path
+        };
         std::fs::rename(&old_path, &new_path).map_err(|e| map_io_error(&e))?;
         let old_sidecar = dosmeta::sidecar_path(&old_path);
         if old_sidecar.exists() {
@@ -867,6 +884,25 @@ impl DosState {
         };
         let mut comps: Vec<&str> = rest.split('/').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() {
+            let vfs = self.vfs.as_ref().expect("checked above");
+            if vfs.is_assign_name(vol) {
+                // An assign root (`C:` -> `SYS:C`) has a parent: the
+                // directory above its target. Re-resolve `C:/`; only a
+                // real volume root has none (issue #362).
+                return match vfs
+                    .resolve_with_amiga_path(&format!("{vol}:/"), ResolveMode::MustExist)
+                {
+                    Ok(resolved) => self.new_lock(
+                        heap,
+                        mem,
+                        resolved.host_path,
+                        resolved.amiga_path,
+                        SHARED_LOCK,
+                    ),
+                    Err(crate::vfs::VfsError::NotFound { .. }) => Ok(0),
+                    Err(e) => Err(map_vfs_error(&e)),
+                };
+            }
             // Already at a volume root: "no parent", not an error.
             return Ok(0);
         }
@@ -1173,7 +1209,13 @@ pub(crate) fn fill_fib(
     write_c_string(
         mem,
         fib_addr.wrapping_add(FIB_COMMENT_OFFSET),
-        meta.comment.as_deref().unwrap_or(b""),
+        // A sidecar can hold a longer comment than the field (written by
+        // another tool, or before SetComment checked): truncate rather
+        // than run past the FileInfoBlock.
+        {
+            let comment = meta.comment.as_deref().unwrap_or(b"");
+            &comment[..comment.len().min(crate::dosfile::MAX_COMMENT_LEN)]
+        },
     );
 }
 
@@ -3793,5 +3835,54 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, ERROR_OBJECT_WRONG_TYPE);
+    }
+
+    #[test]
+    fn rename_to_a_different_case_of_the_same_name_works_362() {
+        let tmp = TempDir::new("rename-case");
+        fs::write(tmp.path().join("foo"), b"x").unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.rename("SYS:foo", "SYS:Foo")
+            .expect("a case change is a rename");
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["Foo".to_string()]);
+
+        // Renaming onto a *different* existing file still fails.
+        fs::write(tmp.path().join("Bar"), b"y").unwrap();
+        assert_eq!(
+            dos.rename("SYS:Foo", "SYS:bar"),
+            Err(crate::dosfile::ERROR_OBJECT_EXISTS)
+        );
+    }
+
+    #[test]
+    fn parent_dir_of_an_assign_root_is_the_directory_above_its_target_362() {
+        let tmp = TempDir::new("parentdir-assign");
+        fs::create_dir(tmp.path().join("C")).unwrap();
+        let vfs = Vfs::new(VfsConfig {
+            volumes: vec![("SYS".to_string(), tmp.path().to_path_buf())],
+            assigns: vec![("C".to_string(), vec!["SYS:C".to_string()])],
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = FlatMemory::new(0x4000);
+        let mut dos = DosState::new(Some(vfs));
+
+        let c = addr_from_bptr(dos.lock(&mut heap, &mut mem, "C:", SHARED_LOCK).unwrap());
+        let parent = dos.parent_dir(&mut heap, &mut mem, c).unwrap();
+        assert_ne!(parent, 0, "C: sits inside SYS:");
+        assert_eq!(dos.name_from_lock(addr_from_bptr(parent)).unwrap(), "SYS:");
+
+        let sys = addr_from_bptr(dos.lock(&mut heap, &mut mem, "SYS:", SHARED_LOCK).unwrap());
+        assert_eq!(
+            dos.parent_dir(&mut heap, &mut mem, sys),
+            Ok(0),
+            "a volume root has none"
+        );
     }
 }

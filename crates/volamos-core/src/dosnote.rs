@@ -28,6 +28,12 @@ fn set_comment_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let comment = read_c_string(ctx.mem, comment_ptr);
 
     let result = (|| -> Result<(), i32> {
+        // `fib_Comment` is TEXT[80]: real SetComment refuses a longer one
+        // (the old code stored any length, and Examine then wrote it past
+        // the 260-byte FileInfoBlock -- issue #362).
+        if comment.len() > crate::dosfile::MAX_COMMENT_LEN {
+            return Err(crate::dosfile::ERROR_COMMENT_TOO_BIG);
+        }
         let vfs = ctx
             .dos
             .vfs
@@ -256,5 +262,20 @@ mod tests {
         let tmp = TempDir::new("missing");
         let code = run_set_comment(b"SYS:nope.txt\0", b"comment", tmp.path());
         assert_eq!(code, DOSFALSE as i32);
+    }
+
+    #[test]
+    fn set_comment_longer_than_79_bytes_is_refused_362() {
+        // fib_Comment is TEXT[80]; a longer comment used to be stored and
+        // then written past the FileInfoBlock by Examine.
+        let tmp = TempDir::new("comment-too-big");
+        fs::write(tmp.path().join("f.txt"), b"x").unwrap();
+
+        let ok = run_set_comment(b"SYS:f.txt\0", &[b'a'; 79], tmp.path());
+        assert_eq!(ok, DOSTRUE as i32, "79 bytes fit");
+        let too_big = run_set_comment(b"SYS:f.txt\0", &[b'b'; 80], tmp.path());
+        assert_eq!(too_big, DOSFALSE as i32, "80 bytes do not");
+        let meta = crate::dosmeta::read_sidecar(&tmp.path().join("f.txt")).unwrap();
+        assert_eq!(meta.comment, Some(vec![b'a'; 79]), "the old comment stands");
     }
 }

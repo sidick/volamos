@@ -407,7 +407,7 @@ fn match_first(
         // non-wildcard `MatchFirst`'s `ap_Buf` is just `pat_str` itself
         // on real hardware (issue #46), not this module's internal
         // `VFS`-qualified `entry.amiga_path`.
-        write_match_result(
+        if let Err(e) = write_match_result(
             mem,
             ap_addr,
             achain_addr,
@@ -416,7 +416,15 @@ fn match_first(
             size,
             &pat_str,
             &entry.host_path,
-        )?;
+        ) {
+            // The scan state isn't stored yet, so MatchEnd could never
+            // free these: release the AChain and the lock here (a small
+            // `ap_Strlen` made this return ERROR_BUFFER_OVERFLOW and
+            // leak both -- issue #362).
+            let _ = heap.free(achain_addr);
+            dos.unlock(heap, addr);
+            return Err(e);
+        }
         mem.write_u32(ap_addr + AP_BASE_OFFSET, achain_addr);
         mem.write_u32(ap_addr + AP_LAST_OFFSET, achain_addr);
 
@@ -487,7 +495,7 @@ fn match_first(
             .map(|m| m.len() as u32)
             .unwrap_or(0)
     };
-    write_match_result(
+    if let Err(e) = write_match_result(
         mem,
         ap_addr,
         achain_addr,
@@ -496,7 +504,13 @@ fn match_first(
         size0,
         &display_path0,
         &host_path0,
-    )?;
+    ) {
+        // See the non-wildcard path above: nothing stored yet, so release
+        // the AChain and the directory lock now.
+        let _ = heap.free(achain_addr);
+        dos.unlock(heap, addr);
+        return Err(e);
+    }
     mem.write_u32(ap_addr + AP_BASE_OFFSET, achain_addr);
     mem.write_u32(ap_addr + AP_LAST_OFFSET, achain_addr);
     set_flag_bit(mem, ap_addr, APF_ITSWILD, true);
@@ -650,6 +664,9 @@ fn match_next_inner(
     }
     let finished = state.levels.pop().expect("len() > 1 just checked");
     dos.unlock(heap, finished.dir_lock_addr);
+    // This level's AChain is no longer reachable from `ap_Last` (set to
+    // the parent's just below), so it can go.
+    let _ = heap.free(finished.achain_addr);
     let parent = state.levels.last().expect("len() > 1 just checked");
     let parent_achain = parent.achain_addr;
     // `finished.display_prefix` is already this level's own full display
@@ -684,6 +701,9 @@ fn match_end(heap: &mut GuestHeap, dos: &mut DosState, ap_addr: u32) {
     if let Some(state) = dos.anchor_states.remove(&ap_addr) {
         for level in state.levels {
             dos.unlock(heap, level.dir_lock_addr);
+            // Real MatchEnd frees every AChain the walk allocated; they
+            // were never freed here at all (issue #362).
+            let _ = heap.free(level.achain_addr);
         }
     }
 }
@@ -1277,5 +1297,37 @@ mod tests {
             code, ERROR_NO_MORE_ENTRIES,
             "IoErr() should report the same code MatchNext returned in D0"
         );
+    }
+
+    #[test]
+    fn match_end_frees_the_achains_and_a_buffer_overflow_leaks_nothing_362() {
+        let tmp = TempDir::new("achain-free");
+        fs::write(tmp.path().join("a.txt"), b"x").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub").join("b.txt"), b"x").unwrap();
+        let (mut heap, mut mem, mut dos) = setup(tmp.path());
+
+        // A normal walk: every AChain it allocated is gone after MatchEnd.
+        let ap = alloc_ap(&mut heap, &mut mem, 64);
+        match_first(&mut heap, &mut mem, &mut dos, b"SYS:#?", ap).expect("match");
+        let base = mem.read_u32(ap + AP_BASE_OFFSET);
+        assert!(
+            heap.size_of_live_alloc(base).is_some(),
+            "live during the walk"
+        );
+        match_end(&mut heap, &mut dos, ap);
+        assert!(heap.size_of_live_alloc(base).is_none(), "freed by MatchEnd");
+        assert!(dos.locks.is_empty());
+
+        // MatchFirst failing with ERROR_BUFFER_OVERFLOW stores no scan
+        // state, so MatchEnd could never free what it had allocated:
+        // it must clean up itself.
+        let live_before = heap.size_of_live_alloc(ap);
+        let small = alloc_ap(&mut heap, &mut mem, 4);
+        let err = match_first(&mut heap, &mut mem, &mut dos, b"SYS:a.txt", small).unwrap_err();
+        assert_eq!(err, ERROR_BUFFER_OVERFLOW);
+        assert!(dos.locks.is_empty(), "the lock was released");
+        assert!(dos.anchor_states.is_empty());
+        assert_eq!(heap.size_of_live_alloc(ap), live_before);
     }
 }
