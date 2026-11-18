@@ -1794,7 +1794,7 @@ type Continuation<C> = Box<dyn FnOnce(&mut HandlerContext<'_, C>) -> Result<(), 
 /// [`ContinuationStack::trampoline`] (the whole point there *is* the
 /// generic epilogue's pop, to unwind back to whatever pushed
 /// `subroutine_entry`, or to a further chained trampoline).
-type PendingEntry<C> = (bool, Continuation<C>);
+type PendingEntry<C> = (bool, u32, Continuation<C>);
 
 /// The trampoline primitive (library/device-loading plan §2.1, phase
 /// "L2"): lets a [`LibraryHandler`] run an arbitrary guest subroutine --
@@ -1918,6 +1918,15 @@ pub struct ContinuationStack<C: Cpu> {
     /// just for different reasons (a switch not yet applied, vs. one a
     /// continuation already fully applied itself).
     skip_epilogue: bool,
+    /// The task whose guest stack a continuation pushed *now* would be
+    /// returned to from: set by [`Runtime::run`] before every dispatch
+    /// and by the task-switch hooks' own trampolines. Each pending entry
+    /// remembers it, and [`continuation_stub_handler`] only pops an entry
+    /// owned by the task that hit the stub. One global LIFO let a task
+    /// switch inside a trampolined routine (a `RunCommand` child that
+    /// `Wait`s, a disk-library init, ...) hand another task's closure to
+    /// the wrong task (issue #359).
+    owner: u32,
 }
 
 impl<C: Cpu> Default for ContinuationStack<C> {
@@ -1932,7 +1941,25 @@ impl<C: Cpu> ContinuationStack<C> {
         Self {
             pending: Vec::new(),
             skip_epilogue: false,
+            owner: 0,
         }
+    }
+
+    /// Removes and returns the newest pending continuation `task` pushed
+    /// (and its epilogue-skip flag), leaving other tasks' entries alone.
+    fn pop_for(&mut self, task: u32) -> Option<(bool, Continuation<C>)> {
+        let index = self
+            .pending
+            .iter()
+            .rposition(|(_, owner, _)| *owner == task)?;
+        let (skip_epilogue, _, continuation) = self.pending.remove(index);
+        Some((skip_epilogue, continuation))
+    }
+
+    /// Sets the task that continuations pushed from now on belong to --
+    /// see [`Self::owner`]'s doc.
+    pub fn set_owner(&mut self, task: u32) {
+        self.owner = task;
     }
 
     /// Takes (and clears) a pending epilogue-skip request -- see
@@ -1970,7 +1997,8 @@ impl<C: Cpu> ContinuationStack<C> {
         mem.write_u32(sp, subroutine_entry);
         cpu.set_address_register(AddressRegister(7), sp);
 
-        self.pending.push((false, Box::new(continuation)));
+        self.pending
+            .push((false, self.owner, Box::new(continuation)));
     }
 
     /// Like [`Self::trampoline`], but for a caller that is *not* a
@@ -1999,7 +2027,8 @@ impl<C: Cpu> ContinuationStack<C> {
         cpu.set_address_register(AddressRegister(7), sp);
         cpu.set_pc(subroutine_entry);
 
-        self.pending.push((true, Box::new(continuation)));
+        self.pending
+            .push((true, self.owner, Box::new(continuation)));
     }
 }
 
@@ -2011,7 +2040,10 @@ impl<C: Cpu> ContinuationStack<C> {
 /// bug (see [`DispatchError::EmptyContinuationStack`]'s doc), not a
 /// state a correctly-behaving trampoline user can reach.
 fn continuation_stub_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    let Some((skip_epilogue, continuation)) = ctx.continuations.pending.pop() else {
+    // The newest entry the *task that hit the stub* pushed -- not simply
+    // the newest, which may belong to a task that switched away
+    // mid-trampoline (see `ContinuationStack::owner`).
+    let Some((skip_epilogue, continuation)) = ctx.continuations.pop_for(ctx.current_task) else {
         return Err(DispatchError::EmptyContinuationStack { pc: ctx.pc });
     };
     let result = continuation(ctx);
@@ -2674,6 +2706,7 @@ fn commit_task_switch<C: Cpu + 'static>(
             // just for the incoming task's hook instead of the
             // outgoing one's.
             tasks.begin_switch_hook();
+            continuations.set_owner(next);
             continuations.trampoline_now(cpu, mem, tc_launch, move |ctx| {
                 ctx.tasks.end_switch_hook();
                 crate::cpu::restore(ctx.cpu, &snapshot);
@@ -3856,7 +3889,13 @@ impl<C: Cpu + 'static> Runtime<C> {
             .expect("a task switch was signaled without a pending restore to apply");
 
         let outgoing = self.task;
-        let outgoing_flags = self.mem.read_u8(outgoing + exectask::TC_FLAGS);
+        // An exited task's struct is already freed and its `tc_Switch`
+        // already ran (exectask's exit path): nothing to read or call.
+        let outgoing_flags = if self.tasks.is_exiting() {
+            0
+        } else {
+            self.mem.read_u8(outgoing + exectask::TC_FLAGS)
+        };
         if outgoing_flags & exectask::TF_SWITCH != 0 {
             let tc_switch = self.mem.read_u32(outgoing + exectask::TC_SWITCH_OFFSET);
             if tc_switch != 0 {
@@ -3867,6 +3906,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                 // still-set `TF_SWITCH` and re-enter `tc_Switch` a
                 // second time, mid-flight.
                 self.tasks.begin_switch_hook();
+                self.continuations.set_owner(outgoing);
                 self.continuations.trampoline_now(
                     &mut self.cpu,
                     &mut self.mem,
@@ -4027,7 +4067,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                     // running concurrently -- clobber another one's
                     // pending flag.
                     if self.host_break_folding {
-                        exectask::fold_pending_host_break(&mut self.mem, self.task);
+                        exectask::fold_pending_host_break(&mut self.mem, &mut self.tasks);
                     }
 
                     // Stack-overflow check (Phase 3 stage 6): compare A7
@@ -4054,6 +4094,7 @@ impl<C: Cpu + 'static> Runtime<C> {
                     }
 
                     let mut call_detail = None;
+                    self.continuations.set_owner(self.task);
                     let mut ctx = HandlerContext {
                         cpu: &mut self.cpu,
                         mem: &mut self.mem,
@@ -6629,5 +6670,32 @@ mod tests {
             code, 0,
             "expected baseline 111, chained-hook 211, and restored 111"
         );
+    }
+
+    #[test]
+    fn continuation_stub_pops_the_entry_pushed_by_the_task_that_hit_it_359() {
+        // Task A trampolines, switches away mid-routine, task B
+        // trampolines; A's routine then returns to the stub. It must get
+        // A's continuation, not B's (newest) one.
+        let mut cpu = M68kCpu::new();
+        let mut mem = FlatMemory::new(0x1_0000);
+        cpu.set_address_register(AddressRegister(7), 0x8000);
+        let mut stack: ContinuationStack<M68kCpu> = ContinuationStack::new();
+        let (a, b) = (0x1000u32, 0x2000u32);
+
+        stack.set_owner(a);
+        stack.trampoline(&mut cpu, &mut mem, 0x100, |_| Ok(()));
+        stack.set_owner(b);
+        stack.trampoline_now(&mut cpu, &mut mem, 0x200, |_| Ok(()));
+
+        let (skip, _) = stack.pop_for(a).expect("A's entry");
+        assert!(
+            !skip,
+            "A's was pushed by trampoline(), not trampoline_now()"
+        );
+        let (skip, _) = stack.pop_for(b).expect("B's entry");
+        assert!(skip, "B's was pushed by trampoline_now()");
+        assert!(stack.pop_for(a).is_none());
+        assert!(stack.pop_for(b).is_none());
     }
 }

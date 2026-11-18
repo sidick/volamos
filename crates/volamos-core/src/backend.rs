@@ -1055,6 +1055,29 @@ impl Cpu for M68kCpu {
         self.core.fpiar
     }
 
+    fn fpu_state(&self) -> Option<crate::cpu::FpuState> {
+        let mut fp = [(0u16, 0u64); 8];
+        for (slot, reg) in fp.iter_mut().zip(self.core.fpr.iter()) {
+            *slot = (reg.sign_exp, reg.mantissa);
+        }
+        Some(crate::cpu::FpuState {
+            fp,
+            fpcr: self.core.fpcr,
+            fpsr: self.core.fpsr,
+            fpiar: self.core.fpiar,
+        })
+    }
+
+    fn set_fpu_state(&mut self, state: &crate::cpu::FpuState) {
+        for (reg, &(sign_exp, mantissa)) in self.core.fpr.iter_mut().zip(state.fp.iter()) {
+            reg.sign_exp = sign_exp;
+            reg.mantissa = mantissa;
+        }
+        self.core.fpcr = state.fpcr;
+        self.core.fpsr = state.fpsr;
+        self.core.fpiar = state.fpiar;
+    }
+
     /// Mirrors `CACRF_EnableI`/`CACRF_EnableD` onto the 68060's `EIC`/
     /// `EDC`, the two bits the real 68060.library's `CacheControl()` patch
     /// edits (its mask is `$80008000`; see the disassembly note in
@@ -2454,5 +2477,29 @@ mod tests {
             cycles_with_cache(1) > cycles_without_cache(1),
             "the very first pass through a cold cache should still record real misses"
         );
+    }
+
+    #[test]
+    fn task_switch_snapshot_round_trips_the_fpu_registers_359() {
+        // A task blocked mid-computation (pthread_mutex_lock, Delay, a
+        // semaphore wait) must get its FP registers back after another
+        // task has used the FPU.
+        let mut cpu = M68kCpu::new();
+        let mut state = cpu.fpu_state().expect("the m68k backend has an FPU");
+        state.fp[2] = (0x4000, 0xC000_0000_0000_0000);
+        state.fpcr = 0x3400;
+        state.fpsr = 0x0800_0000;
+        state.fpiar = 0x1234;
+        cpu.set_fpu_state(&state);
+        let snapshot = crate::cpu::capture(&cpu);
+
+        let mut other = state;
+        other.fp[2] = (0xBFFF, 0x8000_0000_0000_0000);
+        other.fpcr = 0;
+        cpu.set_fpu_state(&other);
+        assert_ne!(cpu.fpu_state(), Some(state));
+
+        crate::cpu::restore(&mut cpu, &snapshot);
+        assert_eq!(cpu.fpu_state(), Some(state));
     }
 }

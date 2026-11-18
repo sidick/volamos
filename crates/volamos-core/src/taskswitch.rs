@@ -248,6 +248,12 @@ pub struct TaskScheduler {
     /// [`Self::yield_to_ready`]/[`Self::terminate_current`] instead of
     /// letting that happen.
     switch_hook_active: bool,
+    /// Set by [`Self::terminate_current`] until the switch it staged is
+    /// committed: the task losing the CPU has exited and its `struct
+    /// Process` and stack are already freed, so the caller must not read
+    /// `tc_Flags`/`tc_Switch` out of it (issue #359). Its own `tc_Switch`
+    /// was run *before* the free, by `crate::exectask`'s exit path.
+    exiting: bool,
     /// Set by [`Self::request_yield`] (`Permit`/`SetTaskPri`'s
     /// handlers), taken by [`Self::take_yield_request`]. Deliberately
     /// a flag rather than having those handlers call
@@ -310,6 +316,7 @@ impl TaskScheduler {
             others: BTreeMap::new(),
             pending_restore: None,
             switch_hook_active: false,
+            exiting: false,
             yield_requested: false,
             reschedule_requested: None,
             ready_seq: 0,
@@ -423,6 +430,12 @@ impl TaskScheduler {
         self.current
     }
 
+    /// The program's own task (the CLI process), which a host
+    /// `SIGINT`/`SIGTERM` is delivered to.
+    pub fn main(&self) -> u32 {
+        self.main
+    }
+
     /// Whether `task` is the program's own task rather than one that
     /// `CreateNewProc` started.
     pub fn is_main(&self, task: u32) -> bool {
@@ -456,6 +469,19 @@ impl TaskScheduler {
         // task's `SetTaskPri` value over to whoever runs next and be
         // judged against *their* priority.
         self.reschedule_requested = None;
+        self.exiting = false;
+    }
+
+    /// Whether the switch staged but not yet committed is away from a
+    /// task that has exited -- see [`Self::exiting`]'s doc.
+    pub fn is_exiting(&self) -> bool {
+        self.exiting
+    }
+
+    /// Whether a `tc_Switch`/`tc_Launch` trampoline is in flight -- see
+    /// [`Self::begin_switch_hook`].
+    pub fn switch_hook_in_flight(&self) -> bool {
+        self.switch_hook_active
     }
 
     /// Marks a `tc_Switch`/`tc_Launch` trampoline as in flight -- see
@@ -895,12 +921,11 @@ impl TaskScheduler {
             .remove(&next)
             .expect("pick_ready only returns a known task");
         // Not `self.current = next` -- see `Self::commit`'s doc. The
-        // terminating task is gone either way, but real hardware still
-        // calls its `tc_Switch` on this exact loss-of-CPU (the caller
-        // checks the *current* task's `TF_SWITCH`/`tc_Flags`
-        // generically for every switch, not specially for this one),
-        // so `current()` must keep reporting it until that's run.
+        // terminating task is gone either way, but `current()` must keep
+        // reporting it until the commit. Its `tc_Switch` has already
+        // run, before its struct was freed (see `Self::exiting`).
         self.pending_restore = Some((next, next_record));
+        self.exiting = true;
         Ok(())
     }
 }
@@ -917,6 +942,7 @@ mod tests {
             a: [0; 8],
             pc: 0,
             sr: 0,
+            fpu: None,
         }
     }
 
@@ -1233,5 +1259,22 @@ mod tests {
         crate::execlist::signal_port_task(&mut mem, &mut tasks, port);
         assert_eq!(tasks.others[&waiter].state, TaskState::Ready);
         assert_eq!(mem.read_u32(waiter + crate::exectask::TC_SIGRECVD), 1 << 22);
+    }
+
+    #[test]
+    fn terminate_current_marks_the_switch_as_away_from_an_exited_task_359() {
+        // The switch away from an exited task must not read its (freed)
+        // tc_Flags to look for tc_Switch.
+        let main = 0x1000;
+        let child = 0x2000;
+        let mem = FlatMemory::new(0x8000);
+        let mut tasks = TaskScheduler::new(child);
+        tasks.spawn_ready(main, zero_snapshot(), 0, 0x1000);
+        assert!(!tasks.is_exiting());
+
+        tasks.terminate_current(&mem).expect("main is ready");
+        assert!(tasks.is_exiting());
+        switch_now(&mut tasks);
+        assert!(!tasks.is_exiting(), "committing the switch clears it");
     }
 }

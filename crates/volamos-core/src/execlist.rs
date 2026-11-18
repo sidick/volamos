@@ -1494,6 +1494,7 @@ mod tests {
                 a: [0; 8],
                 pc: 0,
                 sr: 0,
+                fpu: None,
             },
             0,
             0x1000,

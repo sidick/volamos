@@ -177,7 +177,8 @@ Changelog.
 - Tasks and signals: `FindTask`/`SetSignal`/`SetExcept`/`Wait`/
   `Signal`/`AllocSignal`/`FreeSignal`/`Forbid`/`Permit`/`SetTaskPri`,
   including host `SIGINT`/`SIGTERM` delivered to the guest as
-  `SIGBREAKF_CTRL_C`. Real cooperative multi-tasking once
+  `SIGBREAKF_CTRL_C` (to the main task, even while a `CreateNewProc`
+  task is the one running). Real cooperative multi-tasking once
   `dos.library`'s `CreateNewProc` has started a second task: `Wait`
   genuinely blocks and switches to another runnable task instead of
   always failing loudly, `Signal` wakes a blocked task, and `Permit`
@@ -187,7 +188,10 @@ Changelog.
   incoming task's `tc_Launch` (`tc_Flags`' `TF_SWITCH`/`TF_LAUNCH`) are
   called on every switch, as real guest subroutines, matching real
   `exec.library` — real thread-local storage and newlib's per-task
-  `errno` rely on this.
+  `errno` rely on this. A task's FPU registers (`FP0`-`FP7`, `FPCR`,
+  `FPSR`, `FPIAR`) are saved and restored across a switch too, and an
+  exiting task's `tc_Switch` runs before its `struct Process` and stack
+  are freed.
 - The full `SignalSemaphore` API: `InitSemaphore`/`ObtainSemaphore`/
   `ReleaseSemaphore`/`AttemptSemaphore`/`FindSemaphore`/`AddSemaphore`/
   `RemSemaphore`/`ObtainSemaphoreList`/`ReleaseSemaphoreList`/

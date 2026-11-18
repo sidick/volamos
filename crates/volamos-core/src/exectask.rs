@@ -216,7 +216,9 @@
 //! The SIGINT handler does nothing but set an atomic flag
 //! ([`PENDING_HOST_BREAK`]). [`fold_pending_host_break`] is the only
 //! thing that ever consults it: it atomically takes-and-clears it, and
-//! if it was set, ORs [`SIGBREAKF_CTRL_C`] into `tc_SigRecvd`.
+//! if it was set, ORs [`SIGBREAKF_CTRL_C`] into the *main* task's
+//! `tc_SigRecvd` (the CLI process owns Ctrl-C, not whichever task is
+//! running) and wakes it if it is blocked in a matching `Wait`.
 //! [`crate::dispatch::Runtime::run`] calls it once per dispatched
 //! library call (right before building the
 //! [`crate::dispatch::HandlerContext`] for the trapped call), and
@@ -670,13 +672,24 @@ pub fn install_host_break_handler() {
 }
 
 /// Atomically takes-and-clears [`PENDING_HOST_BREAK`]; if it was set,
-/// ORs [`SIGBREAKF_CTRL_C`] into `task`'s `tc_SigRecvd`. See the module
-/// docs' "Host `SIGINT`/`SIGTERM`" section for when this is called and
-/// its polling-granularity limitation.
-pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, task: u32) {
+/// ORs [`SIGBREAKF_CTRL_C`] into the *main* task's `tc_SigRecvd` and
+/// wakes it if it is blocked in a `Wait` that includes the bit. Ctrl-C
+/// belongs to the CLI process the user is typing at, not to whichever
+/// `CreateNewProc` task happens to be running when the host signal is
+/// noticed: delivered to the running task, a worker absorbed it and a
+/// main task in `Wait(done | SIGBREAKF_CTRL_C)` was never interrupted
+/// (issue #359). See the module docs' "Host `SIGINT`/`SIGTERM`" section
+/// for when this is called and its polling-granularity limitation (the
+/// woken main task still only runs at the next switch point -- there is
+/// no preemption).
+pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, tasks: &mut TaskScheduler) {
     if PENDING_HOST_BREAK.swap(false, Ordering::SeqCst) {
-        let recvd = mem.read_u32(task + TC_SIGRECVD);
-        mem.write_u32(task + TC_SIGRECVD, recvd | SIGBREAKF_CTRL_C);
+        let main = tasks.main();
+        let recvd = mem.read_u32(main + TC_SIGRECVD) | SIGBREAKF_CTRL_C;
+        mem.write_u32(main + TC_SIGRECVD, recvd);
+        if main != tasks.current() {
+            tasks.wake_if_signal_matches(main, recvd);
+        }
     }
 }
 
@@ -1179,6 +1192,7 @@ pub(crate) fn spawn_process<C: Cpu>(
         // from everything else this runtime assumes would be a
         // needless, confusing special case for no benefit.
         sr: ctx.cpu.sr(),
+        fpu: None,
     };
     ctx.tasks.spawn_ready(task, snapshot, stack_block, sp_upper);
     Some(task)
@@ -1256,9 +1270,33 @@ pub(crate) fn task_exit_stub_handler<C: Cpu + 'static>(
 }
 
 /// The rest of [`task_exit_stub_handler`], once any `NP_ExitCode`
-/// routine has returned: close the handles, free what the process owned
-/// and switch to the next task.
+/// routine has returned. The exiting task loses the CPU for good, so its
+/// `tc_Switch` hook (if `TF_SWITCH`) runs now, *before* anything is
+/// freed -- it executes on this task's own stack and may read its
+/// `struct Process`, which [`release_exited_task`] is about to free. The
+/// switch away from the freed task then skips the hook
+/// ([`crate::taskswitch::TaskScheduler::is_exiting`]). Before issue #359
+/// the hook ran after the free, on freed memory.
 fn finish_task_exit<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let task = ctx.current_task;
+    if ctx.mem.read_u8(task + TC_FLAGS) & TF_SWITCH != 0 && !ctx.tasks.switch_hook_in_flight() {
+        let tc_switch = ctx.mem.read_u32(task + TC_SWITCH_OFFSET);
+        if tc_switch != 0 {
+            ctx.tasks.begin_switch_hook();
+            ctx.continuations
+                .trampoline(ctx.cpu, ctx.mem, tc_switch, |ctx| {
+                    ctx.tasks.end_switch_hook();
+                    release_exited_task(ctx)
+                });
+            return Ok(());
+        }
+    }
+    release_exited_task(ctx)
+}
+
+/// Closes the exiting task's handles, frees what the process owned and
+/// switches to the next task -- see [`finish_task_exit`].
+fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let task = ctx.current_task;
     let flags = ctx.mem.read_u32(task + PR_FLAGS_OFFSET);
     for (flag, offset) in [
@@ -1555,7 +1593,7 @@ fn free_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let signal_set = ctx.cpu.data_register(DataRegister(0));
     let task = ctx.current_task;
-    fold_pending_host_break(ctx.mem, task);
+    fold_pending_host_break(ctx.mem, ctx.tasks);
     ctx.timers.fire_due(ctx.mem, ctx.tasks);
 
     loop {
@@ -1667,7 +1705,7 @@ fn signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
 fn check_signal_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let mask = ctx.cpu.data_register(DataRegister(1));
     let task = ctx.current_task;
-    fold_pending_host_break(ctx.mem, task);
+    fold_pending_host_break(ctx.mem, ctx.tasks);
     ctx.timers.fire_due(ctx.mem, ctx.tasks);
 
     let recvd = ctx.mem.read_u32(task + TC_SIGRECVD);
@@ -3573,6 +3611,39 @@ mod tests {
             code, 31,
             "AllocSignal(-1) should hand out the highest free bit first"
         );
+    }
+
+    #[test]
+    fn host_break_goes_to_the_main_task_not_the_running_one_359() {
+        let _guard = lock_host_break();
+        let main = 0x1000;
+        let worker = 0x2000;
+        let mut mem = FlatMemory::new(0x8000);
+        let mut tasks = TaskScheduler::new(main);
+        tasks.spawn_ready(
+            worker,
+            crate::cpu::RegisterSnapshot {
+                d: [0; 8],
+                a: [0; 8],
+                pc: 0,
+                sr: 0,
+                fpu: None,
+            },
+            0,
+            0x1000,
+        );
+        tasks.commit(worker); // the worker is running when the break is noticed
+
+        PENDING_HOST_BREAK.store(true, Ordering::SeqCst);
+        fold_pending_host_break(&mut mem, &mut tasks);
+
+        assert_eq!(mem.read_u32(main + TC_SIGRECVD), SIGBREAKF_CTRL_C);
+        assert_eq!(
+            mem.read_u32(worker + TC_SIGRECVD),
+            0,
+            "the worker must not absorb the CLI's Ctrl-C"
+        );
+        assert!(!PENDING_HOST_BREAK.load(Ordering::SeqCst), "taken");
     }
 
     #[test]

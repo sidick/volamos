@@ -197,6 +197,17 @@ pub trait Cpu {
         0
     }
 
+    /// The architectural FPU state (`FP0`-`FP7`, `FPCR`, `FPSR`,
+    /// `FPIAR`), for a task switch to save and restore. `None` for a
+    /// backend with no FPU registers to expose.
+    fn fpu_state(&self) -> Option<FpuState> {
+        None
+    }
+
+    /// Writes back what [`Cpu::fpu_state`] captured. A backend with no
+    /// FPU ignores it.
+    fn set_fpu_state(&mut self, _state: &FpuState) {}
+
     /// Delivers the real m68k hardware exception for a trap [`Cpu::step`]/
     /// [`Cpu::run`] just reported, other than [`TrapKind::ALine`] (this
     /// runtime's own library-call dispatch convention, always handled by
@@ -315,6 +326,21 @@ pub trait Cpu {
     }
 }
 
+/// A task's FPU registers: eight 80-bit extended values (`sign_exp` and
+/// the 64-bit mantissa, as the `m68k` crate holds them) plus the control,
+/// status and instruction-address registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FpuState {
+    /// `FP0`-`FP7` as `(sign_exp, mantissa)`.
+    pub fp: [(u16, u64); 8],
+    /// `FPCR`.
+    pub fpcr: u32,
+    /// `FPSR`.
+    pub fpsr: u32,
+    /// `FPIAR`.
+    pub fpiar: u32,
+}
+
 /// A complete snapshot of one task's architectural register state --
 /// everything a cooperative task switch (issue #121) needs to suspend a
 /// task and later resume it exactly where it left off.
@@ -329,13 +355,11 @@ pub trait Cpu {
 /// [`capture`]/[`restore`] -- 18 calls each way, cheap, and correct for
 /// any `Cpu` implementation rather than tied to one backend's internals.
 ///
-/// Deliberately **not** FPU state (`FP0`-`FP7`/`FPSR`/`FPCR`/`FPIAR`):
-/// nothing in scope for the first cooperative-switching slice runs
-/// FPU-using code across a switch point, and the [`Cpu`] trait doesn't
-/// expose FPU registers at all today. A task that switches away mid-FPU
-/// computation would lose that state -- a known gap, not yet a problem
-/// for anything this runtime's switch points (`Wait`/`Permit`+`SFB_SAR`/
-/// same-priority `SetTaskPri`) actually hit.
+/// The FPU registers (`FP0`-`FP7`/`FPCR`/`FPSR`/`FPIAR`) are saved too,
+/// via [`Cpu::fpu_state`]: a task blocked in `pthread_mutex_lock`, a
+/// `Delay` or a semaphore wait can hold a value in a callee-saved `FP2`
+/// across the switch (issue #359; the first slice assumed no switch point
+/// was ever reached mid-FPU-work, which stopped being true).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterSnapshot {
     /// D0-D7.
@@ -349,6 +373,8 @@ pub struct RegisterSnapshot {
     pub pc: u32,
     /// The full status register (condition codes + system byte).
     pub sr: u16,
+    /// The FPU registers, if the backend has any.
+    pub fpu: Option<FpuState>,
 }
 
 /// Captures `cpu`'s current architectural registers into a
@@ -368,6 +394,7 @@ pub fn capture<C: Cpu>(cpu: &C) -> RegisterSnapshot {
         a,
         pc: cpu.pc(),
         sr: cpu.sr(),
+        fpu: cpu.fpu_state(),
     }
 }
 
@@ -396,4 +423,7 @@ pub fn restore<C: Cpu>(cpu: &mut C, snapshot: &RegisterSnapshot) {
         cpu.set_address_register(AddressRegister(i as u8), value);
     }
     cpu.set_pc(snapshot.pc);
+    if let Some(fpu) = &snapshot.fpu {
+        cpu.set_fpu_state(fpu);
+    }
 }
