@@ -460,6 +460,14 @@ pub struct DosState {
     /// carries back on every subsequent overlay-node load) -- see
     /// `crate::dosseg`'s module docs.
     pub(crate) overlay_roots: HashMap<u32, crate::dosseg::OverlayRootState>,
+    /// Currently loaded overlay nodes, keyed by the `BPTR` of each node's
+    /// first segment (also a key of `seglists`) -- see `crate::dosseg`'s
+    /// module docs on `UnLoadSeg` for overlay executables.
+    pub(crate) overlay_nodes: HashMap<u32, crate::dosseg::OverlayNodeInfo>,
+    /// Overlay root first-segment `BPTR` -> that root's `oh_Segments`
+    /// `BPTR` (the key of `overlay_roots`), so unloading the root can find
+    /// the rest of what hangs off it.
+    pub(crate) overlay_root_tables: HashMap<u32, u32>,
     /// Host-side callback installed by a CLI (never by library code
     /// itself) to actually run a resolved `System()`/`Execute()` command
     /// as a nested guest invocation -- see `crate::dosseg`'s module docs
@@ -605,6 +613,8 @@ impl DosState {
             next_lock_id: 0,
             seglists: HashMap::new(),
             overlay_roots: HashMap::new(),
+            overlay_nodes: HashMap::new(),
+            overlay_root_tables: HashMap::new(),
             system_runner: None,
             input_buf: Vec::new(),
             input_pos: 0,

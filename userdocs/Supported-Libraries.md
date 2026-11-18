@@ -131,7 +131,11 @@ Changelog.
   reported instead.
 - `LoadSeg`/`UnLoadSeg` (real `BPTR` seglists), `RunCommand`, and
   `SystemTagList`/`System`/`Execute` for tools that shell out to
-  another guest program.
+  another guest program. Overlay executables (`HUNK_OVERLAY`) load node
+  by node through the overlay manager's `LoadSeg(NULL, table, fh)`; a
+  node can be `UnLoadSeg`ed when a sibling displaces it, and unloading
+  the root frees every loaded node, the overlay tables, and closes the
+  overlay file.
 - Hunk memory flags: `LoadSeg` and overlay programs place each hunk in
   the kind of memory its size longword asks for. A `HUNKF_CHIP` hunk (data
   for the custom chips) is in chip RAM, so `TypeOfMem` on it reports a
