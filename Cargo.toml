@@ -7,7 +7,6 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sidick/volamos"
 authors = ["Simon Dick"]
-description = "A Rust-native, Wine-style runtime for classic AmigaOS m68k CLI binaries"
 
 [workspace.dependencies]
 volamos-core = { path = "crates/volamos-core" }
