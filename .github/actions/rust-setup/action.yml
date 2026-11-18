@@ -3,7 +3,8 @@
 # actions/cache), differing only in targets/components/cache key.
 # Requires actions/checkout to have already run in the calling job (a
 # local composite action can't be resolved before the repo is checked
-# out).
+# out), and reads the toolchain version from rust-toolchain.toml in the
+# repo root.
 
 name: Rust setup
 description: Install a Rust toolchain and cache cargo registry/target dirs.
@@ -31,7 +32,7 @@ runs:
       id: pin
       shell: bash
       run: |
-        channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
         test -n "$channel" || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
         echo "channel=$channel" >> "$GITHUB_OUTPUT"
 

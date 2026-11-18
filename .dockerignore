@@ -6,3 +6,6 @@ __pycache__/
 *.lha
 /ndk/
 /NDK/
+# The image builds with the base image's own toolchain; this pin is for CI and
+# local builds, and would make rustup download it mid-build (under QEMU for arm64).
+rust-toolchain.toml

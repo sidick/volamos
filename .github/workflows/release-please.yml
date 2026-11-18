@@ -60,6 +60,8 @@ jobs:
     name: Test (${{ matrix.os }})
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -161,6 +163,8 @@ jobs:
     name: Standalone binary (${{ matrix.target }})
     needs: [release-please, test, docker]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -215,6 +219,8 @@ jobs:
     name: Standalone binary (aarch64-apple-darwin)
     needs: [release-please, test]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -252,6 +258,8 @@ jobs:
     name: Standalone binary (x86_64-pc-windows-gnu)
     needs: [release-please, test]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

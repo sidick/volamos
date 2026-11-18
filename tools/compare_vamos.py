@@ -29,7 +29,8 @@ A mismatch against an entry in KNOWN_DIVERGENCES prints as tracked
 (`KNOWN`) rather than failing the run -- see each entry's linked GitHub
 issue -- but only while volamos's own output still equals the pinned
 expected `(stdout, exit code)` recorded with the entry: the divergence
-being tolerated is vamos's, not any change in volamos. This harness's job is to keep *finding* divergences, not to block
+being tolerated is vamos's, not any change in volamos. This harness's
+job is to keep *finding* divergences, not to block
 on root-causing every one before it can run in CI; removing an entry
 here (because the underlying bug got fixed and the two sides now agree)
 is the "verified fixed" signal.
@@ -164,7 +165,10 @@ def main() -> int:
         vam_norm = normalize(fixture, vam_stdout)
 
         if vol_norm == vam_norm and vol_code == vam_code:
-            results.append((fixture, "PASS", ""))
+            note = ""
+            if fixture in KNOWN_DIVERGENCES:
+                note = "now agrees with vamos: remove it from KNOWN_DIVERGENCES"
+            results.append((fixture, "PASS", note))
         elif fixture in KNOWN_DIVERGENCES:
             reason, issue, expected = KNOWN_DIVERGENCES[fixture]
             if (vol_norm, vol_code) == expected:
