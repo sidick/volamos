@@ -104,18 +104,30 @@ fn writef_width(c: u8) -> usize {
 /// Renders a BCPL `Writef`-style format string (`VFWritef`/`FWritef` --
 /// see this module's doc note) against the `LONG` array at `argv_ptr`,
 /// returning the formatted bytes. Every directive consumes exactly one
-/// 4-byte array slot except `%%` (consumes none) -- `argv` is a plain
+/// 4-byte array slot; a non-directive `%c` (such as `%%`) consumes none
+/// -- `argv` is a plain
 /// `LONG*`, unlike [`render_format`]'s mixed 16-/32-bit `RawDoFmt`
 /// stream, so slot advancement is always by 4.
 ///
+/// Measured on real Kickstart 3.1 (r40.68) under Copperline (issue #362),
+/// and matching the NDK `VFWritef` autodoc:
+///
+/// - The directives are `%S`, `%T<w>`, `%C`, `%O<w>`, `%X<w>`, `%I<w>`,
+///   `%U<w>`, `%N` and `%$` (ignore one argument). Any other `%c`
+///   (including `%D` and `%*`, which an earlier version implemented)
+///   prints the character `c` with the `%` dropped and consumes no
+///   argument; that is also how `%%` prints a single `%`.
+/// - `<w>` is one character in base 36 (`'0'`-`'9'` then `'A'`-`'Z'`, so
+///   `A` is 10 and `G` is 16).
+/// - `%I`/`%U` right-align a signed/unsigned decimal in a field of at
+///   least `<w>` spaces and never truncate (`%I2` of 12345 is `12345`).
+///   `%O`/`%X` print the low `<w>` digits, zero-padded: `%X4` of 255 is
+///   `00FF` (uppercase), `%X2` of 0x1234 is `34`. `%N` is any length.
+///
 /// Directive letters are matched case-insensitively: `%S`/`%T<w>` are
-/// confirmed against the real `Which` binary (issue tracker: an
-/// existing end-to-end test uses `%s`, lowercase, as that binary
-/// literally embeds it), and `%N` against the real `Eval` binary
-/// (issue #12, lowercase `%n`). The rest (`%C`/`%O<w>`/`%X<w>`/
-/// `%D<w>`/`%U<w>`/`%*`) are implemented per the RKRM's prose
-/// description of `Writef`'s directive set, not independently
-/// disassembly-confirmed against a real binary the way `%S`/`%N` were.
+/// confirmed against the real `Which` binary (which literally embeds
+/// `%s`), and `%N` against the real `Eval` binary (lowercase `%n`, issue
+/// #12).
 fn render_writef_format(mem: &dyn AddressSpace, fmt: &[u8], argv_ptr: u32) -> Vec<u8> {
     let mut out = Vec::new();
     let mut argv = argv_ptr;
@@ -140,8 +152,7 @@ fn render_writef_format(mem: &dyn AddressSpace, fmt: &[u8], argv_ptr: u32) -> Ve
         };
         i += 1;
         match directive.to_ascii_uppercase() {
-            b'%' => out.push(b'%'),
-            b'*' => {
+            b'$' => {
                 next_arg(mem, &mut argv);
             }
             b'S' => {
@@ -164,22 +175,29 @@ fn render_writef_format(mem: &dyn AddressSpace, fmt: &[u8], argv_ptr: u32) -> Ve
                 let v = next_arg(mem, &mut argv);
                 out.push(v as u8);
             }
-            b'O' | b'X' | b'D' | b'U' => {
+            b'O' | b'X' | b'I' | b'U' => {
+                let kind = directive.to_ascii_uppercase();
                 let width = fmt.get(i).copied().map(writef_width).unwrap_or(0);
                 if fmt.get(i).is_some() {
                     i += 1;
                 }
                 let v = next_arg(mem, &mut argv);
-                let digits = match directive.to_ascii_uppercase() {
+                let mut digits = match kind {
                     b'O' => format!("{v:o}"),
-                    b'X' => format!("{v:x}"),
-                    b'D' => format!("{}", v as i32),
+                    b'X' => format!("{v:X}"),
+                    b'I' => format!("{}", v as i32),
                     _ => format!("{v}"),
                 };
-                let zero_pad = matches!(directive.to_ascii_uppercase(), b'O' | b'X');
-                if digits.len() < width {
-                    let pad = width - digits.len();
-                    out.resize(out.len() + pad, if zero_pad { b'0' } else { b' ' });
+                if matches!(kind, b'O' | b'X') {
+                    // Zero-padded, and cut to the low `width` digits.
+                    if width > 0 && digits.len() > width {
+                        digits = digits[digits.len() - width..].to_string();
+                    }
+                    if digits.len() < width {
+                        out.resize(out.len() + (width - digits.len()), b'0');
+                    }
+                } else if digits.len() < width {
+                    out.resize(out.len() + (width - digits.len()), b' ');
                 }
                 out.extend(digits.as_bytes());
             }
@@ -187,10 +205,8 @@ fn render_writef_format(mem: &dyn AddressSpace, fmt: &[u8], argv_ptr: u32) -> Ve
                 let v = next_arg(mem, &mut argv);
                 out.extend(format!("{}", v as i32).as_bytes());
             }
-            _ => {
-                out.push(b'%');
-                out.push(directive);
-            }
+            // Not a directive: the character itself, no argument.
+            _ => out.push(directive),
         }
     }
     out
@@ -367,5 +383,59 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 11, "\"found Which\" is 11 characters");
         assert_eq!(out, b"found Which");
+    }
+
+    /// Renders `fmt` against `args` (each a plain `LONG`), with `"abcdef"`
+    /// available at 0x2000 for a `%T`/`%S` argument.
+    fn writef(fmt: &str, args: &[u32]) -> String {
+        let mut mem = FlatMemory::new(0x4000);
+        for (i, &a) in args.iter().enumerate() {
+            mem.write_u32(0x100 + 4 * i as u32, a);
+        }
+        crate::guestmem::write_c_string(&mut mem, 0x2000, b"abcdef");
+        String::from_utf8(super::render_writef_format(&mem, fmt.as_bytes(), 0x100)).unwrap()
+    }
+
+    #[test]
+    fn vfwritef_matches_real_kickstart_31_362() {
+        // Every expectation below was measured on real Kickstart 3.1
+        // (r40.68) under Copperline.
+        assert_eq!(writef("%I5|%N", &[42, 43]), "   42|43");
+        assert_eq!(
+            writef("%IA|%N", &[42, 43]),
+            "        42|43",
+            "base-36 width: A = 10"
+        );
+        assert_eq!(writef("%I0|%N", &[42, 43]), "42|43");
+        assert_eq!(writef("%I5", &[-42i32 as u32]), "  -42");
+        assert_eq!(writef("%U5|%N", &[-42i32 as u32, 43]), "4294967254|43");
+        assert_eq!(writef("%U5", &[7]), "    7");
+        assert_eq!(writef("%I2", &[12345]), "12345", "I never truncates");
+        assert_eq!(writef("%X4", &[255]), "00FF", "uppercase, zero-padded");
+        assert_eq!(writef("%O4", &[255]), "0377");
+        assert_eq!(
+            writef("%X2|%N", &[0x1234, 43]),
+            "34|43",
+            "X keeps the low digits"
+        );
+        assert_eq!(writef("%O2", &[0x1234]), "64");
+        assert_eq!(writef("%X8", &[0x1234_ABCD]), "1234ABCD");
+        assert_eq!(writef("%XG", &[0x1234_ABCD]), "000000001234ABCD", "G = 16");
+        assert_eq!(writef("%T2", &[0x2000]), "abcdef", "T is a minimum width");
+        assert_eq!(writef("%T8|", &[0x2000]), "abcdef  |");
+        assert_eq!(writef("%C%C", &[b'A' as u32, b'B' as u32]), "AB");
+        assert_eq!(writef("%N|%N|%N", &[1, 2, 3]), "1|2|3");
+    }
+
+    #[test]
+    fn vfwritef_non_directives_print_the_character_and_take_no_argument_362() {
+        // %D and %* are not directives on real Kickstart 3.1: the % is
+        // dropped, the letter prints, and the next argument is untouched.
+        assert_eq!(writef("%D5|%N", &[42, 43]), "D5|42");
+        assert_eq!(writef("%*5|%N", &[42, 43]), "*5|42");
+        assert_eq!(writef("%Z5|%N", &[42, 43]), "Z5|42");
+        assert_eq!(writef("%%", &[]), "%");
+        // %$ ignores exactly one argument.
+        assert_eq!(writef("%$|%N", &[1, 2]), "|2");
     }
 }

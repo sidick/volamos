@@ -97,7 +97,12 @@ Changelog.
   volume's own task. Every lock's `fl_Task` and `GetDeviceProc`'s
   `dvp_Port` point at this same synthetic handler port, so a caller
   that resolves it itself (as `ixemul.library`'s `__plock()` does)
-  reaches it too. Any other packet type fails cleanly with
+  reaches it too. `GetDeviceProc`'s `dvp_Lock` is what the name is
+  relative to: the volume (or assign) root for a `Vol:`-qualified name,
+  the current directory for a bare or relative one (checked against real
+  Kickstart 3.1; real Kickstart returns a `NULL` lock for a device,
+  where volumes here share one port and the root lock identifies the
+  volume). Any other packet type fails cleanly with
   `ERROR_ACTION_NOT_KNOWN`; an unknown action's `Res1` is `DOSFALSE`,
   not `-1`, matching real `dos.library` for callers that read it as a
   boolean.
@@ -122,7 +127,14 @@ Changelog.
   than an omission — a caller needing the general case is documented
   to `SetIoErr(code)` first.
 - Path strings: `SplitName` (alongside `AddPart`/`FilePart`/`PathPart`).
-- The `DosList`: `LockDosList`/`UnLockDosList`/`FindDosEntry`/`Info`.
+- Formatted output: `VPrintf`/`VFPrintf` (C `printf` directives) and
+  `VFWritef`/`FWritef` (the BCPL set: `%S %Tw %C %Ow %Xw %Iw %Uw %N %$`,
+  with `w` one base-36 digit). Any other `%c` prints `c` and takes no
+  argument, as on real Kickstart 3.1, which is also what the checked
+  behaviour of `%X`/`%O` (zero-padded, low digits kept, hex uppercase)
+  and `%I`/`%U` (space-padded, never truncated) comes from.
+- The `DosList`: `LockDosList` (which nests, as on AmigaOS)/`UnLockDosList`/
+  `FindDosEntry`/`Info`.
   `Info` and `ACTION_DISK_INFO`/`ACTION_INFO` report the real size and
   free space of the host filesystem behind the volume (in 512-byte
   blocks, larger when a huge disk would overflow a 32-bit block count),

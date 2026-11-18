@@ -525,12 +525,11 @@ pub struct DosState {
     /// rather than a caller-specified byte.
     pub(crate) last_getc: HashMap<u32, i32>,
 
-    /// Heap addresses allocated by the most recent `LockDosList` (the
-    /// header node, every `DosList` entry built, and their `dol_Name`
-    /// buffers) -- freed by `UnLockDosList`. See `crate::dosdevlist`'s
-    /// module docs for why a single session (rather than one keyed by
-    /// handle) is enough here.
-    pub(crate) dos_list_active: Vec<u32>,
+    /// One entry per outstanding `LockDosList` call (innermost last): the
+    /// heap addresses it allocated (the header node, every `DosList`
+    /// entry built, and their `dol_Name` buffers), freed by the matching
+    /// `UnLockDosList`. See `crate::dosdevlist`'s module docs.
+    pub(crate) dos_list_active: Vec<Vec<u32>>,
     /// Uppercased volume name -> a stable, process-lifetime, non-
     /// dereferenceable synthetic `dol_Task` id, allocated lazily the
     /// first time a `DosList` entry is built for that volume (see
@@ -1051,6 +1050,12 @@ impl DosState {
             if let HostHandle::Pipe { channel, end } = handle {
                 self.close_pipe(&channel, end);
             }
+            // A task blocked mid-write on this handle left how far it got
+            // keyed by `(task, addr)`. The address is about to be freed and
+            // can be handed to a *new* pipe handle: the same task writing
+            // to that one would resume the stale count, skipping its first
+            // bytes yet reporting them written (issue #362).
+            self.pipe_write_progress.retain(|&(_, a), _| a != addr);
             if !self.dos_object_filehandles.contains(&addr) {
                 let _ = heap.free(addr);
             }

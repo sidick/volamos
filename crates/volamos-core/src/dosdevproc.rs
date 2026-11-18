@@ -19,12 +19,20 @@
 //! and the action itself to `dvp_Port`), and gives up with
 //! `ERROR_OBJECT_NOT_FOUND` when `dvp_Port` is `NULL`.
 //!
-//! `dvp_Lock` is a [`crate::doslock::SHARED_LOCK`] on the target's
-//! containing directory -- `GetDeviceProc`'s actual role for e.g.
-//! `CreateDir()` internally, per the RKRM's own packet documentation
-//! ("The lock in `dp_Arg1` is the directory to which the path in
-//! `dp_Arg2` is relative. The `CreateDir()` function obtains it from
-//! `GetDeviceProc()`").
+//! `dvp_Lock` is a [`crate::doslock::SHARED_LOCK`] on the directory the
+//! caller's packet name is *relative to* -- `GetDeviceProc`'s actual
+//! role for e.g. `CreateDir()` internally, per the RKRM's own packet
+//! documentation ("The lock in `dp_Arg1` is the directory to which the
+//! path in `dp_Arg2` is relative. The `CreateDir()` function obtains it
+//! from `GetDeviceProc()`"): for a name with a volume/assign prefix, the
+//! root of that volume/assign (the caller sends the part after the
+//! colon), and for a bare or relative name, the current directory (the
+//! caller sends the name as given). The second half is measured on real
+//! Kickstart 3.1 (r40.68, Copperline); real Kickstart returns a `NULL`
+//! lock for a device-qualified name, but its per-volume `dvp_Port`
+//! identifies the volume, where here every volume shares one port, so
+//! the root lock is what carries it. The path itself is not checked:
+//! `GetDeviceProc` finds the handler, not the file (issue #362).
 //!
 //! Multi-assign iteration (`GetDeviceProc` called again with a
 //! previous, non-`NULL` result to advance to the next directory of a
@@ -68,8 +76,9 @@ fn free_device_proc(
     let _ = heap.free(addr);
 }
 
-/// Core of `GetDeviceProc`: `name`'s containing directory, locked
-/// ([`SHARED_LOCK`]) and wrapped in a heap-allocated `DevProc`. Returns
+/// Core of `GetDeviceProc`: the lock `name` is relative to (see the
+/// comment in the body), locked ([`SHARED_LOCK`]) and wrapped in a
+/// heap-allocated `DevProc`. Returns
 /// `Ok(0)` (not `Err`) for the "no more matches" `prev != 0` case, per
 /// the module docs.
 fn get_device_proc(
@@ -84,19 +93,34 @@ fn get_device_proc(
         return Ok(0);
     }
 
-    let dir_part = match name.rfind([':', '/']) {
+    // `dvp_Lock` is what the caller's packet names are relative to (RKRM:
+    // the part of `name` after the colon, or the whole name if there is
+    // none, is "a path relative to dvp_Lock"). So:
+    //
+    // - a name with a volume/assign prefix gets a lock on that
+    //   volume/assign *root*, and the caller sends the remainder. Real
+    //   Kickstart hands back a NULL lock for a device (measured with
+    //   Copperline) because its per-volume `dvp_Port` identifies the
+    //   volume; here every volume shares one packet port, so the lock is
+    //   what carries the volume.
+    // - a bare or relative name gets a lock on the *current directory*
+    //   (measured on real Kickstart 3.1: `GetDeviceProc("sub/f.txt")` and
+    //   `GetDeviceProc("probe")` both return the cwd lock).
+    //
+    // This used to lock the name's containing directory, so the caller's
+    // relative path was applied twice (`SYS:work` + `work/f.txt`), and a
+    // bare name with the cwd at a volume root tried to lock `SYS:/`, the
+    // parent of the root, and failed (issue #362).
+    let lock_path = match name.find(':') {
         Some(i) => name[..=i].to_string(),
-        None => {
-            let cwd = dos
-                .vfs
-                .as_ref()
-                .map(|v| v.cwd().to_string())
-                .unwrap_or_default();
-            format!("{cwd}/")
-        }
+        None => dos
+            .vfs
+            .as_ref()
+            .map(|v| v.cwd().to_string())
+            .unwrap_or_default(),
     };
 
-    let lock_bptr = dos.lock(heap, mem, &dir_part, SHARED_LOCK)?;
+    let lock_bptr = dos.lock(heap, mem, &lock_path, SHARED_LOCK)?;
     // The packet port every lock's fl_Task and handle's fh_Type name:
     // see the module docs.
     let port = match dos.fs_port_addr(heap, mem) {
@@ -131,7 +155,14 @@ fn get_device_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
     let name = String::from_utf8_lossy(&read_c_string(ctx.mem, name_ptr)).into_owned();
 
     match get_device_proc(ctx.heap, ctx.mem, ctx.dos, &name, prev) {
-        Ok(addr) => ctx.cpu.set_data_register(DataRegister(0), addr),
+        Ok(addr) => {
+            // A previous DevProc passed back means "next directory of the
+            // assign": NULL with ERROR_NO_MORE_ENTRIES (NDK autodoc).
+            if prev != 0 {
+                ctx.dos.set_io_err(crate::doslock::ERROR_NO_MORE_ENTRIES);
+            }
+            ctx.cpu.set_data_register(DataRegister(0), addr);
+        }
         Err(code) => {
             ctx.dos.set_io_err(code);
             ctx.cpu.set_data_register(DataRegister(0), 0);
@@ -231,12 +262,13 @@ mod tests {
     // --- get_device_proc / free_device_proc: unit-level ---
 
     #[test]
-    fn get_device_proc_locks_the_containing_directory() {
+    fn get_device_proc_locks_what_the_name_is_relative_to_362() {
         let tmp = TempDir::new("unit-basic");
         fs::create_dir(tmp.path().join("work")).unwrap();
         fs::write(tmp.path().join("work/f.txt"), b"hi").unwrap();
         let (mut heap, mut mem, mut dos) = setup(tmp.path());
 
+        // A qualified name: the volume root (the caller sends `work/f.txt`).
         let addr = get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:work/f.txt", 0).unwrap();
         assert_ne!(addr, 0);
         let port = mem.read_u32(addr + DVP_PORT_OFFSET);
@@ -244,20 +276,40 @@ mod tests {
             dos.is_fs_handler_port(port),
             "dvp_Port should be the filesystem packet port"
         );
-        let lock_bptr = mem.read_u32(addr + DVP_LOCK_OFFSET);
-        assert_ne!(lock_bptr, 0);
-        let lock_addr = addr_from_bptr(lock_bptr);
+        let lock_addr = addr_from_bptr(mem.read_u32(addr + DVP_LOCK_OFFSET));
         assert_eq!(
             dos.locks.get(&lock_addr).unwrap().host_path,
-            tmp.path().join("work")
+            tmp.path(),
+            "not SYS:work, or `work/f.txt` would be applied twice"
         );
+
+        // A bare name at the volume root used to try to lock `SYS:/` (the
+        // parent of the root) and fail.
+        let addr = get_device_proc(&mut heap, &mut mem, &mut dos, "f.txt", 0).unwrap();
+        let lock_addr = addr_from_bptr(mem.read_u32(addr + DVP_LOCK_OFFSET));
+        assert_eq!(dos.locks.get(&lock_addr).unwrap().host_path, tmp.path());
+
+        // Bare and relative names: the current directory (real Kickstart
+        // 3.1 returns the cwd lock for `sub/f.txt` and for a bare name).
+        dos.vfs.as_mut().unwrap().set_cwd("SYS:work").unwrap();
+        for name in ["f.txt", "sub/f.txt"] {
+            let addr = get_device_proc(&mut heap, &mut mem, &mut dos, name, 0).unwrap();
+            let lock_addr = addr_from_bptr(mem.read_u32(addr + DVP_LOCK_OFFSET));
+            assert_eq!(
+                dos.locks.get(&lock_addr).unwrap().host_path,
+                tmp.path().join("work"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn get_device_proc_missing_directory_fails() {
+    fn get_device_proc_finds_the_handler_not_the_file_362() {
         let tmp = TempDir::new("unit-missing");
         let (mut heap, mut mem, mut dos) = setup(tmp.path());
-        assert!(get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:nope/f.txt", 0).is_err());
+        // The path under the volume need not exist; the volume must.
+        assert!(get_device_proc(&mut heap, &mut mem, &mut dos, "SYS:nope/f.txt", 0).is_ok());
+        assert!(get_device_proc(&mut heap, &mut mem, &mut dos, "NOPE:f.txt", 0).is_err());
     }
 
     #[test]
@@ -398,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_get_device_proc_missing_path_returns_null() {
+    fn end_to_end_get_device_proc_unknown_volume_returns_null() {
         let tmp = TempDir::new("getdeviceproc-missing");
 
         let mut words = Vec::new();
@@ -407,7 +459,7 @@ mod tests {
         push_jsr(&mut words, 6, -642);
         words.push(RTS);
 
-        let name = b"SYS:nope/f.txt\0";
+        let name = b"NOPE:f.txt\0";
         let name_addr = TRAP_TABLE_END + (words.len() as u32) * 2;
         patch_imm32(&mut words, name_idx, name_addr);
 
