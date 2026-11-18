@@ -156,7 +156,10 @@ Changelog.
   (mirroring `vamos`); a handful of standard Workbench libraries
   (`mathtrans`, `mathieee*`, `locale`, `intuition`) are always present,
   matching real ROM-resident behavior.
-- Memory: `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem`, memory
+- Memory: `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem`
+  (`AllocMem` blocks sit on exec's 8-byte boundary, and `AllocVec` keeps
+  its size in the 4 bytes before the block, so its result is 4 mod 8 --
+  as on exec, and independent of the program's size), memory
   pools (`CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`),
   `AllocEntry`/`FreeEntry` (per-entry `MEMF_CLEAR` honoured; a partial
   failure backs out fully, the post-SetPatch/V36+ behavior, and returns

@@ -37,24 +37,29 @@
 //! arena; that's fine and intended, exactly as the plan calls for ("the
 //! exec calls become the guest-visible interface to that SAME heap").
 //!
-//! # Size rounding: `AllocMem` rounds to 8, `GuestHeap` aligns to 4
+//! # Size rounding and alignment: `AllocMem` is 8-aligned, `GuestHeap` is 4
 //!
 //! Real `AllocMem` rounds the requested size up to a multiple of `MEMBLOCKSIZE`
-//! (8 bytes on all real AmigaOS memory pools) before allocating, because
-//! `MemChunk` fidelity needs every block on an 8-byte boundary. This
-//! runtime's `GuestHeap` only guarantees 4-byte alignment (T8's own
-//! requirement -- see `guestmem.rs`). Rather than changing `GuestHeap`
-//! (used by every other handler in the runtime, where 4-byte alignment is
-//! sufficient and 8 would waste space for no benefit), [`round_up_8`] is
-//! applied *here*, at the `AllocMem`/`AllocVec` call boundary, before the
-//! request ever reaches [`crate::guestmem::GuestHeap::alloc`] -- since 8
-//! is itself a multiple of 4, the value `GuestHeap` records as the live
-//! allocation's size (see [`crate::guestmem::GuestHeap::size_of_live_alloc`])
-//! is exactly the already-8-aligned value this module rounded to, with no
-//! further rounding happening inside `GuestHeap` itself. This is what
-//! lets `FreeMem`'s size-mismatch check (below) compare directly against
-//! `GuestHeap`'s own bookkeeping instead of needing a parallel host-side
-//! size map.
+//! (8 bytes on all real AmigaOS memory pools) before allocating, and every
+//! block it returns sits on an 8-byte boundary (`Allocate`'s autodoc: "All
+//! blocks, whether free or allocated, will be block aligned"; `MEM_BLOCKSIZE`
+//! is 8 in `<exec/memory.h>`). This runtime's `GuestHeap` only guarantees
+//! 4-byte alignment by default (T8's own requirement -- see `guestmem.rs`).
+//! Rather than changing that for every other handler in the runtime, where
+//! 4-byte alignment is sufficient and 8 would waste space for no benefit,
+//! the exec handlers ask for it per allocation: [`round_up_8`] rounds the
+//! *size* here, at the call boundary, and
+//! [`crate::guestmem::GuestHeap::alloc_aligned_for`] places the *address* on
+//! an 8-byte boundary (`AllocMem`, `AllocEntry`, `AllocPooled`, the pool
+//! header). Without that a block's address mod 8 depended on how large the
+//! loaded program happened to be -- so any code with an alignment-dependent
+//! path (OpenSSL's `sha512.c` copies unaligned input) changed speed when
+//! unrelated code grew or shrank (issue #355). Since 8 is a multiple of 4,
+//! the value `GuestHeap` records as the live allocation's size (see
+//! [`crate::guestmem::GuestHeap::size_of_live_alloc`]) is exactly the
+//! 8-rounded value, which is what lets `FreeMem`'s size-mismatch check
+//! (below) compare directly against `GuestHeap`'s own bookkeeping instead of
+//! needing a parallel host-side size map.
 //!
 //! # `FreeMem`: loud failure on a wrong size
 //!
@@ -89,25 +94,24 @@
 //!   point of view, which is fine: a well-behaved caller checks for NULL
 //!   either way.
 //!
-//! # `AllocVec`/`FreeVec`: the classic "+8 header" scheme
+//! # `AllocVec`/`FreeVec`: the classic "+4 header" scheme
 //!
 //! Real `AllocVec` allocates `byteSize + sizeof(ULONG)` bytes, stores the
 //! *total* allocated size in the leading `ULONG`, and returns a pointer
 //! just past it -- so `FreeVec` (which takes no size argument at all) can
 //! recover how much to free from `returned_ptr[-1]`. This module follows
-//! that scheme with one adjustment: the header is 8 bytes, not 4,
-//! specifically so the *user* pointer `AllocVec` returns stays 8-byte
-//! aligned (matching `AllocMem`'s own 8-byte rounding above) rather than
-//! trailing a 4-byte header off a `GuestHeap` block that's itself only
-//! guaranteed 4-byte aligned. The leading `u32` at `block[0..4]` holds the
-//! total block size (header included); `block[4..8]` is unused padding
-//! (reserved, written as zero) purely to keep the header's own size a
-//! multiple of 8. `AllocVec` returns `block + HEADER_SIZE`.
+//! that scheme exactly: the block is `AllocMem`-aligned (8 bytes, above),
+//! the header is the 4-byte total at `block[0..4]`, and `AllocVec` returns
+//! `block + 4`, so the result is always 4 mod 8 as on exec. (An earlier
+//! version used an 8-byte header to keep the result 8-aligned on a heap that
+//! was itself only 4-aligned; that gave neither exec's addresses nor stable
+//! ones -- issue #355.) The block is rounded to 8 as a whole, so the guest
+//! gets up to 4 spare bytes past `byteSize`.
 //!
 //! Unlike real `FreeVec` (which *reads* the size back out of guest memory
 //! at `ptr[-1]`), this module's `FreeVec` never reads guest memory at
 //! all: since the header size is a fixed constant, the block's start
-//! address is recovered by pure arithmetic (`user_ptr - HEADER_SIZE`),
+//! address is recovered by pure arithmetic (`user_ptr - ALLOCVEC_HEADER_SIZE`),
 //! and [`crate::guestmem::GuestHeap::size_of_live_alloc`] is consulted
 //! (keyed by that derived block address) purely as a validity check --
 //! not because we need it to know how much to free (`GuestHeap::free`
@@ -196,9 +200,9 @@ fn round_up_8(value: u32) -> u32 {
         .map_or(!(MEMBLOCKSIZE - 1), |v| v & !(MEMBLOCKSIZE - 1))
 }
 
-/// `AllocVec`'s header size -- see the module docs' "`AllocVec`/`FreeVec`"
-/// section.
-const ALLOCVEC_HEADER_SIZE: u32 = 8;
+/// `AllocVec`'s header size (one `ULONG`) -- see the module docs'
+/// "`AllocVec`/`FreeVec`" section.
+const ALLOCVEC_HEADER_SIZE: u32 = 4;
 
 /// Fills a freshly-allocated block's user range with the
 /// `--dirty-heap` poison pattern, if one is configured on the heap
@@ -334,10 +338,13 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     // reservation: the difference is alignment slack the guest has no
     // business touching, and this handler is the last place that still
     // knows the unrounded number.
-    match ctx
-        .heap
-        .alloc_for(&mut *ctx.mem, rounded, byte_size, placement(requirements))
-    {
+    match ctx.heap.alloc_aligned_for(
+        &mut *ctx.mem,
+        rounded,
+        byte_size,
+        placement(requirements),
+        MEMBLOCKSIZE,
+    ) {
         Ok(addr) => {
             let cleared = requirements & MEMF_CLEAR != 0;
             if cleared {
@@ -466,17 +473,22 @@ fn alloc_vec_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
         return Ok(());
     }
 
-    let user_rounded = round_up_8(byte_size);
-    let total = user_rounded + ALLOCVEC_HEADER_SIZE;
-    match ctx
-        .heap
-        .alloc_for(&mut *ctx.mem, total, total, placement(requirements))
-    {
+    // Real AllocVec is AllocMem(byteSize + 4) with the total stored in
+    // the leading ULONG; the 8-aligned block's rounding gives the guest
+    // up to 4 spare bytes past `byteSize`, which are its to use.
+    let total = round_up_8(byte_size.saturating_add(ALLOCVEC_HEADER_SIZE));
+    let user_rounded = total - ALLOCVEC_HEADER_SIZE;
+    match ctx.heap.alloc_aligned_for(
+        &mut *ctx.mem,
+        total,
+        total,
+        placement(requirements),
+        MEMBLOCKSIZE,
+    ) {
         Ok(block) => {
-            // Header: total block size (u32) followed by 4 bytes of
-            // reserved padding (see the module docs).
+            // Header: the total block size (u32), as the module docs
+            // describe.
             ctx.mem.write_u32(block, total);
-            ctx.mem.write_u32(block.wrapping_add(4), 0);
 
             let user_ptr = block.wrapping_add(ALLOCVEC_HEADER_SIZE);
             let cleared = requirements & MEMF_CLEAR != 0;
@@ -637,9 +649,9 @@ fn alloc_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // own comment), i.e. the header before the entries is 16 bytes.
     let list_size = ML_FIRST_ENTRY_OFFSET + num_entries * MEMENTRY_SIZE;
     let list_rounded = round_up_8(list_size);
-    let Ok(list) = ctx
-        .heap
-        .alloc_with_requested(&mut *ctx.mem, list_rounded, list_size)
+    let Ok(list) =
+        ctx.heap
+            .alloc_aligned_for(&mut *ctx.mem, list_rounded, list_size, 0, MEMBLOCKSIZE)
     else {
         // The MemList struct itself couldn't be allocated. The autodoc
         // only describes the failure return in terms of a failed
@@ -678,7 +690,13 @@ fn alloc_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             // Each entry's me_Reqs picks its memory kind, as AllocMem's
             // requirements do (issue #332).
             ctx.heap
-                .alloc_for(&mut *ctx.mem, rounded, length, placement(reqs))
+                .alloc_aligned_for(
+                    &mut *ctx.mem,
+                    rounded,
+                    length,
+                    placement(reqs),
+                    MEMBLOCKSIZE,
+                )
                 .map_err(|_| ())
         };
         let Ok(addr) = result else {
@@ -832,8 +850,8 @@ fn free_entry_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
 /// `CreatePool`/`DeletePool`/`AllocPooled`/`FreePooled`'s pool-header
 /// size: one `u32` holding the pool's `requirements` (`MEMF_*`, applied
 /// to every subsequent `AllocPooled` from it, since that call takes no
-/// flags of its own), rounded up to 8 bytes for the same alignment
-/// reasoning [`ALLOCVEC_HEADER_SIZE`] documents.
+/// flags of its own), rounded up to [`MEMBLOCKSIZE`] like any other
+/// block.
 const POOL_HEADER_SIZE: u32 = 8;
 
 /// `exec.library`'s `CreatePool` (LVO -696: `D0` = `requirements`
@@ -857,7 +875,13 @@ fn create_pool_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // D1 (puddleSize) and D2 (threshSize) are intentionally unused --
     // see this handler's doc comment.
 
-    match ctx.heap.alloc(&mut *ctx.mem, POOL_HEADER_SIZE) {
+    match ctx.heap.alloc_aligned_for(
+        &mut *ctx.mem,
+        POOL_HEADER_SIZE,
+        POOL_HEADER_SIZE,
+        0,
+        MEMBLOCKSIZE,
+    ) {
         Ok(pool) => {
             ctx.mem.write_u32(pool, requirements);
             ctx.cpu.set_data_register(DataRegister(0), pool);
@@ -915,10 +939,13 @@ fn alloc_pooled_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 
     let requirements = ctx.mem.read_u32(pool);
     let rounded = round_up_8(byte_size);
-    match ctx
-        .heap
-        .alloc_for(&mut *ctx.mem, rounded, byte_size, placement(requirements))
-    {
+    match ctx.heap.alloc_aligned_for(
+        &mut *ctx.mem,
+        rounded,
+        byte_size,
+        placement(requirements),
+        MEMBLOCKSIZE,
+    ) {
         Ok(addr) => {
             let cleared = requirements & MEMF_CLEAR != 0;
             if cleared {
@@ -1703,10 +1730,43 @@ mod tests {
         for i in 0..32u32 {
             assert_eq!(rt.memory().read_u8(addr + i), 0);
         }
-        // The header (8 bytes just before the returned pointer) should
-        // hold the total block size, exactly as the module docs promise.
-        let total = rt.memory().read_u32(addr - 8);
-        assert_eq!(total, 32 + 8);
+        // The header (the ULONG just before the returned pointer) should
+        // hold the total block size, exactly as the module docs promise:
+        // 32 + 4 rounded up to the 8-byte block size.
+        let total = rt.memory().read_u32(addr - 4);
+        assert_eq!(total, 40);
+    }
+
+    /// Runs `AllocMem(100)` (`vec == false`) or `AllocVec(100)` and returns
+    /// the pointer, after `pad_words` NOPs that grow the loaded program.
+    fn alloc_address_with_program_padding(vec: bool, pad_words: usize) -> u32 {
+        let mut words = vec![0x4E71; pad_words]; // NOP
+        words.push(move_imm_to_d(0)); // D0 = byteSize
+        words.push(0);
+        words.push(100);
+        words.push(move_imm_to_d(1)); // D1 = MEMF_ANY
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(if vec { -684 } else { -198 }));
+        words.push(RTS);
+        let mut rt = program(&words);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(code, 0);
+        code as u32
+    }
+
+    /// Issue #355: exec's blocks sit on an 8-byte boundary whatever the
+    /// program size, and `AllocVec`'s 4-byte size header makes its result
+    /// 4 mod 8 -- not an address that moves with the code size.
+    #[test]
+    fn alloc_mem_is_8_aligned_and_alloc_vec_4_mod_8_whatever_the_program_size_355() {
+        for pad_words in 0..=4 {
+            let mem = alloc_address_with_program_padding(false, pad_words);
+            assert_eq!(mem % 8, 0, "AllocMem {mem:#x} with {pad_words} pad words");
+            let vec = alloc_address_with_program_padding(true, pad_words);
+            assert_eq!(vec % 8, 4, "AllocVec {vec:#x} with {pad_words} pad words");
+        }
     }
 
     #[test]

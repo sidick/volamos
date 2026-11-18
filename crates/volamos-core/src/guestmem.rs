@@ -817,8 +817,36 @@ impl GuestHeap {
         requested: u32,
         required: u32,
     ) -> Result<u32, GuestHeapError> {
+        self.alloc_aligned_for(mem, size, requested, required, 4)
+    }
+
+    /// [`GuestHeap::alloc_for`] with the returned address aligned to
+    /// `align` bytes (4 or 8) instead of the heap's default 4.
+    ///
+    /// exec's `AllocMem` hands out blocks that sit on a `MEM_BLOCKSIZE`
+    /// (8-byte) boundary -- `Allocate`'s autodoc: "All blocks, whether
+    /// free or allocated, will be block aligned" -- and this is how the
+    /// exec handlers get that without making every other allocation in
+    /// the runtime pay 8-byte alignment (see the `execmem` module doc).
+    ///
+    /// The address is chosen *within* the free block that fits, not by
+    /// rounding the heap's own cursor: when the first usable address is
+    /// not already `align`-aligned, the gap is folded into the block's
+    /// leading redzone (`user_start - block_start` is then `redzone +
+    /// pad`), so the bytes stay accounted to the allocation, `free`
+    /// returns them with it, and `--sanitize` poisons them like any other
+    /// redzone byte. Each candidate free block is judged on its own pad,
+    /// since it depends on where that block happens to start.
+    pub fn alloc_aligned_for(
+        &mut self,
+        mem: &mut dyn AddressSpace,
+        size: u32,
+        requested: u32,
+        required: u32,
+        align: u32,
+    ) -> Result<u32, GuestHeapError> {
         let (user_start, block_start, block_end) =
-            self.alloc_untracked(size, requested, required)?;
+            self.alloc_untracked(size, requested, required, align)?;
         mem.clear_fresh_block(block_start, block_end - block_start);
         Ok(user_start)
     }
@@ -840,7 +868,9 @@ impl GuestHeap {
         size: u32,
         requested: u32,
         required: u32,
+        align: u32,
     ) -> Result<(u32, u32, u32), GuestHeapError> {
+        debug_assert!(align == 4 || align == 8, "unsupported alignment {align}");
         let aligned_size = align_up(size);
 
         // Clamp `requested` to what was actually reserved. A caller that
@@ -890,7 +920,8 @@ impl GuestHeap {
         let best_possible = self.best_priority_matching(required);
         let mut chosen: Option<(usize, i8)> = None;
         for (i, b) in self.free.iter().enumerate() {
-            if b.size < total_needed || !self.block_matches(b.start, required) {
+            let pad = self.align_pad(b.start, align);
+            if b.size < total_needed.saturating_add(pad) || !self.block_matches(b.start, required) {
                 continue;
             }
             let prio = self.block_priority(b.start);
@@ -912,14 +943,17 @@ impl GuestHeap {
 
         let block = self.free[idx];
         let block_start = block.start;
-        let block_end = block_start + total_needed;
-        let user_start = block_start + self.redzone_size;
-        if block.size == total_needed {
+        // The alignment gap (0 for the default 4) is part of this block:
+        // it extends the leading redzone, see `alloc_aligned_for`.
+        let block_len = total_needed + self.align_pad(block_start, align);
+        let block_end = block_start + block_len;
+        let user_start = block_end - self.redzone_size - aligned_size;
+        if block.size == block_len {
             self.free.remove(idx);
         } else {
             self.free[idx] = FreeBlock {
                 start: block_end,
-                size: block.size - total_needed,
+                size: block.size - block_len,
             };
         }
 
@@ -934,6 +968,16 @@ impl GuestHeap {
             },
         );
         Ok((user_start, block_start, block_end))
+    }
+
+    /// Bytes to skip at the front of a free block starting at
+    /// `block_start` so that the user address (`block_start` + leading
+    /// redzone + pad) lands on an `align` boundary. Always 0 for `align`
+    /// 4, since every free block start and every redzone is a multiple
+    /// of 4.
+    fn align_pad(&self, block_start: u32, align: u32) -> u32 {
+        let first_user = block_start.wrapping_add(self.redzone_size);
+        first_user.wrapping_neg() & (align - 1)
     }
 
     /// Permanently removes `[start, start + len)` from the free list so
@@ -1352,7 +1396,7 @@ impl GuestHeap {
     }
 
     fn alloc_bare_req(&mut self, size: u32, requested: u32) -> Result<u32, GuestHeapError> {
-        self.alloc_untracked(size, requested, 0)
+        self.alloc_untracked(size, requested, 0, 4)
             .map(|(addr, _, _)| addr)
     }
 }
@@ -1683,6 +1727,43 @@ mod tests {
         assert_eq!(b % 4, 0);
         // 3 rounds up to 4, so b should be right after a's 4-byte block.
         assert_eq!(b, 0x1008);
+    }
+
+    /// Issue #355: `alloc_aligned_for(.., 8)` lands on an 8-byte boundary
+    /// wherever the free block starts, with and without redzones, and the
+    /// alignment gap goes back to the free list with the allocation.
+    #[test]
+    fn alloc_aligned_for_8_lands_on_an_8_byte_boundary_and_frees_the_gap_355() {
+        for redzone in [0, 4, 16, 32] {
+            for start in [0x1000, 0x1004] {
+                let mut mem = FlatMemory::new(0x4000);
+                let mut heap = GuestHeap::new(start, 0x3000).with_redzone_size(redzone);
+                let free_before = heap.free_bytes();
+                let a = heap.alloc_aligned_for(&mut mem, 100, 100, 0, 8).unwrap();
+                assert_eq!(a % 8, 0, "start {start:#x} redzone {redzone}");
+                let ext = heap.extent_of_live_alloc(a).unwrap();
+                assert!(ext.block_start <= a - redzone, "gap precedes the redzone");
+                assert_eq!(ext.block_end, a + 100 + redzone);
+                // A second, default-aligned block must follow without overlap.
+                let b = heap.alloc_bare(8).unwrap();
+                assert!(b >= ext.block_end);
+                heap.free(b).unwrap();
+                heap.free(a).unwrap();
+                assert_eq!(heap.free_bytes(), free_before, "nothing leaked");
+            }
+        }
+    }
+
+    /// `alloc_aligned_for` still reports `OutOfMemory` when only the
+    /// alignment gap would make the request not fit.
+    #[test]
+    fn alloc_aligned_for_counts_the_alignment_gap_when_fitting_355() {
+        let mut mem = FlatMemory::new(0x4000);
+        // 0x1004..0x1010 is 12 bytes; an 8-aligned 12-byte block needs
+        // 4 bytes of gap and so does not fit.
+        let mut heap = GuestHeap::new(0x1004, 0x1010);
+        assert!(heap.alloc_aligned_for(&mut mem, 12, 12, 0, 8).is_err());
+        assert!(heap.alloc_aligned_for(&mut mem, 8, 8, 0, 8).is_ok());
     }
 
     #[test]
