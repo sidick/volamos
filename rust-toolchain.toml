@@ -7,5 +7,5 @@
 # `.dockerignore` keeps this file out of the Docker build, which uses its
 # base image's Rust.
 [toolchain]
-channel = "1.99.0"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
