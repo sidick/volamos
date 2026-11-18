@@ -3,6 +3,56 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.21.0](https://github.com/sidick/volamos/compare/v0.20.0...v0.21.0) (2026-11-18)
+
+
+### Features
+
+* **backend:** bill 68040 instruction-fetch misses under --cache --mem-wait ([#309](https://github.com/sidick/volamos/issues/309)) ([0ef819d](https://github.com/sidick/volamos/commit/0ef819dbca1ac688e5e36e522c83a325b256abed))
+* **cli:** CPU-dependent memory map and --chip/--fast/--slow/--accel/--z3 ([#337](https://github.com/sidick/volamos/issues/337)) ([b1f4f79](https://github.com/sidick/volamos/commit/b1f4f794bcea7673548c0542dcd90e7d51e9f340))
+* **cli:** exit 98 when volamos itself fails, not 1 ([#300](https://github.com/sidick/volamos/issues/300)) ([7925bde](https://github.com/sidick/volamos/commit/7925bde21fddcfa7cf2893804b9440c0318e19c5))
+* **exec:** expansion.library, answering that nothing is plugged in ([#293](https://github.com/sidick/volamos/issues/293)) ([032caf8](https://github.com/sidick/volamos/commit/032caf8d460b1bd07b8a8e198bc79a3da774d885))
+* **exec:** honour MEMF_CHIP/MEMF_FAST with per-region placement ([#336](https://github.com/sidick/volamos/issues/336)) ([f47058a](https://github.com/sidick/volamos/commit/f47058a375d66ae8d5413226d5e34edfe3c0211b))
+* **exec:** publish a real MemHeader per RAM region in ExecBase.MemList ([#339](https://github.com/sidick/volamos/issues/339)) ([58d874f](https://github.com/sidick/volamos/commit/58d874f4ea23c92228cbac1360d8d8f420198e97))
+* **loader:** honour HUNKF_CHIP/HUNKF_FAST when LoadSeg allocates hunks ([#344](https://github.com/sidick/volamos/issues/344)) ([170f3a6](https://github.com/sidick/volamos/commit/170f3a6bc71eea887ab24ab686cec2ad347ff9ce))
+* **sanitize:** report NULL/low-memory and wild-pointer guest accesses ([#349](https://github.com/sidick/volamos/issues/349)) ([9fdc90d](https://github.com/sidick/volamos/commit/9fdc90d8d04ba917543f7e06b26445f7f376090b))
+* **sanitize:** shadow every RAM segment, not just the primary one ([#343](https://github.com/sidick/volamos/issues/343)) ([b8511c0](https://github.com/sidick/volamos/commit/b8511c06b0c5c6d6a009931803194abcdae2dc57))
+
+
+### Bug Fixes
+
+* **backend:** mask guest addresses to 24 bits in native handlers on a 68000/68010 ([#342](https://github.com/sidick/volamos/issues/342)) ([2256dd5](https://github.com/sidick/volamos/commit/2256dd5cae381aa7edf5d291e8f358ca06a65e55))
+* **backend:** start --cpu 68060 superscalar, as a booted machine is ([#308](https://github.com/sidick/volamos/issues/308)) ([685e848](https://github.com/sidick/volamos/commit/685e84883b3f8cab972a47a20651f9fdecc8a463))
+* **backend:** start --cpu 68060 with the CACR bits 68060.library sets ([#350](https://github.com/sidick/volamos/issues/350)) ([013cae9](https://github.com/sidick/volamos/commit/013cae93f597b124ef34416b48a3157cf2cbb80b))
+* **cli,bsdsocket:** honour -V for the default cwd, keep the program after grouped flags, bound WaitSelect, reuse fds ([#370](https://github.com/sidick/volamos/issues/370)) ([26ede2e](https://github.com/sidick/volamos/commit/26ede2ee527126a0bbf0a41501a1714337460de4))
+* **deps:** update rust crate m68k to v0.16.1 ([#304](https://github.com/sidick/volamos/issues/304)) ([80ab425](https://github.com/sidick/volamos/commit/80ab425e61167b5050f90fb87fd5a5c48d7fd6e2))
+* **deps:** update rust crate m68k to v0.17.0 ([#328](https://github.com/sidick/volamos/issues/328)) ([55d493c](https://github.com/sidick/volamos/commit/55d493c5dee3828af62e4653080c740c1ba775c9))
+* **deps:** update rust crate m68k to v0.17.1 ([#357](https://github.com/sidick/volamos/issues/357)) ([da4c22d](https://github.com/sidick/volamos/commit/da4c22db06112aa376a2f0923b9baf354ab34139))
+* **dispatch:** name the instruction when a 68040/68060 traps on an unimplemented one ([#334](https://github.com/sidick/volamos/issues/334)) ([a58dc21](https://github.com/sidick/volamos/commit/a58dc21a4e4d97b34d03914a7a4ff5772b4e384e))
+* **dos,exec:** match real Kickstart for ReadArgs positional fill and the AllocVec header ([#373](https://github.com/sidick/volamos/issues/373)) ([6e5f749](https://github.com/sidick/volamos/commit/6e5f749cd10aa0c6602ed581713579e89f40c338))
+* **dos:** AmigaDOS semantics deviations (Open on dir, assign parent, comment length, Rename case, MatchFirst leaks) ([#371](https://github.com/sidick/volamos/issues/371)) ([fa96659](https://github.com/sidick/volamos/commit/fa966590937d4e7f28d5089a84d1954468172e2d))
+* **dos:** let CurrentDir accept an unknown or already-released lock ([#324](https://github.com/sidick/volamos/issues/324)) ([82f9db5](https://github.com/sidick/volamos/commit/82f9db5daf69ef158f43185e303d11689b2260a1))
+* **dos:** report host filesystem capacity from Info and ACTION_DISK_INFO ([#325](https://github.com/sidick/volamos/issues/325)) ([c28820f](https://github.com/sidick/volamos/commit/c28820f71581e9e03e81023021d1de9e585b0206))
+* **dos:** seed pr_CurrentDir with the starting directory's lock ([#312](https://github.com/sidick/volamos/issues/312)) ([98c9def](https://github.com/sidick/volamos/commit/98c9def9163968bb88f1995d0e225b3c380839a9))
+* **dos:** stop guests escaping a volume via soft links and auto-assign names; fix world-writable SetProtection ([#365](https://github.com/sidick/volamos/issues/365)) ([f2a118b](https://github.com/sidick/volamos/commit/f2a118b8a42e911b6bac97045694acf234ae5d07))
+* **dos:** write CurrentDir's lock into pr_CurrentDir ([#311](https://github.com/sidick/volamos/issues/311)) ([0baee59](https://github.com/sidick/volamos/commit/0baee593c21c868bc6d1ef4a17e9c7c7a4c36c6d))
+* **exec:** give AllocMem exec's 8-byte alignment and AllocVec a 4-byte header ([#356](https://github.com/sidick/volamos/issues/356)) ([5e1b8eb](https://github.com/sidick/volamos/commit/5e1b8eb10074f69c5340d10ab3f849778d6e53fa))
+* **exec:** initialise ExecBase frequency fields and stop LibList names overlapping ExecBase ([#323](https://github.com/sidick/volamos/issues/323)) ([1aab34b](https://github.com/sidick/volamos/commit/1aab34b32cc33c591a7ad34f8215227fd8ac1743))
+* **exec:** name the instruction when an unimplemented FPU trap has no handler ([#348](https://github.com/sidick/volamos/issues/348)) ([a8175a1](https://github.com/sidick/volamos/commit/a8175a160a2ab0c3c958018cb1c45cb1c3abe266))
+* **exec:** per-task continuations, FPU save across switches, exit-time tc_Switch, Ctrl-C to the main task ([#367](https://github.com/sidick/volamos/issues/367)) ([3e6fd29](https://github.com/sidick/volamos/commit/3e6fd29820607cbe4cca71445b31941164b8ba5b))
+* **exec:** signal and block on message ports so tasks can pass messages ([#366](https://github.com/sidick/volamos/issues/366)) ([95725f6](https://github.com/sidick/volamos/commit/95725f6439d23607f7a21dc753d3df31a0857a9e))
+* **hardening:** bound guest-controlled sizes, list walks and pattern matching ([#369](https://github.com/sidick/volamos/issues/369)) ([733515e](https://github.com/sidick/volamos/commit/733515ec3e856c510e5a9d6e46ed6ea282da4aa7))
+* **icon:** answer a missing icon with NULL instead of aborting the run ([#314](https://github.com/sidick/volamos/issues/314)) ([0a9bf03](https://github.com/sidick/volamos/commit/0a9bf03c2189239b0358c362f2e7d3d051e6c412))
+* **loader:** honour HUNKF_ADVISORY instead of failing the load ([#303](https://github.com/sidick/volamos/issues/303)) ([bb8caa7](https://github.com/sidick/volamos/commit/bb8caa786a8e3637a8acd7011526b75d48fee45e))
+* **loader:** refuse oversized hunks, honour HUNK_RELRELOC32 in LoadSeg, harden overlay roots ([#368](https://github.com/sidick/volamos/issues/368)) ([2363b16](https://github.com/sidick/volamos/commit/2363b166bc13f75cc5ecd487443fb4a9aa1e1a7d))
+* **locale:** populate OpenLocale with the built-in default locale ([#330](https://github.com/sidick/volamos/issues/330)) ([bfbf116](https://github.com/sidick/volamos/commit/bfbf11652bce3022584b6dc909e34ca2ec178bd1))
+* **locale:** report the host's UTC offset in loc_GMTOffset ([#331](https://github.com/sidick/volamos/issues/331)) ([98b7a29](https://github.com/sidick/volamos/commit/98b7a29697d870f6f4384bf9c0cc7e2ef08fb36d))
+
+
+### Performance Improvements
+
+* **backend:** keep FlatMemory's extra-segment fallbacks out of the hot path ([#347](https://github.com/sidick/volamos/issues/347)) ([96a8e4f](https://github.com/sidick/volamos/commit/96a8e4f80b85fca286997ee0c5ea813b83cfa250))
+
 ## [0.20.0](https://github.com/sidick/volamos/compare/v0.19.0...v0.20.0) (2026-11-12)
 
 
