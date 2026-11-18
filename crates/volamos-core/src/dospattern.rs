@@ -1119,6 +1119,8 @@ mod tests {
         // search for it can exhaust the work limit first. `~` must then
         // answer "no match", not read the failed search as "inner didn't
         // match" and accept the name the pattern was meant to exclude.
-        assert!(!m("~(#?#?#?#?#?#?#?#?#?#?a)", &"a".repeat(30), false));
+        // `#(ab)` recurses once per repetition, so 1200 bytes blow past the
+        // depth limit while the pattern does match.
+        assert!(!m("~(#(ab))", &"ab".repeat(600), false));
     }
 }
