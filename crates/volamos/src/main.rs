@@ -1126,13 +1126,16 @@ fn short_cluster_takes_next_token(arg: &str) -> Option<bool> {
     if rest.starts_with('-') || rest.chars().count() < 2 {
         return None;
     }
-    let value_shorts: Vec<char> = value_flag_spellings()
-        .iter()
-        .filter_map(|s| {
-            let s = s.strip_prefix('-')?;
-            (!s.starts_with('-') && s.chars().count() == 1).then(|| s.chars().next())?
-        })
-        .collect();
+    static VALUE_SHORTS: std::sync::OnceLock<Vec<char>> = std::sync::OnceLock::new();
+    let value_shorts = VALUE_SHORTS.get_or_init(|| {
+        value_flag_spellings()
+            .iter()
+            .filter_map(|s| {
+                let s = s.strip_prefix('-')?;
+                (!s.starts_with('-') && s.chars().count() == 1).then(|| s.chars().next())?
+            })
+            .collect()
+    });
     let mut chars = rest.chars().peekable();
     while let Some(c) = chars.next() {
         if value_shorts.contains(&c) {

@@ -382,8 +382,18 @@ impl BsdSocketState {
     /// The lowest unused descriptor number (from 1), like BSD's lowest
     /// free fd. Numbers are reused after `CloseSocket`, so they stay
     /// small instead of counting up for the life of the process.
-    fn lowest_free_fd(&self) -> i32 {
-        (1..).find(|fd| !self.sockets.contains_key(fd)).unwrap_or(1)
+    ///
+    /// `None` when every number below [`Self::fd_limit`] is taken.
+    fn lowest_free_fd(&self) -> Option<i32> {
+        (1..self.fd_limit() as i32).find(|fd| !self.sockets.contains_key(fd))
+    }
+
+    /// One past the highest descriptor number this runtime hands out:
+    /// the descriptor table size, but never beyond what a guest
+    /// `fd_set` (256 bits) can name -- a higher fd could never be
+    /// reported by `WaitSelect`.
+    fn fd_limit(&self) -> u32 {
+        self.dtablesize.min(FD_SET_BYTES * 8)
     }
 
     pub fn new() -> Self {
@@ -510,7 +520,7 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
     };
 
-    if ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize {
+    if ctx.bsdsocket.lowest_free_fd().is_none() {
         fail(ctx, EMFILE);
         return Ok(());
     }
@@ -538,7 +548,10 @@ fn socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     // module docs' "Blocking by default" section). Non-blocking mode is
     // only entered via an explicit IoctlSocket(fd, FIONBIO, ...) call.
 
-    let id = ctx.bsdsocket.lowest_free_fd();
+    let id = ctx
+        .bsdsocket
+        .lowest_free_fd()
+        .expect("checked for a free descriptor above");
     ctx.bsdsocket.sockets.insert(id, SocketEntry::new(socket));
     ctx.bsdsocket.set_errno(ctx.mem, 0);
     ctx.cpu.set_data_register(DataRegister(0), id as u32);
@@ -633,7 +646,7 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
     let fd = ctx.cpu.data_register(DataRegister(0)) as i32;
     let addr_ptr = ctx.cpu.address_register(AddressRegister(0));
 
-    if ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize {
+    if ctx.bsdsocket.lowest_free_fd().is_none() {
         ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         return Ok(());
@@ -649,7 +662,10 @@ fn accept_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatc
             {
                 write_sockaddr_in(ctx.mem, addr_ptr, peer);
             }
-            let id = ctx.bsdsocket.lowest_free_fd();
+            let id = ctx
+                .bsdsocket
+                .lowest_free_fd()
+                .expect("checked for a free descriptor above");
             let mut entry = SocketEntry::new(accepted);
             entry.connected = true;
             ctx.bsdsocket.sockets.insert(id, entry);
@@ -1680,9 +1696,12 @@ fn wait_select_poll<C: Cpu>(
     // (issue #363); EINTR (a host signal) used to surface as errno EIO.
     let ready = loop {
         let slice_ms = match deadline {
+            // Rounded *up*: a sub-millisecond remainder truncated to a
+            // 0 ms slice and spun on poll(0) until the deadline passed.
             Some(d) => d
                 .saturating_duration_since(std::time::Instant::now())
-                .as_millis()
+                .as_micros()
+                .div_ceil(1000)
                 .min(WAIT_SELECT_SLICE_MS as u128) as i32,
             None => WAIT_SELECT_SLICE_MS,
         };
@@ -2830,13 +2849,20 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // forever (a long-running server's later sockets used to land beyond
     // the 256-bit fd_sets WaitSelect can report, and a huge target wrapped
     // the counter onto a live fd -- issue #363).
-    if new_fd >= 0 && new_fd as u32 >= ctx.bsdsocket.dtablesize {
+    if new_fd >= 0 && new_fd as u32 >= ctx.bsdsocket.fd_limit() {
         ctx.bsdsocket.set_errno(ctx.mem, EBADF);
         ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
         return Ok(());
     }
     let id = if new_fd < 0 {
-        ctx.bsdsocket.lowest_free_fd()
+        match ctx.bsdsocket.lowest_free_fd() {
+            Some(id) => id,
+            None => {
+                ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
+                ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
+                return Ok(());
+            }
+        }
     } else {
         new_fd
     };
@@ -2847,14 +2873,6 @@ fn dup2_socket_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     // enforce this same cap on every path that does grow it; this one
     // didn't, letting a guest looping on Dup2Socket(old, -1) grow the
     // real, open-host-fd table without bound.
-    if !ctx.bsdsocket.sockets.contains_key(&id)
-        && ctx.bsdsocket.sockets.len() as u32 >= ctx.bsdsocket.dtablesize
-    {
-        ctx.bsdsocket.set_errno(ctx.mem, EMFILE);
-        ctx.cpu.set_data_register(DataRegister(0), 0xFFFF_FFFF);
-        return Ok(());
-    }
-
     let dup = match entry.socket.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -5436,11 +5454,15 @@ mod tests {
         for fd in 1..=3 {
             state.sockets.insert(fd, SocketEntry::new(sock()));
         }
-        assert_eq!(state.lowest_free_fd(), 4);
+        assert_eq!(state.lowest_free_fd(), Some(4));
         state.sockets.remove(&2);
-        assert_eq!(state.lowest_free_fd(), 2, "a closed fd number is reused");
+        assert_eq!(
+            state.lowest_free_fd(),
+            Some(2),
+            "a closed fd number is reused"
+        );
         state.sockets.clear();
-        assert_eq!(state.lowest_free_fd(), 1);
+        assert_eq!(state.lowest_free_fd(), Some(1));
     }
 
     fn run_waitselect_program(words: &[u16], mem: FlatMemory) -> Result<i32, String> {
@@ -5494,5 +5516,22 @@ mod tests {
         words.push(RTS);
         let code = run_waitselect_program(&words, FlatMemory::new(0x2_0000)).unwrap();
         assert_eq!(code, -1);
+    }
+
+    #[test]
+    fn descriptor_numbers_stay_below_the_table_and_the_fd_set_size_363() {
+        let sock = || Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+        // Fds 1..=63 fill a 64-entry table: the next must be EMFILE, not
+        // fd 64 (which Dup2Socket would then refuse as EBADF).
+        let mut state = BsdSocketState::new();
+        for fd in 1..64 {
+            state.sockets.insert(fd, SocketEntry::new(sock()));
+        }
+        assert_eq!(state.lowest_free_fd(), None);
+        // A raised table size never hands out an fd a 256-bit fd_set
+        // can't name, so WaitSelect can always report it.
+        state.dtablesize = 300;
+        assert_eq!(state.fd_limit(), 256);
+        assert_eq!(state.lowest_free_fd(), Some(64));
     }
 }

@@ -686,17 +686,37 @@ fn force_exit(signum: i32) {
 /// pipe or thread can't be made, [`force_exit`] keeps its direct `_exit`.
 #[cfg(unix)]
 fn start_force_exit_thread() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut started_here = false;
+    STARTED.call_once(|| started_here = true);
+    if !started_here {
+        return; // a second install must not leak a thread or swap the pipe
+    }
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return;
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
+    // Not inherited by `popen`/`System` children.
+    for fd in [read_fd, write_fd] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     let spawned = std::thread::Builder::new()
         .name("volamos-force-exit".to_string())
         .spawn(move || {
             let mut byte = 0u8;
-            let n = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
-            let signum = if n == 1 { i32::from(byte) } else { SIGTERM };
+            let signum = loop {
+                let n = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
+                if n == 1 {
+                    break i32::from(byte);
+                }
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break SIGTERM;
+            };
             let dirs =
                 std::mem::take(&mut *EXIT_CLEANUP_DIRS.lock().unwrap_or_else(|e| e.into_inner()));
             for dir in dirs {
