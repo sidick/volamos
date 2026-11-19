@@ -189,9 +189,11 @@ Changelog.
   call no longer changes its parent's (`RunCommand`/`SystemTagList` run on
   the calling task and share its `IoErr()`, as on real AmigaOS). Likewise
   `SelectInput`/`SelectOutput` in a child change only that process's
-  `pr_CIS`/`pr_COS`, not the main task's `Input()`/`Output()`. The rest of
-  the per-process state (the buffered-stdin position) is still shared between processes for now
-  (#326); a child starts with `IoErr()` 0, not its parent's.
+  `pr_CIS`/`pr_COS`, not the main task's `Input()`/`Output()`. The
+  buffered standard input (what `ReadArgs` and `FGetC` read from `Input()`)
+  and `GetFileSysTask`/`SetFileSysTask` (`pr_FileSystemTask`, which a new
+  process copies from its parent) are per process as well; a child starts
+  with `IoErr()` 0, not its parent's, and with an empty input buffer.
 
 ## exec.library
 

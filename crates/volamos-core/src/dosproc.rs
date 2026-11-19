@@ -51,6 +51,14 @@ pub(crate) struct ProcessState {
     /// `crate::dosvar`).
     pub(crate) local_vars: HashMap<String, Vec<u8>>,
     pub(crate) local_var_nodes: HashMap<String, [u32; 4]>,
+    /// `pr_FileSystemTask`: `GetFileSysTask`/`SetFileSysTask`'s value.
+    pub(crate) file_sys_task: u32,
+    /// The buffered standard input (`ReadArgs`' and `FGetC`'s source on
+    /// `Input()`) and how much of it has been read. On real AmigaOS the
+    /// buffer is the `FileHandle`'s, so a process that did not read
+    /// `Input()` cannot see or consume another's.
+    pub(crate) input_buf: Vec<u8>,
+    pub(crate) input_pos: usize,
 }
 
 impl DosState {
@@ -69,6 +77,9 @@ impl DosState {
             // Moved, not copied: `load_process` puts the next ones in.
             local_vars: std::mem::take(&mut self.local_vars),
             local_var_nodes: std::mem::take(&mut self.local_var_nodes),
+            file_sys_task: self.current_file_sys_task,
+            input_buf: std::mem::take(&mut self.input_buf),
+            input_pos: self.input_pos,
         }
     }
 
@@ -81,6 +92,9 @@ impl DosState {
         self.current_dir_lock = state.current_dir_lock;
         self.local_vars = state.local_vars;
         self.local_var_nodes = state.local_var_nodes;
+        self.current_file_sys_task = state.file_sys_task;
+        self.input_buf = state.input_buf;
+        self.input_pos = state.input_pos;
         if let Some(vfs) = self.vfs.as_mut() {
             match state.progdir {
                 Some(path) => vfs.set_assign("PROGDIR", vec![path]),
@@ -150,6 +164,9 @@ impl DosState {
             } else {
                 HashMap::new()
             },
+            // `pr_FileSystemTask` is the caller's; the input buffer starts
+            // empty (the child reads its own `Input()`).
+            file_sys_task: self.current_file_sys_task,
             ..ProcessState::default()
         };
         (
@@ -184,6 +201,8 @@ impl DosState {
                 self.io_err = 0;
                 self.local_vars.clear();
                 self.local_var_nodes.clear();
+                self.input_buf.clear();
+                self.input_pos = 0;
             }
         }
     }
@@ -232,6 +251,37 @@ mod tests {
         assert!(copied.local_var_nodes.is_empty());
         let (empty, ..) = dos.new_process_state(&mut heap, &mut mem, None, None, 0, false);
         assert!(empty.local_vars.is_empty());
+    }
+
+    #[test]
+    fn each_process_keeps_its_own_buffered_input_326() {
+        let mut dos = DosState::new(None);
+        dos.input_buf = b"PARENT ARGS\n".to_vec();
+        dos.input_pos = 7;
+        dos.switch_process(1, false, 2);
+        assert!(dos.input_buf.is_empty(), "a new process has read nothing");
+        assert_eq!(dos.input_pos, 0);
+        dos.input_buf = b"child\n".to_vec();
+        dos.input_pos = 2;
+        dos.switch_process(2, false, 1);
+        assert_eq!(dos.input_buf, b"PARENT ARGS\n");
+        assert_eq!(dos.input_pos, 7);
+        dos.switch_process(1, false, 2);
+        assert_eq!(
+            (dos.input_buf.as_slice(), dos.input_pos),
+            (&b"child\n"[..], 2)
+        );
+    }
+
+    #[test]
+    fn a_new_process_inherits_its_callers_file_system_task_326() {
+        let mut dos = DosState::new(None);
+        dos.current_file_sys_task = 0x1234;
+        let mut heap = GuestHeap::new(0x1000, 0x1000);
+        let mut mem = crate::memory::FlatMemory::new(0x4000);
+        let (state, ..) = dos.new_process_state(&mut heap, &mut mem, None, None, 0, true);
+        assert_eq!(state.file_sys_task, 0x1234);
+        assert!(state.input_buf.is_empty());
     }
 
     #[test]

@@ -399,7 +399,7 @@ pub struct DosState {
     /// `GetFileSysTask`/`SetFileSysTask`'s current value -- see
     /// [`get_file_sys_task_handler`]'s doc comment for why a fixed
     /// sentinel (never a real, dereferenceable `MsgPort`) is sufficient.
-    current_file_sys_task: u32,
+    pub(crate) current_file_sys_task: u32,
     /// Guest address of the lazily-created filesystem handler `MsgPort`
     /// every non-`NIL:` `FileHandle`'s `fh_Type` points at -- see
     /// [`FH_TYPE_OFFSET`]'s doc and [`Self::fs_port_addr`]. `None` until

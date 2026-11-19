@@ -10,7 +10,8 @@
 //!   `RunCommand` stuffed into the buffer of `Input()`,
 //!   [`DosState::input_buf`], as real `ReadArgs` "normally gets the
 //!   arguments by reading buffered IO from Input()" (autodoc). Reading
-//!   advances [`DosState::input_pos`], which buffered reads share, so
+//!   advances [`DosState::input_pos`], which buffered reads of the same
+//!   process share (each process has its own, see [`crate::dosproc`]), so
 //!   repeated `ReadArgs(NULL)` calls walk forward through the stream
 //!   rather than each re-parsing it from the start. Once that buffer is
 //!   used up, `ReadArgs` sees an empty line rather than waiting on host
