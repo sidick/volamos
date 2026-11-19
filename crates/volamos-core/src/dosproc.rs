@@ -65,9 +65,9 @@ impl DosState {
     }
 
     /// The state a new process starts with, parked until it first runs:
-    /// the current directory is `np_current_dir`'s lock as given, or a
-    /// `DupLock` of the caller's (real `CreateNewProc`'s default; `0`
-    /// when the caller has none). Returns the `pr_CurrentDir` BPTR to
+    /// the current directory is `np_current_dir`'s lock as given (`0`: none,
+    /// i.e. the starting directory), or a `DupLock` of the caller's (real
+    /// `CreateNewProc`'s default; none if the caller has no lock). Returns the `pr_CurrentDir` BPTR to
     /// store in the new process too.
     pub(crate) fn new_process_state(
         &mut self,
@@ -77,11 +77,16 @@ impl DosState {
     ) -> (ProcessState, u32) {
         let caller_cwd = self.vfs.as_ref().map(|vfs| vfs.cwd().to_string());
         let (lock, cwd) = match np_current_dir.map(addr_from_bptr) {
+            // Given: used as is.
             Some(addr) if addr != 0 => {
                 let path = self.lock_amiga_path(addr).or(caller_cwd);
                 (Some(addr), path)
             }
-            _ => {
+            // An explicit 0: no current directory, i.e. where the program
+            // started.
+            Some(_) => (None, self.initial_cwd.clone().or(caller_cwd)),
+            // Not given: a `DupLock` of the caller's.
+            None => {
                 let dup = self
                     .current_dir_lock
                     .and_then(|addr| self.dup_lock(heap, mem, addr).ok())

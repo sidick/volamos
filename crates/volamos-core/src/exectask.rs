@@ -940,9 +940,11 @@ const NP_ERROR: u32 = NP_DUMMY + 8;
 /// `NP_CloseError` (`NP_Dummy + 9`): close `pr_CES` at exit. Default
 /// FALSE.
 const NP_CLOSEERROR: u32 = NP_DUMMY + 9;
-/// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
-/// `NP_CurrentDir` (`BPTR`): the new process's current directory.
+/// `NP_CurrentDir` (`NP_Dummy + 10`, `BPTR`): the new process's current
+/// directory, used as given; `0` means none. Default: a `DupLock` of the
+/// caller's.
 const NP_CURRENTDIR: u32 = NP_DUMMY + 10;
+/// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
 const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
 /// string per the autodoc (not a `BSTR`).
@@ -1245,12 +1247,6 @@ pub(crate) fn spawn_process<C: Cpu>(
         .write_u32(task + PR_RETURNADDR_OFFSET, return_addr_footer);
     ctx.mem.write_u32(task + PR_EXITCODE_OFFSET, spec.exit_code);
     ctx.mem.write_u32(task + PR_EXITDATA_OFFSET, spec.exit_data);
-    let (child_state, current_dir) = ctx
-        .dos
-        .new_process_state(ctx.heap, ctx.mem, spec.current_dir);
-    ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
-    ctx.dos.parked_procs.insert(task, child_state);
-
     if let Some(command_name) = &spec.cli_command_name {
         let cli = ctx.heap.alloc(ctx.mem, CLI_STRUCT_SIZE).ok()?;
         for i in 0..CLI_STRUCT_SIZE {
@@ -1272,6 +1268,14 @@ pub(crate) fn spawn_process<C: Cpu>(
     if spec.seglist != 0 {
         ctx.dos.process_seglists.insert(task, spec.seglist);
     }
+
+    // Last, so a failure above leaves no duplicated lock or parked state
+    // behind for a process that never starts.
+    let (child_state, current_dir) = ctx
+        .dos
+        .new_process_state(ctx.heap, ctx.mem, spec.current_dir);
+    ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
+    ctx.dos.parked_procs.insert(task, child_state);
 
     let mut a = [0u32; 8];
     a[0] = args;

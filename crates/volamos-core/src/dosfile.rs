@@ -2316,8 +2316,6 @@ fn set_arg_str_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
-/// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
-/// `BPTR`.
 /// `SelectInput`/`SelectOutput` for a `CreateNewProc` process: its input
 /// and output are its own `pr_CIS`/`pr_COS` (the main task's are
 /// `DosState`'s default handles), so swap just that field, returning the
@@ -2328,6 +2326,8 @@ fn swap_own_stream<C: Cpu>(ctx: &mut HandlerContext<'_, C>, field_addr: u32, bpt
     ctx.cpu.set_data_register(DataRegister(0), old);
 }
 
+/// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
+/// `BPTR`.
 fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let new_addr = addr_from_bptr(bptr);
