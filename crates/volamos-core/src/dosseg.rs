@@ -1311,6 +1311,7 @@ fn start_system_child<C: Cpu>(
         exit_code: tag(crate::exectask::NP_EXITCODE).unwrap_or(0),
         exit_data: tag(crate::exectask::NP_EXITDATA).unwrap_or(0),
         current_dir: None,
+        home_dir: None,
         cli_command_name: Some(program.to_string()),
         seglist,
     };

@@ -946,6 +946,10 @@ const NP_CLOSEERROR: u32 = NP_DUMMY + 9;
 const NP_CURRENTDIR: u32 = NP_DUMMY + 10;
 /// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
 const NP_STACKSIZE: u32 = NP_DUMMY + 11;
+/// `NP_HomeDir` (`NP_Dummy + 16`, `BPTR`): the new process's home
+/// directory, used as given; `0` means none. Default: a `DupLock` of the
+/// caller's.
+const NP_HOMEDIR: u32 = NP_DUMMY + 16;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
 /// string per the autodoc (not a `BSTR`).
 const NP_NAME: u32 = NP_DUMMY + 12;
@@ -1120,6 +1124,7 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         exit_code: tag_data(ctx.mem, tags, NP_EXITCODE).unwrap_or(0),
         exit_data: tag_data(ctx.mem, tags, NP_EXITDATA).unwrap_or(0),
         current_dir: tag_data(ctx.mem, tags, NP_CURRENTDIR),
+        home_dir: tag_data(ctx.mem, tags, NP_HOMEDIR),
         cli_command_name: None,
         seglist: 0,
     };
@@ -1155,6 +1160,8 @@ pub(crate) struct SpawnSpec {
     /// `NP_CurrentDir` (a lock BPTR used as given); `None` is a `DupLock`
     /// of the caller's current directory.
     pub current_dir: Option<u32>,
+    /// `NP_HomeDir`, as `current_dir`.
+    pub home_dir: Option<u32>,
     /// `Some(name)` gives the process a real `CommandLineInterface`
     /// whose `cli_CommandName` is `name`, as a process started by a shell
     /// has -- startup code treats a process without one as launched from
@@ -1271,10 +1278,16 @@ pub(crate) fn spawn_process<C: Cpu>(
 
     // Last, so a failure above leaves no duplicated lock or parked state
     // behind for a process that never starts.
-    let (child_state, current_dir) = ctx
-        .dos
-        .new_process_state(ctx.heap, ctx.mem, spec.current_dir);
+    let caller_home_dir = ctx.mem.read_u32(parent + PR_HOMEDIR_OFFSET);
+    let (child_state, current_dir, home_dir) = ctx.dos.new_process_state(
+        ctx.heap,
+        ctx.mem,
+        spec.current_dir,
+        spec.home_dir,
+        caller_home_dir,
+    );
     ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
+    ctx.mem.write_u32(task + PR_HOMEDIR_OFFSET, home_dir);
     ctx.dos.parked_procs.insert(task, child_state);
 
     let mut a = [0u32; 8];
@@ -1418,9 +1431,11 @@ fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     }
     // DOS unlocks a process's current directory when it ends (the
     // `DupLock` it started with, or the `NP_CurrentDir` lock it was given).
-    let current_dir = ctx.mem.read_u32(task + PR_CURRENT_DIR_OFFSET);
-    ctx.dos
-        .unlock(ctx.heap, crate::guestmem::addr_from_bptr(current_dir));
+    for offset in [PR_CURRENT_DIR_OFFSET, PR_HOMEDIR_OFFSET] {
+        let lock = ctx.mem.read_u32(task + offset);
+        ctx.dos
+            .unlock(ctx.heap, crate::guestmem::addr_from_bptr(lock));
+    }
     // Abandon this task's own still-pending TR_ADDREQUESTs rather than
     // letting them fire later against an ioreq address this task's own
     // exit may leave free for the heap to hand out again -- see
@@ -6828,10 +6843,10 @@ mod tests {
         vfs: Option<crate::vfs::Vfs>,
         /// NUL-terminated strings, at [`str_addr`]`(marker, offset)`.
         strings: Vec<(u32, &'static [u8])>,
-        /// Adds an `NP_CurrentDir` tag to the child's `CreateNewProc`
-        /// whose value is read from [`np_current_dir_cell`] -- the parent's
-        /// `before_spawn` code stores a lock there.
-        np_current_dir: bool,
+        /// Adds this tag to the child's `CreateNewProc` with its value
+        /// read from [`extra_tag_cell`] -- the parent's `before_spawn`
+        /// code stores a lock there.
+        extra_tag: Option<u32>,
     }
 
     /// Where a case's string at `offset` lives.
@@ -6839,8 +6854,8 @@ mod tests {
         marker + 0x100 + offset
     }
 
-    /// The `NP_CurrentDir` tag's value cell for a given shared word.
-    fn np_current_dir_cell(marker: u32) -> u32 {
+    /// The extra tag's value cell for a given shared word.
+    fn extra_tag_cell(marker: u32) -> u32 {
         marker + 16 + 12
     }
 
@@ -6954,8 +6969,8 @@ mod tests {
         mem.write_u32(tags_addr, NP_ENTRY);
         mem.write_u32(tags_addr + 4, child_entry);
         let mut next_tag = tags_addr + 8;
-        if case.np_current_dir {
-            mem.write_u32(next_tag, NP_CURRENTDIR);
+        if let Some(tag) = case.extra_tag {
+            mem.write_u32(next_tag, tag);
             mem.write_u32(next_tag + 4, 0); // filled in by the parent's code
             next_tag += 8;
         }
@@ -7088,7 +7103,7 @@ mod tests {
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(0, b"a"), (8, b"b"), (16, b"fa")],
-            np_current_dir: false,
+            extra_tag: None,
         };
         let code = run_case(
             case,
@@ -7117,7 +7132,7 @@ mod tests {
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(0, b"a"), (16, b"fa")],
-            np_current_dir: false,
+            extra_tag: None,
         };
         let code = run_case(
             case,
@@ -7146,13 +7161,13 @@ mod tests {
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(8, b"b"), (24, b"fb")],
-            np_current_dir: true,
+            extra_tag: Some(NP_CURRENTDIR),
         };
         let code = run_case(
             case,
             &|marker| {
                 let mut w = lock_words(marker, 8);
-                w.extend_from_slice(&store_d0_at(np_current_dir_cell(marker)));
+                w.extend_from_slice(&store_d0_at(extra_tag_cell(marker)));
                 w
             },
             &|marker| {
@@ -7174,5 +7189,102 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
         assert_ne!(code, 0, "NP_CurrentDir wasn't the child's directory");
+    }
+
+    /// `SetProgramDir(D0)` (the lock a `Lock` just returned).
+    fn set_program_dir_of_d0_words() -> Vec<u16> {
+        let mut w = vec![0x2200]; // move.l d0,d1
+        w.extend_from_slice(&jsr_disp16_a6(-594));
+        w
+    }
+
+    #[test]
+    fn a_childs_set_program_dir_does_not_move_the_parents_progdir_326() {
+        // Parent: SetProgramDir(Lock("a")). Child: SetProgramDir(Lock("b")).
+        // Back in the parent PROGDIR:fa (only in a/) must still resolve.
+        let (vfs, root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(0, b"a"), (8, b"b"), (16, b"PROGDIR:fa")],
+            extra_tag: None,
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 0);
+                w.extend_from_slice(&set_program_dir_of_d0_words());
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 8);
+                w.extend_from_slice(&set_program_dir_of_d0_words());
+                w
+            },
+            &|marker| lock_words(marker, 16),
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert_ne!(code, 0, "the parent's PROGDIR: moved to the child's");
+    }
+
+    #[test]
+    fn a_child_inherits_its_parents_progdir_326() {
+        let (vfs, root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(0, b"a"), (16, b"PROGDIR:fa")],
+            extra_tag: None,
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 0);
+                w.extend_from_slice(&set_program_dir_of_d0_words());
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 16);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| load_d0_from(marker).to_vec(),
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert_ne!(code, 0, "the child couldn't resolve its parent's PROGDIR:");
+    }
+
+    #[test]
+    fn np_home_dir_sets_the_childs_progdir_326() {
+        // The parent has no PROGDIR:; the child gets "b" through NP_HomeDir
+        // and finds fb there; the parent still can't resolve PROGDIR:fb.
+        let (vfs, root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(8, b"b"), (24, b"PROGDIR:fb")],
+            extra_tag: Some(NP_HOMEDIR),
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 8);
+                w.extend_from_slice(&store_d0_at(extra_tag_cell(marker)));
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 24);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 24);
+                w.push(0x2E00); // move.l d0,d7 = the parent's own result
+                w.extend_from_slice(&load_d0_from(marker));
+                w.push(0x4A87); // tst.l d7
+                w.push(0x6702); // beq.s +2 (parent failed: keep d0)
+                w.push(0x7000); // moveq #0,d0
+                w
+            },
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert_ne!(code, 0, "NP_HomeDir wasn't the child's PROGDIR:");
     }
 }

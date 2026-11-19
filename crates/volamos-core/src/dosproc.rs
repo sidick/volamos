@@ -41,6 +41,9 @@ pub(crate) struct ProcessState {
     /// The lock `CurrentDir` last installed, which `CurrentDir` hands
     /// back as the previous one.
     pub(crate) current_dir_lock: Option<u32>,
+    /// What `PROGDIR:` resolves to (`pr_HomeDir`'s path); `None` leaves
+    /// it unresolvable.
+    pub(crate) progdir: Option<String>,
 }
 
 impl DosState {
@@ -52,6 +55,10 @@ impl DosState {
             io_err: self.io_err,
             cwd: self.vfs.as_ref().map(|vfs| vfs.cwd().to_string()),
             current_dir_lock: self.current_dir_lock,
+            progdir: self
+                .vfs
+                .as_ref()
+                .and_then(|vfs| vfs.assign_target("PROGDIR")),
         }
     }
 
@@ -62,6 +69,12 @@ impl DosState {
             vfs.restore_cwd(cwd);
         }
         self.current_dir_lock = state.current_dir_lock;
+        if let Some(vfs) = self.vfs.as_mut() {
+            match state.progdir {
+                Some(path) => vfs.set_assign("PROGDIR", vec![path]),
+                None => vfs.remove_assign("PROGDIR"),
+            }
+        }
     }
 
     /// The state a new process starts with, parked until it first runs:
@@ -74,7 +87,9 @@ impl DosState {
         heap: &mut GuestHeap,
         mem: &mut dyn AddressSpace,
         np_current_dir: Option<u32>,
-    ) -> (ProcessState, u32) {
+        np_home_dir: Option<u32>,
+        caller_home_dir: u32,
+    ) -> (ProcessState, u32, u32) {
         let caller_cwd = self.vfs.as_ref().map(|vfs| vfs.cwd().to_string());
         let (lock, cwd) = match np_current_dir.map(addr_from_bptr) {
             // Given: used as is.
@@ -94,12 +109,35 @@ impl DosState {
                 (dup, caller_cwd)
             }
         };
+        // The home directory (`PROGDIR:`) the same way: as given (`0`:
+        // none), or a `DupLock` of the caller's.
+        let caller_progdir = self
+            .vfs
+            .as_ref()
+            .and_then(|vfs| vfs.assign_target("PROGDIR"));
+        let (home_lock, progdir) = match np_home_dir.map(addr_from_bptr) {
+            Some(addr) if addr != 0 => (addr, self.lock_amiga_path(addr)),
+            Some(_) => (0, None),
+            None => {
+                let dup = self.dup_lock(heap, mem, addr_from_bptr(caller_home_dir));
+                (dup.unwrap_or(0), caller_progdir)
+            }
+        };
         let state = ProcessState {
             cwd,
             current_dir_lock: lock,
+            progdir,
             ..ProcessState::default()
         };
-        (state, lock.map(bptr_from_addr).unwrap_or(0))
+        (
+            state,
+            lock.map(bptr_from_addr).unwrap_or(0),
+            if home_lock == 0 {
+                0
+            } else {
+                bptr_from_addr(home_lock)
+            },
+        )
     }
 
     /// Parks the running process's fields as `outgoing`'s (unless it has

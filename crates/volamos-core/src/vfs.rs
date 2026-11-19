@@ -421,6 +421,16 @@ impl Vfs {
         }
     }
 
+    /// The first target of the assign `name:`, if there is one (the
+    /// single target of a regular assign).
+    pub(crate) fn assign_target(&self, name: &str) -> Option<String> {
+        self.config
+            .assigns
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .and_then(|(_, targets)| targets.first().cloned())
+    }
+
     /// Removes the assign `name:` if one exists (a no-op otherwise).
     /// Used by `crate::dosassign`'s `AssignLock(name, 0)` ("cancel"
     /// form).
