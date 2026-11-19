@@ -2684,12 +2684,16 @@ fn commit_task_switch<C: Cpu + 'static>(
     mem: &mut C::Memory,
     tasks: &mut TaskScheduler,
     continuations: &mut ContinuationStack<C>,
+    dos: &mut DosState,
     // `(next task, its snapshot, its stack bounds)` -- exactly what
     // `TaskScheduler::take_pending_restore` returns, bundled into one
     // parameter (rather than four) so callers pass it straight through.
     pending: (u32, crate::cpu::RegisterSnapshot, u32, u32),
 ) {
     let (next, snapshot, sp_lower, sp_upper) = pending;
+    // The outgoing task's per-process DOS state is parked, or dropped if
+    // it has exited (see `crate::dosproc`).
+    dos.switch_process(tasks.current(), tasks.is_exiting(), next);
     tasks.commit(next);
     crate::cpu::restore(cpu, &snapshot);
     mem.write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_THISTASK_OFFSET, next);
@@ -3913,7 +3917,14 @@ impl<C: Cpu + 'static> Runtime<C> {
                     tc_switch,
                     move |ctx| {
                         ctx.tasks.end_switch_hook();
-                        commit_task_switch(ctx.cpu, ctx.mem, ctx.tasks, ctx.continuations, pending);
+                        commit_task_switch(
+                            ctx.cpu,
+                            ctx.mem,
+                            ctx.tasks,
+                            ctx.continuations,
+                            ctx.dos,
+                            pending,
+                        );
                         Ok(())
                     },
                 );
@@ -3925,6 +3936,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             &mut self.mem,
             &mut self.tasks,
             &mut self.continuations,
+            &mut self.dos,
             pending,
         );
     }

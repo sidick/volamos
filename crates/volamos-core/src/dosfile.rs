@@ -373,7 +373,7 @@ pub struct DosState {
     /// doc.
     pub(crate) handles: HashMap<u32, HostHandle>,
     /// The current `IoErr()` value.
-    io_err: i32,
+    pub(crate) io_err: i32,
     /// Guest address of the lazily-created `Input()` default handle's
     /// `FileHandle` struct -- always backed by [`HostHandle::Stdin`].
     /// Distinct from `current_input`: this is only ever the *host stdin*
@@ -516,6 +516,11 @@ pub struct DosState {
     /// implemented; see that module's docs.
     pub(crate) local_vars: HashMap<String, Vec<u8>>,
 
+    /// The per-process fields of every task that is *not* running, keyed
+    /// by task address; the running task's live in the fields of this
+    /// struct. See `crate::dosproc`.
+    pub(crate) parked_procs: HashMap<u32, crate::dosproc::ProcessState>,
+
     /// Guest `struct LocalVar` blocks handed out by `FindVar`, keyed
     /// like [`Self::local_vars`]: the node, its name, its value buffer
     /// and that buffer's capacity (see `crate::dosvar`). The node follows
@@ -625,6 +630,7 @@ impl DosState {
             input_pos: 0,
             rdargs: HashMap::new(),
             local_vars: HashMap::new(),
+            parked_procs: HashMap::new(),
             local_var_nodes: HashMap::new(),
             anchor_states: HashMap::new(),
             ungetc_buf: HashMap::new(),

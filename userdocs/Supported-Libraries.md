@@ -177,7 +177,11 @@ Changelog.
   `pr_CIS`). `NP_Seglist` (loading a seglist rather than a bare entry
   point) isn't supported — every known caller always supplies
   `NP_Entry` — and `NP_CurrentDir`/`NP_HomeDir` aren't read, since this
-  runtime has one current directory for the whole run.
+  runtime has one current directory for the whole run. Each process has
+  its own `IoErr()` (`pr_Result2`): a child's failed call no longer
+  changes its parent's. The rest of the per-process state (standard
+  streams, current directory, `PROGDIR:`, local variables) is still
+  shared between processes for now (#326).
 
 ## exec.library
 
