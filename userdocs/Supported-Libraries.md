@@ -69,8 +69,8 @@ Changelog.
   `RunCommand` actually populates it.
 - Environment variables: `GetVar`/`SetVar`/`DeleteVar`/`FindVar`, backed by
   a real, directory-mapped `ENV:` volume. `FindVar` returns a guest
-  `struct LocalVar` for a local (`LV_VAR`) variable, valid until that
-  variable is set again or deleted; the structures are not linked into
+  `struct LocalVar` for a local (`LV_VAR`) variable; a later `SetVar`
+  updates it in place and `DeleteVar` frees it. The structures are not linked into
   `pr_LocalVars`, and an `LV_ALIAS` lookup reports "not found". clib2's
   `setenv()`/`putenv()` need it.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.

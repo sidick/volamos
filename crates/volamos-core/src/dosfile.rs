@@ -517,10 +517,10 @@ pub struct DosState {
     pub(crate) local_vars: HashMap<String, Vec<u8>>,
 
     /// Guest `struct LocalVar` blocks handed out by `FindVar`, keyed
-    /// like [`Self::local_vars`]: the node, its name and its value
-    /// buffer (see `crate::dosvar`). Freed when the variable is set again
-    /// or deleted.
-    pub(crate) local_var_nodes: HashMap<String, [u32; 3]>,
+    /// like [`Self::local_vars`]: the node, its name, its value buffer
+    /// and that buffer's capacity (see `crate::dosvar`). The node follows
+    /// the variable when it is set again and is freed when it is deleted.
+    pub(crate) local_var_nodes: HashMap<String, [u32; 4]>,
 
     /// Live `MatchFirst`/`MatchNext` scan state, keyed by the guest
     /// `AnchorPath*` address -- see `crate::dosanchor`'s module docs.
