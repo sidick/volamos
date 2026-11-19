@@ -2321,10 +2321,19 @@ fn set_arg_str_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let new_addr = addr_from_bptr(bptr);
+    let pr_cis = ctx.current_task + crate::exectask::PR_CIS_OFFSET;
+    if !ctx.tasks.is_main(ctx.current_task) {
+        // A `CreateNewProc` process's input is its own `pr_CIS` (the main
+        // task's is `DosState`'s default handle): swap just that, not the
+        // main task's selection.
+        let old = ctx.mem.read_u32(pr_cis);
+        ctx.mem.write_u32(pr_cis, bptr);
+        ctx.cpu.set_data_register(DataRegister(0), old);
+        return Ok(());
+    }
     match ctx.dos.select_input(ctx.heap, ctx.mem, new_addr) {
         Ok(old) => {
-            ctx.mem
-                .write_u32(ctx.current_task + crate::exectask::PR_CIS_OFFSET, bptr);
+            ctx.mem.write_u32(pr_cis, bptr);
             ctx.cpu
                 .set_data_register(DataRegister(0), bptr_from_addr(old))
         }
@@ -2341,10 +2350,17 @@ fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 fn select_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let new_addr = addr_from_bptr(bptr);
+    let pr_cos = ctx.current_task + crate::exectask::PR_COS_OFFSET;
+    if !ctx.tasks.is_main(ctx.current_task) {
+        // As `SelectInput`: only this process's own `pr_COS`.
+        let old = ctx.mem.read_u32(pr_cos);
+        ctx.mem.write_u32(pr_cos, bptr);
+        ctx.cpu.set_data_register(DataRegister(0), old);
+        return Ok(());
+    }
     match ctx.dos.select_output(ctx.heap, ctx.mem, new_addr) {
         Ok(old) => {
-            ctx.mem
-                .write_u32(ctx.current_task + crate::exectask::PR_COS_OFFSET, bptr);
+            ctx.mem.write_u32(pr_cos, bptr);
             ctx.cpu
                 .set_data_register(DataRegister(0), bptr_from_addr(old))
         }

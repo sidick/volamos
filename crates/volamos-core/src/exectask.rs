@@ -6902,4 +6902,65 @@ mod tests {
         });
         assert_eq!(code, 0, "a new process doesn't inherit its parent's IoErr");
     }
+
+    /// `move.l d0,d7`.
+    const MOVE_D0_TO_D7: u16 = 0x2E00;
+    /// `sub.l d7,d0`.
+    const SUB_D7_FROM_D0: u16 = 0x9087;
+
+    #[test]
+    fn a_childs_select_output_does_not_redirect_the_parents_output_326() {
+        // The parent remembers its Output(); the child SelectOutput()s some
+        // other handle; the parent's Output() must be unchanged. The exit
+        // code is the difference, 0 when it is.
+        let mut before = jsr_disp16_a6(-60).to_vec(); // Output
+        before.push(MOVE_D0_TO_D7);
+        let child = |_| {
+            let mut w = imm_to_d(1, 0x1234).to_vec();
+            w.extend_from_slice(&jsr_disp16_a6(-300)); // SelectOutput
+            w
+        };
+        let after = |_| {
+            let mut w = jsr_disp16_a6(-60).to_vec(); // Output
+            w.push(SUB_D7_FROM_D0);
+            w
+        };
+        let code = run_parent_and_child(&before, &child, &after);
+        assert_eq!(code, 0, "the parent's Output() changed to the child's");
+    }
+
+    #[test]
+    fn a_childs_select_input_does_not_redirect_the_parents_input_326() {
+        let mut before = jsr_disp16_a6(-54).to_vec(); // Input
+        before.push(MOVE_D0_TO_D7);
+        let child = |_| {
+            let mut w = imm_to_d(1, 0x1234).to_vec();
+            w.extend_from_slice(&jsr_disp16_a6(-294)); // SelectInput
+            w
+        };
+        let after = |_| {
+            let mut w = jsr_disp16_a6(-54).to_vec(); // Input
+            w.push(SUB_D7_FROM_D0);
+            w
+        };
+        let code = run_parent_and_child(&before, &child, &after);
+        assert_eq!(code, 0, "the parent's Input() changed to the child's");
+    }
+
+    #[test]
+    fn a_childs_select_output_swaps_its_own_pr_cos_326() {
+        // Select twice: the second call returns what the first selected,
+        // and Output() then reports the latest -- all on the child's own
+        // pr_COS.
+        let child = |marker: u32| {
+            let mut w = imm_to_d(1, 0x1234).to_vec();
+            w.extend_from_slice(&jsr_disp16_a6(-300)); // SelectOutput
+            w.extend_from_slice(&imm_to_d(1, 0x5678));
+            w.extend_from_slice(&jsr_disp16_a6(-300)); // returns 0x1234
+            w.extend_from_slice(&store_d0_at(marker));
+            w
+        };
+        let code = run_parent_and_child(&[], &child, &|marker| load_d0_from(marker).to_vec());
+        assert_eq!(code, 0x1234);
+    }
 }
