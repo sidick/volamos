@@ -25,6 +25,8 @@
 //! real AmigaOS.
 
 use crate::dosfile::DosState;
+use crate::guestmem::{GuestHeap, addr_from_bptr, bptr_from_addr};
+use crate::memory::AddressSpace;
 
 /// The fields of [`DosState`] that belong to one process. Grows one
 /// field per step of #326.
@@ -32,6 +34,13 @@ use crate::dosfile::DosState;
 pub(crate) struct ProcessState {
     /// `pr_Result2`: this process's `IoErr()`.
     pub(crate) io_err: i32,
+    /// `pr_CurrentDir`, as the Amiga path the VFS resolves relative
+    /// names against. `None` (never run, or no VFS) leaves the VFS's as
+    /// it is.
+    pub(crate) cwd: Option<String>,
+    /// The lock `CurrentDir` last installed, which `CurrentDir` hands
+    /// back as the previous one.
+    pub(crate) current_dir_lock: Option<u32>,
 }
 
 impl DosState {
@@ -41,12 +50,51 @@ impl DosState {
     fn save_process(&self) -> ProcessState {
         ProcessState {
             io_err: self.io_err,
+            cwd: self.vfs.as_ref().map(|vfs| vfs.cwd().to_string()),
+            current_dir_lock: self.current_dir_lock,
         }
     }
 
     /// Makes `state` the running process's fields.
     fn load_process(&mut self, state: ProcessState) {
         self.io_err = state.io_err;
+        if let (Some(vfs), Some(cwd)) = (self.vfs.as_mut(), state.cwd.as_deref()) {
+            vfs.restore_cwd(cwd);
+        }
+        self.current_dir_lock = state.current_dir_lock;
+    }
+
+    /// The state a new process starts with, parked until it first runs:
+    /// the current directory is `np_current_dir`'s lock as given, or a
+    /// `DupLock` of the caller's (real `CreateNewProc`'s default; `0`
+    /// when the caller has none). Returns the `pr_CurrentDir` BPTR to
+    /// store in the new process too.
+    pub(crate) fn new_process_state(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        np_current_dir: Option<u32>,
+    ) -> (ProcessState, u32) {
+        let caller_cwd = self.vfs.as_ref().map(|vfs| vfs.cwd().to_string());
+        let (lock, cwd) = match np_current_dir.map(addr_from_bptr) {
+            Some(addr) if addr != 0 => {
+                let path = self.lock_amiga_path(addr).or(caller_cwd);
+                (Some(addr), path)
+            }
+            _ => {
+                let dup = self
+                    .current_dir_lock
+                    .and_then(|addr| self.dup_lock(heap, mem, addr).ok())
+                    .filter(|&addr| addr != 0);
+                (dup, caller_cwd)
+            }
+        };
+        let state = ProcessState {
+            cwd,
+            current_dir_lock: lock,
+            ..ProcessState::default()
+        };
+        (state, lock.map(bptr_from_addr).unwrap_or(0))
     }
 
     /// Parks the running process's fields as `outgoing`'s (unless it has

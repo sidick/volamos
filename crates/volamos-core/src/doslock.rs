@@ -955,10 +955,7 @@ impl DosState {
         let new_path = if addr == 0 {
             self.initial_cwd.clone()
         } else {
-            self.locks
-                .get(&addr)
-                .map(|entry| entry.amiga_path.clone())
-                .or_else(|| self.released_lock_paths.get(&addr).cloned())
+            self.lock_amiga_path(addr)
         };
 
         if let Some(new_path) = new_path {
@@ -969,6 +966,15 @@ impl DosState {
         let old = self.current_dir_lock.map(bptr_from_addr).unwrap_or(0);
         self.current_dir_lock = if addr == 0 { None } else { Some(addr) };
         Ok(old)
+    }
+
+    /// The Amiga path a lock (or a lock already released, per
+    /// [`Self::released_lock_paths`]) was taken on.
+    pub(crate) fn lock_amiga_path(&self, addr: u32) -> Option<String> {
+        self.locks
+            .get(&addr)
+            .map(|entry| entry.amiga_path.clone())
+            .or_else(|| self.released_lock_paths.get(&addr).cloned())
     }
 
     /// `Examine(lock, fib)`: fills `fib` (a guest `struct FileInfoBlock`

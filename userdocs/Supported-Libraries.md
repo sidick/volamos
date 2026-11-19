@@ -176,15 +176,17 @@ Changelog.
   `NP_Input`, not a real filehandle, and reads it straight back out of
   `pr_CIS`). `NP_Seglist` (loading a seglist rather than a bare entry
   point) isn't supported — every known caller always supplies
-  `NP_Entry` — and `NP_CurrentDir`/`NP_HomeDir` aren't read, since this
-  runtime has one current directory for the whole run. Each process has
+  `NP_Entry` — and `NP_HomeDir` isn't read yet. Each process has its own
+  current directory: it starts in a `DupLock` of its parent's (or in
+  `NP_CurrentDir`'s lock as given), `CurrentDir` in one process no longer
+  moves another's, and DOS unlocks it when the process ends. Each process has
   its own `IoErr()` (`pr_Result2`) across task switches: a child's failed
   call no longer changes its parent's (`RunCommand`/`SystemTagList` run on
   the calling task and share its `IoErr()`, as on real AmigaOS). Likewise
   `SelectInput`/`SelectOutput` in a child change only that process's
   `pr_CIS`/`pr_COS`, not the main task's `Input()`/`Output()`. The rest of
-  the per-process state (current directory, `PROGDIR:`, local variables, the
-  buffered-stdin position) is still shared between processes for now
+  the per-process state (`PROGDIR:`, local variables, the buffered-stdin
+  position) is still shared between processes for now
   (#326); a child starts with `IoErr()` 0, not its parent's.
 
 ## exec.library

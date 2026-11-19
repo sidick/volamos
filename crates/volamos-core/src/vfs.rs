@@ -444,6 +444,13 @@ impl Vfs {
         Ok(())
     }
 
+    /// Makes `amiga_path` the current directory without re-validating it:
+    /// for restoring a process's own, already-validated directory when
+    /// the scheduler switches to it (see `crate::dosproc`).
+    pub(crate) fn restore_cwd(&mut self, amiga_path: &str) {
+        self.config.cwd = amiga_path.to_string();
+    }
+
     /// Resolve an Amiga path to a host path.
     pub fn resolve(&self, amiga_path: &str, mode: ResolveMode) -> Result<PathBuf, VfsError> {
         Ok(self.resolve_with_amiga_path(amiga_path, mode)?.host_path)

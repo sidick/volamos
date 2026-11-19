@@ -941,6 +941,8 @@ const NP_ERROR: u32 = NP_DUMMY + 8;
 /// FALSE.
 const NP_CLOSEERROR: u32 = NP_DUMMY + 9;
 /// `NP_StackSize` (`NP_Dummy + 11`): stack size in bytes.
+/// `NP_CurrentDir` (`BPTR`): the new process's current directory.
+const NP_CURRENTDIR: u32 = NP_DUMMY + 10;
 const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
 /// string per the autodoc (not a `BSTR`).
@@ -1115,6 +1117,7 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         window: tag_data(ctx.mem, tags, NP_WINDOWPTR),
         exit_code: tag_data(ctx.mem, tags, NP_EXITCODE).unwrap_or(0),
         exit_data: tag_data(ctx.mem, tags, NP_EXITDATA).unwrap_or(0),
+        current_dir: tag_data(ctx.mem, tags, NP_CURRENTDIR),
         cli_command_name: None,
         seglist: 0,
     };
@@ -1147,6 +1150,9 @@ pub(crate) struct SpawnSpec {
     /// `NP_ExitCode`/`NP_ExitData`; `0` for no exit routine.
     pub exit_code: u32,
     pub exit_data: u32,
+    /// `NP_CurrentDir` (a lock BPTR used as given); `None` is a `DupLock`
+    /// of the caller's current directory.
+    pub current_dir: Option<u32>,
     /// `Some(name)` gives the process a real `CommandLineInterface`
     /// whose `cli_CommandName` is `name`, as a process started by a shell
     /// has -- startup code treats a process without one as launched from
@@ -1239,6 +1245,11 @@ pub(crate) fn spawn_process<C: Cpu>(
         .write_u32(task + PR_RETURNADDR_OFFSET, return_addr_footer);
     ctx.mem.write_u32(task + PR_EXITCODE_OFFSET, spec.exit_code);
     ctx.mem.write_u32(task + PR_EXITDATA_OFFSET, spec.exit_data);
+    let (child_state, current_dir) = ctx
+        .dos
+        .new_process_state(ctx.heap, ctx.mem, spec.current_dir);
+    ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
+    ctx.dos.parked_procs.insert(task, child_state);
 
     if let Some(command_name) = &spec.cli_command_name {
         let cli = ctx.heap.alloc(ctx.mem, CLI_STRUCT_SIZE).ok()?;
@@ -1401,6 +1412,11 @@ fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             crate::dospipe::close(ctx, crate::guestmem::addr_from_bptr(bptr));
         }
     }
+    // DOS unlocks a process's current directory when it ends (the
+    // `DupLock` it started with, or the `NP_CurrentDir` lock it was given).
+    let current_dir = ctx.mem.read_u32(task + PR_CURRENT_DIR_OFFSET);
+    ctx.dos
+        .unlock(ctx.heap, crate::guestmem::addr_from_bptr(current_dir));
     // Abandon this task's own still-pending TR_ADDREQUESTs rather than
     // letting them fire later against an ioreq address this task's own
     // exit may leave free for the heap to hand out again -- see
@@ -6801,6 +6817,68 @@ mod tests {
         [0x2039, (addr >> 16) as u16, addr as u16]
     }
 
+    /// What a [`run_case`] program needs besides its code.
+    #[derive(Default)]
+    struct ProcCase {
+        /// Installed before the run, so `Lock`/`CurrentDir` work.
+        vfs: Option<crate::vfs::Vfs>,
+        /// NUL-terminated strings, at [`str_addr`]`(marker, offset)`.
+        strings: Vec<(u32, &'static [u8])>,
+        /// Adds an `NP_CurrentDir` tag to the child's `CreateNewProc`
+        /// whose value is read from [`np_current_dir_cell`] -- the parent's
+        /// `before_spawn` code stores a lock there.
+        np_current_dir: bool,
+    }
+
+    /// Where a case's string at `offset` lives.
+    fn str_addr(marker: u32, offset: u32) -> u32 {
+        marker + 0x100 + offset
+    }
+
+    /// The `NP_CurrentDir` tag's value cell for a given shared word.
+    fn np_current_dir_cell(marker: u32) -> u32 {
+        marker + 16 + 12
+    }
+
+    /// `Lock(str_addr(marker, offset), ACCESS_READ)`; `A6` = dos.library.
+    fn lock_words(marker: u32, offset: u32) -> Vec<u16> {
+        let mut w = imm_to_d(1, str_addr(marker, offset)).to_vec();
+        w.extend_from_slice(&imm_to_d(2, 0xFFFF_FFFE)); // ACCESS_READ
+        w.extend_from_slice(&jsr_disp16_a6(-84));
+        w
+    }
+
+    /// `CurrentDir(D0)` (the lock a `Lock` just returned).
+    fn current_dir_of_d0_words() -> Vec<u16> {
+        let mut w = vec![0x2200]; // move.l d0,d1
+        w.extend_from_slice(&jsr_disp16_a6(-126));
+        w
+    }
+
+    /// A `SYS:` volume over a fresh directory holding `a/fa` and `b/fb`,
+    /// and the directory to remove afterwards.
+    fn vfs_with_two_dirs() -> (crate::vfs::Vfs, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "volamos-procstate-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        for dir in ["a", "b"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("a/fa"), b"x").unwrap();
+        std::fs::write(root.join("b/fb"), b"x").unwrap();
+        let vfs = crate::vfs::Vfs::new(crate::vfs::VfsConfig {
+            volumes: vec![("SYS".to_string(), root.clone())],
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .expect("build vfs");
+        (vfs, root)
+    }
+
     /// Runs `before_spawn` in the parent, then spawns a child running
     /// `child_body`, then the parent waits for the child to finish and
     /// runs `after_wait`. The program's exit code is the parent's `D0`
@@ -6813,6 +6891,22 @@ mod tests {
         child_body: &dyn Fn(u32) -> Vec<u16>,
         after_wait: &dyn Fn(u32) -> Vec<u16>,
     ) -> i32 {
+        run_case(
+            ProcCase::default(),
+            &|_| before_spawn.to_vec(),
+            child_body,
+            after_wait,
+        )
+    }
+
+    /// [`run_parent_and_child`] with a [`ProcCase`]; `before_spawn` also
+    /// gets the shared word's address.
+    fn run_case(
+        case: ProcCase,
+        before_spawn: &dyn Fn(u32) -> Vec<u16>,
+        child_body: &dyn Fn(u32) -> Vec<u16>,
+        after_wait: &dyn Fn(u32) -> Vec<u16>,
+    ) -> i32 {
         let _guard = lock_host_break();
         let entry = TRAP_TABLE_END;
         // The shared word and the tag list sit after the code; the code's
@@ -6821,7 +6915,7 @@ mod tests {
         let build = |marker: u32, tags_addr: u32| {
             let mut words = Vec::new();
             words.extend_from_slice(&movea_dos_base_to_a6());
-            words.extend_from_slice(before_spawn);
+            words.extend_from_slice(&before_spawn(marker));
             words.extend_from_slice(&movea_dos_base_to_a6());
             words.extend_from_slice(&imm_to_d(1, tags_addr));
             words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
@@ -6848,15 +6942,29 @@ mod tests {
         let marker = entry + (measured.len() as u32) * 2 + 16;
         let tags_addr = marker + 16;
         let (words, child_entry, parent_imm_idx) = build(marker, tags_addr);
-        let load_end = tags_addr + 32;
+        let load_end = marker + 0x400;
 
         let mut mem = FlatMemory::new(0x2_0000);
         load_words(&mut mem, entry, &words);
         mem.write_u32(marker, 0);
         mem.write_u32(tags_addr, NP_ENTRY);
         mem.write_u32(tags_addr + 4, child_entry);
-        mem.write_u32(tags_addr + 8, 0);
-        mem.write_u32(tags_addr + 12, 0);
+        let mut next_tag = tags_addr + 8;
+        if case.np_current_dir {
+            mem.write_u32(next_tag, NP_CURRENTDIR);
+            mem.write_u32(next_tag + 4, 0); // filled in by the parent's code
+            next_tag += 8;
+        }
+        mem.write_u32(next_tag, 0);
+        mem.write_u32(next_tag + 4, 0);
+        for (offset, text) in &case.strings {
+            let mut at = str_addr(marker, *offset);
+            for &b in *text {
+                mem.write_u8(at, b);
+                at += 1;
+            }
+            mem.write_u8(at, 0);
+        }
 
         let mut rt = Runtime::new(
             M68kCpu::new(),
@@ -6868,6 +6976,9 @@ mod tests {
                 ..StartConfig::default()
             },
         );
+        if let Some(vfs) = case.vfs {
+            rt.set_vfs(vfs);
+        }
         let parent_task = rt.current_task();
         rt.memory_mut()
             .write_u32(entry + (parent_imm_idx as u32) * 2 + 2, parent_task);
@@ -6962,5 +7073,102 @@ mod tests {
         };
         let code = run_parent_and_child(&[], &child, &|marker| load_d0_from(marker).to_vec());
         assert_eq!(code, 0x1234);
+    }
+
+    #[test]
+    fn a_childs_current_dir_does_not_move_the_parents_326() {
+        // Parent: CurrentDir(Lock("a")). Child: CurrentDir(Lock("b")).
+        // Back in the parent, the relative name "fa" (only in a/) must
+        // still resolve: the exit code is that Lock's result.
+        let (vfs, root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(0, b"a"), (8, b"b"), (16, b"fa")],
+            np_current_dir: false,
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 0);
+                w.extend_from_slice(&current_dir_of_d0_words());
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 8);
+                w.extend_from_slice(&current_dir_of_d0_words());
+                w
+            },
+            &|marker| lock_words(marker, 16),
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert_ne!(
+            code, 0,
+            "the parent's relative Lock(\"fa\") failed: its cwd moved"
+        );
+    }
+
+    #[test]
+    fn a_child_starts_in_its_parents_current_dir_326() {
+        let (vfs, root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(0, b"a"), (16, b"fa")],
+            np_current_dir: false,
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 0);
+                w.extend_from_slice(&current_dir_of_d0_words());
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 16);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| load_d0_from(marker).to_vec(),
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert_ne!(code, 0, "the child didn't start in its parent's directory");
+    }
+
+    #[test]
+    fn np_current_dir_sets_the_childs_current_dir_326() {
+        // The parent stays in SYS:, locks "b" into the NP_CurrentDir tag;
+        // the child finds "fb" (only in b/) relative to it, and the
+        // parent still can't.
+        let (vfs, root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(8, b"b"), (24, b"fb")],
+            np_current_dir: true,
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 8);
+                w.extend_from_slice(&store_d0_at(np_current_dir_cell(marker)));
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 24);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| {
+                // exit = child's Lock("fb") result, but 0 if the parent
+                // can resolve "fb" too (it must not).
+                let mut w = lock_words(marker, 24);
+                w.push(0x2E00); // move.l d0,d7 = parent's own result
+                w.extend_from_slice(&load_d0_from(marker));
+                w.push(0x4A87); // tst.l d7
+                w.push(0x6702); // beq.s +2 (parent failed: keep d0)
+                w.push(0x7000); // moveq #0,d0
+                w
+            },
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert_ne!(code, 0, "NP_CurrentDir wasn't the child's directory");
     }
 }
