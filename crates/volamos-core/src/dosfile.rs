@@ -516,6 +516,12 @@ pub struct DosState {
     /// implemented; see that module's docs.
     pub(crate) local_vars: HashMap<String, Vec<u8>>,
 
+    /// Guest `struct LocalVar` blocks handed out by `FindVar`, keyed
+    /// like [`Self::local_vars`]: the node, its name and its value
+    /// buffer (see `crate::dosvar`). Freed when the variable is set again
+    /// or deleted.
+    pub(crate) local_var_nodes: HashMap<String, [u32; 3]>,
+
     /// Live `MatchFirst`/`MatchNext` scan state, keyed by the guest
     /// `AnchorPath*` address -- see `crate::dosanchor`'s module docs.
     /// `MatchEnd` (and this runtime's own error paths) remove entries
@@ -619,6 +625,7 @@ impl DosState {
             input_pos: 0,
             rdargs: HashMap::new(),
             local_vars: HashMap::new(),
+            local_var_nodes: HashMap::new(),
             anchor_states: HashMap::new(),
             ungetc_buf: HashMap::new(),
             last_getc: HashMap::new(),

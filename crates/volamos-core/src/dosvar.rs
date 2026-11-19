@@ -1,4 +1,4 @@
-//! `dos.library` shell variables: `SetVar`/`GetVar`/`DeleteVar`.
+//! `dos.library` shell variables: `SetVar`/`GetVar`/`DeleteVar`/`FindVar`.
 //!
 //! # Scope: local (`LV_VAR`) variables, plus directory-backed global ones
 //!
@@ -35,6 +35,19 @@
 //! request, not a crash) -- neither has come up in the real binaries
 //! this runtime has been tested against yet.
 //!
+//! `FindVar` returns a guest `struct LocalVar` (`<dos/var.h>`: a 14-byte
+//! `struct Node`, `lv_Flags` at 14, `lv_Value` at 16, `lv_Len` at 20), which
+//! the host-side store has no use for, so one is built on the first
+//! `FindVar` of a variable and handed out again (same address) until the
+//! variable is set again or deleted -- real DOS reallocates the value on
+//! `SetVar`, so a pointer kept across one is stale there too. `ln_Name`
+//! is the upper-cased name, `lv_Value` a `NUL`-terminated copy of the
+//! content, `lv_Len` its length without the `NUL`, and `ln_Type` is
+//! `LV_VAR`. The nodes are **not** linked into `pr_LocalVars` (that list
+//! stays empty, as before) and only `LV_VAR` can be found: an `LV_ALIAS`
+//! lookup fails like any missing variable. Needed by clib2's `setenv()`
+//! (so `putenv()`), which looks the variable up before setting it.
+//!
 //! Variable names are matched case-insensitively (upper-cased before
 //! use as the [`DosState::local_vars`] key, or resolved case-
 //! insensitively by [`Vfs`] for a global one), matching the real
@@ -49,12 +62,15 @@ use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosargs::ERROR_BAD_NUMBER;
 use crate::dosfile::{DosState, ERROR_OBJECT_NOT_FOUND, map_io_error, map_vfs_error};
-use crate::guestmem::read_c_string;
+use crate::guestmem::{GuestHeap, read_c_string, write_c_string};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 use crate::vfs::{ResolveMode, Vfs};
 
+const LV_VAR: u32 = 0;
 const LV_ALIAS: u32 = 1;
+/// `sizeof(struct LocalVar)`.
+const LOCAL_VAR_SIZE: u32 = 24;
 const GVF_GLOBAL_ONLY: u32 = 0x0100;
 const GVF_LOCAL_ONLY: u32 = 0x0200;
 const GVF_BINARY_VAR: u32 = 0x0400;
@@ -112,6 +128,9 @@ fn set_var_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let flags = ctx.cpu.data_register(DataRegister(4));
 
     let result = set_var(ctx.mem, ctx.dos, name_ptr, buffer_ptr, size, flags);
+    if result.is_ok() && flags & GVF_GLOBAL_ONLY == 0 {
+        drop_local_var_node(ctx.heap, ctx.mem, ctx.dos, name_ptr);
+    }
     let value = match result {
         Ok(()) => DOSTRUE,
         Err(code) => {
@@ -250,6 +269,9 @@ fn delete_var_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     let flags = ctx.cpu.data_register(DataRegister(2));
 
     let result = set_var(ctx.mem, ctx.dos, name_ptr, 0, 0, flags);
+    if result.is_ok() && flags & GVF_GLOBAL_ONLY == 0 {
+        drop_local_var_node(ctx.heap, ctx.mem, ctx.dos, name_ptr);
+    }
     let value = match result {
         Ok(()) => DOSTRUE,
         Err(code) => {
@@ -259,6 +281,84 @@ fn delete_var_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dis
     };
     ctx.cpu.set_data_register(DataRegister(0), value);
     Ok(())
+}
+
+/// Frees the `FindVar` node of a local variable, if one was handed out.
+fn drop_local_var_node(
+    heap: &mut GuestHeap,
+    mem: &dyn AddressSpace,
+    dos: &mut DosState,
+    name_ptr: u32,
+) {
+    let key = String::from_utf8_lossy(&read_c_string(mem, name_ptr)).to_ascii_uppercase();
+    if let Some(blocks) = dos.local_var_nodes.remove(&key) {
+        for addr in blocks {
+            let _ = heap.free(addr);
+        }
+    }
+}
+
+/// `FindVar` (`D1` = name, `D2` = type). `D0` = the `struct LocalVar`, or
+/// `NULL` with `IoErr()` = `ERROR_OBJECT_NOT_FOUND`.
+fn find_var_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.data_register(DataRegister(1));
+    let var_type = ctx.cpu.data_register(DataRegister(2)) & 0xFF;
+
+    let node = find_var(ctx.heap, ctx.mem, ctx.dos, name_ptr, var_type);
+    if node == 0 {
+        ctx.dos.set_io_err(ERROR_OBJECT_NOT_FOUND);
+    }
+    ctx.cpu.set_data_register(DataRegister(0), node);
+    Ok(())
+}
+
+/// The guest `struct LocalVar` for a local `LV_VAR` variable, built on
+/// first use; `0` if there is no such variable (or the heap is full).
+fn find_var(
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+    dos: &mut DosState,
+    name_ptr: u32,
+    var_type: u32,
+) -> u32 {
+    if var_type != LV_VAR {
+        return 0;
+    }
+    let key = String::from_utf8_lossy(&read_c_string(mem, name_ptr)).to_ascii_uppercase();
+    if let Some(&[node, ..]) = dos.local_var_nodes.get(&key) {
+        return node;
+    }
+    let Some(content) = dos.local_vars.get(&key).cloned() else {
+        return 0;
+    };
+    let len = content.len() as u32;
+    let mut blocks = Vec::with_capacity(3);
+    for size in [LOCAL_VAR_SIZE, key.len() as u32 + 1, len + 1] {
+        match heap.alloc(mem, size) {
+            Ok(addr) => blocks.push(addr),
+            Err(_) => {
+                // Whatever did allocate goes back; the guest sees "not found".
+                for addr in blocks {
+                    let _ = heap.free(addr);
+                }
+                return 0;
+            }
+        }
+    }
+    let (node, name, value) = (blocks[0], blocks[1], blocks[2]);
+    write_c_string(mem, name, key.as_bytes());
+    for (i, &b) in content.iter().enumerate() {
+        mem.write_u8(value + i as u32, b);
+    }
+    mem.write_u8(value + len, 0);
+    for off in 0..LOCAL_VAR_SIZE {
+        mem.write_u8(node + off, 0);
+    }
+    mem.write_u32(node + 10, name); // ln_Name
+    mem.write_u32(node + 16, value); // lv_Value
+    mem.write_u32(node + 20, len); // lv_Len
+    dos.local_var_nodes.insert(key, [node, name, value]);
+    node
 }
 
 /// Registers `SetVar`/`GetVar`/`DeleteVar` onto [`DOS_LIBRARY_BASE`],
@@ -286,6 +386,7 @@ pub fn register_dosvar_handlers<C: Cpu + 'static>(
     reg!("SetVar", set_var_handler::<C>);
     reg!("GetVar", get_var_handler::<C>);
     reg!("DeleteVar", delete_var_handler::<C>);
+    reg!("FindVar", find_var_handler::<C>);
 }
 
 #[cfg(test)]
@@ -587,5 +688,70 @@ mod tests {
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 2, "GetVar should report 2 characters copied");
         assert_eq!(read_c_string(rt.memory(), out_addr), b"hi");
+    }
+
+    // FindVar (issue #299)
+
+    fn heap_and_mem() -> (GuestHeap, FlatMemory, DosState) {
+        (
+            GuestHeap::new(0x1000, 0x1_0000),
+            FlatMemory::new(0x2_0000),
+            DosState::new(None),
+        )
+    }
+
+    #[test]
+    fn find_var_returns_a_local_var_struct_for_a_set_variable_299() {
+        let (mut heap, mut mem, mut dos) = heap_and_mem();
+        write_c_string(&mut mem, 0x100, b"findvar-test");
+        write_c_string(&mut mem, 0x200, b"value");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, GVF_LOCAL_ONLY).unwrap();
+
+        let lv = find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_VAR);
+        assert_ne!(lv, 0);
+        assert_eq!(mem.read_u8(lv + 8), 0, "ln_Type is LV_VAR");
+        assert_eq!(read_c_string(&mem, mem.read_u32(lv + 10)), b"FINDVAR-TEST");
+        assert_eq!(read_c_string(&mem, mem.read_u32(lv + 16)), b"value");
+        assert_eq!(mem.read_u32(lv + 20), 5, "lv_Len");
+
+        // Same variable, any case: the same node.
+        write_c_string(&mut mem, 0x110, b"FINDVAR-test");
+        assert_eq!(find_var(&mut heap, &mut mem, &mut dos, 0x110, LV_VAR), lv);
+    }
+
+    #[test]
+    fn find_var_misses_are_null_and_alias_type_is_not_found_299() {
+        let (mut heap, mut mem, mut dos) = heap_and_mem();
+        write_c_string(&mut mem, 0x100, b"nope");
+        assert_eq!(find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_VAR), 0);
+
+        write_c_string(&mut mem, 0x200, b"x");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, 0).unwrap();
+        assert_eq!(find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_ALIAS), 0);
+        assert_ne!(find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_VAR), 0);
+    }
+
+    #[test]
+    fn setting_or_deleting_a_variable_frees_its_find_var_node_299() {
+        let (mut heap, mut mem, mut dos) = heap_and_mem();
+        write_c_string(&mut mem, 0x100, b"V");
+        write_c_string(&mut mem, 0x200, b"one");
+        let baseline = heap.live_alloc_count();
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, 0).unwrap();
+        find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_VAR);
+        assert_eq!(heap.live_alloc_count(), baseline + 3);
+
+        drop_local_var_node(&mut heap, &mem, &mut dos, 0x100);
+        assert_eq!(heap.live_alloc_count(), baseline);
+
+        // A node built after a changed value shows the new value.
+        write_c_string(&mut mem, 0x200, b"two");
+        set_var(&mem, &mut dos, 0x100, 0x200, -1, 0).unwrap();
+        let lv = find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_VAR);
+        assert_eq!(read_c_string(&mem, mem.read_u32(lv + 16)), b"two");
+        set_var(&mem, &mut dos, 0x100, 0, 0, 0).unwrap();
+        drop_local_var_node(&mut heap, &mem, &mut dos, 0x100);
+        assert_eq!(heap.live_alloc_count(), baseline);
+        assert_eq!(find_var(&mut heap, &mut mem, &mut dos, 0x100, LV_VAR), 0);
     }
 }

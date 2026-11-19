@@ -67,8 +67,12 @@ Changelog.
   `ReadArgs(NULL)`
   reads the command line from the process's `Input()` buffer, the way
   `RunCommand` actually populates it.
-- Environment variables: `GetVar`/`SetVar`/`DeleteVar`, backed by a
-  real, directory-mapped `ENV:` volume.
+- Environment variables: `GetVar`/`SetVar`/`DeleteVar`/`FindVar`, backed by
+  a real, directory-mapped `ENV:` volume. `FindVar` returns a guest
+  `struct LocalVar` for a local (`LV_VAR`) variable, valid until that
+  variable is set again or deleted; the structures are not linked into
+  `pr_LocalVars`, and an `LV_ALIAS` lookup reports "not found". clib2's
+  `setenv()`/`putenv()` need it.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.
 - Process/CLI: `Cli`/`GetProgramName`/`SetProgramName`/`MaxCli`/
   `GetArgStr`/`SetArgStr` (`pr_Arguments`, the same buffer startup
