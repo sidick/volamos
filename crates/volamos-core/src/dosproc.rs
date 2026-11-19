@@ -119,8 +119,11 @@ impl DosState {
             Some(addr) if addr != 0 => (addr, self.lock_amiga_path(addr)),
             Some(_) => (0, None),
             None => {
-                let dup = self.dup_lock(heap, mem, addr_from_bptr(caller_home_dir));
-                (dup.unwrap_or(0), caller_progdir)
+                let dup = self
+                    .dup_lock(heap, mem, addr_from_bptr(caller_home_dir))
+                    .unwrap_or(0);
+                // `PROGDIR:` and `pr_HomeDir` agree: no lock, no assign.
+                (dup, if dup != 0 { caller_progdir } else { None })
             }
         };
         let state = ProcessState {

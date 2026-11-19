@@ -452,6 +452,11 @@ pub const PR_FLAGS_OFFSET: u32 = 192;
 /// MinList`, at 208, then `pr_ShellPrivate` 220). The error stream, or
 /// `0` to use `pr_COS`.
 pub const PR_CES_OFFSET: u32 = 224;
+/// `PRF_FREECURRDIR`: unlock `pr_CurrentDir` at exit. Set when
+/// `CreateNewProc` installs a non-`ZERO` current directory (RKRM
+/// *AmigaDOS Manual*, "Process Flags"); a `NP_CurrentDir` of `0` leaves
+/// it clear.
+pub const PRF_FREECURRDIR: u32 = 1 << 1;
 /// `PRF_CLOSEINPUT`, per `<dos/dosextens.h>`: close `pr_CIS` at exit.
 pub const PRF_CLOSEINPUT: u32 = 1 << 3;
 /// `PRF_CLOSEOUTPUT`: close `pr_COS` at exit.
@@ -1288,6 +1293,11 @@ pub(crate) fn spawn_process<C: Cpu>(
     );
     ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
     ctx.mem.write_u32(task + PR_HOMEDIR_OFFSET, home_dir);
+    if current_dir != 0 {
+        let flags = ctx.mem.read_u32(task + PR_FLAGS_OFFSET);
+        ctx.mem
+            .write_u32(task + PR_FLAGS_OFFSET, flags | PRF_FREECURRDIR);
+    }
     ctx.dos.parked_procs.insert(task, child_state);
 
     let mut a = [0u32; 8];
@@ -1429,13 +1439,17 @@ fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             crate::dospipe::close(ctx, crate::guestmem::addr_from_bptr(bptr));
         }
     }
-    // DOS unlocks a process's current directory when it ends (the
-    // `DupLock` it started with, or the `NP_CurrentDir` lock it was given).
-    for offset in [PR_CURRENT_DIR_OFFSET, PR_HOMEDIR_OFFSET] {
-        let lock = ctx.mem.read_u32(task + offset);
+    // DOS unlocks the current directory when `PRF_FREECURRDIR` is set (see
+    // there) and the home directory always: "`dos.library` unlocks it when
+    // the process dies" (RKRM *AmigaDOS Manual*, `pr_HomeDir`).
+    if flags & PRF_FREECURRDIR != 0 {
+        let lock = ctx.mem.read_u32(task + PR_CURRENT_DIR_OFFSET);
         ctx.dos
             .unlock(ctx.heap, crate::guestmem::addr_from_bptr(lock));
     }
+    let home = ctx.mem.read_u32(task + PR_HOMEDIR_OFFSET);
+    ctx.dos
+        .unlock(ctx.heap, crate::guestmem::addr_from_bptr(home));
     // Abandon this task's own still-pending TR_ADDREQUESTs rather than
     // letting them fire later against an ioreq address this task's own
     // exit may leave free for the heap to hand out again -- see
@@ -6874,9 +6888,18 @@ mod tests {
         w
     }
 
+    /// Removes a test's directory when dropped, even if the test panics.
+    struct TempRoot(std::path::PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A `SYS:` volume over a fresh directory holding `a/fa` and `b/fb`,
-    /// and the directory to remove afterwards.
-    fn vfs_with_two_dirs() -> (crate::vfs::Vfs, std::path::PathBuf) {
+    /// and a guard that removes the directory afterwards.
+    fn vfs_with_two_dirs() -> (crate::vfs::Vfs, TempRoot) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -6895,7 +6918,7 @@ mod tests {
             ..Default::default()
         })
         .expect("build vfs");
-        (vfs, root)
+        (vfs, TempRoot(root))
     }
 
     /// Runs `before_spawn` in the parent, then spawns a child running
@@ -7099,7 +7122,7 @@ mod tests {
         // Parent: CurrentDir(Lock("a")). Child: CurrentDir(Lock("b")).
         // Back in the parent, the relative name "fa" (only in a/) must
         // still resolve: the exit code is that Lock's result.
-        let (vfs, root) = vfs_with_two_dirs();
+        let (vfs, _root) = vfs_with_two_dirs();
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(0, b"a"), (8, b"b"), (16, b"fa")],
@@ -7119,7 +7142,6 @@ mod tests {
             },
             &|marker| lock_words(marker, 16),
         );
-        let _ = std::fs::remove_dir_all(root);
         assert_ne!(
             code, 0,
             "the parent's relative Lock(\"fa\") failed: its cwd moved"
@@ -7128,7 +7150,7 @@ mod tests {
 
     #[test]
     fn a_child_starts_in_its_parents_current_dir_326() {
-        let (vfs, root) = vfs_with_two_dirs();
+        let (vfs, _root) = vfs_with_two_dirs();
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(0, b"a"), (16, b"fa")],
@@ -7148,7 +7170,6 @@ mod tests {
             },
             &|marker| load_d0_from(marker).to_vec(),
         );
-        let _ = std::fs::remove_dir_all(root);
         assert_ne!(code, 0, "the child didn't start in its parent's directory");
     }
 
@@ -7157,7 +7178,7 @@ mod tests {
         // The parent stays in SYS:, locks "b" into the NP_CurrentDir tag;
         // the child finds "fb" (only in b/) relative to it, and the
         // parent still can't.
-        let (vfs, root) = vfs_with_two_dirs();
+        let (vfs, _root) = vfs_with_two_dirs();
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(8, b"b"), (24, b"fb")],
@@ -7187,7 +7208,6 @@ mod tests {
                 w
             },
         );
-        let _ = std::fs::remove_dir_all(root);
         assert_ne!(code, 0, "NP_CurrentDir wasn't the child's directory");
     }
 
@@ -7202,7 +7222,7 @@ mod tests {
     fn a_childs_set_program_dir_does_not_move_the_parents_progdir_326() {
         // Parent: SetProgramDir(Lock("a")). Child: SetProgramDir(Lock("b")).
         // Back in the parent PROGDIR:fa (only in a/) must still resolve.
-        let (vfs, root) = vfs_with_two_dirs();
+        let (vfs, _root) = vfs_with_two_dirs();
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(0, b"a"), (8, b"b"), (16, b"PROGDIR:fa")],
@@ -7222,13 +7242,12 @@ mod tests {
             },
             &|marker| lock_words(marker, 16),
         );
-        let _ = std::fs::remove_dir_all(root);
         assert_ne!(code, 0, "the parent's PROGDIR: moved to the child's");
     }
 
     #[test]
     fn a_child_inherits_its_parents_progdir_326() {
-        let (vfs, root) = vfs_with_two_dirs();
+        let (vfs, _root) = vfs_with_two_dirs();
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(0, b"a"), (16, b"PROGDIR:fa")],
@@ -7248,7 +7267,6 @@ mod tests {
             },
             &|marker| load_d0_from(marker).to_vec(),
         );
-        let _ = std::fs::remove_dir_all(root);
         assert_ne!(code, 0, "the child couldn't resolve its parent's PROGDIR:");
     }
 
@@ -7256,7 +7274,7 @@ mod tests {
     fn np_home_dir_sets_the_childs_progdir_326() {
         // The parent has no PROGDIR:; the child gets "b" through NP_HomeDir
         // and finds fb there; the parent still can't resolve PROGDIR:fb.
-        let (vfs, root) = vfs_with_two_dirs();
+        let (vfs, _root) = vfs_with_two_dirs();
         let case = ProcCase {
             vfs: Some(vfs),
             strings: vec![(8, b"b"), (24, b"PROGDIR:fb")],
@@ -7284,7 +7302,34 @@ mod tests {
                 w
             },
         );
-        let _ = std::fs::remove_dir_all(root);
         assert_ne!(code, 0, "NP_HomeDir wasn't the child's PROGDIR:");
+    }
+
+    #[test]
+    fn an_explicit_np_current_dir_of_zero_is_no_current_directory_326() {
+        // The tag is present with value 0 (the cell is never filled in):
+        // the child doesn't get a DupLock of its parent's "a", so it
+        // can't see "fa" relative to it.
+        let (vfs, _root) = vfs_with_two_dirs();
+        let case = ProcCase {
+            vfs: Some(vfs),
+            strings: vec![(0, b"a"), (16, b"fa")],
+            extra_tag: Some(NP_CURRENTDIR),
+        };
+        let code = run_case(
+            case,
+            &|marker| {
+                let mut w = lock_words(marker, 0);
+                w.extend_from_slice(&current_dir_of_d0_words());
+                w
+            },
+            &|marker| {
+                let mut w = lock_words(marker, 16);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| load_d0_from(marker).to_vec(),
+        );
+        assert_eq!(code, 0, "NP_CurrentDir 0 still inherited the parent's");
     }
 }
