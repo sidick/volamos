@@ -955,6 +955,9 @@ const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 /// directory, used as given; `0` means none. Default: a `DupLock` of the
 /// caller's.
 const NP_HOMEDIR: u32 = NP_DUMMY + 16;
+/// `NP_CopyVars` (`NP_Dummy + 17`, `BOOL`): copy the caller's local
+/// shell variables to the new process. Default TRUE.
+const NP_COPYVARS: u32 = NP_DUMMY + 17;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
 /// string per the autodoc (not a `BSTR`).
 const NP_NAME: u32 = NP_DUMMY + 12;
@@ -1130,6 +1133,7 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         exit_data: tag_data(ctx.mem, tags, NP_EXITDATA).unwrap_or(0),
         current_dir: tag_data(ctx.mem, tags, NP_CURRENTDIR),
         home_dir: tag_data(ctx.mem, tags, NP_HOMEDIR),
+        copy_vars: tag_data(ctx.mem, tags, NP_COPYVARS).is_none_or(|v| v != 0),
         cli_command_name: None,
         seglist: 0,
     };
@@ -1167,6 +1171,8 @@ pub(crate) struct SpawnSpec {
     pub current_dir: Option<u32>,
     /// `NP_HomeDir`, as `current_dir`.
     pub home_dir: Option<u32>,
+    /// `NP_CopyVars`: start with a copy of the caller's local variables.
+    pub copy_vars: bool,
     /// `Some(name)` gives the process a real `CommandLineInterface`
     /// whose `cli_CommandName` is `name`, as a process started by a shell
     /// has -- startup code treats a process without one as launched from
@@ -1290,6 +1296,7 @@ pub(crate) fn spawn_process<C: Cpu>(
         spec.current_dir,
         spec.home_dir,
         caller_home_dir,
+        spec.copy_vars,
     );
     ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
     ctx.mem.write_u32(task + PR_HOMEDIR_OFFSET, home_dir);
@@ -1450,6 +1457,13 @@ fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let home = ctx.mem.read_u32(task + PR_HOMEDIR_OFFSET);
     ctx.dos
         .unlock(ctx.heap, crate::guestmem::addr_from_bptr(home));
+    // The `FindVar` structures of this process's local variables (its
+    // variables themselves go with its `ProcessState`).
+    for blocks in std::mem::take(&mut ctx.dos.local_var_nodes).into_values() {
+        for addr in &blocks[..3] {
+            let _ = ctx.heap.free(*addr);
+        }
+    }
     // Abandon this task's own still-pending TR_ADDREQUESTs rather than
     // letting them fire later against an ioreq address this task's own
     // exit may leave free for the heap to hand out again -- see
@@ -7331,5 +7345,86 @@ mod tests {
             &|marker| load_d0_from(marker).to_vec(),
         );
         assert_eq!(code, 0, "NP_CurrentDir 0 still inherited the parent's");
+    }
+
+    /// `SetVar(name, value, -1, GVF_LOCAL_ONLY)`; strings at the offsets.
+    fn set_local_var_words(marker: u32, name: u32, value: u32) -> Vec<u16> {
+        let mut w = imm_to_d(1, str_addr(marker, name)).to_vec();
+        w.extend_from_slice(&imm_to_d(2, str_addr(marker, value)));
+        w.extend_from_slice(&imm_to_d(3, 0xFFFF_FFFF));
+        w.extend_from_slice(&imm_to_d(4, 0x0200)); // GVF_LOCAL_ONLY
+        w.extend_from_slice(&jsr_disp16_a6(-900));
+        w
+    }
+
+    /// `GetVar(name, buffer, 32, GVF_LOCAL_ONLY)`, then `D0` = the
+    /// buffer's first byte (0 if the call failed and left it untouched).
+    fn first_byte_of_local_var_words(marker: u32, name: u32, buffer: u32) -> Vec<u16> {
+        let mut w = imm_to_d(1, str_addr(marker, name)).to_vec();
+        w.extend_from_slice(&imm_to_d(2, str_addr(marker, buffer)));
+        w.extend_from_slice(&imm_to_d(3, 32));
+        w.extend_from_slice(&imm_to_d(4, 0x0200)); // GVF_LOCAL_ONLY
+        w.extend_from_slice(&jsr_disp16_a6(-906));
+        w.push(0x7000); // moveq #0,d0
+        let at = str_addr(marker, buffer);
+        w.extend_from_slice(&[0x1039, (at >> 16) as u16, at as u16]); // move.b (at).l,d0
+        w
+    }
+
+    #[test]
+    fn a_childs_local_var_does_not_change_the_parents_326() {
+        // Parent: V=parent. Child: V=child. The parent must still read
+        // "parent" ('p' = 0x70), not "child" ('c' = 0x63).
+        let case = ProcCase {
+            strings: vec![(0, b"V"), (8, b"parent"), (16, b"child")],
+            ..ProcCase::default()
+        };
+        let code = run_case(
+            case,
+            &|marker| set_local_var_words(marker, 0, 8),
+            &|marker| set_local_var_words(marker, 0, 16),
+            &|marker| first_byte_of_local_var_words(marker, 0, 64),
+        );
+        assert_eq!(code, i32::from(b'p'), "the parent's variable changed");
+    }
+
+    #[test]
+    fn a_child_starts_with_a_copy_of_its_parents_local_vars_326() {
+        let case = ProcCase {
+            strings: vec![(0, b"V"), (8, b"parent")],
+            ..ProcCase::default()
+        };
+        let code = run_case(
+            case,
+            &|marker| set_local_var_words(marker, 0, 8),
+            &|marker| {
+                let mut w = first_byte_of_local_var_words(marker, 0, 64);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| load_d0_from(marker).to_vec(),
+        );
+        assert_eq!(code, i32::from(b'p'), "NP_CopyVars defaults to TRUE");
+    }
+
+    #[test]
+    fn np_copy_vars_false_gives_the_child_no_local_vars_326() {
+        // The tag's cell is never filled in, so its value is 0 (FALSE).
+        let case = ProcCase {
+            strings: vec![(0, b"V"), (8, b"parent")],
+            extra_tag: Some(NP_COPYVARS),
+            ..ProcCase::default()
+        };
+        let code = run_case(
+            case,
+            &|marker| set_local_var_words(marker, 0, 8),
+            &|marker| {
+                let mut w = first_byte_of_local_var_words(marker, 0, 64);
+                w.extend_from_slice(&store_d0_at(marker));
+                w
+            },
+            &|marker| load_d0_from(marker).to_vec(),
+        );
+        assert_eq!(code, 0, "the child saw its parent's variable");
     }
 }

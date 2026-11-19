@@ -181,13 +181,16 @@ Changelog.
   moves another's, and DOS unlocks it when the process ends. Its home
   directory (`pr_HomeDir`, what `PROGDIR:` resolves to) works the same way:
   a `DupLock` of its parent's, or `NP_HomeDir`'s lock as given, and
-  `SetProgramDir` in one process leaves the others' alone. Each process has
+  `SetProgramDir` in one process leaves the others' alone. Local shell
+  variables are per process too: a new process starts with a copy of its
+  parent's (unless `NP_CopyVars` is `FALSE`), and changes in one don't
+  show in the other. Each process has
   its own `IoErr()` (`pr_Result2`) across task switches: a child's failed
   call no longer changes its parent's (`RunCommand`/`SystemTagList` run on
   the calling task and share its `IoErr()`, as on real AmigaOS). Likewise
   `SelectInput`/`SelectOutput` in a child change only that process's
   `pr_CIS`/`pr_COS`, not the main task's `Input()`/`Output()`. The rest of
-  the per-process state (local variables, the buffered-stdin position) is still shared between processes for now
+  the per-process state (the buffered-stdin position) is still shared between processes for now
   (#326); a child starts with `IoErr()` 0, not its parent's.
 
 ## exec.library
