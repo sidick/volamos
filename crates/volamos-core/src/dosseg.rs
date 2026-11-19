@@ -2419,7 +2419,7 @@ mod tests {
         // The parent calls ReadArgs on *its own* command line first,
         // advancing DosState::input_pos partway (here, all the way)
         // into the parent's buffer. Without resetting that cursor for
-        // the child (DosState::input_pos is a single, shared field --
+        // the child (DosState::input_pos is one cursor per process,
         // see crate::dosargs's module doc), the child's own ReadArgs
         // call would start wherever the parent's left off, typically
         // past the end of the *child's* entirely different buffer,

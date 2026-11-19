@@ -1290,7 +1290,7 @@ pub(crate) fn spawn_process<C: Cpu>(
     // Last, so a failure above leaves no duplicated lock or parked state
     // behind for a process that never starts.
     let caller_home_dir = ctx.mem.read_u32(parent + PR_HOMEDIR_OFFSET);
-    let (child_state, current_dir, home_dir) = ctx.dos.new_process_state(
+    let (mut child_state, current_dir, home_dir) = ctx.dos.new_process_state(
         ctx.heap,
         ctx.mem,
         spec.current_dir,
@@ -1298,6 +1298,12 @@ pub(crate) fn spawn_process<C: Cpu>(
         caller_home_dir,
         spec.copy_vars,
     );
+    // The arguments (`SystemTagList`'s command line) are also what the
+    // child's `ReadArgs(NULL)` reads from its `Input()`, as `RunCommand`
+    // arranges for its command.
+    if let Some(bytes) = &spec.args {
+        child_state.input_buf = bytes.clone();
+    }
     ctx.mem.write_u32(task + PR_CURRENT_DIR_OFFSET, current_dir);
     ctx.mem.write_u32(task + PR_HOMEDIR_OFFSET, home_dir);
     if current_dir != 0 {
