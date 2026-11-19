@@ -2318,17 +2318,22 @@ fn set_arg_str_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
 
 /// `SelectInput` (`D1` = `BPTR`). `D0` = the previous input handle's
 /// `BPTR`.
+/// `SelectInput`/`SelectOutput` for a `CreateNewProc` process: its input
+/// and output are its own `pr_CIS`/`pr_COS` (the main task's are
+/// `DosState`'s default handles), so swap just that field, returning the
+/// previous value, and leave the main task's selection alone.
+fn swap_own_stream<C: Cpu>(ctx: &mut HandlerContext<'_, C>, field_addr: u32, bptr: u32) {
+    let old = ctx.mem.read_u32(field_addr);
+    ctx.mem.write_u32(field_addr, bptr);
+    ctx.cpu.set_data_register(DataRegister(0), old);
+}
+
 fn select_input_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let bptr = ctx.cpu.data_register(DataRegister(1));
     let new_addr = addr_from_bptr(bptr);
     let pr_cis = ctx.current_task + crate::exectask::PR_CIS_OFFSET;
     if !ctx.tasks.is_main(ctx.current_task) {
-        // A `CreateNewProc` process's input is its own `pr_CIS` (the main
-        // task's is `DosState`'s default handle): swap just that, not the
-        // main task's selection.
-        let old = ctx.mem.read_u32(pr_cis);
-        ctx.mem.write_u32(pr_cis, bptr);
-        ctx.cpu.set_data_register(DataRegister(0), old);
+        swap_own_stream(ctx, pr_cis, bptr);
         return Ok(());
     }
     match ctx.dos.select_input(ctx.heap, ctx.mem, new_addr) {
@@ -2352,10 +2357,7 @@ fn select_output_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     let new_addr = addr_from_bptr(bptr);
     let pr_cos = ctx.current_task + crate::exectask::PR_COS_OFFSET;
     if !ctx.tasks.is_main(ctx.current_task) {
-        // As `SelectInput`: only this process's own `pr_COS`.
-        let old = ctx.mem.read_u32(pr_cos);
-        ctx.mem.write_u32(pr_cos, bptr);
-        ctx.cpu.set_data_register(DataRegister(0), old);
+        swap_own_stream(ctx, pr_cos, bptr);
         return Ok(());
     }
     match ctx.dos.select_output(ctx.heap, ctx.mem, new_addr) {

@@ -183,8 +183,9 @@ Changelog.
   the calling task and share its `IoErr()`, as on real AmigaOS). Likewise
   `SelectInput`/`SelectOutput` in a child change only that process's
   `pr_CIS`/`pr_COS`, not the main task's `Input()`/`Output()`. The rest of
-  the per-process state (current directory, `PROGDIR:`, local variables)
-  is still shared between processes for now (#326).
+  the per-process state (current directory, `PROGDIR:`, local variables, the
+  buffered-stdin position) is still shared between processes for now
+  (#326); a child starts with `IoErr()` 0, not its parent's.
 
 ## exec.library
 
