@@ -14,7 +14,9 @@
 //! outgoing task's values are parked in [`DosState::parked_procs`], keyed
 //! by task address, and the incoming task's are loaded (a task that has
 //! never run starts from [`ProcessState::default`]). A task that has
-//! exited is dropped instead of parked.
+//! exited is dropped instead of parked. Exiting is the only way a task
+//! leaves the scheduler (`RemTask` of another task is a no-op here), so
+//! nothing else needs to clean the map.
 //!
 //! Not per-process on real AmigaOS either, and so not in
 //! [`ProcessState`]: file handles, locks, seglists, pipes, volumes and
@@ -33,6 +35,20 @@ pub(crate) struct ProcessState {
 }
 
 impl DosState {
+    /// The running process's fields, copied out of `self`. With
+    /// [`Self::load_process`] this is the only place a field has to be
+    /// listed, besides [`ProcessState`] itself.
+    fn save_process(&self) -> ProcessState {
+        ProcessState {
+            io_err: self.io_err,
+        }
+    }
+
+    /// Makes `state` the running process's fields.
+    fn load_process(&mut self, state: ProcessState) {
+        self.io_err = state.io_err;
+    }
+
     /// Parks the running process's fields as `outgoing`'s (unless it has
     /// exited) and loads `incoming`'s. Called when the scheduler commits
     /// a task switch.
@@ -40,14 +56,12 @@ impl DosState {
         if outgoing == incoming {
             return;
         }
-        let current = ProcessState {
-            io_err: self.io_err,
-        };
         if !outgoing_exited {
+            let current = self.save_process();
             self.parked_procs.insert(outgoing, current);
         }
         let next = self.parked_procs.remove(&incoming).unwrap_or_default();
-        self.io_err = next.io_err;
+        self.load_process(next);
     }
 }
 

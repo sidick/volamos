@@ -178,8 +178,9 @@ Changelog.
   point) isn't supported — every known caller always supplies
   `NP_Entry` — and `NP_CurrentDir`/`NP_HomeDir` aren't read, since this
   runtime has one current directory for the whole run. Each process has
-  its own `IoErr()` (`pr_Result2`): a child's failed call no longer
-  changes its parent's. The rest of the per-process state (standard
+  its own `IoErr()` (`pr_Result2`) across task switches: a child's failed
+  call no longer changes its parent's (`RunCommand`/`SystemTagList` run on
+  the calling task and share its `IoErr()`, as on real AmigaOS). The rest of the per-process state (standard
   streams, current directory, `PROGDIR:`, local variables) is still
   shared between processes for now (#326).
 

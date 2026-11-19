@@ -2692,7 +2692,10 @@ fn commit_task_switch<C: Cpu + 'static>(
 ) {
     let (next, snapshot, sp_lower, sp_upper) = pending;
     // The outgoing task's per-process DOS state is parked, or dropped if
-    // it has exited (see `crate::dosproc`).
+    // it has exited (see `crate::dosproc`). This must stay *before*
+    // `tasks.commit`, which clears the scheduler's `exiting` flag: after
+    // it an exited task would be parked and its state reused if the
+    // address were ever handed out again.
     dos.switch_process(tasks.current(), tasks.is_exiting(), next);
     tasks.commit(next);
     crate::cpu::restore(cpu, &snapshot);
