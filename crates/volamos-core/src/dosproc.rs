@@ -174,8 +174,18 @@ impl DosState {
             let current = self.save_process();
             self.parked_procs.insert(outgoing, current);
         }
-        let next = self.parked_procs.remove(&incoming).unwrap_or_default();
-        self.load_process(next);
+        match self.parked_procs.remove(&incoming) {
+            Some(next) => self.load_process(next),
+            // A task nothing parked state for (`spawn_process` always
+            // does, so this is a task made some other way): a clean
+            // `IoErr()` and no local variables, but the directories and
+            // `PROGDIR:` stay as they are rather than being wiped.
+            None => {
+                self.io_err = 0;
+                self.local_vars.clear();
+                self.local_var_nodes.clear();
+            }
+        }
     }
 }
 
@@ -194,6 +204,34 @@ mod tests {
         assert_eq!(dos.io_err(), 111);
         dos.switch_process(1, false, 2);
         assert_eq!(dos.io_err(), 222);
+    }
+
+    #[test]
+    fn a_task_with_no_parked_state_keeps_the_directories_326() {
+        let mut dos = DosState::new(None);
+        dos.set_io_err(5);
+        dos.local_vars.insert("V".to_string(), b"x".to_vec());
+        dos.switch_process(1, false, 2);
+        assert_eq!(dos.io_err(), 0);
+        assert!(dos.local_vars.is_empty());
+        assert!(dos.parked_procs.contains_key(&1));
+    }
+
+    #[test]
+    fn a_new_process_copies_its_callers_local_vars_but_not_their_nodes_326() {
+        let mut dos = DosState::new(None);
+        dos.local_vars.insert("V".to_string(), b"x".to_vec());
+        dos.local_var_nodes.insert("V".to_string(), [1, 2, 3, 4]);
+        let mut heap = GuestHeap::new(0x1000, 0x1000);
+        let mut mem = crate::memory::FlatMemory::new(0x4000);
+        let (copied, ..) = dos.new_process_state(&mut heap, &mut mem, None, None, 0, true);
+        assert_eq!(
+            copied.local_vars.get("V").map(Vec::as_slice),
+            Some(&b"x"[..])
+        );
+        assert!(copied.local_var_nodes.is_empty());
+        let (empty, ..) = dos.new_process_state(&mut heap, &mut mem, None, None, 0, false);
+        assert!(empty.local_vars.is_empty());
     }
 
     #[test]
