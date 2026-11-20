@@ -1330,3 +1330,18 @@ siblings). It:
 5. `ReplyMsg`s the message and exits with `sm_NumArgs`.
 
 Used by `crates/volamos/tests/workbench_e2e.rs`.
+
+## issue #315 fixture: `rawtest`
+
+What an interactive guest (a REPL) does to read one key, by hand, to
+test `SetMode` on a terminal. Source of truth: `gen_rawtest.py` (no
+vasm, like its siblings). It:
+
+1. `SetMode(Input(), 1)` (raw input);
+2. prints `READY`;
+3. `Read`s one byte from `Input()`;
+4. exits with that byte as its return code, **without** putting the mode
+   back -- volamos must restore the terminal itself.
+
+Used by `crates/volamos/tests/setmode_raw_e2e.rs`, which runs it on a
+pseudo-terminal.

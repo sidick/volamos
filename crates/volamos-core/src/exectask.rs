@@ -722,6 +722,9 @@ fn start_force_exit_thread() {
                 }
                 break SIGTERM;
             };
+            // A forced exit must not leave the user's terminal raw
+            // (issue #315).
+            crate::hostterm::restore_stdin_mode();
             let dirs =
                 std::mem::take(&mut *EXIT_CLEANUP_DIRS.lock().unwrap_or_else(|e| e.into_inner()));
             for dir in dirs {

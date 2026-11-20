@@ -1123,6 +1123,19 @@ impl DosState {
         None
     }
 
+    /// Whether the handle at `addr` is the host console: the `Input()`
+    /// handle, or the `Output()` handle (which doubles as the console
+    /// `*`) when stdout is a terminal too -- the handles `SetMode` and
+    /// `WaitForChar` mean something for. `false` when stdin is not a
+    /// terminal at all.
+    pub(crate) fn is_host_console(&self, addr: u32) -> bool {
+        match self.handles.get(&addr) {
+            Some(HostHandle::Stdin) => crate::hostterm::stdio_is_console(false),
+            Some(HostHandle::Stdout) => crate::hostterm::stdio_is_console(true),
+            _ => false,
+        }
+    }
+
     /// `Read`: reads up to `len` bytes from the handle at `addr`,
     /// returning the bytes actually read (may be shorter than `len`,
     /// including empty at EOF -- matching real `Read`'s "actual count"
@@ -1145,9 +1158,15 @@ impl DosState {
             // startup uses its one `CON:` handle for stdin too (#345).
             Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => {
                 let mut buf = vec![0u8; len];
-                let n = std::io::stdin()
-                    .read(&mut buf)
-                    .map_err(|e| map_io_error(&e))?;
+                // A terminal is read without `std`'s buffer, so that
+                // `WaitForChar` and `SetMode`'s raw mode see the same
+                // bytes the guest will (see `crate::hostterm`).
+                let n = if crate::hostterm::stdin_is_tty() {
+                    crate::hostterm::read_stdin(&mut buf)
+                } else {
+                    std::io::stdin().read(&mut buf)
+                }
+                .map_err(|e| map_io_error(&e))?;
                 buf.truncate(n);
                 Ok(buf)
             }
@@ -1757,33 +1776,80 @@ fn is_interactive_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
     Ok(())
 }
 
-/// `SetMode` (`D1` = `BPTR`, `D2` = mode). `D0` = `DOSTRUE`, always --
-/// this runtime has no real `CON:`/`RAW:`/`AUX:` console handler for
-/// the concept of a buffer mode to apply to (see [`crate::dosfile`]'s
-/// module docs: `Input()`/`Output()` are backed directly by host
-/// stdin/stdout, not a console handler process), so there is nothing to
-/// change and nothing that can fail. `IoErr()` is set to `0` on success
-/// (real `SetMode` sets it to `1` only "if the console is attached to a
-/// window of the Amiga graphical user interface" -- never true here).
+/// `SetMode` (`D1` = `BPTR`, `D2` = mode). `D0` = `DOSTRUE`/`DOSFALSE`.
+///
+/// The autodoc: it "sends an `ACTION_SCREEN_MODE` packet to the handler in
+/// question, normally for changing a `CON:` handler to raw mode or
+/// vice-versa": 1 for `RAW:`, 0 for `CON:`, and 2 for the V47 medium mode.
+/// `Input()`/`Output()` are backed by host stdin/stdout, not a console
+/// handler, so on the console handles (see [`DosState::is_host_console`])
+/// this switches the host terminal instead -- raw for 1, cooked for 0 and
+/// 2 -- as [`crate::hostterm`] describes (issue #315). `FALSE` with
+/// `ERROR_ACTION_NOT_KNOWN` only if the terminal driver refuses.
+///
+/// Everything else, as before: with stdin not a terminal (pipes, CI) there
+/// is no console to change, so it succeeds without doing anything, and so
+/// does any other handle. `IoErr()` is `0` (real `SetMode` sets it to `1`
+/// only "if the console is attached to a window of the Amiga graphical
+/// user interface" -- never true here).
 fn set_mode_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let mode = ctx.cpu.data_register(DataRegister(2)) as i32;
     ctx.dos.set_io_err(0);
-    ctx.cpu.set_data_register(DataRegister(0), DOSTRUE);
+    let mut result = DOSTRUE;
+    if bptr != 0 && ctx.dos.is_host_console(addr_from_bptr(bptr)) {
+        let raw = match mode {
+            1 => Some(true),
+            0 | 2 => Some(false),
+            // Not a mode the console documents: leave the terminal be.
+            _ => None,
+        };
+        if let Some(raw) = raw
+            && crate::hostterm::set_stdin_raw(raw).is_err()
+        {
+            result = DOSFALSE;
+            ctx.dos.set_io_err(ERROR_ACTION_NOT_KNOWN);
+        }
+    }
+    ctx.cpu.set_data_register(DataRegister(0), result);
     Ok(())
 }
 
 /// `WaitForChar` (`D1` = `BPTR`, `D2` = timeout in microseconds). `D0` =
-/// `DOSFALSE`, always -- this runtime has no way to non-blockingly peek
-/// at host stdin (and no real console handler to ask instead), so
-/// rather than actually block for up to `timeout` this always reports
-/// "nothing available yet" immediately. Real callers (e.g. `Dir`'s
-/// abort-on-keypress check during a long listing) treat that as "no key
-/// was pressed" and carry on, which is the correct behavior for this
-/// runtime's typical non-interactive/piped corpus-testing use. `IoErr()`
-/// is set to `0`, matching "no bytes became available and the handler
-/// was able to complete the function" (not an error).
+/// `DOSTRUE` if a character can be read from the handle now or arrives
+/// within `timeout`, else `DOSFALSE`. The autodoc says it "is only valid
+/// when the I/O stream is connected to a virtual terminal device", and
+/// that is the only case that answers: on the console handles of a
+/// terminal ([`DosState::is_host_console`]) it asks the host terminal
+/// (`poll(2)`) and blocks the host for at most `timeout` as the real call
+/// blocks its caller (issue #315). The timeout is taken as unsigned, so a
+/// guest's "wait for ever" `-1` waits about 71 minutes. Text
+/// `ReadArgs` or `UnGetC` keeps in `Input()`'s buffer (the command line
+/// reads back from there) is not a key and does not count: the real call
+/// only asks the console handler.
+///
+/// For every other handle -- stdin not a terminal, a file, a pipe -- it
+/// still answers `DOSFALSE` at once, without waiting: real callers (e.g.
+/// `Dir`'s abort-on-keypress check during a long listing) treat that as
+/// "no key was pressed" and carry on, which is right for this runtime's
+/// typical non-interactive/piped corpus-testing use, and a piped stdin
+/// that happened to hold data would otherwise read as a keypress.
+/// `IoErr()` is `0`: no bytes arrived and the call completed.
 fn wait_for_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let bptr = ctx.cpu.data_register(DataRegister(1));
+    let timeout_us = ctx.cpu.data_register(DataRegister(2));
     ctx.dos.set_io_err(0);
-    ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+    let mut ready = false;
+    if bptr != 0 {
+        let addr = addr_from_bptr(bptr);
+        if ctx.dos.is_host_console(addr) {
+            ready = crate::hostterm::stdin_ready(std::time::Duration::from_micros(u64::from(
+                timeout_us,
+            )));
+        }
+    }
+    ctx.cpu
+        .set_data_register(DataRegister(0), if ready { DOSTRUE } else { DOSFALSE });
     Ok(())
 }
 

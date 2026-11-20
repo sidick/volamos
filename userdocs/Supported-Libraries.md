@@ -27,6 +27,28 @@ Changelog.
   windows, so the specification is ignored. `GetProgramName` and
   `SetProgramName` fail (`DOSFALSE`) in a process with no CLI, as under
   [`--workbench`](CLI-Reference.md#-workbench).
+- `SetMode` and `WaitForChar` on the console, when stdin is a terminal.
+  `SetMode(fh, 1)` puts the host terminal in raw mode and `SetMode(fh,
+  0)` puts it back (mode 2, the V47 medium mode, is treated as cooked),
+  so a REPL with its own line editing needs no `stty` wrapper. As on the
+  Amiga's `RAW:`, every key arrives on its own with no Return, nothing is
+  echoed, Return arrives as `CR` (`0x0d`), and `Ctrl+\` and `Ctrl+Z`
+  arrive as bytes. `Ctrl+C` is still a break (`SIGBREAKF_CTRL_C`), so a
+  runaway guest can be interrupted; `Ctrl+D`, `Ctrl+E` and `Ctrl+F`
+  arrive as bytes instead of breaks. As with any break, it reaches the
+  guest at its next library call, so a guest blocked in `Read` sees it
+  when the read returns; a second `Ctrl+C` forces the exit. Output is
+  untouched, so `LF` still starts a new line. `WaitForChar(fh, timeout)`
+  waits up to `timeout` microseconds (unsigned, so `-1` is about 71
+  minutes) for a key and answers `TRUE` if one is there. Volamos
+  puts the terminal back as it found it however it ends: a normal exit
+  (even with the guest still raw), a failed run, or a host `SIGTERM` or
+  second `Ctrl+C`. When stdin is not a terminal (a pipe, CI) nothing
+  changes: `SetMode` succeeds and does nothing, and `WaitForChar`
+  answers `FALSE` at once. On Windows there is no terminal control, so
+  that is always the case. A guest that sends `ACTION_SCREEN_MODE` to
+  the console as a raw packet, bypassing `SetMode`, still gets no
+  effect.
 - `PIPE:` — named in-memory channels, as libnix's `pipe()` needs:
   `Open("PIPE:name", MODE_NEWFILE)` opens the write end and
   `MODE_OLDFILE` the read end (either may come first). A `Read` waits

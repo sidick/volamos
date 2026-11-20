@@ -54,6 +54,7 @@ pub mod exectask;
 pub mod expansion;
 pub mod graphics;
 pub mod guestmem;
+pub mod hostterm;
 pub mod icon;
 pub mod iconfile;
 pub mod iconobj;

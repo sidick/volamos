@@ -14,3 +14,7 @@ path = "src/main.rs"
 [dependencies]
 volamos-core = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+
+# Opens the pseudo-terminal for tests/setmode_raw_e2e.rs (a unix-only test).
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
