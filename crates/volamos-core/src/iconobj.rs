@@ -41,7 +41,7 @@
 //! `dd_ViewModes` taken from the file's extension, or `0` for a 1.3
 //! drawer that has none.
 
-use crate::execlist::{LH_HEAD, LN_SUCC, LN_TYPE, add_tail_impl, init_list_header};
+use crate::execlist::{LH_HEAD, LH_TAIL, LN_SUCC, LN_TYPE, add_tail_impl, init_list_header};
 use crate::guestmem::{GuestHeap, write_c_string};
 use crate::iconfile::{
     DRAWER_EXTENSION_SIZE, DiskObjectFile, IconImage, NEW_WINDOW_SIZE, WB_DISKMAGIC,
@@ -63,11 +63,9 @@ const ML_NUMENTRIES: u32 = 14;
 const ML_ME: u32 = 16;
 /// `NT_MEMORY`, `<exec/nodes.h>`.
 const NT_MEMORY: u8 = 10;
-/// More entries than this in one `MemList`, or more nodes than this in
-/// a list, is a corrupt structure, not an icon: stop rather than walk
-/// forever.
+/// More entries than this in one `MemList` is a corrupt structure, not
+/// an icon.
 const MAX_ENTRIES_PER_NODE: u16 = 256;
-const MAX_NODES: usize = 1 << 20;
 
 /// `sizeof(struct DrawerData)` in memory: the 56 bytes the file holds,
 /// then `dd_Flags` (`ULONG`) and `dd_ViewModes` (`UWORD`).
@@ -113,8 +111,18 @@ pub fn add_free_list(
 /// `FreeFreeList`: frees every block recorded in the `FreeList` at
 /// `free_list` and every `MemList` node, including the `FreeList`
 /// itself if it is in one of the blocks. Returns how many blocks were
-/// freed, or why the structure is not a free list this module can walk
-/// (a loop, a nonsense entry count, a block the heap does not know).
+/// freed, or why the structure is not a free list this module can walk.
+///
+/// Everything is validated before anything is freed, so a bad list is
+/// refused whole rather than half-freed. Every node and every recorded
+/// block must be a live guest-heap allocation (nodes made by
+/// [`add_free_list`] and [`build_disk_object`] always are), and none may
+/// appear twice. That bounds the walk by the heap's own live count --
+/// a cycle or garbage pointer fails at the first repeated or unknown
+/// node -- and catches a second `FreeDiskObject` of the same object,
+/// whose first node is no longer live. A stale pointer whose memory has
+/// since been recycled into a new, valid-looking list cannot be told
+/// apart from a real one; `--sanitize`'s quarantine reports that.
 pub fn free_free_list(
     heap: &mut GuestHeap,
     mem: &mut dyn AddressSpace,
@@ -124,10 +132,18 @@ pub fn free_free_list(
     // the first block, which must not be freed while it is being read.
     let mut nodes = Vec::new();
     let mut blocks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut node = mem.read_u32(free_list + FL_MEMLIST + LH_HEAD);
-    while mem.read_u32(node + LN_SUCC) != 0 {
-        if nodes.len() >= MAX_NODES {
-            return Err("the free list is too long or loops".to_string());
+    // The list's tail sentinel is inside the FreeList, not a heap node.
+    while node != free_list + FL_MEMLIST + LH_TAIL && node != 0 {
+        if heap
+            .size_of_live_alloc(node)
+            .is_none_or(|size| size < MEMLIST_SIZE)
+        {
+            return Err(format!("{node:#010x} is not a live MemList"));
+        }
+        if !seen.insert(node) {
+            return Err(format!("the list loops back to {node:#010x}"));
         }
         let entries = mem.read_u16(node + ML_NUMENTRIES);
         if entries > MAX_ENTRIES_PER_NODE {
@@ -137,9 +153,16 @@ pub fn free_free_list(
         }
         for i in 0..entries as u32 {
             let addr = mem.read_u32(node + ML_ME + 8 * i);
-            if addr != 0 {
-                blocks.push(addr);
+            if addr == 0 {
+                continue;
             }
+            if heap.size_of_live_alloc(addr).is_none() {
+                return Err(format!("{addr:#010x} is not a live allocation"));
+            }
+            if !seen.insert(addr) {
+                return Err(format!("{addr:#010x} is recorded twice"));
+            }
+            blocks.push(addr);
         }
         nodes.push(node);
         node = mem.read_u32(node + LN_SUCC);
@@ -285,17 +308,17 @@ fn fill(
     let drawer = match &icon.drawer {
         Some(d) => {
             let addr = alloc_tracked(heap, mem, free_list, DRAWER_DATA_MEM_SIZE)?;
+            // The block is zeroed, so the pointer fields stay NULL.
             for (i, &b) in d.new_window.iter().enumerate() {
-                mem.write_u8(addr + i as u32, b);
+                if !NEW_WINDOW_POINTERS.contains(&(i as u32)) {
+                    mem.write_u8(addr + i as u32, b);
+                }
             }
-            for off in NEW_WINDOW_POINTERS {
-                mem.write_u8(addr + off, 0);
-            }
-            debug_assert_eq!(NEW_WINDOW_SIZE, 48);
-            mem.write_u32(addr + 48, d.current_x as u32);
-            mem.write_u32(addr + 52, d.current_y as u32);
-            mem.write_u32(addr + 56, d.flags());
-            mem.write_u16(addr + 60, d.view_modes());
+            let tail = NEW_WINDOW_SIZE as u32;
+            mem.write_u32(addr + tail, d.current_x as u32);
+            mem.write_u32(addr + tail + 4, d.current_y as u32);
+            mem.write_u32(addr + tail + 8, d.flags());
+            mem.write_u16(addr + tail + 12, d.view_modes());
             addr
         }
         None => 0,
@@ -529,6 +552,31 @@ mod tests {
         mem.write_u16(first + ML_NUMENTRIES, 0xFFFF);
         let err = free_free_list(&mut heap, &mut mem, fl).unwrap_err();
         assert!(err.contains("entries"), "{err}");
+    }
+
+    #[test]
+    fn a_list_naming_a_block_the_heap_does_not_own_frees_nothing() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let obj = build_disk_object(&mut heap, &mut mem, &project()).unwrap();
+        let fl = obj + DISK_OBJECT_MEM_SIZE;
+        let before = heap.free_bytes();
+        assert!(add_free_list(&mut heap, &mut mem, fl, 0x1234_5670, 16));
+        let after_add = heap.free_bytes();
+        let err = free_free_list(&mut heap, &mut mem, fl).unwrap_err();
+        assert!(err.contains("not a live allocation"), "{err}");
+        assert_eq!(heap.free_bytes(), after_add, "nothing half-freed");
+        assert!(before > after_add);
+    }
+
+    #[test]
+    fn a_looping_list_fails_at_the_first_repeat() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let obj = build_disk_object(&mut heap, &mut mem, &DiskObjectFile::default()).unwrap();
+        let fl = obj + DISK_OBJECT_MEM_SIZE;
+        let first = mem.read_u32(fl + FL_MEMLIST + LH_HEAD);
+        mem.write_u32(first + LN_SUCC, first);
+        let err = free_free_list(&mut heap, &mut mem, fl).unwrap_err();
+        assert!(err.contains("loops"), "{err}");
     }
 
     /// Builds and frees every real icon under a directory, for ground

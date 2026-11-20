@@ -275,10 +275,10 @@ impl DiskObjectFile {
     /// no `ENV:Sys/def_<type>.info` exists. It has no images: nothing
     /// here draws an icon, and a default's pictures are not metadata
     /// any caller reads. What it does have is what a program branches
-    /// on: the type, a drawer's `DrawerData` (disks, drawers and Kickstart
+    /// on: the type, a drawer's `DrawerData` (disks, drawers, trashcans and Kickstart
     /// icons are drawers to Workbench), and a tool's default stack.
     pub fn builtin_default(object_type: u8) -> Self {
-        let is_drawer = matches!(object_type, WBDISK | WBDRAWER | WBKICK);
+        let is_drawer = matches!(object_type, WBDISK | WBDRAWER | WBGARBAGE | WBKICK);
         DiskObjectFile {
             object_type,
             stack_size: if object_type == WBTOOL { 4096 } else { 0 },
@@ -1051,10 +1051,10 @@ mod tests {
 
     #[test]
     fn builtin_defaults_have_drawer_data_only_for_drawer_like_types() {
-        for t in [WBDISK, WBDRAWER, WBKICK] {
+        for t in [WBDISK, WBDRAWER, WBGARBAGE, WBKICK] {
             assert!(DiskObjectFile::builtin_default(t).drawer.is_some(), "{t}");
         }
-        for t in [WBTOOL, WBPROJECT, WBGARBAGE] {
+        for t in [WBTOOL, WBPROJECT] {
             assert!(DiskObjectFile::builtin_default(t).drawer.is_none(), "{t}");
         }
         assert_eq!(DiskObjectFile::builtin_default(WBTOOL).stack_size, 4096);

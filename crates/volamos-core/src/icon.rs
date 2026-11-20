@@ -110,6 +110,23 @@ fn is_missing(err: i32) -> bool {
     err == crate::dosfile::ERROR_OBJECT_NOT_FOUND || err == crate::dosfile::ERROR_DIR_NOT_FOUND
 }
 
+/// The icon file for the object `name`: `name.info`, except that a volume
+/// (a name ending in `:`) keeps its icon in `Disk.info` at the root, so
+/// `SYS:` is `SYS:Disk.info`. The `Disk` rule is from memory of real
+/// Workbench practice, unverified (phase 0 of #313).
+fn info_path(name: &str) -> String {
+    if name.ends_with(':') {
+        format!("{name}Disk.info")
+    } else {
+        format!("{name}.info")
+    }
+}
+
+/// The largest `.info` file read: far beyond any real icon (a big
+/// `ColorIcon` is some hundreds of KiB), small enough that a stray huge
+/// file named `*.info` is refused, not read into host memory.
+const MAX_INFO_FILE_SIZE: u64 = 64 << 20;
+
 /// Reads and parses the icon file at `path` (a full Amiga path, `.info`
 /// included), or says what `IoErr()` should be. A file that is not an
 /// icon, or is cut short, is `ERROR_OBJECT_WRONG_TYPE`; the real
@@ -123,6 +140,10 @@ fn load_icon(ctx: &HandlerContext<'_, impl Cpu>, path: &str) -> Result<DiskObjec
     let host = vfs
         .resolve(path, ResolveMode::MustExist)
         .map_err(|e| map_vfs_error(&e))?;
+    let meta = std::fs::metadata(&host).map_err(|e| crate::dosfile::map_io_error(&e))?;
+    if !meta.is_file() || meta.len() > MAX_INFO_FILE_SIZE {
+        return Err(crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+    }
     let bytes = std::fs::read(host).map_err(|e| crate::dosfile::map_io_error(&e))?;
     DiskObjectFile::parse(&bytes)
         .map(|(icon, _)| icon)
@@ -157,7 +178,7 @@ fn get_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         deliver(ctx, &DiskObjectFile::empty());
         return Ok(());
     }
-    let info = format!("{}.info", guest_string(ctx.mem, name_ptr));
+    let info = info_path(&guest_string(ctx.mem, name_ptr));
     match load_icon(ctx, &info) {
         Ok(icon) => deliver(ctx, &icon),
         Err(code) => fail(ctx, code),
@@ -175,7 +196,14 @@ fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8
     let vfs = ctx.dos.vfs.as_ref()?;
     let host = vfs.resolve(name, ResolveMode::MustExist).ok()?;
     if host.is_dir() {
-        let is_root = name.ends_with(':');
+        // A volume root, not an assign to a subdirectory (`LIBS:`).
+        let is_root = name.strip_suffix(':').is_some_and(|v| {
+            ctx.dos.vfs.as_ref().is_some_and(|vfs| {
+                vfs.volumes()
+                    .iter()
+                    .any(|(n, _)| n.trim_end_matches(':').eq_ignore_ascii_case(v))
+            })
+        });
         return Some(if is_root { WBDISK } else { WBDRAWER });
     }
     let mut magic = [0u8; 4];
@@ -186,8 +214,8 @@ fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8
     Some(if is_hunk { WBTOOL } else { WBPROJECT })
 }
 
-/// `GetDiskObjectNew` (`A0` = name): `GetDiskObject`, and where that
-/// fails, the default icon for the object's type -- "useful when there
+/// `GetDiskObjectNew` (`A0` = name): `GetDiskObject`, and where there is
+/// no `.info` file, the default icon for the object's type -- "useful when there
 /// is no .info file for the icon you are trying to get a disk object
 /// for". If the object itself is not there, the original failure stands.
 fn get_disk_object_new_handler<C: Cpu>(
@@ -199,8 +227,11 @@ fn get_disk_object_new_handler<C: Cpu>(
         return Ok(());
     }
     let name = guest_string(ctx.mem, name_ptr);
-    match load_icon(ctx, &format!("{name}.info")) {
+    match load_icon(ctx, &info_path(&name)) {
         Ok(icon) => deliver(ctx, &icon),
+        // Only a missing icon is replaced by a default: a corrupt or
+        // unreadable one is the caller's to hear about, not to overwrite.
+        Err(code) if !is_missing(code) => fail(ctx, code),
         Err(code) => match default_type_for(ctx, &name) {
             Some(def_type) => {
                 let icon = default_icon(ctx, def_type);
@@ -284,7 +315,10 @@ fn delete_disk_object_handler<C: Cpu>(
 }
 
 /// A [`crate::iconobj`] failure as the call that hit it.
-fn free_failed(handler: &str, lvo: i32, message: String) -> DispatchError {
+fn free_failed(handler: &str, message: String) -> DispatchError {
+    let lvo = crate::lvos::find_by_name(ICON_LVOS, handler)
+        .expect("in the table")
+        .lvo;
     DispatchError::HandlerFailed {
         library: "icon.library".to_string(),
         lvo,
@@ -303,9 +337,6 @@ fn free_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     if obj == 0 {
         return Ok(());
     }
-    let lvo = crate::lvos::find_by_name(ICON_LVOS, "FreeDiskObject")
-        .expect("in the table")
-        .lvo;
     crate::iconobj::free_free_list(
         ctx.heap,
         ctx.mem,
@@ -315,7 +346,6 @@ fn free_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     .map_err(|e| {
         free_failed(
             "FreeDiskObject",
-            lvo,
             format!("{obj:#010x} is not a DiskObject: {e}"),
         )
     })
@@ -340,12 +370,9 @@ fn free_free_list_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
     if list == 0 {
         return Ok(());
     }
-    let lvo = crate::lvos::find_by_name(ICON_LVOS, "FreeFreeList")
-        .expect("in the table")
-        .lvo;
     crate::iconobj::free_free_list(ctx.heap, ctx.mem, list)
         .map(|_| ())
-        .map_err(|e| free_failed("FreeFreeList", lvo, format!("{list:#010x}: {e}")))
+        .map_err(|e| free_failed("FreeFreeList", format!("{list:#010x}: {e}")))
 }
 
 /// Whether `entry` starts with `name`, compared as `icon.library` does
@@ -821,6 +848,38 @@ mod tests {
             WBTOOL,
             "the file's type, not a guess"
         );
+    }
+
+    #[test]
+    fn a_volume_keeps_its_icon_in_disk_info() {
+        let tmp = TempDir::new("diskinfo");
+        let mut icon = project_icon();
+        icon.object_type = WBDISK;
+        fs::write(tmp.path().join("Disk.info"), icon.to_bytes()).unwrap();
+        let (obj, rt, _) = call_with_name("GetDiskObject", b"SYS:\0", tmp.path());
+        assert_ne!(obj, 0, "SYS: reads SYS:Disk.info");
+        assert_eq!(rt.memory().read_u8(obj + 48), WBDISK);
+        let (obj, rt, _) = call_with_name("GetDiskObjectNew", b"SYS:\0", tmp.path());
+        assert_eq!(rt.memory().read_u8(obj + 48), WBDISK);
+    }
+
+    #[test]
+    fn get_disk_object_new_does_not_hide_a_corrupt_icon_behind_a_default() {
+        let tmp = TempDir::new("newcorrupt");
+        fs::write(tmp.path().join("notes.txt"), b"plain text").unwrap();
+        fs::write(tmp.path().join("notes.txt.info"), b"junk").unwrap();
+        let (obj, _, code) = new_type(&tmp, "notes.txt");
+        assert_eq!(obj, 0);
+        assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+    }
+
+    #[test]
+    fn a_directory_named_like_an_icon_is_wrong_type_not_a_crash() {
+        let tmp = TempDir::new("infodir");
+        fs::create_dir(tmp.path().join("thing.info")).unwrap();
+        let (obj, _, code) = call_with_name("GetDiskObject", b"SYS:thing\0", tmp.path());
+        assert_eq!(obj, 0);
+        assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
     }
 
     #[test]
