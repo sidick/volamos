@@ -2200,6 +2200,106 @@ const IO_ERROR_OFFSET: u32 = 31;
 const TR_TIME_SECS_OFFSET: u32 = 32;
 const TR_TIME_MICRO_OFFSET: u32 = 36;
 
+/// `struct IORequest.io_Unit`: `APTR`, offset 24 (`io_Message` 20 +
+/// `io_Device` 4).
+const IO_UNIT_OFFSET: u32 = 24;
+
+/// `devices/timer.h`'s unit numbers (`UNIT_VBLANK` is 1 and, like
+/// `UNIT_MICROHZ`, takes a plain duration, so it needs no name here).
+/// `tr_time` means something different for the other three (see
+/// [`timer_wait`]); the NDK 3.2 `timer.device` autodoc describes them,
+/// and codewiz's issue #296 measured them on Kickstart 47.115.
+const UNIT_MICROHZ: u32 = 0;
+const UNIT_ECLOCK: u32 = 2;
+const UNIT_WAITUNTIL: u32 = 3;
+const UNIT_WAITECLOCK: u32 = 4;
+
+/// What `OpenDevice("timer.device", unit, ..)` stores in `io_Unit`, so a
+/// request copied from the opened one (the usual way to make several)
+/// still says which unit it is for. Real `io_Unit` is a pointer to the
+/// device's own unit structure and no guest reads through it, so this is
+/// just a distinct non-`NULL` value (unit 0 is not `NULL` on a real
+/// machine either), placed inside the timer device's own base so it is
+/// never another allocation's address.
+fn timer_unit_token(unit: u32) -> u32 {
+    TIMER_DEVICE_BASE + 4 * (unit + 1)
+}
+
+/// The unit a timer request is for, from its `io_Unit`. A request whose
+/// `io_Unit` is not one of [`timer_unit_token`]'s (never opened through
+/// `OpenDevice`, or a unit outside 0..=4, which is still accepted) is
+/// taken as `UNIT_MICROHZ`, as every request was before issue #296.
+fn timer_unit_of(mem: &dyn AddressSpace, ioreq: u32) -> u32 {
+    let unit_ptr = mem.read_u32(ioreq + IO_UNIT_OFFSET);
+    (UNIT_MICROHZ..=UNIT_WAITECLOCK)
+        .find(|&unit| timer_unit_token(unit) == unit_ptr)
+        .unwrap_or(UNIT_MICROHZ)
+}
+
+/// How long a `TR_ADDREQUEST` of `unit` waits, from what its `tr_time`
+/// (`secs`, `micro`) holds for that unit (issue #296, hardware-checked on
+/// Kickstart 47.115 by the reporter):
+///
+/// - `UNIT_MICROHZ`/`UNIT_VBLANK` (0 and 1): the time to wait.
+/// - `UNIT_ECLOCK`: E-clock ticks to wait, as a `struct EClockVal`
+///   (`tv_secs` = `ev_hi`, `tv_micro` = `ev_lo`), at [`ECLOCK_PAL_HZ`].
+/// - `UNIT_WAITUNTIL`: the system time to wait for, on the clock
+///   `GetSysTime` reads (`now_time`).
+/// - `UNIT_WAITECLOCK`: the E-clock counter value to wait for, against
+///   what `ReadEClock` would read now (`now_eclock`).
+///
+/// A time already past is no wait: the request comes back at once. The
+/// clocks are closures because only the two absolute units read one, and
+/// every `TR_ADDREQUEST` (a `sleep_for` loop's, say) comes through here.
+///
+/// Under `--clock-mhz` the E-clock counter is the emulated one, which
+/// only advances while the guest executes, but the wait itself is host
+/// time (as `Delay`'s is): a `UNIT_WAITECLOCK` request completes after
+/// the host time its target is ahead by, and the emulated counter need
+/// not have reached the target by then.
+fn timer_wait(
+    unit: u32,
+    secs: u32,
+    micro: u32,
+    now_time: impl FnOnce() -> (u32, u32),
+    now_eclock: impl FnOnce() -> u64,
+) -> std::time::Duration {
+    let eclock_ticks = (u64::from(secs) << 32) | u64::from(micro);
+    match unit {
+        UNIT_ECLOCK => eclock_duration(eclock_ticks),
+        UNIT_WAITUNTIL => {
+            let target = u64::from(secs) * 1_000_000 + u64::from(micro);
+            let (now_secs, now_micro) = now_time();
+            let now = u64::from(now_secs) * 1_000_000 + u64::from(now_micro);
+            std::time::Duration::from_micros(target.saturating_sub(now))
+        }
+        UNIT_WAITECLOCK => eclock_duration(eclock_ticks.saturating_sub(now_eclock())),
+        _ => timeval_duration(secs, micro),
+    }
+}
+
+/// `ticks` E-clock ticks as a duration (`ticks / `[`ECLOCK_PAL_HZ`]).
+fn eclock_duration(ticks: u64) -> std::time::Duration {
+    let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(ECLOCK_PAL_HZ);
+    std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// How long the `TR_ADDREQUEST` at `ioreq` waits, given its unit.
+fn timer_request_duration<C: Cpu>(
+    cpu: &C,
+    mem: &dyn AddressSpace,
+    ioreq: u32,
+) -> std::time::Duration {
+    let (secs, micro) = read_timeval(mem, ioreq + TR_TIME_SECS_OFFSET);
+    timer_wait(
+        timer_unit_of(mem, ioreq),
+        secs,
+        micro,
+        host_time_secs_micro,
+        || eclock_ticks_now(cpu),
+    )
+}
+
 /// `timer.device`'s three documented commands (`devices/timer.h`,
 /// numerically `CMD_NONSTD` (9) + 0/1/2 -- confirmed against the
 /// AmiBlitz3 `timer.ab3`/`io.ab3` includes, the RKRM Devices book's own
@@ -2245,6 +2345,16 @@ fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     if name.eq_ignore_ascii_case(b"timer.device") {
         ctx.mem
             .write_u32(ioreq + IO_DEVICE_OFFSET, TIMER_DEVICE_BASE);
+        // A unit above 4 still opens and acts as `UNIT_MICROHZ`: its token
+        // replaces whatever an earlier open of this request left.
+        let unit = ctx.cpu.data_register(DataRegister(0));
+        let unit = if unit <= UNIT_WAITECLOCK {
+            unit
+        } else {
+            UNIT_MICROHZ
+        };
+        ctx.mem
+            .write_u32(ioreq + IO_UNIT_OFFSET, timer_unit_token(unit));
         ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());
@@ -2692,8 +2802,7 @@ fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
     let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
-        let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
-        let duration = timeval_duration(secs, micro);
+        let duration = timer_request_duration(&*ctx.cpu, ctx.mem, ioreq);
         let retrap = ctx.timers.has_delay(ctx.current_task);
         if crate::dosdate::block_current_for(ctx, duration) {
             return Ok(());
@@ -2729,10 +2838,10 @@ fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
     let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
-        let (secs, micro) = read_timeval(ctx.mem, ioreq + TR_TIME_SECS_OFFSET);
+        let duration = timer_request_duration(&*ctx.cpu, ctx.mem, ioreq);
         ctx.timers.push(
             ioreq,
-            std::time::Instant::now() + timeval_duration(secs, micro),
+            std::time::Instant::now() + duration,
             ctx.current_task,
         );
         return Ok(());
@@ -2970,16 +3079,27 @@ fn get_sys_time_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 /// to be the same one the ticks were generated at.
 fn read_eclock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let dest = ctx.cpu.address_register(AddressRegister(0));
-    let ticks = match ctx.cpu.clock_hz() {
+    let ticks = eclock_ticks_now(&*ctx.cpu);
+    ctx.mem.write_u32(dest, (ticks >> 32) as u32);
+    ctx.mem.write_u32(dest.wrapping_add(4), ticks as u32);
+    ctx.cpu.set_data_register(DataRegister(0), ECLOCK_PAL_HZ);
+    Ok(())
+}
+
+/// The E-clock counter `ReadEClock` reports -- see [`read_eclock_handler`]
+/// for where it comes from, with and without `--clock-mhz`. Also what a
+/// `UNIT_WAITECLOCK` request is measured against.
+fn eclock_ticks_now<C: Cpu>(cpu: &C) -> u64 {
+    match cpu.clock_hz() {
         Some(clock_hz) => {
-            let emulated_secs = ctx.cpu.emulated_cycles() as f64 / clock_hz;
+            let emulated_secs = cpu.emulated_cycles() as f64 / clock_hz;
             (emulated_secs * f64::from(ECLOCK_PAL_HZ)) as u64
         }
         None => {
             // Deliberately *not* host_time_secs_micro: this counter
             // exists for interval arithmetic (its absolute value is
-            // meaningless, see this handler's doc), so it has to be
-            // monotonic. Local time is neither -- a DST transition
+            // meaningless, see `read_eclock_handler`'s doc), so it has to
+            // be monotonic. Local time is neither -- a DST transition
             // moves it by an hour, and backwards in autumn, which
             // would make a guest's elapsed-time subtraction wildly
             // wrong or negative. It also keeps `localtime_r`'s lock
@@ -2989,11 +3109,7 @@ fn read_eclock_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             u64::from(secs) * u64::from(ECLOCK_PAL_HZ)
                 + u64::from(micro) * u64::from(ECLOCK_PAL_HZ) / 1_000_000
         }
-    };
-    ctx.mem.write_u32(dest, (ticks >> 32) as u32);
-    ctx.mem.write_u32(dest.wrapping_add(4), ticks as u32);
-    ctx.cpu.set_data_register(DataRegister(0), ECLOCK_PAL_HZ);
-    Ok(())
+    }
 }
 
 /// Registers every implemented task/signal handler: `exec.library`'s
@@ -5290,6 +5406,14 @@ mod tests {
     fn run_open_timer_device_and_do_io(
         command: Option<(u16, u32, u32)>,
     ) -> (i32, Runtime<M68kCpu>, u32) {
+        run_open_timer_unit_and_do_io(0, command)
+    }
+
+    /// [`run_open_timer_device_and_do_io`] for timer unit `unit`.
+    fn run_open_timer_unit_and_do_io(
+        unit: u16,
+        command: Option<(u16, u32, u32)>,
+    ) -> (i32, Runtime<M68kCpu>, u32) {
         let entry = TRAP_TABLE_END;
         let name = b"timer.device\0";
 
@@ -5298,7 +5422,7 @@ mod tests {
         let name_idx = words.len();
         words.push(0);
         words.push(0);
-        words.push(0x7000); // moveq #0,d0 (unit)
+        words.push(0x7000 | unit); // moveq #unit,d0
         words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
         let ioreq_idx = words.len();
         words.push(0);
@@ -5942,6 +6066,107 @@ mod tests {
                 "{{{secs}, {micro}}}"
             );
         }
+    }
+
+    #[test]
+    fn timer_wait_follows_the_unit_issue_296() {
+        use std::time::Duration;
+        let hz = u64::from(ECLOCK_PAL_HZ);
+        let wait = |unit, secs, micro| {
+            // System time 1000.5 s; E-clock counter 5_000_000_000.
+            timer_wait(unit, secs, micro, || (1_000, 500_000), || 5_000_000_000_u64)
+        };
+
+        // UNIT_MICROHZ and UNIT_VBLANK: tr_time is the time to wait.
+        for unit in [UNIT_MICROHZ, 1] {
+            assert_eq!(wait(unit, 0, 250_000), Duration::from_millis(250));
+        }
+        // UNIT_ECLOCK: an EClockVal of ticks. The reporter's case was
+        // freq/4 ticks, a quarter of a second (not 177 ms of microseconds).
+        let quarter = wait(UNIT_ECLOCK, 0, (hz / 4) as u32);
+        assert!(
+            quarter.abs_diff(Duration::from_millis(250)) < Duration::from_micros(2),
+            "{quarter:?}"
+        );
+        // ... and ev_hi counts in units of 2^32 ticks, about 6054 s each.
+        let one_hi = wait(UNIT_ECLOCK, 1, 0);
+        assert_eq!(one_hi.as_secs(), (1_u64 << 32) / hz);
+        // UNIT_WAITUNTIL: the system time to wait for, not a duration.
+        assert_eq!(
+            wait(UNIT_WAITUNTIL, 1_000, 750_000),
+            Duration::from_millis(250)
+        );
+        assert_eq!(wait(UNIT_WAITUNTIL, 1_001, 0), Duration::from_millis(500));
+        // A time that has passed returns at once, down to the microsecond.
+        assert_eq!(wait(UNIT_WAITUNTIL, 990, 500_000), Duration::ZERO);
+        assert_eq!(wait(UNIT_WAITUNTIL, 1_000, 500_000), Duration::ZERO);
+        assert_eq!(wait(UNIT_WAITUNTIL, 1_000, 499_999), Duration::ZERO);
+        // UNIT_WAITECLOCK: the counter to wait for, against ReadEClock's.
+        let ahead = wait(
+            UNIT_WAITECLOCK,
+            1,
+            (5_000_000_000_u64 - (1_u64 << 32) + hz / 4) as u32,
+        );
+        assert!(
+            ahead.abs_diff(Duration::from_millis(250)) < Duration::from_micros(2),
+            "{ahead:?}"
+        );
+        assert_eq!(
+            wait(
+                UNIT_WAITECLOCK,
+                1,
+                (5_000_000_000_u64 - (1_u64 << 32) - 1) as u32
+            ),
+            Duration::ZERO,
+            "one tick in the past"
+        );
+        assert_eq!(wait(UNIT_WAITECLOCK, 0, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn open_device_records_the_timer_unit_in_io_unit_issue_296() {
+        let _guard = lock_host_break();
+        for unit in 0..=4_u16 {
+            let (_code, rt, ioreq_addr) = run_open_timer_unit_and_do_io(unit, None);
+            assert_eq!(
+                timer_unit_of(rt.memory(), ioreq_addr),
+                u32::from(unit),
+                "a request copied from the opened one must still name unit {unit}"
+            );
+            assert_ne!(
+                rt.memory().read_u32(ioreq_addr + IO_UNIT_OFFSET),
+                0,
+                "io_Unit is non-NULL for every unit, as on a real machine"
+            );
+        }
+    }
+
+    #[test]
+    fn open_device_with_a_unit_above_4_acts_as_microhz_issue_296() {
+        let _guard = lock_host_break();
+        let (_code, rt, ioreq_addr) = run_open_timer_unit_and_do_io(9, None);
+        assert_eq!(timer_unit_of(rt.memory(), ioreq_addr), UNIT_MICROHZ);
+        assert_eq!(
+            rt.memory().read_u32(ioreq_addr + IO_UNIT_OFFSET),
+            timer_unit_token(UNIT_MICROHZ),
+            "io_Unit is overwritten, not left holding an earlier open's unit"
+        );
+    }
+
+    #[test]
+    fn do_io_wait_until_a_past_time_returns_at_once_issue_296() {
+        // Before the fix a UNIT_WAITUNTIL request for system time {10, 0}
+        // (1978) was a ten-second wait; with the real semantics it is
+        // already due. The bound is far above any slow CI runner's start-up.
+        let _guard = lock_host_break();
+        let started = std::time::Instant::now();
+        let (code, _rt, _ioreq) = run_open_timer_unit_and_do_io(3, Some((TR_ADDREQUEST, 10, 0)));
+        let elapsed = started.elapsed();
+        assert_eq!(code, 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a past UNIT_WAITUNTIL time must come back at once, took {elapsed:?}"
+        );
     }
 
     #[test]

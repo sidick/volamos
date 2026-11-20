@@ -434,6 +434,25 @@ gives them a turn. Like `Delay()`, that relies on the other tasks
 making library calls: volamos doesn't preempt, so a task that
 busy-waits on memory without one keeps the CPU.
 
+A `TR_ADDREQUEST` follows its unit, as on a real machine, so the unit
+you pass to `OpenDevice` decides what `tr_time` means (a request copied
+from the opened one keeps its unit):
+
+| unit | `tr_time` holds |
+| --- | --- |
+| `UNIT_MICROHZ`, `UNIT_VBLANK` | the time to wait |
+| `UNIT_ECLOCK` | E-clock ticks to wait, as an `EClockVal` (`tv_secs` is `ev_hi`, `tv_micro` is `ev_lo`), at 709379 ticks a second |
+| `UNIT_WAITUNTIL` | the system time to wait for, on the clock `GetSysTime()` reads |
+| `UNIT_WAITECLOCK` | the E-clock counter to wait for, against what `ReadEClock()` reads |
+
+A `UNIT_WAITUNTIL` or `UNIT_WAITECLOCK` time that has already passed
+comes back at once. `UNIT_VBLANK` waits exactly the time given, with no
+rounding to a vertical blank. A unit above 4 still opens and acts as
+`UNIT_MICROHZ`. Under `--clock-mhz`, `ReadEClock()` reads emulated time,
+which only advances while the guest runs, but a request still waits out
+host time (as `Delay()` does), so a `UNIT_WAITECLOCK` request can come
+back before the emulated counter reaches its target.
+
 ## expansion.library
 
 The Zorro autoconfig bookkeeping library — and here, the truthful
