@@ -212,16 +212,29 @@ fn a_plain_key_raises_no_break_signal() {
     assert_eq!(wait_for_exit(&mut child).code(), Some(0));
 }
 
-#[test]
-fn a_break_key_reaches_a_guest_that_waits_for_it_without_reading() {
-    // fixtures/rawwait never reads: it Waits for SIGBREAKF_CTRL_D. The
-    // console raises the break whatever the guest is doing, so the key
-    // must be noticed without a Read to find it.
+/// `fixtures/rawwait` never reads: it `Wait`s for `SIGBREAKF_CTRL_D`. The
+/// console raises the break whatever the guest is doing, so the key must
+/// be noticed without a `Read` to find it -- whether it was typed before
+/// the guest reached `Wait` or while it is blocked there.
+fn rawwait_with_key_typed_after(delay: Duration) {
     let pty = open_pty();
     let mut child = pty.spawn(RAWWAIT_PATH);
     pty.read_until("READY");
+    std::thread::sleep(delay);
     pty.write(b"\x04");
     let status = wait_for_exit(&mut child);
     assert_eq!(status.code(), Some(0b001), "SIGBREAKF_CTRL_D received");
     assert!(pty.is_cooked());
+}
+
+#[test]
+fn a_break_key_reaches_a_guest_already_blocked_in_wait() {
+    // Long enough for the guest to have reached Wait and found nothing:
+    // the terminal is then the only thing that can wake it.
+    rawwait_with_key_typed_after(Duration::from_millis(500));
+}
+
+#[test]
+fn a_break_key_typed_before_the_guest_waits_is_not_lost() {
+    rawwait_with_key_typed_after(Duration::ZERO);
 }

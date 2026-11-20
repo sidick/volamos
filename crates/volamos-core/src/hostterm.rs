@@ -172,6 +172,7 @@ pub use unix::restore_stdin_mode;
 #[cfg(unix)]
 pub(crate) use unix::{
     pump_console_breaks, read_stdin, set_stdin_raw, stdin_has_key, stdin_is_tty, stdio_is_console,
+    wait_for_console_input,
 };
 
 #[cfg(not(unix))]
@@ -193,6 +194,9 @@ mod fallback {
         false
     }
     pub(crate) fn pump_console_breaks() {}
+    pub(crate) fn wait_for_console_input() -> bool {
+        false
+    }
     pub(crate) fn read_stdin(_buf: &mut [u8]) -> std::io::Result<usize> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
@@ -202,6 +206,7 @@ pub use fallback::restore_stdin_mode;
 #[cfg(not(unix))]
 pub(crate) use fallback::{
     pump_console_breaks, read_stdin, set_stdin_raw, stdin_has_key, stdin_is_tty, stdio_is_console,
+    wait_for_console_input,
 };
 
 #[cfg(unix)]
@@ -466,6 +471,25 @@ mod unix {
         if raised != 0 {
             super::PENDING_CONSOLE_BREAKS.fetch_or(raised, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Blocks until stdin has input or a signal arrives (a host `SIGINT`
+    /// interrupts the poll, so its break can be delivered). `false` if the
+    /// terminal has hung up -- it would never block again, so a caller
+    /// must not wait on it in a loop. For a `Wait` on a console break key
+    /// with nothing else that could wake it ([`crate::exectask`]).
+    pub(crate) fn wait_for_console_input() -> bool {
+        let mut pollfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if n < 0 {
+            return last_errno() == libc::EINTR;
+        }
+        pollfd.revents & libc::POLLIN != 0
+            || pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0
     }
 
     /// Whether a key can be read from stdin now or arrives within

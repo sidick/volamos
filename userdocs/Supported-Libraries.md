@@ -37,7 +37,9 @@ Changelog.
   not input: they raise `SIGBREAKF_CTRL_C`, `_D`, `_E` and `_F` on the
   main task, whether or not the guest is reading, so a guest that wants
   `Ctrl+D` as a key has to watch for the signal, as it would on an
-  Amiga. A break reaches the guest at its next library call, so a guest blocked in `Read` sees it when the read
+  Amiga; a `Wait` for one of them with nothing else to wake it waits for
+  the terminal rather than failing as a deadlock. A break reaches the
+  guest at its next library call, so a guest blocked in `Read` sees it when the read
   returns; a second `Ctrl+C` forces the exit. Output is untouched, so
   `LF` still starts a new line. `WaitForChar(fh, timeout)` waits up to
   `timeout` microseconds (unsigned, so `-1` is about 71 minutes) for a

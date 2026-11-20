@@ -1861,6 +1861,19 @@ fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
         // either once something's satisfied or once there are no more
         // pending timers to fall back on.
         if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
+            // The one thing left that can wake this task is the user at a
+            // raw console, if the guest is waiting for a break key
+            // (issue #315): wait for the terminal, then deliver whatever
+            // it raised and look again.
+            if signal_set
+                & (SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D | SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_F)
+                != 0
+                && crate::hostterm::stdin_is_raw()
+                && crate::hostterm::wait_for_console_input()
+            {
+                fold_pending_host_break(ctx.mem, ctx.tasks);
+                continue;
+            }
             // No other task could ever satisfy this, and no pending
             // timer either -- a real deadlock, not just "no
             // scheduler": fail loudly instead of hanging the host
