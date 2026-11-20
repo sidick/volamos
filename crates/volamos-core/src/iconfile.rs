@@ -258,6 +258,86 @@ impl Default for DiskObjectFile {
     }
 }
 
+/// One built-in default icon's measured properties (Kickstart 3.1,
+/// icon.library 40.1: `tools/iconprobe/results-kickstart-3.1-icon-40.1.txt`).
+struct DefaultIconSpec {
+    object_type: u8,
+    /// The gadget's size, flags and activation.
+    width: i16,
+    height: i16,
+    flags: u16,
+    activation: u16,
+    /// The picture's height (its width is the gadget's).
+    image_height: i16,
+    /// Whether there is a separate selected picture.
+    selected: bool,
+    /// Whether it is a drawer (has `DrawerData`).
+    drawer: bool,
+}
+
+const DEFAULT_ICON_SPECS: [DefaultIconSpec; 6] = [
+    DefaultIconSpec {
+        object_type: WBDISK,
+        width: 35,
+        height: 18,
+        flags: 4,
+        activation: 3,
+        image_height: 17,
+        selected: false,
+        drawer: true,
+    },
+    DefaultIconSpec {
+        object_type: WBDRAWER,
+        width: 57,
+        height: 14,
+        flags: 6,
+        activation: 3,
+        image_height: 14,
+        selected: true,
+        drawer: true,
+    },
+    DefaultIconSpec {
+        object_type: WBTOOL,
+        width: 54,
+        height: 23,
+        flags: 4,
+        activation: 1,
+        image_height: 22,
+        selected: false,
+        drawer: false,
+    },
+    DefaultIconSpec {
+        object_type: WBPROJECT,
+        width: 54,
+        height: 23,
+        flags: 5,
+        activation: 1,
+        image_height: 22,
+        selected: false,
+        drawer: false,
+    },
+    DefaultIconSpec {
+        object_type: WBGARBAGE,
+        width: 51,
+        height: 31,
+        flags: 6,
+        activation: 3,
+        image_height: 31,
+        selected: true,
+        drawer: true,
+    },
+    DefaultIconSpec {
+        object_type: WBKICK,
+        width: 35,
+        height: 18,
+        flags: 4,
+        activation: 3,
+        image_height: 17,
+        selected: false,
+        drawer: false,
+    },
+];
+
 impl DiskObjectFile {
     /// What `GetDiskObject(NULL)` hands back: "a DiskObject structure
     /// allocated for you", which on a real Kickstart 3.1 (icon.library
@@ -287,24 +367,25 @@ impl DiskObjectFile {
     /// real size and depth: nothing here draws, and the artwork is
     /// Commodore's. A trashcan is a drawer, a Kickstart icon is not.
     pub fn builtin_default(object_type: u8) -> Self {
-        // (width, height, gadget flags, activation, image height,
-        // has a selected image, is a drawer)
-        let Some((width, height, flags, activation, image_height, selected, drawer)) =
-            (match object_type {
-                WBDISK => Some((35, 18, 4, 3, 17, false, true)),
-                WBDRAWER => Some((57, 14, 6, 3, 14, true, true)),
-                WBTOOL => Some((54, 23, 4, 1, 22, false, false)),
-                WBPROJECT => Some((54, 23, 5, 1, 22, false, false)),
-                WBGARBAGE => Some((51, 31, 6, 3, 31, true, true)),
-                WBKICK => Some((35, 18, 4, 3, 17, false, false)),
-                _ => None,
-            })
+        let Some(spec) = DEFAULT_ICON_SPECS
+            .iter()
+            .find(|d| d.object_type == object_type)
         else {
             return DiskObjectFile {
                 object_type,
                 ..DiskObjectFile::default()
             };
         };
+        let DefaultIconSpec {
+            width,
+            height,
+            flags,
+            activation,
+            image_height,
+            selected,
+            drawer,
+            ..
+        } = *spec;
         let image = || IconImage {
             width,
             height: image_height,

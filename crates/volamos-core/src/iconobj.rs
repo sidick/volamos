@@ -366,6 +366,19 @@ pub fn read_disk_object(mem: &dyn AddressSpace, obj: u32) -> Result<DiskObjectFi
     })
 }
 
+/// The object `GetDiskObject(NULL)` allocates: a `DiskObject` and
+/// `FreeList` like any other (so `FreeDiskObject` works), but all zeros
+/// in the `DiskObject` itself, the magic word included, as real Kickstart
+/// 3.1 gives ([`DiskObjectFile::empty`]).
+pub fn build_zero_disk_object(
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+) -> Result<u32, NoMemory> {
+    let obj = build_disk_object(heap, mem, &DiskObjectFile::empty())?;
+    zero(mem, obj, DISK_OBJECT_MEM_SIZE);
+    Ok(obj)
+}
+
 /// Builds the guest `DiskObject` (with its `FreeList` and everything it
 /// points at) for `icon`, returning its address.
 ///

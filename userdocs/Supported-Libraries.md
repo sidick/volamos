@@ -510,7 +510,7 @@ all — so it always opens. Reading and writing icons both work.
 - `GetDiskObjectNew` falls back to the default for the object's type
   when there is no icon file: a volume root is a disk, any other
   directory a drawer, and a file a tool — unless its execute bit is
-  denied (`Protect +e`, kept in the file's [`.uaem`](Volumes-and-Assigns.md)
+  denied (`Protect -e`, kept in the file's [`.uaem`](Volumes-and-Assigns.md)
   sidecar), when it is a project. A plain file with no protection bits
   is therefore a *tool*, whatever it holds; that is what a real 3.1
   does.

@@ -41,6 +41,8 @@ const DOSFALSE: u32 = 0;
 /// `FIBB_WRITE`'s bit position (per `dos/dos.h`); set means "the file
 /// system refuses to modify the file" (write-protected).
 const FIBF_WRITE: u32 = 1 << 2;
+/// `FIBF_EXECUTE`: set means the file may *not* be executed.
+pub(crate) const FIBF_EXECUTE: u32 = 1 << 1;
 
 /// Sets or clears write protection on `perms`. On Unix, clearing it
 /// restores only the *owner* write bit: `Permissions::set_readonly(false)`

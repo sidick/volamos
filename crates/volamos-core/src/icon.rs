@@ -72,7 +72,7 @@ use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{DispatchError, HandlerContext, ICON_LIBRARY_BASE, LibraryTable};
 use crate::dosfile::map_vfs_error;
 use crate::guestmem::read_c_string;
-use crate::iconfile::{DiskObjectFile, WBDISK, WBDRAWER, WBPROJECT, WBTOOL};
+use crate::iconfile::{DiskObjectFile, WBDEVICE, WBDISK, WBDRAWER, WBPROJECT, WBTOOL};
 use crate::lvos::icon::ICON_LVOS;
 use crate::memory::AddressSpace;
 use crate::utility::amiga_tolower;
@@ -166,14 +166,12 @@ fn deliver<C: Cpu>(ctx: &mut HandlerContext<'_, C>, icon: &DiskObjectFile) {
     }
 }
 
-/// The object `GetDiskObject(NULL)` allocates: all zeros, magic included
-/// ([`DiskObjectFile::empty`]), with a `FreeList` so `FreeDiskObject`
-/// works on it.
+/// `GetDiskObject(NULL)`'s all-zero object ([`crate::iconobj::build_zero_disk_object`]),
+/// or `NULL` + `ERROR_NO_FREE_STORE`.
 fn deliver_empty<C: Cpu>(ctx: &mut HandlerContext<'_, C>) {
-    deliver(ctx, &DiskObjectFile::empty());
-    let obj = ctx.cpu.data_register(DataRegister(0));
-    if obj != 0 {
-        ctx.mem.write_u16(obj, 0);
+    match crate::iconobj::build_zero_disk_object(ctx.heap, ctx.mem) {
+        Ok(obj) => ctx.cpu.set_data_register(DataRegister(0), obj),
+        Err(crate::iconobj::NoMemory) => fail(ctx, crate::dosfile::ERROR_NO_FREE_STORE),
     }
 }
 
@@ -203,16 +201,14 @@ fn get_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 
 /// The `def_type` for an object that has no icon file of its own, for
 /// `GetDiskObjectNew`: a volume root is a disk, any other directory a
-/// drawer, a file a tool unless its execute bit is denied (`Protect
-/// +e`... that is, `FIBF_EXECUTE` set), when it is a project. That last
+/// drawer, a file a tool unless its execute bit is denied (`Protect -e`,
+/// that is `FIBF_EXECUTE` set), when it is a project. That last
 /// test is what real Kickstart 3.1 does (icon.library 40.1, measured on
 /// Copperline, phase 0 of #313): a plain file with no protection bits is a
 /// *tool*, whatever it contains. Host files have no protection bits of
 /// their own; the `.uaem` sidecar's ([`crate::dosmeta`]) are used, `0`
 /// without one. `None` when `name` is not there at all.
 fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8> {
-    /// `FIBF_EXECUTE`: set means the file may *not* be executed.
-    const FIBF_EXECUTE: u32 = 1 << 1;
     let vfs = ctx.dos.vfs.as_ref()?;
     let host = vfs.resolve(name, ResolveMode::MustExist).ok()?;
     if host.is_dir() {
@@ -225,7 +221,7 @@ fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8
         return Some(if is_root { WBDISK } else { WBDRAWER });
     }
     let protection = crate::dosmeta::read_sidecar(&host).map_or(0, |meta| meta.prot);
-    Some(if protection & FIBF_EXECUTE == 0 {
+    Some(if protection & crate::dosprotect::FIBF_EXECUTE == 0 {
         WBTOOL
     } else {
         WBPROJECT
@@ -251,11 +247,7 @@ fn get_disk_object_new_handler<C: Cpu>(
         // unreadable one is the caller's to hear about, not to overwrite.
         Err(code) if !is_missing(code) => fail(ctx, code),
         Err(code) => match default_type_for(ctx, &name) {
-            Some(def_type) => match default_icon(
-                ctx,
-                def_type as u32,
-                default_icon_name(def_type as u32).expect("a type default_type_for returns"),
-            ) {
+            Some(def_type) => match default_icon(ctx, def_type as u32) {
                 Ok(icon) => deliver(ctx, &icon),
                 Err(code) => fail(ctx, code),
             },
@@ -273,11 +265,8 @@ fn get_disk_object_new_handler<C: Cpu>(
 /// a reason to quietly use the built-in. Both `GetDefDiskObject` and
 /// `GetDiskObjectNew` answer through this, so a bad file gets the same
 /// outcome from each.
-fn default_icon(
-    ctx: &HandlerContext<'_, impl Cpu>,
-    def_type: u32,
-    name: &str,
-) -> Result<DiskObjectFile, i32> {
+fn default_icon(ctx: &HandlerContext<'_, impl Cpu>, def_type: u32) -> Result<DiskObjectFile, i32> {
+    let name = default_icon_name(def_type).ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
     match load_icon(ctx, &format!("ENV:Sys/def_{name}.info")) {
         Err(code) if is_missing(code) => Ok(DiskObjectFile::builtin_default(def_type as u8)),
         other => other,
@@ -301,18 +290,16 @@ fn default_icon_name(def_type: u32) -> Option<&'static str> {
 fn get_def_disk_object_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
-    /// `WBDEVICE`: in 3.1's type range, but with no default icon.
-    const WBDEVICE_TYPE: u32 = 6;
     let def_type = ctx.cpu.data_register(DataRegister(0));
-    let Some(name) = default_icon_name(def_type) else {
-        if def_type == WBDEVICE_TYPE {
+    if default_icon_name(def_type).is_none() {
+        if def_type == WBDEVICE as u32 {
             fail(ctx, crate::dosfile::ERROR_OBJECT_NOT_FOUND);
         } else {
             ctx.cpu.set_data_register(DataRegister(0), 0);
         }
         return Ok(());
-    };
-    match default_icon(ctx, def_type, name) {
+    }
+    match default_icon(ctx, def_type) {
         Ok(icon) => deliver(ctx, &icon),
         Err(code) => fail(ctx, code),
     }
@@ -583,6 +570,11 @@ fn match_tool_value_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
+/// `BumpRevisionLength` (3.2) refuses a limit of this or less for a
+/// numbered copy, whatever the number: measured as 19 with `Copy_2_of_foo`
+/// refused at 19 and made at 20.
+const V47_NUMBERED_COPY_ROOM: usize = 19;
+
 /// Which library's `BumpRevision` naming rules.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BumpStyle {
@@ -631,14 +623,21 @@ fn bump_revision(old: &[u8], max: usize, style: BumpStyle) -> Option<Vec<u8>> {
             Some((n, rest))
         })
         .or_else(|| {
-            let dropped = old.get(..5).filter(|h| h[4] == b'_' || h[4] == b' ')?;
-            (style == BumpStyle::V47 && dropped[..4].eq_ignore_ascii_case(b"copy"))
+            // V47 only: `copy_` or `copy ` is dropped and the rest counts as
+            // a first copy.
+            if style != BumpStyle::V47 {
+                return None;
+            }
+            let head = old.get(..5)?;
+            ((head[4] == b'_' || head[4] == b' ') && head[..4].eq_ignore_ascii_case(b"copy"))
                 .then(|| (1u64, &old[5..]))
         });
     let (count, rest) = match counted {
         Some((n, rest)) => (Some(n.saturating_add(1)), rest),
         None => (None, old),
     };
+    // V47 writes a first copy as plain `Copy_of_`; V40 numbers every
+    // copy of an already-copied name.
     let numbered = match (style, count) {
         (BumpStyle::V47, Some(1)) | (_, None) => None,
         (_, n) => n,
@@ -648,7 +647,11 @@ fn bump_revision(old: &[u8], max: usize, style: BumpStyle) -> Option<Vec<u8>> {
         None => b"Copy_of_".to_vec(),
     };
     if style == BumpStyle::V47 {
-        let room = if numbered.is_some() { 19 } else { new.len() };
+        let room = if numbered.is_some() {
+            V47_NUMBERED_COPY_ROOM
+        } else {
+            new.len()
+        };
         if max <= room {
             return None;
         }
@@ -1086,11 +1089,18 @@ mod tests {
     fn get_disk_object_new_falls_back_to_a_default_of_the_objects_type() {
         let tmp = TempDir::new("new");
         fs::create_dir(tmp.path().join("adrawer")).unwrap();
+        fs::write(tmp.path().join("allowed"), b"plain text").unwrap();
+        // ...and one that leaves execute allowed is still a tool.
+        fs::write(
+            tmp.path().join("allowed.uaem"),
+            b"----rwed 2025-01-01 00:00:00.00\n",
+        )
+        .unwrap();
         fs::write(tmp.path().join("locked"), b"plain text").unwrap();
-        // `Protect locked +e`'s sidecar: FIBF_EXECUTE denied.
+        // `Protect locked -e`'s sidecar: FIBF_EXECUTE denied.
         fs::write(
             tmp.path().join("locked.uaem"),
-            b"----ts-- 2025-01-01 00:00:00.00 \n",
+            b"----rw-d 2025-01-01 00:00:00.00\n",
         )
         .unwrap();
         fs::write(tmp.path().join("notes.txt"), b"plain text").unwrap();
@@ -1101,6 +1111,7 @@ mod tests {
             "real 3.1: a file with no protection bits is a tool, whatever it holds"
         );
         assert_eq!(new_type(&tmp, "locked").1, WBPROJECT, "execute denied");
+        assert_eq!(new_type(&tmp, "allowed").1, WBTOOL, "execute allowed");
         assert_eq!(new_type(&tmp, "").1, WBDISK, "a volume root");
     }
 
