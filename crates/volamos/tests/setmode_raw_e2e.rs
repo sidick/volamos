@@ -21,6 +21,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const RAWTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/rawtest");
+const RAWWAIT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/rawwait");
+const RAWBREAK_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/rawbreak");
 
 /// Long enough for a slow CI runner to start the binary, short enough
 /// that a hang fails the test instead of the job.
@@ -105,9 +107,13 @@ impl Pty {
     }
 
     fn spawn_rawtest(&self) -> Child {
+        self.spawn(RAWTEST_PATH)
+    }
+
+    fn spawn(&self, program: &str) -> Child {
         let stdio = || Stdio::from(self.slave.try_clone().expect("dup the slave"));
         Command::new(env!("CARGO_BIN_EXE_volamos"))
-            .arg(RAWTEST_PATH)
+            .arg(program)
             .stdin(stdio())
             .stdout(stdio())
             .stderr(stdio())
@@ -176,4 +182,46 @@ fn a_host_sigterm_while_raw_restores_the_terminal() {
         pty.is_cooked(),
         "a forced exit must not leave the terminal raw"
     );
+}
+
+#[test]
+fn ctrl_d_e_f_in_raw_mode_are_break_signals_not_input() {
+    // fixtures/rawbreak reads ONE key, then exits with the break signals
+    // pending (bit 0 = Ctrl+D, 1 = Ctrl+E, 2 = Ctrl+F). Ctrl+D and Ctrl+F
+    // typed first must not be that key -- the read goes on to the `x` --
+    // and must arrive as signals.
+    let pty = open_pty();
+    let mut child = pty.spawn(RAWBREAK_PATH);
+    pty.read_until("READY");
+    pty.write(b"\x04\x06x");
+    let status = wait_for_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(0b101),
+        "Ctrl+D and Ctrl+F raised as SIGBREAKF_CTRL_D and _F"
+    );
+    assert!(pty.is_cooked(), "and the terminal is restored");
+}
+
+#[test]
+fn a_plain_key_raises_no_break_signal() {
+    let pty = open_pty();
+    let mut child = pty.spawn(RAWBREAK_PATH);
+    pty.read_until("READY");
+    pty.write(b"z");
+    assert_eq!(wait_for_exit(&mut child).code(), Some(0));
+}
+
+#[test]
+fn a_break_key_reaches_a_guest_that_waits_for_it_without_reading() {
+    // fixtures/rawwait never reads: it Waits for SIGBREAKF_CTRL_D. The
+    // console raises the break whatever the guest is doing, so the key
+    // must be noticed without a Read to find it.
+    let pty = open_pty();
+    let mut child = pty.spawn(RAWWAIT_PATH);
+    pty.read_until("READY");
+    pty.write(b"\x04");
+    let status = wait_for_exit(&mut child);
+    assert_eq!(status.code(), Some(0b001), "SIGBREAKF_CTRL_D received");
+    assert!(pty.is_cooked());
 }

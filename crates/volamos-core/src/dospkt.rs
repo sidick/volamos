@@ -115,6 +115,9 @@ const ACTION_SET_OWNER: u32 = 1036;
 const ACTION_MAKE_LINK: u32 = 1021;
 const ACTION_SET_FILE_SIZE: u32 = 1022;
 const ACTION_WAIT_CHAR: u32 = 20;
+/// `ACTION_SCREEN_MODE` (994): `dp_Arg1` = the mode (0 `CON:`, 1 `RAW:`,
+/// 2 medium), what `SetMode` sends.
+const ACTION_SCREEN_MODE: u32 = 994;
 
 /// `ACTION_MAKE_LINK`'s `dp_Arg4` for a soft link (`LINK_SOFT`, dos/dos.h).
 const LINK_SOFT: u32 = 1;
@@ -690,9 +693,33 @@ fn service_action<C: Cpu>(
             (DOSTRUE, 0)
         }
         // ACTION_WAIT_CHAR (20): Arg1 = timeout in microseconds. Res1 =
-        // whether a character arrived; never here, as for the
-        // WaitForChar call.
-        ACTION_WAIT_CHAR => (DOSFALSE, 0),
+        // whether a character arrived: the host terminal's answer when
+        // stdin is one, never otherwise -- as for the WaitForChar call.
+        // Every file and console handle shares this one port, so the
+        // packet cannot say which console it means; there is only the
+        // host's.
+        ACTION_WAIT_CHAR => {
+            let ready = crate::hostterm::stdin_is_tty()
+                && crate::hostterm::stdin_has_key(std::time::Duration::from_micros(u64::from(
+                    arg1,
+                )));
+            (if ready { DOSTRUE } else { DOSFALSE }, 0)
+        }
+        // ACTION_SCREEN_MODE (994): Arg1 = the mode, as for SetMode (issue
+        // #315): 1 puts the host terminal in raw mode, 0 and 2 in cooked.
+        // As above, the packet cannot name its console. Without a
+        // terminal there is none, so it is an action not known, as before.
+        ACTION_SCREEN_MODE if crate::hostterm::stdin_is_tty() => {
+            let raw = match arg1 {
+                1 => Some(true),
+                0 | 2 => Some(false),
+                _ => None,
+            };
+            match raw.map_or(Ok(()), crate::hostterm::set_stdin_raw) {
+                Ok(()) => (DOSTRUE, 0),
+                Err(_) => (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32),
+            }
+        }
         // A handler answers an action it does not know with DOSFALSE:
         // RESULT_ERROR (-1) would read as DOSTRUE to a caller of a
         // boolean action, which would then believe it succeeded.
@@ -1782,6 +1809,19 @@ mod tests {
         let (res1, res2, _, _) =
             run_path_packet(&dir, ACTION_WAIT_CHAR, vec![PktArg::Raw(1_000_000)]);
         assert_eq!((res1, res2), (DOSFALSE, 0));
+    }
+
+    #[test]
+    fn screen_mode_packet_is_an_action_not_known_without_a_terminal_315() {
+        // With stdin a terminal the packet switches it (see hostterm), so
+        // this only means something under a pipe, as CI runs it; a
+        // developer's own terminal must not be switched by a test.
+        if crate::hostterm::stdin_is_tty() {
+            return;
+        }
+        let dir = TempDir::new("pkt-screenmode");
+        let (res1, res2, _, _) = run_path_packet(&dir, ACTION_SCREEN_MODE, vec![PktArg::Raw(1)]);
+        assert_eq!((res1, res2), (DOSFALSE, ERROR_ACTION_NOT_KNOWN as u32));
     }
 
     // --- issue #186: AllocDosObject(DOS_FILEHANDLE) + packet-level

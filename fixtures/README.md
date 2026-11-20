@@ -1345,3 +1345,16 @@ vasm, like its siblings). It:
 
 Used by `crates/volamos/tests/setmode_raw_e2e.rs`, which runs it on a
 pseudo-terminal.
+
+`rawbreak` (`gen_rawbreak.py`) is its sibling for the console break keys:
+it switches to raw, prints `READY`, reads one byte, then exits with the
+break signals pending (`SetSignal(0, 0) >> 13 & 7`: bit 0 = `Ctrl+D`, bit
+1 = `Ctrl+E`, bit 2 = `Ctrl+F`). In raw mode those keys are raised as
+`SIGBREAKF_CTRL_D`/`E`/`F` and are not input, so the read goes on to the
+next byte. Used by the same e2e test.
+
+`rawwait` (also from `gen_rawbreak.py`) does the same without the read:
+it `Wait`s for `SIGBREAKF_CTRL_D` and exits with the signals it
+received, since the console raises the break whatever the guest is
+doing.
+

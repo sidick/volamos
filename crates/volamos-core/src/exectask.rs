@@ -580,6 +580,11 @@ pub const NT_PROCESS: u8 = 13;
 /// what a real AmigaOS Shell maps a host Ctrl-C onto, and what
 /// [`fold_pending_host_break`] folds a host `SIGINT`/`SIGTERM` into.
 pub const SIGBREAKF_CTRL_C: u32 = 1 << 12;
+/// `SIGBREAKF_CTRL_D`/`E`/`F` (bits 13-15), per `<exec/exec.h>`: what the
+/// console raises for `Ctrl+D`/`E`/`F` in raw mode ([`crate::hostterm`]).
+pub const SIGBREAKF_CTRL_D: u32 = 1 << 13;
+pub const SIGBREAKF_CTRL_E: u32 = 1 << 14;
+pub const SIGBREAKF_CTRL_F: u32 = 1 << 15;
 
 /// Initial value of `tc_SigAlloc`: signal bits 0-15 are reserved for
 /// system use and start out pre-allocated on a real kernel (`AllocSignal`
@@ -777,9 +782,16 @@ pub fn install_host_break_handler() {
 /// woken main task still only runs at the next switch point -- there is
 /// no preemption).
 pub fn fold_pending_host_break<M: AddressSpace>(mem: &mut M, tasks: &mut TaskScheduler) {
+    // `Ctrl+D`/`E`/`F` typed in raw mode (issue #315) travel with the
+    // `SIGINT`: the same console, the same task, the same delivery points.
+    crate::hostterm::pump_console_breaks();
+    let mut breaks = crate::hostterm::take_console_breaks();
     if PENDING_HOST_BREAK.swap(false, Ordering::SeqCst) {
+        breaks |= SIGBREAKF_CTRL_C;
+    }
+    if breaks != 0 {
         let main = tasks.main();
-        let recvd = mem.read_u32(main + TC_SIGRECVD) | SIGBREAKF_CTRL_C;
+        let recvd = mem.read_u32(main + TC_SIGRECVD) | breaks;
         mem.write_u32(main + TC_SIGRECVD, recvd);
         if main != tasks.current() {
             tasks.wake_if_signal_matches(main, recvd);

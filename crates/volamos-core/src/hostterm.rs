@@ -36,13 +36,20 @@
 //!   stops it before that. `VQUIT` and `VSUSP` (and `VDSUSP`
 //!   where it exists) are disabled instead, so `Ctrl+\` and `Ctrl+Z`
 //!   arrive as bytes, as they do from the Amiga console. `Ctrl+D`,
-//!   `Ctrl+E` and `Ctrl+F` also arrive as bytes: the real console turns
-//!   them into `SIGBREAKF_CTRL_D`/`E`/`F`, which this does not.
+//!   `Ctrl+E` and `Ctrl+F` do not arrive at all: as on the real console
+//!   they are taken out of the input and raised as `SIGBREAKF_CTRL_D`,
+//!   `SIGBREAKF_CTRL_E` and `SIGBREAKF_CTRL_F` ([`strip_console_breaks`]).
+//!   A guest that wants `Ctrl+D` as a key (an end-of-input convention) has
+//!   to watch for the signal instead, as it would on an Amiga.
 //! - Output processing (`OPOST`) is left alone, so a guest's `LF` still
 //!   moves to the start of the next line.
 //!
 //! `SetMode(fh, 0)` restores the settings saved at the first switch.
-//! (`SetMode(fh, 2)`, the V47 medium mode, is treated as cooked.)
+//! (`SetMode(fh, 2)`, the V47 medium mode, is treated as cooked.) A guest
+//! that talks to the console by hand gets the same through
+//! `ACTION_SCREEN_MODE` and `ACTION_WAIT_CHAR` packets
+//! (`crate::dospkt`): every handle shares one packet port, so a packet
+//! cannot name its console and acts on the host's.
 //!
 //! # Leaving the terminal as it was
 //!
@@ -72,12 +79,100 @@
 //! far as this module is concerned, so `SetMode` and `WaitForChar` keep
 //! their old answers.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
+
+/// Whether `SetMode` has the console in raw mode right now.
+static RAW: AtomicBool = AtomicBool::new(false);
+
+/// Break signals (`SIGBREAKF_CTRL_D`/`E`/`F`) raised by keys typed in raw
+/// mode and not yet delivered: [`crate::exectask::fold_pending_host_break`]
+/// takes them, as it does a host `SIGINT`'s `SIGBREAKF_CTRL_C`.
+static PENDING_CONSOLE_BREAKS: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the console is in raw mode (`SetMode(fh, 1)`).
+pub(crate) fn stdin_is_raw() -> bool {
+    RAW.load(Ordering::SeqCst)
+}
+
+/// Takes and clears the pending console break signals.
+pub(crate) fn take_console_breaks() -> u32 {
+    PENDING_CONSOLE_BREAKS.swap(0, Ordering::SeqCst)
+}
+
+/// Removes `Ctrl+D`, `Ctrl+E` and `Ctrl+F` from raw-mode input and raises
+/// the break signals they stand for instead, as the console does ("the
+/// keystrokes `Ctrl+C` to `Ctrl+F` are always interpreted and send break
+/// signals instead of their ASCII codes" -- `Ctrl+C` is the host `SIGINT`
+/// here). Compacts `buf` and returns how many bytes are left.
+pub(crate) fn strip_console_breaks(buf: &mut [u8]) -> usize {
+    let (kept, raised) = strip_breaks(buf);
+    if raised != 0 {
+        PENDING_CONSOLE_BREAKS.fetch_or(raised, Ordering::SeqCst);
+    }
+    kept
+}
+
+/// [`strip_console_breaks`] without the side effect: the bytes kept and
+/// the break signals the removed ones stand for.
+fn strip_breaks(buf: &mut [u8]) -> (usize, u32) {
+    use crate::exectask::{SIGBREAKF_CTRL_D, SIGBREAKF_CTRL_E, SIGBREAKF_CTRL_F};
+    let mut raised = 0;
+    let mut kept = 0;
+    for i in 0..buf.len() {
+        let byte = buf[i];
+        match byte {
+            0x04 => raised |= SIGBREAKF_CTRL_D,
+            0x05 => raised |= SIGBREAKF_CTRL_E,
+            0x06 => raised |= SIGBREAKF_CTRL_F,
+            _ => {
+                buf[kept] = byte;
+                kept += 1;
+            }
+        }
+    }
+    (kept, raised)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exectask::{SIGBREAKF_CTRL_D, SIGBREAKF_CTRL_E, SIGBREAKF_CTRL_F};
+
+    #[test]
+    fn ctrl_d_e_f_become_break_signals_and_leave_the_input_315() {
+        let mut buf = *b"a\x04b\x05\x06c";
+        let (kept, raised) = strip_breaks(&mut buf);
+        assert_eq!(&buf[..kept], b"abc");
+        assert_eq!(
+            raised,
+            SIGBREAKF_CTRL_D | SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_F
+        );
+    }
+
+    #[test]
+    fn input_without_those_keys_is_untouched_315() {
+        // Ctrl-C (0x03) never arrives as a byte (ISIG); Ctrl-\ and Ctrl-Z
+        // (0x1c, 0x1a) are ordinary raw input, and so is CR.
+        let mut buf = *b"\x03\x1c\x1a\rx";
+        let (kept, raised) = strip_breaks(&mut buf);
+        assert_eq!((kept, raised), (5, 0));
+        assert_eq!(&buf, b"\x03\x1c\x1a\rx");
+    }
+
+    #[test]
+    fn a_read_of_only_break_keys_keeps_nothing_315() {
+        let mut buf = [0x04, 0x04];
+        assert_eq!(strip_breaks(&mut buf), (0, SIGBREAKF_CTRL_D));
+    }
+}
 
 #[cfg(unix)]
 pub use unix::restore_stdin_mode;
 #[cfg(unix)]
-pub(crate) use unix::{read_stdin, set_stdin_raw, stdin_is_tty, stdin_ready, stdio_is_console};
+pub(crate) use unix::{
+    pump_console_breaks, read_stdin, set_stdin_raw, stdin_has_key, stdin_is_tty, stdio_is_console,
+};
 
 #[cfg(not(unix))]
 mod fallback {
@@ -94,9 +189,10 @@ mod fallback {
     pub(crate) fn set_stdin_raw(_raw: bool) -> Result<(), i32> {
         Ok(())
     }
-    pub(crate) fn stdin_ready(_timeout: Duration) -> bool {
+    pub(crate) fn stdin_has_key(_timeout: Duration) -> bool {
         false
     }
+    pub(crate) fn pump_console_breaks() {}
     pub(crate) fn read_stdin(_buf: &mut [u8]) -> std::io::Result<usize> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
@@ -104,7 +200,9 @@ mod fallback {
 #[cfg(not(unix))]
 pub use fallback::restore_stdin_mode;
 #[cfg(not(unix))]
-pub(crate) use fallback::{read_stdin, set_stdin_raw, stdin_is_tty, stdin_ready, stdio_is_console};
+pub(crate) use fallback::{
+    pump_console_breaks, read_stdin, set_stdin_raw, stdin_has_key, stdin_is_tty, stdio_is_console,
+};
 
 #[cfg(unix)]
 mod unix {
@@ -227,6 +325,7 @@ mod unix {
         let mut term = STDIN_TERM.lock().unwrap_or_else(|e| e.into_inner());
         let first = term.saved.is_none();
         term.set_raw(raw)?;
+        super::RAW.store(raw, std::sync::atomic::Ordering::SeqCst);
         if first {
             register_exit_hook();
         }
@@ -241,6 +340,7 @@ mod unix {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .restore();
+        super::RAW.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     extern "C" fn restore_at_exit() {
@@ -299,9 +399,93 @@ mod unix {
         }
     }
 
-    /// Reads from stdin without `std`'s buffer; see the module docs.
+    /// Keys read ahead of the guest while it was not reading, with
+    /// `Ctrl+D`/`E`/`F` already taken out: see [`pump_console_breaks`].
+    static LOOKAHEAD: Mutex<std::collections::VecDeque<u8>> =
+        Mutex::new(std::collections::VecDeque::new());
+
+    fn lookahead() -> std::sync::MutexGuard<'static, std::collections::VecDeque<u8>> {
+        LOOKAHEAD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reads from stdin without `std`'s buffer; see the module docs. In raw
+    /// mode `Ctrl+D`/`E`/`F` are not input but break signals
+    /// ([`super::strip_console_breaks`]), so a read that finds only those
+    /// goes on waiting for a key; keys [`pump_console_breaks`] already read
+    /// ahead come first.
     pub(crate) fn read_stdin(buf: &mut [u8]) -> std::io::Result<usize> {
-        read_fd(libc::STDIN_FILENO, buf)
+        loop {
+            {
+                let mut ahead = lookahead();
+                if !ahead.is_empty() && !buf.is_empty() {
+                    let n = buf.len().min(ahead.len());
+                    for slot in &mut buf[..n] {
+                        *slot = ahead.pop_front().unwrap_or(0);
+                    }
+                    return Ok(n);
+                }
+            }
+            let n = read_fd(libc::STDIN_FILENO, buf)?;
+            if n == 0 || !super::stdin_is_raw() {
+                return Ok(n);
+            }
+            let kept = super::strip_console_breaks(&mut buf[..n]);
+            if kept > 0 {
+                return Ok(kept);
+            }
+        }
+    }
+
+    /// In raw mode, reads whatever is waiting on `fd` into `ahead` with
+    /// `Ctrl+D`/`E`/`F` taken out, and returns the break signals they
+    /// stand for. Never blocks.
+    pub(super) fn pump_from(fd: i32, ahead: &mut std::collections::VecDeque<u8>) -> u32 {
+        if !fd_ready(fd, Duration::ZERO) {
+            return 0;
+        }
+        let mut buf = [0u8; 256];
+        let Ok(n) = read_fd(fd, &mut buf) else {
+            return 0;
+        };
+        let (kept, raised) = super::strip_breaks(&mut buf[..n]);
+        ahead.extend(&buf[..kept]);
+        raised
+    }
+
+    /// Notices `Ctrl+D`/`E`/`F` typed while the guest is not reading, so a
+    /// guest that `Wait`s for the signal gets it (the real console raises
+    /// it whatever the guest is doing). Called from
+    /// [`crate::exectask::fold_pending_host_break`], i.e. at every library
+    /// call; does nothing unless the console is raw. The other keys read
+    /// are kept, in order, for the guest's next read.
+    pub(crate) fn pump_console_breaks() {
+        if !super::stdin_is_raw() {
+            return;
+        }
+        let raised = pump_from(libc::STDIN_FILENO, &mut lookahead());
+        if raised != 0 {
+            super::PENDING_CONSOLE_BREAKS.fetch_or(raised, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a key can be read from stdin now or arrives within
+    /// `timeout`. In raw mode a `Ctrl+D`/`E`/`F` is a break signal, not a
+    /// key, so those do not count (and are raised as they are noticed).
+    pub(crate) fn stdin_has_key(timeout: Duration) -> bool {
+        if !super::stdin_is_raw() {
+            return stdin_ready(timeout);
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            pump_console_breaks();
+            if !lookahead().is_empty() {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline || !stdin_ready(deadline - now) {
+                return false;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -430,6 +614,27 @@ mod unix {
             );
             assert_eq!(unsafe { libc::write(master, b"\n".as_ptr().cast(), 1) }, 1);
             assert!(fd_ready(slave, Duration::from_secs(2)));
+            close(&[master, slave]);
+        }
+
+        #[test]
+        fn pump_takes_break_keys_out_and_keeps_the_rest_in_order_315() {
+            let (master, slave) = pty();
+            let mut term = Term::new(slave);
+            term.set_raw(true).expect("raw");
+            let mut ahead = std::collections::VecDeque::new();
+
+            assert_eq!(pump_from(slave, &mut ahead), 0, "nothing typed: no wait");
+            assert_eq!(
+                unsafe { libc::write(master, b"a\x04b\x06".as_ptr().cast(), 4) },
+                4
+            );
+            let raised = pump_from(slave, &mut ahead);
+            assert_eq!(
+                raised,
+                crate::exectask::SIGBREAKF_CTRL_D | crate::exectask::SIGBREAKF_CTRL_F
+            );
+            assert_eq!(ahead.iter().copied().collect::<Vec<_>>(), b"ab");
             close(&[master, slave]);
         }
 

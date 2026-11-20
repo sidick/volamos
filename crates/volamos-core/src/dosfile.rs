@@ -1162,11 +1162,12 @@ impl DosState {
                 // `WaitForChar` and `SetMode`'s raw mode see the same
                 // bytes the guest will (see `crate::hostterm`).
                 let n = if crate::hostterm::stdin_is_tty() {
-                    crate::hostterm::read_stdin(&mut buf)
+                    crate::hostterm::read_stdin(&mut buf).map_err(|e| map_io_error(&e))?
                 } else {
-                    std::io::stdin().read(&mut buf)
-                }
-                .map_err(|e| map_io_error(&e))?;
+                    std::io::stdin()
+                        .read(&mut buf)
+                        .map_err(|e| map_io_error(&e))?
+                };
                 buf.truncate(n);
                 Ok(buf)
             }
@@ -1843,7 +1844,7 @@ fn wait_for_char_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), 
     if bptr != 0 {
         let addr = addr_from_bptr(bptr);
         if ctx.dos.is_host_console(addr) {
-            ready = crate::hostterm::stdin_ready(std::time::Duration::from_micros(u64::from(
+            ready = crate::hostterm::stdin_has_key(std::time::Duration::from_micros(u64::from(
                 timeout_us,
             )));
         }
