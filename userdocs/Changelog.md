@@ -3,6 +3,33 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.22.0](https://github.com/sidick/volamos/compare/v0.21.0...v0.22.0) (2026-11-20)
+
+
+### Features
+
+* **cli:** give a program's own directory a volume when none covers it ([#400](https://github.com/sidick/volamos/issues/400)) ([7956999](https://github.com/sidick/volamos/commit/7956999110468b45ff92de26e6993f99f45b6e8e))
+* **cli:** start a program as Workbench does with --workbench ([#391](https://github.com/sidick/volamos/issues/391)) ([653d5c3](https://github.com/sidick/volamos/commit/653d5c327591392e69b8e23621bc25a4901bcc78))
+* **icon:** add BumpRevisionLength and cover ColorIcon/NewIcons reads ([#397](https://github.com/sidick/volamos/issues/397)) ([3d79e87](https://github.com/sidick/volamos/commit/3d79e879cac2897a3f16fdc600b76b59fd337d2c))
+* **icon:** parse and write the classic .info file format ([#393](https://github.com/sidick/volamos/issues/393)) ([e680345](https://github.com/sidick/volamos/commit/e68034546071be9514ba8b62d9b5fe8115d59382))
+* **icon:** read .info files into guest DiskObjects ([#394](https://github.com/sidick/volamos/issues/394)) ([80e5925](https://github.com/sidick/volamos/commit/80e592577557722fa1c8fb140dcb01b800fc8683))
+* **icon:** write .info files with PutDiskObject and PutDefDiskObject ([#396](https://github.com/sidick/volamos/issues/396)) ([abcd45c](https://github.com/sidick/volamos/commit/abcd45c5fefd8b58e70e6f9651d4f01df84b93b5))
+
+
+### Bug Fixes
+
+* **dos:** don't name the deprecated libc::time_t alias on musl ([#376](https://github.com/sidick/volamos/issues/376)) ([19f3290](https://github.com/sidick/volamos/commit/19f3290c5e0bcafee853564d734d618c6eed1844))
+* **dos:** findings from the in-depth read of the pipe, device-list and printf code ([#378](https://github.com/sidick/volamos/issues/378)) ([c7cdd43](https://github.com/sidick/volamos/commit/c7cdd43bb4e9583bc3878b25b76a1b073f5773ef))
+* **dos:** give each process its own current directory ([#385](https://github.com/sidick/volamos/issues/385)) ([668e39f](https://github.com/sidick/volamos/commit/668e39ff1dbe893c0039feeb89af4c168ac455ac))
+* **dos:** give each process its own home directory ([#386](https://github.com/sidick/volamos/issues/386)) ([c7b0d21](https://github.com/sidick/volamos/commit/c7b0d21a57e3bccc72c544dfa0188fc851d542b5))
+* **dos:** give each process its own IoErr ([#382](https://github.com/sidick/volamos/issues/382)) ([3a12afb](https://github.com/sidick/volamos/commit/3a12afbdbd2f60ef4ba07af409dc04f3b3a51362))
+* **dos:** give each process its own local variables ([#387](https://github.com/sidick/volamos/issues/387)) ([85dd87c](https://github.com/sidick/volamos/commit/85dd87c1cbfb95a1da3b26e3bd09e291f0594ecc))
+* **dos:** give each process its own stdin buffer and file system task ([#388](https://github.com/sidick/volamos/issues/388)) ([11bac7b](https://github.com/sidick/volamos/commit/11bac7bafce189dc5af81b04004b9b9d245f2468))
+* **dos:** implement FindVar for local variables ([#381](https://github.com/sidick/volamos/issues/381)) ([3636577](https://github.com/sidick/volamos/commit/36365773ceb9ae9c9f5b8398b36388ce07cc6f2e))
+* **dos:** SelectInput/SelectOutput in a child change only its own streams ([#383](https://github.com/sidick/volamos/issues/383)) ([601eb25](https://github.com/sidick/volamos/commit/601eb253af36689fcb297cd8db468f45d0bec7d1))
+* **dos:** UnLoadSeg of overlay nodes and roots ([#380](https://github.com/sidick/volamos/issues/380)) ([fa758e4](https://github.com/sidick/volamos/commit/fa758e4d347fd094c010a729a0898dc4ab85e368))
+* **icon:** match real Kickstart 3.1 where volamos had guessed ([#399](https://github.com/sidick/volamos/issues/399)) ([ec0fa07](https://github.com/sidick/volamos/commit/ec0fa07b1cc9a4b1bafecccdff7aa2cfed00aebe))
+
 ## [0.21.0](https://github.com/sidick/volamos/compare/v0.20.0...v0.21.0) (2026-11-18)
 
 
