@@ -768,7 +768,19 @@ impl DosState {
         // no-op" path for free, and any `Write`/`IsInteractive()` call
         // against it already works through the existing default-output
         // machinery.
-        if name == "*" || name.eq_ignore_ascii_case("CONSOLE:") {
+        // `CON:`/`RAW:` with or without a window spec (issue #345): the C
+        // runtimes' Workbench startup opens `CON://///AUTO/CLOSE/WAIT`
+        // for stdio. There are no windows here, so the spec is ignored
+        // and the same stand-in applies.
+        let is_console_window = |prefix: &str| {
+            name.get(..prefix.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+        };
+        if name == "*"
+            || name.eq_ignore_ascii_case("CONSOLE:")
+            || is_console_window("CON:")
+            || is_console_window("RAW:")
+        {
             return self.output_addr(heap, mem).map(bptr_from_addr);
         }
         if let Some(key) = crate::dospipe::pipe_key(name) {
@@ -1892,6 +1904,12 @@ fn get_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
         .mem
         .read_u32(ctx.current_task + crate::exectask::PR_CLI_OFFSET);
     let cli_addr = addr_from_bptr(cli_bptr);
+    if cli_addr == 0 {
+        // Not a CLI process (a Workbench start, issue #345): nothing to
+        // read or replace, which real dos.library reports as failure.
+        ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        return Ok(());
+    }
     let name_bptr = ctx
         .mem
         .read_u32(cli_addr + crate::exectask::CLI_COMMAND_NAME_OFFSET);
@@ -1942,6 +1960,12 @@ fn set_program_name_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
         .mem
         .read_u32(ctx.current_task + crate::exectask::PR_CLI_OFFSET);
     let cli_addr = addr_from_bptr(cli_bptr);
+    if cli_addr == 0 {
+        // Not a CLI process (a Workbench start, issue #345): nothing to
+        // read or replace, which real dos.library reports as failure.
+        ctx.cpu.set_data_register(DataRegister(0), DOSFALSE);
+        return Ok(());
+    }
     let old_name_bptr = ctx
         .mem
         .read_u32(cli_addr + crate::exectask::CLI_COMMAND_NAME_OFFSET);
@@ -2758,6 +2782,29 @@ mod tests {
             .open(&mut heap, &mut mem, "console:", MODE_OLDFILE)
             .expect("Open(\"console:\") should succeed");
         assert_eq!(console_bptr_lower, output_bptr);
+    }
+
+    #[test]
+    fn open_con_and_raw_windows_return_the_output_handle() {
+        // The C runtimes' Workbench startup opens this for stdio (#345).
+        let mut heap = GuestHeap::new(0x1000, 0x2000);
+        let mut mem = FlatMemory::new(0x2000);
+        let mut dos = DosState::new(None);
+        let output_bptr = bptr_from_addr(
+            dos.output_addr(&mut heap, &mut mem)
+                .expect("Output() should succeed"),
+        );
+        for name in [
+            "CON://///AUTO/CLOSE/WAIT",
+            "con:0/0/640/200/Title",
+            "RAW:",
+            "raw:0/0/1/1/x",
+        ] {
+            let bptr = dos
+                .open(&mut heap, &mut mem, name, MODE_NEWFILE)
+                .unwrap_or_else(|e| panic!("Open({name:?}) failed: {e}"));
+            assert_eq!(bptr, output_bptr, "{name}");
+        }
     }
 
     #[test]

@@ -2566,6 +2566,13 @@ pub struct Runtime<C: Cpu> {
     /// after a `StackSwap`). Empty unless [`Self::enable_stack_report`]
     /// was called. See [`Self::stack_usage_report`].
     stack_usage: BTreeMap<u32, StackUsageEntry>,
+    /// The `BPTR` seglist [`Self::load_top_level_program`] loaded, `0`
+    /// before it ran: [`Self::start_as_workbench`] hands it to the
+    /// program as `sm_Segment`.
+    top_seglist: u32,
+    /// The `WBStartup` message [`Self::start_as_workbench`] posted, `0`
+    /// for a shell start -- see [`Self::workbench_message_replied`].
+    wb_message: u32,
 }
 
 /// One distinct stack region's high-water mark, as reported by
@@ -3391,6 +3398,8 @@ impl<C: Cpu + 'static> Runtime<C> {
             host_break_folding: false,
             stack_report_enabled: false,
             stack_usage: BTreeMap::new(),
+            top_seglist: 0,
+            wb_message: 0,
         }
     }
 
@@ -3615,7 +3624,155 @@ impl<C: Cpu + 'static> Runtime<C> {
         let entry =
             crate::guestmem::addr_from_bptr(bptr).wrapping_add(crate::dosseg::NEXT_SEG_OFFSET);
         self.cpu.set_pc(entry);
+        self.top_seglist = bptr;
         Ok(())
+    }
+
+    /// Makes this run start the way Workbench starts a program (issue
+    /// #345) rather than the way a shell does: no CLI (`pr_CLI` = 0),
+    /// no command line (`A0`/`D0` = 0), and a `WBStartup` message
+    /// already queued on the process's `pr_MsgPort`, which the C
+    /// runtimes' startup code (libnix, newlib, clib2) `WaitPort`s for
+    /// and `GetMsg`s before calling `main(0, wbmsg)`.
+    ///
+    /// The message follows `<workbench/startup.h>` (NDK 3.2): `sm_Process`
+    /// is `pr_MsgPort`, `sm_Segment` the loaded seglist, `sm_ToolWindow`
+    /// `NULL`, and `sm_ArgList` has `tool` as entry 0 and then one entry
+    /// per `projects` item -- each a `{wa_Lock, wa_Name}` pair, the lock
+    /// on the file's directory and the name relative to it, as
+    /// Workbench builds them for a project icon double-click. Its
+    /// `mn_ReplyPort` is a host-owned port with nothing to signal, so
+    /// the program's `ReplyMsg` (which its startup code does just
+    /// before it exits) is observable through
+    /// [`Self::workbench_message_replied`]. The return code is taken
+    /// from the exit exactly as for a shell start, since Workbench's
+    /// "wait for the reply" is the program finishing.
+    ///
+    /// Must be called after [`Self::set_vfs`] and
+    /// [`Self::load_top_level_program`], before [`Self::run`]. Fails,
+    /// with a message for the user, when a file's directory is not under
+    /// any configured volume (no lock can name it) or the heap is full.
+    pub fn start_as_workbench(
+        &mut self,
+        tool: &std::path::Path,
+        projects: &[std::path::PathBuf],
+    ) -> Result<(), String> {
+        const SM_PROCESS: u32 = 20;
+        const SM_SEGMENT: u32 = 24;
+        const SM_NUMARGS: u32 = 28;
+        const SM_TOOLWINDOW: u32 = 32;
+        const SM_ARGLIST: u32 = 36;
+        const WBSTARTUP_SIZE: u32 = 40;
+        const WBARG_SIZE: u32 = 8;
+        let heap_full = || "the guest heap is full".to_string();
+
+        if self.top_seglist == 0 {
+            return Err("the program must be loaded before a Workbench start".to_string());
+        }
+
+        // No CLI: free what create_current_task gave this process.
+        let task = self.task;
+        let cli =
+            crate::guestmem::addr_from_bptr(self.mem.read_u32(task + exectask::PR_CLI_OFFSET));
+        if cli != 0 {
+            let name = crate::guestmem::addr_from_bptr(
+                self.mem.read_u32(cli + exectask::CLI_COMMAND_NAME_OFFSET),
+            );
+            if name != 0 {
+                let _ = self.heap.free(name);
+            }
+            let _ = self.heap.free(cli);
+            self.mem.write_u32(task + exectask::PR_CLI_OFFSET, 0);
+        }
+        self.cpu.set_address_register(AddressRegister(0), 0);
+        self.cpu.set_data_register(DataRegister(0), 0);
+        self.mem.write_u32(task + exectask::PR_ARGUMENTS_OFFSET, 0);
+        self.dos.input_buf.clear();
+
+        let files: Vec<&std::path::Path> = std::iter::once(tool)
+            .chain(projects.iter().map(|p| p.as_path()))
+            .collect();
+        let arglist = self
+            .heap
+            .alloc(&mut self.mem, WBARG_SIZE * files.len() as u32)
+            .map_err(|_| heap_full())?;
+        for (i, file) in files.iter().enumerate() {
+            let name = file
+                .file_name()
+                .ok_or_else(|| format!("{}: not a file name", file.display()))?
+                .to_string_lossy()
+                .into_owned();
+            let dir = match file.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                _ => std::path::PathBuf::from("."),
+            };
+            let vfs = self.dos.vfs.as_ref().ok_or("no volumes are configured")?;
+            let amiga_dir = vfs.amiga_path_for_host_dir(&dir).ok_or_else(|| {
+                format!(
+                    "{}: its directory is not under any volume (see -V)",
+                    file.display()
+                )
+            })?;
+            let lock = self
+                .dos
+                .lock(
+                    &mut self.heap,
+                    &mut self.mem,
+                    &amiga_dir,
+                    crate::doslock::SHARED_LOCK,
+                )
+                .map_err(|e| format!("{}: cannot lock {amiga_dir} (error {e})", file.display()))?;
+            let name_addr = self
+                .heap
+                .alloc(&mut self.mem, name.len() as u32 + 1)
+                .map_err(|_| heap_full())?;
+            crate::guestmem::write_c_string(&mut self.mem, name_addr, name.as_bytes());
+            let entry = arglist + WBARG_SIZE * i as u32;
+            self.mem.write_u32(entry, lock);
+            self.mem.write_u32(entry + 4, name_addr);
+        }
+
+        let reply_port = self
+            .heap
+            .alloc(&mut self.mem, crate::execlist::MSGPORT_SIZE)
+            .map_err(|_| heap_full())?;
+        crate::execlist::init_msg_port_fields(&mut self.mem, reply_port, 0);
+        let msg = self
+            .heap
+            .alloc(&mut self.mem, WBSTARTUP_SIZE)
+            .map_err(|_| heap_full())?;
+        for i in 0..WBSTARTUP_SIZE {
+            self.mem.write_u8(msg + i, 0);
+        }
+        self.mem
+            .write_u32(msg + crate::execlist::MN_REPLYPORT, reply_port);
+        self.mem
+            .write_u16(msg + crate::execlist::MN_LENGTH, WBSTARTUP_SIZE as u16);
+        self.mem
+            .write_u32(msg + SM_PROCESS, task + exectask::PR_MSGPORT_OFFSET);
+        self.mem.write_u32(msg + SM_SEGMENT, self.top_seglist);
+        self.mem.write_u32(msg + SM_NUMARGS, files.len() as u32);
+        self.mem.write_u32(msg + SM_TOOLWINDOW, 0);
+        self.mem.write_u32(msg + SM_ARGLIST, arglist);
+        crate::execlist::put_msg_impl(
+            &mut self.mem,
+            task + exectask::PR_MSGPORT_OFFSET,
+            msg,
+            crate::execlist::NT_MESSAGE,
+        );
+        self.wb_message = msg;
+        Ok(())
+    }
+
+    /// For a [`Self::start_as_workbench`] run: whether the program has
+    /// replied to its `WBStartup` message (`None` for a shell start).
+    /// Workbench's startup code replies as it exits, so `Some(false)`
+    /// after the run means the program skipped that protocol.
+    pub fn workbench_message_replied(&self) -> Option<bool> {
+        (self.wb_message != 0).then(|| {
+            self.mem.read_u8(self.wb_message + crate::execlist::LN_TYPE)
+                == crate::execlist::NT_REPLYMSG
+        })
     }
 
     /// Installs a host-side `System()`/`Execute()` runner callback (Phase

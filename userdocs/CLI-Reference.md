@@ -8,7 +8,7 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-lowmem] [--sanitize-wild]
         [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
-        [--emu68-debug] [--stack-report] [--net] <program> [args...]
+        [--emu68-debug] [--stack-report] [--net] [--workbench] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself, and
@@ -1489,6 +1489,46 @@ one stack says nothing about usage on another, so they're never summed
 together. Printed to stderr, like every other instrumentation flag's
 exit report, so it never mixes into the guest program's own stdout
 output.
+
+## `--workbench`
+
+Starts `<program>` the way Workbench starts a tool, instead of the way a
+shell starts a command. Default: off (a shell start).
+
+```sh
+volamos -V SYS:./assets --workbench ./assets/mytool ./assets/notes.txt
+```
+
+A Workbench-started process has no CLI (`pr_CLI` is 0), `A0`/`D0` are 0,
+and a `WBStartup` message is already waiting on its process port
+(`pr_MsgPort`). The C runtimes' startup code (libnix, newlib, clib2)
+takes that path when `pr_CLI` is 0: it waits for the message, calls
+`main()` with `argc` 0 and the message as `argv`, makes the tool's
+directory the current directory, and opens a console for stdio
+(`CON://///AUTO/CLOSE/WAIT` by default). Test that path here, not just
+the shell one.
+
+The words after `<program>` are **project files**, not a command line.
+They become further entries of the message's `sm_ArgList` (entry 0 is
+the program itself), as when you double-click a project icon with the
+tool as its default tool. Each entry's `wa_Lock` is a lock on the
+file's directory and `wa_Name` the file's name, so both directories
+must be under a volume (see [`-V`](#-v-volume-namehostdir)); otherwise
+volamos exits with an error. `sm_ToolWindow` is `NULL`.
+
+- The return code is the program's, as for a shell start. Workbench
+  waits for the program to reply to the message, which its startup code
+  does as it exits. If the program exits without replying, volamos says
+  so on stderr.
+- `CON:` and `RAW:`, with or without a window specification, open the
+  host's console, as `*` already did. There are no windows to size.
+- The program is loaded as a seglist (as Workbench does, and as the
+  message's `sm_Segment` needs), so `--sanitize` reports for it carry
+  addresses but no source locations.
+- Reading tool types from the program's icon needs `.info` files, which
+  `icon.library` does not load yet.
+- Not a config-file key: it changes what the arguments after `<program>`
+  mean.
 
 ## No flags at all
 

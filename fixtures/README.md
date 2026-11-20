@@ -1315,3 +1315,18 @@ python3 fixtures/gen_looper.py
 ```
 
 No `vasm` form is given here -- there is no `.s` source to assemble.
+
+## issue #345 fixture: `wbtest`
+
+Takes the Workbench path of the C runtimes' startup code by hand, to
+test `--workbench`. Source of truth: `gen_wbtest.py` (no vasm, like its
+siblings). It:
+
+1. exits 99 if `pr_CLI` is non-zero (a shell start);
+2. `WaitPort`s on `pr_MsgPort` and `GetMsg`s the `WBStartup` message;
+3. exits 98 if `sm_ArgList[0].wa_Lock` is zero;
+4. prints `sm_ArgList[0].wa_Name` and, when `sm_NumArgs` is exactly 2,
+   `sm_ArgList[1].wa_Name`, one per line;
+5. `ReplyMsg`s the message and exits with `sm_NumArgs`.
+
+Used by `crates/volamos/tests/workbench_e2e.rs`.

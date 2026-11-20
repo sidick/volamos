@@ -284,6 +284,10 @@ struct Options {
     snoop: bool,
     program: String,
     guest_args: Vec<String>,
+    /// `--workbench`: start the program as Workbench does, with
+    /// `guest_args` as project files. CLI-only: not a config key, since
+    /// it changes what `guest_args` mean.
+    workbench: bool,
     volumes: Vec<(String, PathBuf)>,
     assigns: Vec<(String, Vec<String>)>,
     cwd: Option<String>,
@@ -541,6 +545,22 @@ fn parse_ignore_pc_arg(s: &str) -> Result<u32, String> {
                         Configuration page in the docs."
 )]
 struct Cli {
+    /// Start <program> as Workbench does: no CLI, a WBStartup message; [args...] are project files
+    #[arg(
+        long = "workbench",
+        action = ArgAction::SetTrue,
+        help_heading = "Machine",
+        long_help = "Start <program> the way Workbench starts a tool: its process has no CLI \
+                      (pr_CLI is 0), A0/D0 are 0, and a WBStartup message is waiting on its \
+                      process port, as the C runtimes' startup code (libnix, newlib, clib2) \
+                      expects. The [args...] after <program> are project files, not a command \
+                      line: they become further entries of the message's argument list. The \
+                      program's directory and each file's directory must be under a volume \
+                      (see -V). CON: and RAW: open the host's console. The program is loaded \
+                      as a seglist, so --sanitize reports carry no source locations."
+    )]
+    workbench: bool,
+
     /// Log each emulated library call to stderr
     #[arg(
         short = 'v',
@@ -1929,6 +1949,7 @@ fn resolve(
         snoop: overrides.snoop.unwrap_or(false),
         program,
         guest_args,
+        workbench: false,
         volumes: overrides.volumes,
         assigns: overrides.assigns,
         cwd: overrides.cwd,
@@ -2747,7 +2768,8 @@ fn run(opts: &Options) -> Result<i32, String> {
     // `load_top_level_program` and produces no `LoadResult` -- those
     // runs simply report addresses without source locations.
     let mut loaded: Option<loader::LoadResult> = None;
-    let mut runtime = if hunk_file.overlay.is_some() {
+    // --workbench needs the seglist too: it is the message's sm_Segment.
+    let mut runtime = if hunk_file.overlay.is_some() || opts.workbench {
         // The overlay path loads through the guest heap, not
         // `loader::load`, so its stack was never checked against RAM at
         // all: an oversized `--stack` panicked deep in heap setup instead
@@ -2850,6 +2872,13 @@ fn run(opts: &Options) -> Result<i32, String> {
         build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?
     };
 
+    if opts.workbench {
+        let projects: Vec<PathBuf> = opts.guest_args.iter().map(PathBuf::from).collect();
+        runtime
+            .start_as_workbench(std::path::Path::new(&opts.program), &projects)
+            .map_err(|e| format!("--workbench: {e}"))?;
+    }
+
     // System()/Execute (Phase 3 stage 7): a nested program is loaded and
     // run through run_nested_program, sharing this run's volumes/assigns
     // and --stack size -- see volamos_core::dosseg's module docs.
@@ -2911,6 +2940,13 @@ fn run(opts: &Options) -> Result<i32, String> {
         report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
     report_emulated_cycles(&runtime);
     report_stack_usage(&runtime);
+    if runtime.workbench_message_replied() == Some(false) && result.is_ok() {
+        eprintln!(
+            "volamos: {}: exited without replying to its WBStartup message \
+             (Workbench would keep the program's segment locked)",
+            opts.program
+        );
+    }
     match result {
         Ok(_) if violated => Ok(SANITIZER_EXIT_CODE),
         other => other,
@@ -3190,6 +3226,7 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     cli.guest_args = guest_args;
+    let workbench = cli.workbench;
     let (
         cli_overrides,
         sanitize,
@@ -3234,7 +3271,7 @@ fn main() -> ExitCode {
         base
     };
 
-    let opts = match resolve(
+    let mut opts = match resolve(
         merged,
         sanitize,
         clock_mhz,
@@ -3253,6 +3290,7 @@ fn main() -> ExitCode {
             return ExitCode::from(RUNTIME_ERROR_EXIT_CODE);
         }
     };
+    opts.workbench = workbench;
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same
