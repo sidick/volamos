@@ -20,6 +20,13 @@ Changelog.
 
 - File I/O: `Open`/`Read`/`Write`/`Seek`/`Close`/`SetFileSize`,
   `Input`/`Output`, `IoErr`/`SetIoErr`.
+- Consoles: `Open("*")`, `CONSOLE:`, and `CON:`/`RAW:` (with or without a
+  window specification, e.g. libnix's `CON://///AUTO/CLOSE/WAIT`) all
+  return the process's own `Output()` handle, which is the host's
+  console: writes go to stdout, reads come from stdin. There are no
+  windows, so the specification is ignored. `GetProgramName` and
+  `SetProgramName` fail (`DOSFALSE`) in a process with no CLI, as under
+  [`--workbench`](CLI-Reference.md#-workbench).
 - `PIPE:` — named in-memory channels, as libnix's `pipe()` needs:
   `Open("PIPE:name", MODE_NEWFILE)` opens the write end and
   `MODE_OLDFILE` the read end (either may come first). A `Read` waits

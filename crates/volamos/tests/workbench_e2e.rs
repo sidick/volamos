@@ -88,3 +88,12 @@ fn workbench_project_outside_every_volume_is_a_clean_error() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+#[test]
+fn workbench_project_that_does_not_exist_is_a_clean_error() {
+    let vol = Volume::new("missing");
+    let out = vol.run(&["--workbench"], &["typo.txt"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no such file"), "stderr was: {stderr}");
+    assert_ne!(out.status.code(), Some(0));
+}

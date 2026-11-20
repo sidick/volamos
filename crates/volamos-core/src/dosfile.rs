@@ -1139,7 +1139,11 @@ impl DosState {
                 buf.truncate(n);
                 Ok(buf)
             }
-            Some(HostHandle::Stdin) => {
+            // The Output() handle doubles as the console `*`, `CONSOLE:`
+            // and `CON:`/`RAW:` opens return (see `Self::open`): a
+            // console is bidirectional, and the C runtimes' Workbench
+            // startup uses its one `CON:` handle for stdin too (#345).
+            Some(HostHandle::Stdin) | Some(HostHandle::Stdout) => {
                 let mut buf = vec![0u8; len];
                 let n = std::io::stdin()
                     .read(&mut buf)
@@ -1147,7 +1151,6 @@ impl DosState {
                 buf.truncate(n);
                 Ok(buf)
             }
-            Some(HostHandle::Stdout) => Err(ERROR_ACTION_NOT_KNOWN),
             // NIL: always reports immediate EOF -- real hardware's null
             // device never produces data.
             Some(HostHandle::Null) => Ok(Vec::new()),
@@ -4048,6 +4051,50 @@ mod tests {
             b"Ami",
             "truncated to capacity - 1, still NUL-terminated"
         );
+    }
+
+    /// Runs `lvo(buf)` (GetProgramName -576 / SetProgramName -570) in a
+    /// process whose `pr_CLI` is `0`, as after `--workbench` (#345).
+    fn program_name_call_without_a_cli(lvo: i16) -> i32 {
+        let buf_addr: u32 = 0x1_8000;
+        let mut words = vec![
+            move_imm_to_d(1),
+            (buf_addr >> 16) as u16,
+            buf_addr as u16,
+            move_imm_to_d(2),
+            0,
+            64,
+        ];
+        words.extend_from_slice(&[jsr_disp16(6), lvo as u16]);
+        words.push(RTS);
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        write_c_string(&mut mem, buf_addr, b"name");
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x400,
+                program_name: "prog".to_string(),
+                ..StartConfig::default()
+            },
+        );
+        let task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(task + crate::exectask::PR_CLI_OFFSET, 0);
+        rt.run(&mut Vec::new(), None).expect("run should succeed")
+    }
+
+    #[test]
+    fn get_program_name_fails_cleanly_without_a_cli() {
+        assert_eq!(program_name_call_without_a_cli(-576), DOSFALSE as i32);
+    }
+
+    #[test]
+    fn set_program_name_fails_cleanly_without_a_cli() {
+        assert_eq!(program_name_call_without_a_cli(-570), DOSFALSE as i32);
     }
 
     // --- SetProgramName (issue #156 follow-up) ---

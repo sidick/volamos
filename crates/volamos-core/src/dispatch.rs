@@ -3686,12 +3686,22 @@ impl<C: Cpu + 'static> Runtime<C> {
         }
         self.cpu.set_address_register(AddressRegister(0), 0);
         self.cpu.set_data_register(DataRegister(0), 0);
+        // The command-line copy create_current_task made for A0/D0.
+        let args = self.mem.read_u32(task + exectask::PR_ARGUMENTS_OFFSET);
+        if args != 0 {
+            let _ = self.heap.free(args);
+        }
         self.mem.write_u32(task + exectask::PR_ARGUMENTS_OFFSET, 0);
         self.dos.input_buf.clear();
 
         let files: Vec<&std::path::Path> = std::iter::once(tool)
             .chain(projects.iter().map(|p| p.as_path()))
             .collect();
+        // Workbench only passes icons that exist.
+        if let Some(missing) = files.iter().find(|f| !f.is_file()) {
+            return Err(format!("{}: no such file", missing.display()));
+        }
+
         let arglist = self
             .heap
             .alloc(&mut self.mem, WBARG_SIZE * files.len() as u32)
