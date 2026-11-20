@@ -171,8 +171,8 @@ mod tests {
 pub use unix::restore_stdin_mode;
 #[cfg(unix)]
 pub(crate) use unix::{
-    pump_console_breaks, read_stdin, set_stdin_raw, stdin_has_key, stdin_is_tty, stdio_is_console,
-    wait_for_console_input,
+    pump_console_breaks, pump_console_breaks_now, read_stdin, set_stdin_raw, stdin_has_key,
+    stdin_is_tty, stdio_is_console, wait_for_console_input_until,
 };
 
 #[cfg(not(unix))]
@@ -194,7 +194,8 @@ mod fallback {
         false
     }
     pub(crate) fn pump_console_breaks() {}
-    pub(crate) fn wait_for_console_input() -> bool {
+    pub(crate) fn pump_console_breaks_now() {}
+    pub(crate) fn wait_for_console_input_until(_deadline: Option<std::time::Instant>) -> bool {
         false
     }
     pub(crate) fn read_stdin(_buf: &mut [u8]) -> std::io::Result<usize> {
@@ -205,8 +206,8 @@ mod fallback {
 pub use fallback::restore_stdin_mode;
 #[cfg(not(unix))]
 pub(crate) use fallback::{
-    pump_console_breaks, read_stdin, set_stdin_raw, stdin_has_key, stdin_is_tty, stdio_is_console,
-    wait_for_console_input,
+    pump_console_breaks, pump_console_breaks_now, read_stdin, set_stdin_raw, stdin_has_key,
+    stdin_is_tty, stdio_is_console, wait_for_console_input_until,
 };
 
 #[cfg(unix)]
@@ -260,13 +261,22 @@ mod unix {
     ///   a terminal whose output is stalled (`Ctrl+S`, a hung ssh session)
     ///   would hold the lock -- and so a forced exit -- up behind it. The
     ///   flags raw mode changes do not touch output.
-    /// - `SIGTTOU` ignored meanwhile, as shells do: from a background
+    /// - `SIGTTOU` blocked meanwhile, as shells do: from a background
     ///   process group the call would stop the whole process, the `atexit`
     ///   restore included.
     /// - Retried after a signal.
     fn apply(fd: i32, settings: &libc::termios) -> Result<(), i32> {
-        // SAFETY: `signal` with `SIG_IGN` and restoring the old handler.
-        let previous = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        // `SIGTTOU` blocked for this thread only (`pthread_sigmask`, not
+        // `signal`: that would change the disposition for every thread, and
+        // race with the others doing the same). A blocked `SIGTTOU` lets
+        // the call through from a background process group.
+        let mut block: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTTOU);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut previous);
+        }
         let result = loop {
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, settings) } == 0 {
                 break Ok(());
@@ -276,9 +286,7 @@ mod unix {
                 break Err(errno);
             }
         };
-        if previous != libc::SIG_ERR {
-            unsafe { libc::signal(libc::SIGTTOU, previous) };
-        }
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
         result
     }
 
@@ -461,9 +469,35 @@ mod unix {
     /// guest that `Wait`s for the signal gets it (the real console raises
     /// it whatever the guest is doing). Called from
     /// [`crate::exectask::fold_pending_host_break`], i.e. at every library
-    /// call; does nothing unless the console is raw. The other keys read
-    /// are kept, in order, for the guest's next read.
+    /// call; does nothing unless the console is raw, and at most every
+    /// [`PUMP_INTERVAL`] (a `poll(2)` per call would cost a busy guest
+    /// dearly). The other keys read are kept, in order, for the guest's
+    /// next read.
     pub(crate) fn pump_console_breaks() {
+        if !super::stdin_is_raw() {
+            return;
+        }
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static LAST_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos() as u64;
+        let last = LAST_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < PUMP_INTERVAL.as_nanos() as u64 {
+            return;
+        }
+        LAST_NANOS.store(now.max(1), std::sync::atomic::Ordering::Relaxed);
+        pump_console_breaks_now();
+    }
+
+    /// How often [`pump_console_breaks`] looks at the terminal.
+    const PUMP_INTERVAL: Duration = Duration::from_millis(2);
+
+    /// [`pump_console_breaks`] without the rate limit, for a caller that has
+    /// just been told input is waiting (a limited pump could skip it and
+    /// spin).
+    pub(crate) fn pump_console_breaks_now() {
         if !super::stdin_is_raw() {
             return;
         }
@@ -473,18 +507,26 @@ mod unix {
         }
     }
 
-    /// Blocks until stdin has input or a signal arrives (a host `SIGINT`
-    /// interrupts the poll, so its break can be delivered). `false` if the
+    /// Blocks until stdin has input, `deadline` passes (`None`: never), or
+    /// a signal arrives; the caller then looks again. Polls in short slices
+    /// so a host `SIGINT` that landed just before the `poll` is noticed
+    /// within one rather than waiting for the next key. `false` if the
     /// terminal has hung up -- it would never block again, so a caller
     /// must not wait on it in a loop. For a `Wait` on a console break key
-    /// with nothing else that could wake it ([`crate::exectask`]).
-    pub(crate) fn wait_for_console_input() -> bool {
+    /// ([`crate::exectask`]).
+    pub(crate) fn wait_for_console_input_until(deadline: Option<std::time::Instant>) -> bool {
+        const SLICE: Duration = Duration::from_millis(50);
         let mut pollfd = libc::pollfd {
             fd: libc::STDIN_FILENO,
             events: libc::POLLIN,
             revents: 0,
         };
-        let n = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        let mut slice = SLICE;
+        if let Some(deadline) = deadline {
+            slice = slice.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        pollfd.revents = 0;
+        let n = unsafe { libc::poll(&mut pollfd, 1, poll_millis(slice)) };
         if n < 0 {
             return last_errno() == libc::EINTR;
         }
@@ -501,7 +543,7 @@ mod unix {
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            pump_console_breaks();
+            pump_console_breaks_now();
             if !lookahead().is_empty() {
                 return true;
             }

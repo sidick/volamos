@@ -1860,20 +1860,25 @@ fn wait_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchE
         // deadlock. Fire the earliest one and retry; this loop ends
         // either once something's satisfied or once there are no more
         // pending timers to fall back on.
-        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
-            // The one thing left that can wake this task is the user at a
-            // raw console, if the guest is waiting for a break key
-            // (issue #315): wait for the terminal, then deliver whatever
-            // it raised and look again.
-            if signal_set
-                & (SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D | SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_F)
-                != 0
-                && crate::hostterm::stdin_is_raw()
-                && crate::hostterm::wait_for_console_input()
+        // A guest waiting for a console break key (issue #315) on a raw
+        // console is also woken by the user: wait for the terminal, up to
+        // the earliest pending timer if there is one, deliver whatever it
+        // raised and look again. Once that timer is due (or the terminal
+        // has hung up) fall through to firing it.
+        if signal_set & (SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D | SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_F)
+            != 0
+            && crate::hostterm::stdin_is_raw()
+        {
+            let deadline = ctx.timers.earliest_deadline();
+            if deadline.is_none_or(|d| std::time::Instant::now() < d)
+                && crate::hostterm::wait_for_console_input_until(deadline)
             {
+                crate::hostterm::pump_console_breaks_now();
                 fold_pending_host_break(ctx.mem, ctx.tasks);
                 continue;
             }
+        }
+        if !ctx.timers.fire_earliest(ctx.mem, ctx.tasks) {
             // No other task could ever satisfy this, and no pending
             // timer either -- a real deadlock, not just "no
             // scheduler": fail loudly instead of hanging the host
@@ -2780,6 +2785,15 @@ impl PendingTimers {
         bound: std::time::Instant,
     ) -> bool {
         self.fire_earliest_impl(mem, tasks, Some(bound))
+    }
+
+    /// When the earliest still-pending entry is due.
+    fn earliest_deadline(&self) -> Option<std::time::Instant> {
+        self.entries
+            .iter()
+            .filter(|e| !e.elapsed)
+            .map(|e| e.deadline)
+            .min()
     }
 
     fn fire_earliest_impl<M: AddressSpace>(
