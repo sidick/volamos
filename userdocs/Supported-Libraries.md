@@ -261,6 +261,12 @@ Changelog.
   (mirroring `vamos`); a handful of standard Workbench libraries
   (`mathtrans`, `mathieee*`, `locale`, `intuition`) are always present,
   matching real ROM-resident behavior.
+- `TaggedOpenLibrary` (V39, a private convenience of the ROM's own
+  modules; the Kickstart 3.1 Shell opens `dos.library` with it): opens a
+  standard library by number, as `OpenLibrary(name, 0)` -- 1 graphics, 2
+  layers, 3 intuition, 4 dos, 5 icon, 6 expansion, 7 utility, 8 keymap, 9
+  gadtools, 10 workbench, from AROS's documentation of the real function.
+  Any other number gives `NULL`.
 - Memory: `AllocMem`/`FreeMem`/`AllocVec`/`FreeVec`/`AvailMem`
   (`AllocMem` blocks sit on exec's 8-byte boundary, and `AllocVec` keeps
   `byteSize + 4` in the 4 bytes before the block, so its result is 4 mod 8 --

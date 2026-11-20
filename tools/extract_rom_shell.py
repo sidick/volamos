@@ -10,10 +10,14 @@ or Shell is shipped with volamos, and this reads yours.
 
 What it relies on, and checks:
 
-- The module is a "Shell-Seg": a segment with BCPL linkage whose code
-  starts with a 0x34-byte header (obsolete init entry at +0, the BCPL
-  call-in a `jmp` at +8) followed by its `struct Resident` (`0x4AFC`).
-  The same layout is in the `L:Shell-Seg` of later disk releases.
+- The module is a "Shell-Seg": a segment with BCPL linkage that starts
+  with two longwords (0 and a small number) and has the BCPL call-in at
+  +8, followed some way in by its `struct Resident` (`0x4AFC`). The ROM
+  build leaves a pointer to the segment's start just before that struct,
+  which is how the tool finds where the module begins (the header is
+  0x34 bytes in `shell 46.10` of the 3.1.4 ROM and 0x58 in `shell 40.2` of
+  the 3.1 ROM). The same layout is in the `L:Shell-Seg` of later disk
+  releases.
 - ROM modules have their absolute addresses resolved at ROM-build time,
   where a hunk file stores them relative to the hunk and lists them in
   a `HUNK_RELOC32`. So every longword in the module that points into
@@ -37,11 +41,6 @@ HUNK_HEADER = 0x3F3
 HUNK_CODE = 0x3E9
 HUNK_RELOC32 = 0x3EC
 HUNK_END = 0x3F2
-
-RTC_MATCHWORD = 0x4AFC
-# Bytes from the start of a Shell-Seg segment to its struct Resident.
-RESIDENT_OFFSET = 0x34
-
 
 def be32(data: bytes, off: int) -> int:
     return struct.unpack_from(">I", data, off)[0]
@@ -94,17 +93,27 @@ def extract(rom: bytes, module: str = "shell") -> tuple[bytes, dict]:
     if len(matches) != 1:
         raise SystemExit(f"expected one {module!r} resident, found {len(matches)}")
     res_off, end, _ = matches[0]
-    start = res_off - RESIDENT_OFFSET
-    if start < 0 or start % 4:
-        raise SystemExit("the resident is not where a Shell-Seg header would put it")
+    # The two longwords just before the struct Resident are pointers the
+    # ROM build left there: the start of the segment, and a second address
+    # inside it. That makes the start independent of how long a given
+    # release's header is (0x34 bytes in shell 46.10, 0x58 in 40.2).
+    seg_start = be32(rom, res_off - 8) - base
+    second = be32(rom, res_off - 4) - base
+    if not (0 <= seg_start < res_off and seg_start % 4 == 0 and seg_start <= second < end):
+        raise SystemExit(
+            f"{module!r}: the pointers before its struct Resident do not describe a "
+            "segment: this is not the Shell layout the tool knows"
+        )
+    start = seg_start
     payload = bytearray(rom[start:end])
     if len(payload) % 4:
         raise SystemExit(
             f"the {module!r} module is {len(payload)} bytes, not a whole number of "
             "longwords: this is not the Shell layout the tool knows"
         )
-    # Shell-Seg signature: BCPL call-in at +8 and +0x10 are `jmp d16(pc)`.
-    if payload[8:10] != b"\x4e\xfa" or payload[0x10:0x12] != b"\x4e\xfa":
+    # Shell-Seg signature: the segment starts with a zero longword and a
+    # small one (BCPL linkage), then the call-in at +8.
+    if be32(payload, 0) != 0 or be32(payload, 4) > 0x100:
         raise SystemExit(f"{module!r} does not have a Shell-Seg header")
     lo, hi = base + start, base + end
     relocs = []

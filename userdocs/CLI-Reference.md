@@ -1562,7 +1562,13 @@ same `Shell-Seg` layout that later releases put in `L:`, with its
 addresses already resolved for the ROM, which the script turns back into
 relocations). The 3.1.4 ROM's Shell (`shell 46.10`) is the one this has
 been run with. A `Shell-Seg` from Workbench 3.2 does not run: it needs
-`dos.library` 47 and private functions of it.
+`dos.library` 47 and private functions of it. The tool also extracts
+the Kickstart 3.1 ROM's Shell (`shell 40.2`), but that one does not work
+yet: it starts, but its built-in commands are not found and it fails
+while running an external one, so it relies on more of `dos.library`'s
+internals than 46.10 does. A ROM from an Amiga Forever / Cloanto package
+is encoded: decode it first (`amirom normalize -k rom.key in.rom out.rom`
+from [amiga-tools](https://github.com/sidick/amiga-tools)).
 
 - The return code is what the Shell replies its startup packet with: the
   last command's return code, so `0` after a session whose last command

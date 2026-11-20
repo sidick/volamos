@@ -2101,6 +2101,44 @@ fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     open_library_common(ctx, &name, 0)
 }
 
+/// `exec.library`'s `TaggedOpenLibrary` handler (LVO -810, V39: `D0` =
+/// tag): opens one of the ROM's standard libraries by number, without a
+/// name string. Added for issue #20: the Kickstart 3.1 Shell opens
+/// `dos.library` this way (`TaggedOpenLibrary(4)`) as the first thing it
+/// does. It is not in the NDK 3.2 autodocs (it is a private convenience
+/// of the ROM's own modules); the numbers are AROS's, which lists them from
+/// the real function: 1 graphics, 2 layers, 3 intuition, 4 dos, 5 icon,
+/// 6 expansion, 7 utility, 8 keymap, 9 gadtools, 10 workbench -- and the
+/// Shell asking for 4 to get dos is consistent with that. Any other tag
+/// is `NULL`. Otherwise it is `OpenLibrary(name, 0)`.
+fn tagged_open_library_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    const NAMES: [&str; 10] = [
+        "graphics.library",
+        "layers.library",
+        "intuition.library",
+        "dos.library",
+        "icon.library",
+        "expansion.library",
+        "utility.library",
+        "keymap.library",
+        "gadtools.library",
+        "workbench.library",
+    ];
+    let tag = ctx.cpu.data_register(DataRegister(0));
+    match tag
+        .checked_sub(1)
+        .and_then(|i| NAMES.get(i as usize).copied())
+    {
+        Some(name) => open_library_common(ctx, name, 0),
+        None => {
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+            Ok(())
+        }
+    }
+}
+
 /// Shared `OpenLibrary`/`OldOpenLibrary` implementation
 /// (`library-device-loading-plan.md` §2.3's lookup order):
 ///
@@ -2916,6 +2954,16 @@ impl<C: Cpu + 'static> Runtime<C> {
                 EXEC_LIBRARY_BASE,
                 crate::lvos::exec::EXEC_LVOS,
                 "exec.library",
+                "TaggedOpenLibrary",
+                tagged_open_library_handler::<C>,
+            )
+            .expect("TaggedOpenLibrary is in EXEC_LVOS");
+        table
+            .register_by_name(
+                &mut mem,
+                EXEC_LIBRARY_BASE,
+                crate::lvos::exec::EXEC_LVOS,
+                "exec.library",
                 "CloseLibrary",
                 close_library_handler::<C>,
             )
@@ -3648,7 +3696,8 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// program does), and the entry a process is meant to start at is
     /// the BCPL call-in at **+8** into the first segment's code. There
     /// `D1` is the `BPTR` of the startup parameter packet and `D2` the
-    /// stack size; `A0`/`D0` are unused. (`vamos -x` starts it the same
+    /// stack size and `A6` the return address (BCPL linkage); `A0`/`D0`
+    /// are unused. (`vamos -x` starts it the same
     /// way, with `D1` = 0, which a 3.9 Shell accepts; the 3.2 Shell
     /// treats a null packet as an obsolete call and raises
     /// `AN_CLIObsolete`, so a packet is built here.)
@@ -3730,6 +3779,12 @@ impl<C: Cpu + 'static> Runtime<C> {
 
         self.shell_packet = packet;
         self.cpu.set_pc(code.wrapping_add(8));
+        // BCPL linkage: the call-in is entered with the return address in
+        // `A6`, and the 3.1 Shell's returns with `jmp (a6)` (46.10's with
+        // `rts`, which the initial stack already covers). That is where the
+        // process ends.
+        self.cpu
+            .set_address_register(AddressRegister(6), EXIT_STUB_ADDR);
         self.cpu.set_address_register(AddressRegister(0), 0);
         self.cpu.set_data_register(DataRegister(0), 0);
         self.cpu
@@ -5836,6 +5891,47 @@ mod tests {
     fn push_jsr(words: &mut Vec<u16>, an: u16, disp: i32) {
         words.push(jsr_disp16(an));
         words.push(disp as u16);
+    }
+
+    /// `TaggedOpenLibrary(tag)` (LVO -810) as a guest calls it: exit code =
+    /// the library base it returns.
+    fn run_tagged_open_library(tag: u32) -> u32 {
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+        words.push(0x203C); // move.l #tag,d0
+        words.push((tag >> 16) as u16);
+        words.push(tag as u16);
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -810);
+        words.push(RTS);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x40,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed") as u32
+    }
+
+    #[test]
+    fn tagged_open_library_opens_the_libraries_the_tags_name_20() {
+        // The 3.1 Shell's first call: TaggedOpenLibrary(4) is dos.library.
+        assert_eq!(run_tagged_open_library(4), DOS_LIBRARY_BASE);
+        // utility.library is tag 7, and is the same base OpenLibrary gives.
+        assert_eq!(run_tagged_open_library(7), UTILITY_LIBRARY_BASE);
+    }
+
+    #[test]
+    fn tagged_open_library_of_a_tag_it_does_not_know_is_null_20() {
+        assert_eq!(run_tagged_open_library(0), 0);
+        assert_eq!(run_tagged_open_library(11), 0);
     }
 
     #[test]
