@@ -256,6 +256,43 @@ impl Default for DiskObjectFile {
     }
 }
 
+impl DiskObjectFile {
+    /// What `GetDiskObject(NULL)` hands back: "a DiskObject structure
+    /// allocated for you" with nothing in it but the magic, version and
+    /// revision, and an icon that "does not really live anywhere"
+    /// ([`NO_ICON_POSITION`]). Its type is `0`: the caller sets it. The
+    /// V40 library's own values for these fields are unverified
+    /// (phase 0 of #313).
+    pub fn empty() -> Self {
+        DiskObjectFile {
+            object_type: 0,
+            ..DiskObjectFile::default()
+        }
+    }
+
+    /// A built-in default icon of `object_type` ([`WBDISK`] to
+    /// [`WBKICK`]), for `GetDefDiskObject` and `GetDiskObjectNew` when
+    /// no `ENV:Sys/def_<type>.info` exists. It has no images: nothing
+    /// here draws an icon, and a default's pictures are not metadata
+    /// any caller reads. What it does have is what a program branches
+    /// on: the type, a drawer's `DrawerData` (disks, drawers and Kickstart
+    /// icons are drawers to Workbench), and a tool's default stack.
+    pub fn builtin_default(object_type: u8) -> Self {
+        let is_drawer = matches!(object_type, WBDISK | WBDRAWER | WBKICK);
+        DiskObjectFile {
+            object_type,
+            stack_size: if object_type == WBTOOL { 4096 } else { 0 },
+            drawer: is_drawer.then_some(DrawerData {
+                new_window: [0; NEW_WINDOW_SIZE],
+                current_x: 0,
+                current_y: 0,
+                extension: Some((0, 0)),
+            }),
+            ..DiskObjectFile::default()
+        }
+    }
+}
+
 /// How many bytes of bitplane data an `Image` of this size has:
 /// `((width + 15) / 16) * 2 * height * depth`. A negative dimension
 /// counts as `0`, as for a drawing routine that draws nothing for it.
@@ -1010,6 +1047,32 @@ mod tests {
         assert_eq!(parsed.default_tool.as_deref(), Some(&b"ab"[..]));
         assert_eq!(parsed.tool_types, Some(vec![b"X=1".to_vec()]));
         assert_eq!(used, icon.to_bytes().len());
+    }
+
+    #[test]
+    fn builtin_defaults_have_drawer_data_only_for_drawer_like_types() {
+        for t in [WBDISK, WBDRAWER, WBKICK] {
+            assert!(DiskObjectFile::builtin_default(t).drawer.is_some(), "{t}");
+        }
+        for t in [WBTOOL, WBPROJECT, WBGARBAGE] {
+            assert!(DiskObjectFile::builtin_default(t).drawer.is_none(), "{t}");
+        }
+        assert_eq!(DiskObjectFile::builtin_default(WBTOOL).stack_size, 4096);
+        assert_eq!(
+            DiskObjectFile::builtin_default(WBPROJECT).object_type,
+            WBPROJECT
+        );
+    }
+
+    #[test]
+    fn the_empty_object_is_unplaced_and_untyped() {
+        let e = DiskObjectFile::empty();
+        assert_eq!(e.object_type, 0);
+        assert_eq!(
+            (e.current_x, e.current_y),
+            (NO_ICON_POSITION, NO_ICON_POSITION)
+        );
+        assert!(e.default_tool.is_none() && e.tool_types.is_none() && e.drawer.is_none());
     }
 
     /// Runs the parser over a directory of real icons, for ground truth

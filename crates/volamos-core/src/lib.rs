@@ -56,6 +56,7 @@ pub mod graphics;
 pub mod guestmem;
 pub mod icon;
 pub mod iconfile;
+pub mod iconobj;
 pub mod intuition;
 pub mod loader;
 pub mod locale;

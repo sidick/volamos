@@ -479,31 +479,45 @@ library and LVO.
 ## icon.library
 
 ROM-resident on 3.x — it isn't on a Workbench 3.1.4 install disk at
-all — so it always opens. Implemented are the calls whose answer
-doesn't depend on reading or writing a `.info` file's contents:
+all — so it always opens. Reading icons works; writing them doesn't yet.
 
-- `GetDiskObject` on a name with no `name.info` returns `NULL`, with
-  `IoErr()` set to why (`ERROR_OBJECT_NOT_FOUND` for a plain missing
-  icon) — the routine "does this file have an icon?" question.
-- `GetDefDiskObject` returns `NULL` + `IoErr()` when
-  `ENV:Sys/def_<type>.info` is absent (`WBDEVICE`, which 3.1 has no
-  default for, gives `ERROR_BAD_NUMBER`).
+- `GetDiskObject` reads `name.info` and returns a real `DiskObject`,
+  with the `FreeList` just after it that `FreeDiskObject` uses. The
+  classic `.info` format is read in full: the default tool, tool types,
+  tool window, stack size, position, drawer data (including the 2.x
+  `dd_Flags`/`dd_ViewModes`) and the icon's images. OS 3.5 ColorIcons,
+  PNG icons and NewIcons read like any other, from their classic part:
+  NewIcons' image data is stored in extra tool types, and a ColorIcon's
+  or PNG icon's extra picture data is ignored, so the answers a program
+  gets are the tool types and settings, not pixels.
+- A name with no `name.info` returns `NULL`, with `IoErr()` set to why
+  (`ERROR_OBJECT_NOT_FOUND` for a plain missing icon) — the routine
+  "does this file have an icon?" question. A file that isn't an icon
+  gives `ERROR_OBJECT_WRONG_TYPE`.
+- `GetDiskObject(NULL)` allocates an empty `DiskObject`.
+- `GetDefDiskObject` reads `ENV:Sys/def_<type>.info`, and when that file
+  is missing returns a built-in default icon of the type (with no
+  images). A real 3.1 `icon.library` may fail here instead; the
+  fallback is deliberate so a program that just wants an icon gets one.
+  `WBDEVICE`, which 3.1 has no default for, gives `ERROR_BAD_NUMBER`.
+- `GetDiskObjectNew` falls back to the default for the object's type
+  when there is no icon file: a volume root is a disk, any other
+  directory a drawer, an executable a tool, anything else a project.
+- `FreeDiskObject`, `FreeFreeList` and `AddFreeList` work on the
+  `FreeList` of such an object. `NULL` is ignored. Passing a pointer
+  that didn't come from `GetDiskObject` fails the run, naming the call.
 - `DeleteDiskObject` deletes `name.info` exactly as `DeleteFile` would.
-- `FreeDiskObject(NULL)` is ignored.
 - `FindToolType`, `MatchToolValue` and `BumpRevision` are implemented in
   full: case-insensitive tool-type lookup (a bare flag entry like
   `DONOTWAIT` is found), `|`-separated value matching, and
   `copy_of_`/`copy_<n>_of_` renaming truncated to 30 characters.
 
-Reading or writing a real icon isn't supported yet
-([issue #313](https://github.com/sidick/volamos/issues/313)):
-`GetDiskObject`/`GetDefDiskObject` finding the file *present*,
-`GetDiskObject(NULL)`, `GetDiskObjectNew`, `PutDiskObject`,
-`PutDefDiskObject` and the free-list calls each fail the run loudly,
-naming the call — rather than telling the guest "no icon" when there is
-one, or that a write succeeded when nothing was written. The 3.5+ calls
-(`GetIconTagList` and friends) aren't part of the 3.1 interface and fail
-the same way.
+`PutDiskObject` and `PutDefDiskObject` aren't supported yet
+([issue #313](https://github.com/sidick/volamos/issues/313)): they fail
+the run loudly, naming the call, rather than telling the guest a write
+succeeded when nothing was written. The 3.5+ calls (`GetIconTagList` and
+friends) aren't part of the 3.1 interface and fail the same way. Nothing
+here draws an icon: the images are kept as data only.
 
 ## battclock.resource
 
