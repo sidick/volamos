@@ -114,8 +114,9 @@ pub fn add_free_list(
 /// itself if it is in one of the blocks. Returns how many blocks were
 /// freed, or why the structure is not a free list this module can walk.
 ///
-/// Everything is validated before anything is freed, so a bad list is
-/// refused whole rather than half-freed. Every node and every recorded
+/// Everything is validated before anything is freed (so a bad list is
+/// refused whole rather than half-freed; the frees themselves cannot fail
+/// once every address is known live and unique). Every node and every recorded
 /// block must be a live guest-heap allocation (nodes made by
 /// [`add_free_list`] and [`build_disk_object`] always are), and none may
 /// appear twice. That bounds the walk by the heap's own live count --
@@ -133,7 +134,12 @@ pub fn free_free_list(
     let mut nodes = Vec::new();
     let mut blocks = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut node = mem.read_u32(free_list + FL_MEMLIST + LH_HEAD);
+    let head = free_list.wrapping_add(FL_MEMLIST + LH_HEAD);
+    if free_list == 0 || free_list.checked_add(FREE_LIST_SIZE).is_none() || !mem.is_mapped(head, 4)
+    {
+        return Err(format!("{free_list:#010x} is not readable memory"));
+    }
+    let mut node = mem.read_u32(head);
     // The list's tail sentinel is inside the FreeList, not a heap node.
     while node != free_list + FL_MEMLIST + LH_TAIL && node != 0 {
         if heap
@@ -187,13 +193,14 @@ pub fn free_disk_object(
     mem: &mut dyn AddressSpace,
     obj: u32,
 ) -> Result<usize, String> {
-    let list = obj + DISK_OBJECT_MEM_SIZE;
     if heap
         .size_of_live_alloc(obj)
         .is_none_or(|size| size < DISK_OBJECT_MEM_SIZE + FREE_LIST_SIZE)
     {
         return Err("not a live DiskObject allocation".to_string());
     }
+    // Live and big enough, so this cannot overflow.
+    let list = obj + DISK_OBJECT_MEM_SIZE;
     let first = mem.read_u32(list + FL_MEMLIST + LH_HEAD);
     let owns_itself = heap
         .size_of_live_alloc(first)
@@ -751,6 +758,21 @@ mod tests {
         assert!(err.contains("not a live allocation"), "{err}");
         assert_eq!(heap.free_bytes(), after_add, "nothing half-freed");
         assert!(before > after_add);
+    }
+
+    #[test]
+    fn a_wild_pointer_near_the_top_of_memory_is_an_error_not_a_panic() {
+        let (mut heap, mut mem) = heap_and_mem();
+        for wild in [0xFFFF_FFF0, 0xFFFF_FFFF, 0] {
+            assert!(
+                free_free_list(&mut heap, &mut mem, wild).is_err(),
+                "{wild:#x}"
+            );
+            assert!(
+                free_disk_object(&mut heap, &mut mem, wild).is_err(),
+                "{wild:#x}"
+            );
+        }
     }
 
     #[test]

@@ -479,7 +479,7 @@ library and LVO.
 ## icon.library
 
 ROM-resident on 3.x — it isn't on a Workbench 3.1.4 install disk at
-all — so it always opens. Reading icons works; writing them doesn't yet.
+all — so it always opens. Reading and writing icons both work.
 
 - `GetDiskObject` reads `name.info` and returns a real `DiskObject`,
   with the `FreeList` just after it that `FreeDiskObject` uses. The
@@ -528,7 +528,10 @@ all — so it always opens. Reading icons works; writing them doesn't yet.
   `copy_of_`/`copy_<n>_of_` renaming truncated to 30 characters.
   `BumpRevisionLength` (3.1.4 and later) does the same with a limit you
   pass, so copies of long file names can be named; it returns `NULL` when
-  not even a truncated copy name fits.
+  not even a truncated copy name fits. Whether the limit counts the
+  terminating NUL, and exactly where `NULL` starts, haven't been checked
+  against a real 3.1.4 `icon.library`; the buffer must hold the limit
+  plus the NUL.
 
 The 3.5+ calls (`GetIconTagList`, `PutIconTagList` and friends) aren't
 part of the 3.1 interface and fail the run loudly, naming the call.

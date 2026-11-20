@@ -1,6 +1,6 @@
 //! `icon.library`: reading `.info` icon files into guest `DiskObject`s,
-//! the free-list calls, and the pure string helpers -- everything in
-//! the 3.1 (V40) interface except writing icons.
+//! writing them back, the free-list calls, and the pure string helpers
+//! -- the 3.1 (V40) interface, plus `BumpRevisionLength`.
 //!
 //! # Why a partial library
 //!
@@ -105,8 +105,7 @@ const BUMP_REVISION_MAX: usize = 30;
 /// `HUNK_HEADER`: the first longword of an AmigaOS executable.
 const HUNK_HEADER: u32 = 0x0000_03F3;
 
-/// Fails the run naming `name`, for a call this module can't answer
-/// truthfully yet -- see the module docs.
+/// The NUL-terminated guest string at `addr`, as (lossy) UTF-8.
 fn guest_string(mem: &dyn AddressSpace, addr: u32) -> String {
     String::from_utf8_lossy(&read_c_string(mem, addr)).into_owned()
 }
@@ -205,11 +204,9 @@ fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8
     if host.is_dir() {
         // A volume root, not an assign to a subdirectory (`LIBS:`).
         let is_root = name.strip_suffix(':').is_some_and(|v| {
-            ctx.dos.vfs.as_ref().is_some_and(|vfs| {
-                vfs.volumes()
-                    .iter()
-                    .any(|(n, _)| n.trim_end_matches(':').eq_ignore_ascii_case(v))
-            })
+            vfs.volumes()
+                .iter()
+                .any(|(n, _)| n.trim_end_matches(':').eq_ignore_ascii_case(v))
         });
         return Some(if is_root { WBDISK } else { WBDRAWER });
     }
@@ -240,10 +237,10 @@ fn get_disk_object_new_handler<C: Cpu>(
         // unreadable one is the caller's to hear about, not to overwrite.
         Err(code) if !is_missing(code) => fail(ctx, code),
         Err(code) => match default_type_for(ctx, &name) {
-            Some(def_type) => {
-                let icon = default_icon(ctx, def_type);
-                deliver(ctx, &icon);
-            }
+            Some(def_type) => match default_icon(ctx, def_type as u32) {
+                Ok(icon) => deliver(ctx, &icon),
+                Err(code) => fail(ctx, code),
+            },
             None => fail(ctx, code),
         },
     }
@@ -252,31 +249,19 @@ fn get_disk_object_new_handler<C: Cpu>(
 
 /// The default icon of `def_type`: `ENV:Sys/def_<type>.info` if there is
 /// one, else the built-in ([`DiskObjectFile::builtin_default`]). An
-/// `ENV:` file that exists but is not an icon is an error for the caller
-/// to report rather than a reason to quietly use the built-in.
-fn default_icon_file(
-    ctx: &HandlerContext<'_, impl Cpu>,
-    def_type: u8,
-    name: &str,
-) -> Result<DiskObjectFile, i32> {
-    match load_icon(ctx, &format!("ENV:Sys/def_{name}.info")) {
-        Err(code) if is_missing(code) => Ok(DiskObjectFile::builtin_default(def_type)),
-        other => other,
-    }
-}
-
-/// [`default_icon_file`] for a `def_type` already known to be valid; a
-/// corrupt default file falls back to the built-in here, since
-/// `GetDiskObjectNew` has no error left to give.
-fn default_icon(ctx: &HandlerContext<'_, impl Cpu>, def_type: u8) -> DiskObjectFile {
-    let name = DEFAULT_ICON_NAMES
+/// `ENV:` file that exists but is not an icon is an error, not a reason
+/// to quietly use the built-in; a type V40 has no default for
+/// (`WBDEVICE`, `WBAPPICON`, anything out of range) is
+/// `ERROR_BAD_NUMBER`. Both `GetDefDiskObject` and `GetDiskObjectNew`
+/// answer through this, so a bad file gets the same outcome from each.
+fn default_icon(ctx: &HandlerContext<'_, impl Cpu>, def_type: u32) -> Result<DiskObjectFile, i32> {
+    let &(_, name) = DEFAULT_ICON_NAMES
         .iter()
-        .find(|(t, _)| *t == def_type as u32)
-        .map(|&(_, n)| n);
-    match name {
-        Some(name) => default_icon_file(ctx, def_type, name)
-            .unwrap_or_else(|_| DiskObjectFile::builtin_default(def_type)),
-        None => DiskObjectFile::builtin_default(def_type),
+        .find(|(t, _)| *t == def_type)
+        .ok_or(crate::dosargs::ERROR_BAD_NUMBER)?;
+    match load_icon(ctx, &format!("ENV:Sys/def_{name}.info")) {
+        Err(code) if is_missing(code) => Ok(DiskObjectFile::builtin_default(def_type as u8)),
+        other => other,
     }
 }
 
@@ -293,11 +278,7 @@ fn get_def_disk_object_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
     let def_type = ctx.cpu.data_register(DataRegister(0));
-    let Some(&(_, name)) = DEFAULT_ICON_NAMES.iter().find(|(t, _)| *t == def_type) else {
-        fail(ctx, crate::dosargs::ERROR_BAD_NUMBER);
-        return Ok(());
-    };
-    match default_icon_file(ctx, def_type as u8, name) {
+    match default_icon(ctx, def_type) {
         Ok(icon) => deliver(ctx, &icon),
         Err(code) => fail(ctx, code),
     }
@@ -332,9 +313,11 @@ fn store_icon(
         .map_err(|e| map_vfs_error(&e))?;
     // Write beside the target and rename over it, so a failed or
     // interrupted write leaves the old icon intact rather than truncated.
-    let mut tmp = host.clone().into_os_string();
-    tmp.push(".volamos-tmp");
-    let tmp = std::path::PathBuf::from(tmp);
+    // A symlinked target is written through, not replaced by a file; the
+    // temp name is short and fixed so a long legal name cannot overflow
+    // the host's limit with a suffix.
+    let host = std::fs::canonicalize(&host).unwrap_or(host);
+    let tmp = host.with_file_name(".volamos-icon-tmp");
     std::fs::write(&tmp, icon.to_bytes())
         .and_then(|()| std::fs::rename(&tmp, &host))
         .map_err(|e| {
@@ -1043,6 +1026,17 @@ mod tests {
             WBTOOL,
             "the file's type, not a guess"
         );
+    }
+
+    #[test]
+    fn a_corrupt_default_file_fails_get_disk_object_new_like_get_def_disk_object() {
+        let tmp = TempDir::new("newcorruptdef");
+        fs::create_dir_all(tmp.path().join("env/Sys")).unwrap();
+        fs::write(tmp.path().join("env/Sys/def_project.info"), b"junk").unwrap();
+        fs::write(tmp.path().join("notes.txt"), b"plain text").unwrap();
+        let (obj, _, code) = new_type(&tmp, "notes.txt");
+        assert_eq!(obj, 0);
+        assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
     }
 
     #[test]
