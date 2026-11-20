@@ -47,15 +47,19 @@
 //!   `NULL` is ignored. A pointer that is not such an object fails the
 //!   run naming the call, since freeing it would corrupt the guest
 //!   heap.
+//! - `PutDiskObject`: reads the guest `DiskObject` back through
+//!   [`crate::iconobj::read_disk_object`] and writes `name.info`
+//!   (`Disk.info` for a volume), replacing any file there; the
+//!   parent directory must exist. A pointer that does not lead to a
+//!   readable `DiskObject` fails the run naming the call. Workbench
+//!   is not notified: there is none.
+//! - `PutDefDiskObject`: the same for `ENV:Sys/def_<type>.info`, where
+//!   `GetDefDiskObject` finds it; `ENV:Sys` is created if missing.
+//!   `ENVARC:` is not written.
 //! - `DeleteDiskObject`: deletes `name.info` exactly as `DeleteFile`
 //!   would, failures and all.
 //! - `FindToolType`, `MatchToolValue`, `BumpRevision`: pure string work
 //!   over guest memory, implemented in full to their V40 autodocs.
-//!
-//! `PutDiskObject` and `PutDefDiskObject` are not here yet
-//! (issue #313, phase 3): like every vector without a handler they fail
-//! the run naming the call, rather than telling the guest a write
-//! succeeded when nothing was written.
 //!
 //! Signatures and LVOs are from the NDK 3.2 autodocs (`icon.doc`) and
 //! [`crate::lvos::icon`]; `DiskObject` type codes from
@@ -297,6 +301,98 @@ fn get_def_disk_object_handler<C: Cpu>(
     Ok(())
 }
 
+/// Writes `icon` to the `.info` file at `path` (a full Amiga path,
+/// `.info` included), creating or replacing it. With `make_dir`, a
+/// missing last directory of the path is created first (for
+/// `ENV:Sys`); otherwise the parent must exist, as for `Open`.
+fn store_icon(
+    ctx: &HandlerContext<'_, impl Cpu>,
+    path: &str,
+    icon: &DiskObjectFile,
+    make_dir: bool,
+) -> Result<(), i32> {
+    let vfs = ctx
+        .dos
+        .vfs
+        .as_ref()
+        .ok_or(crate::dosfile::ERROR_OBJECT_NOT_FOUND)?;
+    if make_dir && let Some((dir, _)) = path.rsplit_once('/') {
+        let dir = vfs
+            .resolve(dir, ResolveMode::ParentMustExist)
+            .map_err(|e| map_vfs_error(&e))?;
+        if !dir.exists() {
+            std::fs::create_dir(&dir).map_err(|e| crate::dosfile::map_io_error(&e))?;
+        }
+    }
+    let host = vfs
+        .resolve(path, ResolveMode::ParentMustExist)
+        .map_err(|e| map_vfs_error(&e))?;
+    std::fs::write(host, icon.to_bytes()).map_err(|e| crate::dosfile::map_io_error(&e))
+}
+
+/// The guest `DiskObject` at `obj`, or the run failing in `handler`: a
+/// pointer that does not lead to a `DiskObject` is a guest bug, and
+/// writing guesswork to disk would bury it.
+fn read_object<C: Cpu>(
+    ctx: &HandlerContext<'_, C>,
+    handler: &str,
+    obj: u32,
+) -> Result<DiskObjectFile, DispatchError> {
+    crate::iconobj::read_disk_object(ctx.mem, obj).map_err(|e| {
+        handler_failed(
+            handler,
+            format!("{obj:#010x} is not a readable DiskObject: {e}"),
+        )
+    })
+}
+
+/// `D0` = `TRUE`, or `FALSE` with `IoErr()` = the code.
+fn finish_put<C: Cpu>(ctx: &mut HandlerContext<'_, C>, result: Result<(), i32>) {
+    match result {
+        Ok(()) => ctx.cpu.set_data_register(DataRegister(0), TRUE),
+        Err(code) => {
+            ctx.dos.set_io_err(code);
+            ctx.cpu.set_data_register(DataRegister(0), FALSE);
+        }
+    }
+}
+
+/// `PutDiskObject` (`A0` = name, `A1` = object): writes `name.info`
+/// (`Disk.info` in a volume's root for a name ending `:`) from the
+/// guest `DiskObject`, replacing any file there. Workbench is not
+/// notified: there is none.
+fn put_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(0));
+    let obj = ctx.cpu.address_register(AddressRegister(1));
+    let icon = read_object(ctx, "PutDiskObject", obj)?;
+    let path = info_path(&guest_string(ctx.mem, name_ptr));
+    let result = store_icon(ctx, &path, &icon, false);
+    finish_put(ctx, result);
+    Ok(())
+}
+
+/// `PutDefDiskObject` (`A0` = object): writes
+/// `ENV:Sys/def_<type>.info` for the object's `do_Type`, creating
+/// `ENV:Sys` if needed -- where `GetDefDiskObject` reads it back. A type
+/// with no default (`WBDEVICE`, `WBAPPICON`, anything else) is `FALSE`
+/// plus `ERROR_BAD_NUMBER`, matching `GetDefDiskObject`. `ENVARC:` is not
+/// written; whether real V40 does is unverified (phase 0 of #313).
+fn put_def_disk_object_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let obj = ctx.cpu.address_register(AddressRegister(0));
+    let icon = read_object(ctx, "PutDefDiskObject", obj)?;
+    let result = match DEFAULT_ICON_NAMES
+        .iter()
+        .find(|(t, _)| *t == icon.object_type as u32)
+    {
+        Some(&(_, name)) => store_icon(ctx, &format!("ENV:Sys/def_{name}.info"), &icon, true),
+        None => Err(crate::dosargs::ERROR_BAD_NUMBER),
+    };
+    finish_put(ctx, result);
+    Ok(())
+}
+
 /// `DeleteDiskObject` (`A0` = name). Deletes `name.info` as `DeleteFile`
 /// does: `D0` = `TRUE`, or `FALSE` + `IoErr()`.
 fn delete_disk_object_handler<C: Cpu>(
@@ -314,8 +410,8 @@ fn delete_disk_object_handler<C: Cpu>(
     Ok(())
 }
 
-/// A [`crate::iconobj`] failure as the call that hit it.
-fn free_failed(handler: &str, message: String) -> DispatchError {
+/// A guest-visible failure of `handler`, as the call that hit it.
+fn handler_failed(handler: &str, message: String) -> DispatchError {
     let lvo = crate::lvos::find_by_name(ICON_LVOS, handler)
         .expect("in the table")
         .lvo;
@@ -340,7 +436,7 @@ fn free_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     crate::iconobj::free_disk_object(ctx.heap, ctx.mem, obj)
         .map(|_| ())
         .map_err(|e| {
-            free_failed(
+            handler_failed(
                 "FreeDiskObject",
                 format!("{obj:#010x} is not a DiskObject: {e}"),
             )
@@ -368,7 +464,7 @@ fn free_free_list_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(),
     }
     crate::iconobj::free_free_list(ctx.heap, ctx.mem, list)
         .map(|_| ())
-        .map_err(|e| free_failed("FreeFreeList", format!("{list:#010x}: {e}")))
+        .map_err(|e| handler_failed("FreeFreeList", format!("{list:#010x}: {e}")))
 }
 
 /// Whether `entry` starts with `name`, compared as `icon.library` does
@@ -517,6 +613,8 @@ pub fn register_icon_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("FreeDiskObject", free_disk_object_handler::<C>);
     reg!("AddFreeList", add_free_list_handler::<C>);
     reg!("FreeFreeList", free_free_list_handler::<C>);
+    reg!("PutDiskObject", put_disk_object_handler::<C>);
+    reg!("PutDefDiskObject", put_def_disk_object_handler::<C>);
     reg!("FindToolType", find_tool_type_handler::<C>);
     reg!("MatchToolValue", match_tool_value_handler::<C>);
     reg!("BumpRevision", bump_revision_handler::<C>);
@@ -876,6 +974,140 @@ mod tests {
         let (obj, _, code) = call_with_name("GetDiskObject", b"SYS:thing\0", tmp.path());
         assert_eq!(obj, 0);
         assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+    }
+
+    /// Reads `SYS:src` with `GetDiskObject`, then hands the result to
+    /// `put` (`PutDiskObject` as `A1`, with `SYS:dst` in `A0`, or
+    /// `PutDefDiskObject` in `A0`); returns the put's `D0` and `IoErr()`.
+    fn get_then_put(put: &str, dst: &[u8], sys: &Path) -> (u32, i32) {
+        const NAMES: u32 = DATA + 0x100;
+        let mut words = Vec::new();
+        push_imm_a(&mut words, 0, DATA);
+        push_jsr_a6(&mut words, "GetDiskObject");
+        if put == "PutDiskObject" {
+            words.push(0x2240); // move.l d0,a1
+            push_imm_a(&mut words, 0, NAMES);
+        } else {
+            words.push(MOVE_D0_TO_A0);
+        }
+        push_jsr_a6(&mut words, put);
+        push_store_d0_then_io_err(&mut words);
+        let mut data = vec![0u8; 0x100];
+        data[..8].copy_from_slice(b"SYS:src\0");
+        data.extend_from_slice(dst);
+        data.push(0);
+        let (result, rt) = run(&words, &data, Some(sys));
+        (rt.memory().read_u32(RESULT), result.unwrap())
+    }
+
+    fn full_icon() -> DiskObjectFile {
+        let mut icon = project_icon();
+        icon.tool_window = Some(b"CON:0/0/320/100/win".to_vec());
+        icon.current_x = 40;
+        icon.current_y = 60;
+        icon.gadget_image = Some(crate::iconfile::IconImage {
+            width: 20,
+            height: 4,
+            depth: 2,
+            data: (0..16u8).map(|i| i * 3).collect::<Vec<_>>().repeat(2)[..16].to_vec(),
+            ..Default::default()
+        });
+        icon.gadget_image
+            .as_mut()
+            .unwrap()
+            .data
+            .resize(crate::iconfile::plane_data_size(20, 4, 2) as usize, 7);
+        icon
+    }
+
+    #[test]
+    fn put_disk_object_writes_what_get_disk_object_read() {
+        let tmp = TempDir::new("put");
+        let icon = full_icon();
+        fs::write(tmp.path().join("src.info"), icon.to_bytes()).unwrap();
+        let (ok, code) = get_then_put("PutDiskObject", b"SYS:dst", tmp.path());
+        assert_eq!((ok, code), (TRUE, 0));
+        let written = fs::read(tmp.path().join("dst.info")).unwrap();
+        let (back, used) = DiskObjectFile::parse(&written).unwrap();
+        assert_eq!(used, written.len());
+        assert_eq!(back, icon, "every field survives the guest round trip");
+    }
+
+    #[test]
+    fn put_disk_object_replaces_an_existing_file() {
+        let tmp = TempDir::new("putreplace");
+        fs::write(tmp.path().join("src.info"), full_icon().to_bytes()).unwrap();
+        fs::write(tmp.path().join("dst.info"), vec![0xAA; 5000]).unwrap();
+        let (ok, _) = get_then_put("PutDiskObject", b"SYS:dst", tmp.path());
+        assert_eq!(ok, TRUE);
+        let written = fs::read(tmp.path().join("dst.info")).unwrap();
+        assert!(DiskObjectFile::parse(&written).is_ok());
+        assert_eq!(written, full_icon().to_bytes(), "no stale tail");
+    }
+
+    #[test]
+    fn put_disk_object_into_a_missing_directory_fails_with_io_err() {
+        let tmp = TempDir::new("putnodir");
+        fs::write(tmp.path().join("src.info"), full_icon().to_bytes()).unwrap();
+        let (ok, code) = get_then_put("PutDiskObject", b"SYS:nowhere/dst", tmp.path());
+        assert_eq!(ok, FALSE);
+        assert_eq!(code, crate::dosfile::ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn put_disk_object_for_a_volume_writes_disk_info() {
+        let tmp = TempDir::new("putdisk");
+        fs::write(tmp.path().join("src.info"), full_icon().to_bytes()).unwrap();
+        let (ok, _) = get_then_put("PutDiskObject", b"SYS:", tmp.path());
+        assert_eq!(ok, TRUE);
+        assert!(tmp.path().join("Disk.info").exists());
+    }
+
+    #[test]
+    fn put_def_disk_object_writes_the_env_file_get_def_disk_object_reads() {
+        let tmp = TempDir::new("putdef");
+        fs::create_dir(tmp.path().join("env")).unwrap(); // ENV:, without Sys
+        let icon = full_icon(); // WBPROJECT
+        fs::write(tmp.path().join("src.info"), icon.to_bytes()).unwrap();
+        let (ok, code) = get_then_put("PutDefDiskObject", b"", tmp.path());
+        assert_eq!((ok, code), (TRUE, 0));
+        let written = fs::read(tmp.path().join("env/Sys/def_project.info")).unwrap();
+        assert_eq!(DiskObjectFile::parse(&written).unwrap().0, icon);
+        // ...and Get reads it back instead of the built-in.
+        let (obj, rt, _) = {
+            let mut words = Vec::new();
+            push_imm_d(&mut words, 0, WBPROJECT as u32);
+            push_jsr_a6(&mut words, "GetDefDiskObject");
+            push_store_d0_then_io_err(&mut words);
+            let (r, rt) = run(&words, b"", Some(tmp.path()));
+            let code = r.unwrap();
+            (rt.memory().read_u32(RESULT), rt, code)
+        };
+        assert_eq!(rt.memory().read_u32(obj + 74), 9000, "the stack we put");
+    }
+
+    #[test]
+    fn put_def_disk_object_for_a_type_with_no_default_is_bad_number() {
+        let tmp = TempDir::new("putdefdev");
+        let mut icon = full_icon();
+        icon.object_type = crate::iconfile::WBDEVICE;
+        fs::write(tmp.path().join("src.info"), icon.to_bytes()).unwrap();
+        let (ok, code) = get_then_put("PutDefDiskObject", b"", tmp.path());
+        assert_eq!(ok, FALSE);
+        assert_eq!(code, crate::dosargs::ERROR_BAD_NUMBER);
+    }
+
+    #[test]
+    fn put_disk_object_with_a_wild_pointer_fails_the_run_naming_the_call() {
+        let tmp = TempDir::new("putwild");
+        let mut words = Vec::new();
+        push_imm_a(&mut words, 0, DATA);
+        push_imm_a(&mut words, 1, 0xFFFF_FF00);
+        push_jsr_a6(&mut words, "PutDiskObject");
+        let (result, _) = run(&words, b"SYS:x\0", Some(tmp.path()));
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains("PutDiskObject"), "{err}");
+        assert!(!tmp.path().join("x.info").exists());
     }
 
     #[test]

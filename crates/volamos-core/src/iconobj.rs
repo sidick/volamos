@@ -44,7 +44,8 @@
 use crate::execlist::{LH_HEAD, LH_TAIL, LN_SUCC, LN_TYPE, add_tail_impl, init_list_header};
 use crate::guestmem::{GuestHeap, write_c_string};
 use crate::iconfile::{
-    DRAWER_EXTENSION_SIZE, DiskObjectFile, IconImage, NEW_WINDOW_SIZE, WB_DISKMAGIC,
+    DRAWER_EXTENSION_SIZE, DiskObjectFile, DrawerData, GadgetFields, IconImage, NEW_WINDOW_SIZE,
+    WB_DISKMAGIC, plane_data_size,
 };
 use crate::memory::AddressSpace;
 
@@ -203,6 +204,159 @@ pub fn free_disk_object(
         return Err("its FreeList does not start with the object itself".to_string());
     }
     free_free_list(heap, mem, list)
+}
+
+/// Longest string (default tool, tool type, tool window) read from the
+/// guest, and most tool types: a pointer that is not a string at all
+/// fails instead of reading the whole address space.
+const MAX_STRING_LEN: u32 = 1 << 20;
+const MAX_TOOL_TYPES: u32 = 1 << 16;
+/// Largest image bitplane block read from the guest.
+const MAX_IMAGE_BYTES: u64 = 16 << 20;
+
+fn mapped(mem: &dyn AddressSpace, addr: u32, len: u32, what: &str) -> Result<(), String> {
+    if addr != 0 && mem.is_mapped(addr, len) {
+        Ok(())
+    } else {
+        Err(format!("{what} at {addr:#010x} is not readable memory"))
+    }
+}
+
+fn read_string(mem: &dyn AddressSpace, addr: u32, what: &str) -> Result<Vec<u8>, String> {
+    mapped(mem, addr, 1, what)?;
+    let mut out = Vec::new();
+    loop {
+        let at = addr
+            .checked_add(out.len() as u32)
+            .filter(|&a| mem.is_mapped(a, 1))
+            .ok_or_else(|| format!("{what} at {addr:#010x} runs off the end of memory"))?;
+        let b = mem.read_u8(at);
+        if b == 0 {
+            return Ok(out);
+        }
+        if out.len() as u32 >= MAX_STRING_LEN {
+            return Err(format!("{what} at {addr:#010x} is not NUL-terminated"));
+        }
+        out.push(b);
+    }
+}
+
+fn read_image(mem: &dyn AddressSpace, addr: u32, what: &str) -> Result<IconImage, String> {
+    mapped(mem, addr, 20, what)?;
+    let word = |off: u32| mem.read_u16(addr + off) as i16;
+    let mut img = IconImage {
+        left_edge: word(0),
+        top_edge: word(2),
+        width: word(4),
+        height: word(6),
+        depth: word(8),
+        plane_pick: mem.read_u8(addr + 14),
+        plane_on_off: mem.read_u8(addr + 15),
+        data: Vec::new(),
+    };
+    let planes = mem.read_u32(addr + 10);
+    if planes != 0 {
+        let size = plane_data_size(img.width, img.height, img.depth);
+        if size > MAX_IMAGE_BYTES {
+            return Err(format!("{what} claims {size} bytes of bitplanes"));
+        }
+        mapped(mem, planes, size as u32, &format!("{what}'s bitplanes"))?;
+        img.data = (0..size as u32).map(|i| mem.read_u8(planes + i)).collect();
+    }
+    Ok(img)
+}
+
+/// Reads the guest `DiskObject` at `obj` into the host model, for
+/// `PutDiskObject`: the inverse of [`build_disk_object`], following the
+/// same pointers (`do_Gadget`'s two images, default tool, tool types,
+/// tool window, drawer data). Pointer fields that are meaningless on
+/// disk are dropped; a drawer is written with its `dd_Flags` /
+/// `dd_ViewModes` extension. Fails, naming what was unreadable, if a
+/// pointer does not lead to memory: a program passing one has a bug,
+/// and writing garbage to the user's `.info` would hide it.
+pub fn read_disk_object(mem: &dyn AddressSpace, obj: u32) -> Result<DiskObjectFile, String> {
+    mapped(mem, obj, DISK_OBJECT_MEM_SIZE, "the DiskObject")?;
+    let w = |off: u32| mem.read_u16(obj + off);
+    let l = |off: u32| mem.read_u32(obj + off);
+    let optional_string = |off: u32, what: &str| match l(off) {
+        0 => Ok(None),
+        p => read_string(mem, p, what).map(Some),
+    };
+
+    let gadget_image = match l(22) {
+        0 => None,
+        p => Some(read_image(mem, p, "do_Gadget.GadgetRender")?),
+    };
+    let select_image = match l(26) {
+        0 => None,
+        p => Some(read_image(mem, p, "do_Gadget.SelectRender")?),
+    };
+    let tool_types = match l(54) {
+        0 => None,
+        array => {
+            let mut types = Vec::new();
+            for i in 0..MAX_TOOL_TYPES {
+                let slot = array.wrapping_add(4 * i);
+                mapped(mem, slot, 4, "the ToolTypes array")?;
+                match mem.read_u32(slot) {
+                    0 => break,
+                    p => types.push(read_string(mem, p, "a tool type")?),
+                }
+                if i + 1 == MAX_TOOL_TYPES {
+                    return Err("the ToolTypes array is not NULL-terminated".to_string());
+                }
+            }
+            Some(types)
+        }
+    };
+    let drawer = match l(66) {
+        0 => None,
+        d => {
+            mapped(mem, d, DRAWER_DATA_MEM_SIZE, "do_DrawerData")?;
+            let mut new_window = [0u8; NEW_WINDOW_SIZE];
+            for (i, b) in new_window.iter_mut().enumerate() {
+                if !NEW_WINDOW_POINTERS.contains(&(i as u32)) {
+                    *b = mem.read_u8(d + i as u32);
+                }
+            }
+            let tail = NEW_WINDOW_SIZE as u32;
+            Some(DrawerData {
+                new_window,
+                current_x: mem.read_u32(d + tail) as i32,
+                current_y: mem.read_u32(d + tail + 4) as i32,
+                extension: Some((mem.read_u32(d + tail + 8), mem.read_u16(d + tail + 12))),
+            })
+        }
+    };
+
+    Ok(DiskObjectFile {
+        version: w(2),
+        gadget: GadgetFields {
+            next_gadget: 0,
+            left_edge: w(8) as i16,
+            top_edge: w(10) as i16,
+            width: w(12) as i16,
+            height: w(14) as i16,
+            flags: w(16),
+            activation: w(18),
+            gadget_type: w(20),
+            gadget_text: 0,
+            mutual_exclude: 0,
+            special_info: 0,
+            gadget_id: w(42),
+            user_data: l(44),
+        },
+        object_type: mem.read_u8(obj + 48),
+        current_x: l(58) as i32,
+        current_y: l(62) as i32,
+        stack_size: l(74) as i32,
+        default_tool: optional_string(50, "do_DefaultTool")?,
+        tool_types,
+        tool_window: optional_string(70, "do_ToolWindow")?,
+        drawer,
+        gadget_image,
+        select_image,
+    })
 }
 
 /// Builds the guest `DiskObject` (with its `FreeList` and everything it
@@ -635,6 +789,65 @@ mod tests {
         assert!(free_disk_object(&mut heap, &mut mem, real).is_err());
     }
 
+    #[test]
+    fn reading_a_built_object_back_gives_the_icon_it_was_built_from() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let mut icon = project();
+        icon.drawer = Some(DrawerData {
+            new_window: {
+                let mut w = [0u8; NEW_WINDOW_SIZE];
+                w[0] = 1;
+                w[5] = 47;
+                w
+            },
+            current_x: 12,
+            current_y: -3,
+            extension: Some((1, 2)),
+        });
+        icon.object_type = WBDRAWER;
+        icon.tool_window = Some(b"CON:0/0/320/100/x".to_vec());
+        let obj = build_disk_object(&mut heap, &mut mem, &icon).unwrap();
+        assert_eq!(read_disk_object(&mem, obj).unwrap(), icon);
+    }
+
+    #[test]
+    fn a_drawer_without_the_extension_reads_back_with_zero_flags() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let mut icon = DiskObjectFile::builtin_default(WBDRAWER);
+        icon.drawer.as_mut().unwrap().extension = None;
+        let obj = build_disk_object(&mut heap, &mut mem, &icon).unwrap();
+        let back = read_disk_object(&mem, obj).unwrap();
+        assert_eq!(back.drawer.unwrap().extension, Some((0, 0)));
+    }
+
+    #[test]
+    fn reading_a_wild_pointer_names_what_was_unreadable() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let obj = build_disk_object(&mut heap, &mut mem, &project()).unwrap();
+        mem.write_u32(obj + 50, 0xFFFF_FFF0); // do_DefaultTool
+        let err = read_disk_object(&mem, obj).unwrap_err();
+        assert!(err.contains("do_DefaultTool"), "{err}");
+        assert!(read_disk_object(&mem, 0).is_err(), "NULL");
+        assert!(read_disk_object(&mem, 0xFFFF_FF00).is_err(), "off the end");
+    }
+
+    #[test]
+    fn an_unterminated_tool_types_array_is_refused() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let obj = build_disk_object(&mut heap, &mut mem, &project()).unwrap();
+        // Point every slot at the same string, forever: the array of
+        // `MAX_TOOL_TYPES` entries never ends within memory or bounds.
+        let arr = mem.read_u32(obj + 54);
+        let first = mem.read_u32(arr);
+        mem.write_u32(arr + 8, first);
+        mem.write_u32(arr + 12, 0xFFFF_FFF0);
+        let err = read_disk_object(&mem, obj).unwrap_err();
+        assert!(
+            err.contains("tool type") || err.contains("ToolTypes"),
+            "{err}"
+        );
+    }
+
     /// Builds and frees every real icon under a directory, for ground
     /// truth the repository cannot hold: `VOLAMOS_INFO_CORPUS=<dir>
     /// cargo test -p volamos-core iconobj::tests::real_icons -- --ignored`.
@@ -674,6 +887,30 @@ mod tests {
             };
             let obj = build_disk_object(&mut heap, &mut mem, &icon)
                 .unwrap_or_else(|_| panic!("{}: out of memory", path.display()));
+            // What PutDiskObject would write is the icon again, apart
+            // from the pointer fields that mean nothing on disk.
+            let back =
+                read_disk_object(&mem, obj).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let who = path.display();
+            assert_eq!(back.object_type, icon.object_type, "{who}");
+            assert_eq!(back.stack_size, icon.stack_size, "{who}");
+            assert_eq!(back.default_tool, icon.default_tool, "{who}");
+            assert_eq!(back.tool_types, icon.tool_types, "{who}");
+            assert_eq!(back.tool_window, icon.tool_window, "{who}");
+            assert_eq!(back.gadget_image, icon.gadget_image, "{who}");
+            assert_eq!(back.select_image, icon.select_image, "{who}");
+            assert_eq!(
+                (back.current_x, back.current_y),
+                (icon.current_x, icon.current_y),
+                "{who}"
+            );
+            assert_eq!(back.drawer.is_some(), icon.drawer.is_some(), "{who}");
+            if let (Some(b), Some(i)) = (&back.drawer, &icon.drawer) {
+                assert_eq!(b.new_window[..18], i.new_window[..18], "{who}");
+                assert_eq!(b.new_window[38..], i.new_window[38..], "{who}");
+                assert_eq!((b.current_x, b.current_y), (i.current_x, i.current_y));
+                assert_eq!((b.flags(), b.view_modes()), (i.flags(), i.view_modes()));
+            }
             free_free_list(&mut heap, &mut mem, obj + DISK_OBJECT_MEM_SIZE)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert_eq!(heap.free_bytes(), before, "{} leaked", path.display());

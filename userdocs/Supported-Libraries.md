@@ -506,18 +506,27 @@ all — so it always opens. Reading icons works; writing them doesn't yet.
 - `FreeDiskObject`, `FreeFreeList` and `AddFreeList` work on the
   `FreeList` of such an object. `NULL` is ignored. Passing a pointer
   that didn't come from `GetDiskObject` fails the run, naming the call.
+- `PutDiskObject(name, diskobj)` writes `name.info` (`Disk.info` in the
+  root for a volume name like `SYS:`) from the guest `DiskObject`,
+  replacing any file there: the default tool, tool types, tool window,
+  stack, position, drawer data and images, so what `GetDiskObject` read
+  is what gets written back. The directory must exist (`FALSE` with
+  `IoErr()` otherwise). Workbench isn't notified, as there is none. A
+  `DiskObject` pointer that doesn't lead to readable memory fails the
+  run, naming the call, rather than writing garbage to the file.
+- `PutDefDiskObject` writes `ENV:Sys/def_<type>.info` for the object's
+  `do_Type` (creating `ENV:Sys` if needed), which `GetDefDiskObject`
+  then reads back. It doesn't write `ENVARC:`. `WBDEVICE` and other
+  types with no default give `ERROR_BAD_NUMBER`.
 - `DeleteDiskObject` deletes `name.info` exactly as `DeleteFile` would.
 - `FindToolType`, `MatchToolValue` and `BumpRevision` are implemented in
   full: case-insensitive tool-type lookup (a bare flag entry like
   `DONOTWAIT` is found), `|`-separated value matching, and
   `copy_of_`/`copy_<n>_of_` renaming truncated to 30 characters.
 
-`PutDiskObject` and `PutDefDiskObject` aren't supported yet
-([issue #313](https://github.com/sidick/volamos/issues/313)): they fail
-the run loudly, naming the call, rather than telling the guest a write
-succeeded when nothing was written. The 3.5+ calls (`GetIconTagList` and
-friends) aren't part of the 3.1 interface and fail the same way. Nothing
-here draws an icon: the images are kept as data only.
+The 3.5+ calls (`GetIconTagList`, `PutIconTagList` and friends) aren't
+part of the 3.1 interface and fail the run loudly, naming the call.
+Nothing here draws an icon: the images are kept as data only.
 
 ## battclock.resource
 
