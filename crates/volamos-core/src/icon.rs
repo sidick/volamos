@@ -337,18 +337,14 @@ fn free_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     if obj == 0 {
         return Ok(());
     }
-    crate::iconobj::free_free_list(
-        ctx.heap,
-        ctx.mem,
-        obj + crate::iconobj::DISK_OBJECT_MEM_SIZE,
-    )
-    .map(|_| ())
-    .map_err(|e| {
-        free_failed(
-            "FreeDiskObject",
-            format!("{obj:#010x} is not a DiskObject: {e}"),
-        )
-    })
+    crate::iconobj::free_disk_object(ctx.heap, ctx.mem, obj)
+        .map(|_| ())
+        .map_err(|e| {
+            free_failed(
+                "FreeDiskObject",
+                format!("{obj:#010x} is not a DiskObject: {e}"),
+            )
+        })
 }
 
 /// `AddFreeList` (`A0` = free list, `A1` = memory, `A2` = length): `D0` =

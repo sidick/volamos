@@ -119,10 +119,9 @@ pub fn add_free_list(
 /// [`add_free_list`] and [`build_disk_object`] always are), and none may
 /// appear twice. That bounds the walk by the heap's own live count --
 /// a cycle or garbage pointer fails at the first repeated or unknown
-/// node -- and catches a second `FreeDiskObject` of the same object,
-/// whose first node is no longer live. A stale pointer whose memory has
-/// since been recycled into a new, valid-looking list cannot be told
-/// apart from a real one; `--sanitize`'s quarantine reports that.
+/// node. For a stale `DiskObject` pointer use [`free_disk_object`],
+/// which also checks the object owns its list; this function takes any
+/// `FreeList`, so it cannot.
 pub fn free_free_list(
     heap: &mut GuestHeap,
     mem: &mut dyn AddressSpace,
@@ -172,6 +171,38 @@ pub fn free_free_list(
             .map_err(|e| format!("freeing {addr:#010x}: {e}"))?;
     }
     Ok(blocks.len())
+}
+
+/// `FreeDiskObject`: [`free_free_list`] on the `FreeList` after the
+/// `DiskObject` at `obj`, after checking that `obj` really is one built
+/// by [`build_disk_object`]: a live heap allocation big enough to hold
+/// both structures, whose list records `obj` itself as its first block.
+/// A stale or foreign pointer, even one whose memory was recycled into
+/// something list-shaped, fails that last test unless it is by now a
+/// genuine `DiskObject` again (a use-after-free no allocator can tell
+/// from a real free).
+pub fn free_disk_object(
+    heap: &mut GuestHeap,
+    mem: &mut dyn AddressSpace,
+    obj: u32,
+) -> Result<usize, String> {
+    let list = obj + DISK_OBJECT_MEM_SIZE;
+    if heap
+        .size_of_live_alloc(obj)
+        .is_none_or(|size| size < DISK_OBJECT_MEM_SIZE + FREE_LIST_SIZE)
+    {
+        return Err("not a live DiskObject allocation".to_string());
+    }
+    let first = mem.read_u32(list + FL_MEMLIST + LH_HEAD);
+    let owns_itself = heap
+        .size_of_live_alloc(first)
+        .is_some_and(|size| size >= MEMLIST_SIZE)
+        && mem.read_u16(first + ML_NUMENTRIES) >= 1
+        && mem.read_u32(first + ML_ME) == obj;
+    if !owns_itself {
+        return Err("its FreeList does not start with the object itself".to_string());
+    }
+    free_free_list(heap, mem, list)
 }
 
 /// Builds the guest `DiskObject` (with its `FreeList` and everything it
@@ -577,6 +608,31 @@ mod tests {
         mem.write_u32(first + LN_SUCC, first);
         let err = free_free_list(&mut heap, &mut mem, fl).unwrap_err();
         assert!(err.contains("loops"), "{err}");
+    }
+
+    #[test]
+    fn free_disk_object_refuses_memory_that_only_looks_like_a_disk_object() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let real = build_disk_object(&mut heap, &mut mem, &project()).unwrap();
+        // A recycled block whose list points at someone else's live nodes.
+        let fake = heap
+            .alloc(&mut mem, DISK_OBJECT_MEM_SIZE + FREE_LIST_SIZE)
+            .unwrap();
+        let theirs = mem.read_u32(real + DISK_OBJECT_MEM_SIZE + FL_MEMLIST + LH_HEAD);
+        mem.write_u32(fake + DISK_OBJECT_MEM_SIZE + FL_MEMLIST + LH_HEAD, theirs);
+        let before = heap.free_bytes();
+        assert!(free_disk_object(&mut heap, &mut mem, fake).is_err());
+        assert_eq!(heap.free_bytes(), before, "nothing was freed");
+        free_disk_object(&mut heap, &mut mem, real).expect("the real one is intact");
+    }
+
+    #[test]
+    fn free_disk_object_refuses_a_pointer_that_is_not_an_allocation() {
+        let (mut heap, mut mem) = heap_and_mem();
+        let real = build_disk_object(&mut heap, &mut mem, &project()).unwrap();
+        assert!(free_disk_object(&mut heap, &mut mem, real + 4).is_err());
+        free_disk_object(&mut heap, &mut mem, real).unwrap();
+        assert!(free_disk_object(&mut heap, &mut mem, real).is_err());
     }
 
     /// Builds and frees every real icon under a directory, for ground
