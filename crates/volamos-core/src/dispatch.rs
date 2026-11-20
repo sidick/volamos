@@ -3565,7 +3565,11 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// yet, or `host_dir` isn't under any configured volume -- matching
     /// real AmigaOS's own "no home directory exists" case (resident/ROM
     /// commands), just reached by a different, host-invocation-specific
-    /// route here. Must be called *after* [`Self::set_vfs`] (the
+    /// route here. The `volamos` binary avoids that case for the
+    /// program it starts: `VfsConfig::cover_host_dir` gives an uncovered
+    /// program directory a volume of its own before the `Vfs` is built,
+    /// so this finds it; a nested program from another uncovered
+    /// directory can still land here. Must be called *after* [`Self::set_vfs`] (the
     /// reverse lookup needs it) -- `crates/volamos/src/main.rs` calls
     /// this once, right after `set_vfs`, for both the top-level run and
     /// every nested `System()`/`Execute()`/`RunCommand()` one.
@@ -3719,7 +3723,8 @@ impl<C: Cpu + 'static> Runtime<C> {
             let vfs = self.dos.vfs.as_ref().ok_or("no volumes are configured")?;
             let amiga_dir = vfs.amiga_path_for_host_dir(&dir).ok_or_else(|| {
                 format!(
-                    "{}: its directory is not under any volume (see -V)",
+                    "{}: its directory is not under any volume \
+                     (the CLI adds one for it; an embedder must configure it)",
                     file.display()
                 )
             })?;

@@ -339,10 +339,16 @@ impl VfsConfig {
     /// directories.
     pub fn cover_host_dir(&mut self, dir: &Path) -> Option<String> {
         let canon = std::fs::canonicalize(dir).ok().filter(|d| d.is_dir())?;
-        let covered = self.volumes.iter().any(|(_, root)| {
-            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-            canon.starts_with(root)
-        });
+        // The internal `--libs-dir` volume is an implementation detail the
+        // guest must never be handed a path on, so it covers nothing.
+        let covered = self
+            .volumes
+            .iter()
+            .filter(|(name, _)| name != crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME)
+            .any(|(_, root)| {
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                canon.starts_with(root)
+            });
         if covered {
             return None;
         }
@@ -365,17 +371,28 @@ impl VfsConfig {
         } else {
             base
         };
+        // Names a program's directory must not take: the assign
+        // `set_program_dir` installs and the DOS devices.
+        const RESERVED: [&str; 7] = ["PROGDIR", "NIL", "CON", "RAW", "PIPE", "PRT", "*"];
+        let auto_root = self.auto_assign_root.clone();
         let taken = |name: &str| {
-            self.volumes
-                .iter()
-                .map(|(n, _)| n)
-                .chain(self.assigns.iter().map(|(n, _)| n))
-                .any(|n| n.eq_ignore_ascii_case(name))
+            RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
+                || self
+                    .volumes
+                    .iter()
+                    .map(|(n, _)| n)
+                    .chain(self.assigns.iter().map(|(n, _)| n))
+                    .any(|n| n.eq_ignore_ascii_case(name))
+                // `--auto-assign` would resolve `name:` to a directory
+                // under its root: do not shadow one that exists.
+                || auto_root.as_ref().is_some_and(|root| root.join(name).exists())
         };
         let mut name = base.clone();
         let mut n = 2;
         while taken(&name) {
-            name = format!("{base}_{n}");
+            let suffix = format!("_{n}");
+            let keep: String = base.chars().take(30 - suffix.len()).collect();
+            name = format!("{keep}{suffix}");
             n += 1;
         }
         self.volumes.push((name.clone(), canon));
@@ -2081,6 +2098,58 @@ mod cover_host_dir_tests {
             ..VfsConfig::default()
         };
         assert_eq!(config.cover_host_dir(&a).as_deref(), Some("sys_3"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_libs_override_volume_does_not_count_as_covering() {
+        let root = temp("libs");
+        let prog = root.join("prog");
+        std::fs::create_dir_all(&prog).unwrap();
+        let mut config = VfsConfig {
+            volumes: vec![(
+                crate::dispatch::LIBS_DIR_OVERRIDE_VOLUME.to_string(),
+                root.clone(),
+            )],
+            ..VfsConfig::default()
+        };
+        assert_eq!(config.cover_host_dir(&prog).as_deref(), Some("prog"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reserved_and_auto_assigned_names_are_not_taken() {
+        let root = temp("reserved");
+        let progdir = root.join("progdir");
+        let work = root.join("work");
+        let auto = root.join("auto");
+        std::fs::create_dir_all(&progdir).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(auto.join("work")).unwrap();
+        let mut config = VfsConfig {
+            auto_assign_root: Some(auto),
+            ..VfsConfig::default()
+        };
+        assert_eq!(
+            config.cover_host_dir(&progdir).as_deref(),
+            Some("progdir_2")
+        );
+        assert_eq!(config.cover_host_dir(&work).as_deref(), Some("work_2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_name_stays_within_30_characters_with_its_suffix() {
+        let root = temp("long");
+        let long = root.join("a".repeat(40));
+        std::fs::create_dir_all(&long).unwrap();
+        let mut config = VfsConfig {
+            volumes: vec![("a".repeat(30), root.join("other"))],
+            ..VfsConfig::default()
+        };
+        let name = config.cover_host_dir(&long).unwrap();
+        assert_eq!(name.len(), 30);
+        assert!(name.ends_with("_2"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

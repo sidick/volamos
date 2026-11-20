@@ -165,10 +165,15 @@ characters, and a name already taken by a volume or assign gets a `_2`,
 [`--workbench`](CLI-Reference.md#-workbench) start can lock the
 directories of the program and its project files without any `-V`.
 
-The new volume is added last, so it never becomes the default current
-directory, and a directory already inside a `-V` volume is left as it is.
-With `--no-defaults` and nothing else configured, no volumes are set up
-at all, except by `--workbench`, which needs them.
+The new volume is added last, so it doesn't change which volume is the
+default current directory, and a directory already inside a `-V` volume
+is left as it is. Names that would clash with `PROGDIR`, a DOS device
+(`NIL`, `CON`, `RAW`, `PIPE`, `PRT`), or a directory `--auto-assign`
+already provides are skipped with the same suffix. The one case where it
+*is* the starting directory: nothing else is configured (no `-V`, `-a`,
+`--cwd` or `--auto-assign`), where there is no other volume to start in.
+With `--no-defaults` and nothing configured, no volumes are set up at
+all, except by `--workbench`, which needs them.
 
 ## Case sensitivity
 

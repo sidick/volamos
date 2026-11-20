@@ -2092,13 +2092,15 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
         && opts.cwd.is_none()
         && opts.volumes.is_empty()
         && opts.assigns.is_empty()
+        && opts.auto_assign_root.is_none()
     {
         config.cwd = format!("{name}:");
     }
     Some(config)
 }
 
-/// The directory containing `file` (`.` for a bare name).
+/// The directory containing `file` (`.` for a bare name, which `Path::parent`
+/// reports as the empty path).
 fn dir_of(file: &Path) -> PathBuf {
     match file.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
@@ -2617,9 +2619,7 @@ fn build_nested_runtime(
     if libs_dir_override {
         runtime.enable_libs_dir_override();
     }
-    if let Some(dir) = host_path.parent() {
-        runtime.set_program_dir(dir);
-    }
+    runtime.set_program_dir(&dir_of(host_path));
     if net {
         runtime.enable_bsdsocket();
     }
@@ -2714,9 +2714,7 @@ fn build_runtime_with_vfs(
     if opts.libs_dir.is_some() {
         runtime.enable_libs_dir_override();
     }
-    if let Some(dir) = std::path::Path::new(&opts.program).parent() {
-        runtime.set_program_dir(dir);
-    }
+    runtime.set_program_dir(&dir_of(Path::new(&opts.program)));
     if opts.net {
         runtime.enable_bsdsocket();
     }
@@ -3362,6 +3360,48 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn dir_of_a_bare_name_is_the_current_directory() {
+        // `Path::new("hello").parent()` is `Some("")`, which no volume
+        // root contains: PROGDIR: needs "." instead.
+        assert_eq!(dir_of(Path::new("hello")), PathBuf::from("."));
+        assert_eq!(dir_of(Path::new("a/hello")), PathBuf::from("a"));
+        assert_eq!(dir_of(Path::new("/hello")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn an_uncovered_program_directory_gets_a_volume_after_the_configured_ones() {
+        let base = std::env::temp_dir().join(format!("volamos-vfscfg-{}", std::process::id()));
+        let sys = base.join("sys");
+        let prog_dir = base.join("progs");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::create_dir_all(&prog_dir).unwrap();
+        let program = prog_dir.join("hello");
+        let opts = parse_args(args(&[
+            "-V",
+            &format!("SYS:{}", sys.display()),
+            program.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let config = vfs_config_from_opts(&opts).unwrap();
+        let names: Vec<&str> = config.volumes.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["SYS", "progs"], "added last");
+        assert_eq!(
+            config.cwd, "SYS:",
+            "the first configured volume stays the cwd"
+        );
+        // A program inside a configured volume adds nothing.
+        let inside = sys.join("hello");
+        let opts = parse_args(args(&[
+            "-V",
+            &format!("SYS:{}", sys.display()),
+            inside.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(vfs_config_from_opts(&opts).unwrap().volumes.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
