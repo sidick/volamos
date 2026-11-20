@@ -75,6 +75,19 @@ deterministic for a given input: re-running with the same `--input` and
 the same `--source-url`/`--commit`/`--generated` values byte-for-byte
 reproduces the file.
 
+## Functions AROS does not list (`--extra`)
+
+The AROS `.conf` stops at the interface AROS implements, so a call that
+exists in the Amiga NDK but not in AROS (e.g. `icon.library`'s
+`BumpRevisionLength`, V45) is missing from the table, and a guest calling it
+would be reported as an anonymous unknown vector. `--extra NAME:LVO:REGS`
+(repeatable; `REGS` comma-separated, e.g. `A0,A1,D0`, in the C
+argument order) adds one such entry from a *different* source -- the
+NDK's own `lvo/<lib>_lib.i` and `.fd` facts -- and the generated header says
+so. The same guardrail applies: name, offset and register letters only. An
+extra must not collide with an existing name or offset; the generator
+refuses rather than guessing.
+
 ## The implicit reserved-vector header (`--start-bias`)
 
 Every AmigaOS library reserves four jump-table slots ahead of its public
@@ -204,6 +217,7 @@ def render(
     conf_path: str,
     table_name: str,
     sanity: list[tuple[str, int]],
+    extras: list[LvoEntry] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"//! Generated `{library_doc}` LVO (library vector offset) metadata table.")
@@ -220,6 +234,12 @@ def render(
     lines.append(f"//! - Generated: {generated}")
     lines.append(f"//! - Generator: `{generator}`")
     lines.append("//!")
+    if extras:
+        names = ", ".join(f"`{e.name}`" for e in extras)
+        verb = "was" if len(extras) == 1 else "were"
+        lines.append(f"//! {names} (not in the AROS source) {verb} added with `--extra` from the")
+        lines.append("//! Amiga NDK's published LVO offsets and register assignments.")
+        lines.append("//!")
     lines.append("//! Only uncopyrightable interface facts were extracted from the source --")
     lines.append("//! function names, LVO offsets, and argument-register assignments -- as")
     lines.append("//! bare data; no descriptive text, comments, or file structure from the")
@@ -344,6 +364,17 @@ def main() -> None:
             "explicitly)"
         ),
     )
+    ap.add_argument(
+        "--extra",
+        action="append",
+        default=[],
+        metavar="NAME:LVO:REGS",
+        help=(
+            "add a function the AROS source lacks, e.g. "
+            "BumpRevisionLength:-204:A0,A1,D0 (repeatable; see the module "
+            "docstring's '--extra' section)"
+        ),
+    )
     args = ap.parse_args()
 
     table_name = args.table_name or (f"{args.library.upper()}_LVOS" if args.library else None)
@@ -381,6 +412,26 @@ def main() -> None:
     if len(lvos) != len(set(lvos)):
         raise SystemExit("duplicate LVO offsets computed -- parser bug or malformed source")
 
+    extras: list[LvoEntry] = []
+    for item in args.extra:
+        parts = item.split(":")
+        if len(parts) != 3 or not parts[0]:
+            raise SystemExit(f"--extra {item!r} must be NAME:LVO:REGS")
+        name, lvo_s, regs_s = parts
+        regs = [r.strip() for r in regs_s.split(",") if r.strip()]
+        for r in regs:
+            if not REG_RE.match(r):
+                raise SystemExit(f"--extra {item!r}: unrecognized register {r!r}")
+        lvo = int(lvo_s)
+        if lvo >= 0 or lvo % 6:
+            raise SystemExit(f"--extra {item!r}: LVO must be a negative multiple of 6")
+        if name in names or lvo in lvos:
+            raise SystemExit(f"--extra {item!r} collides with an entry from the source")
+        extras.append(LvoEntry(name=name, lvo=lvo, regs=regs))
+    entries = entries + sorted(extras, key=lambda e: -e.lvo)
+    if len({e.lvo for e in extras}) != len(extras) or len({e.name for e in extras}) != len(extras):
+        raise SystemExit("duplicate --extra entries")
+
     out = render(
         entries,
         source_url=args.source_url,
@@ -391,6 +442,7 @@ def main() -> None:
         conf_path=conf_path,
         table_name=table_name,
         sanity=sanity,
+        extras=extras,
     )
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(out)

@@ -9,8 +9,11 @@
 //!
 //! - Source URL: <https://raw.githubusercontent.com/aros-development-team/AROS/d57636f86361b34ba7652dd1d9699b4349788844/workbench/libs/icon/icon.conf>
 //! - Source commit: d57636f86361b34ba7652dd1d9699b4349788844
-//! - Generated: 2026-11-15
+//! - Generated: 2026-11-20
 //! - Generator: `tools/gen_lvos.py`
+//!
+//! `BumpRevisionLength` (not in the AROS source) was added with `--extra` from the
+//! Amiga NDK's published LVO offsets and register assignments.
 //!
 //! Only uncopyrightable interface facts were extracted from the source --
 //! function names, LVO offsets, and argument-register assignments -- as
@@ -180,6 +183,16 @@ pub static ICON_LVOS: &[LvoEntry] = &[
         args: &[ArgReg::A(AddressRegister(0))],
         private: false,
     },
+    LvoEntry {
+        name: "BumpRevisionLength",
+        lvo: -204,
+        args: &[
+            ArgReg::A(AddressRegister(0)),
+            ArgReg::A(AddressRegister(1)),
+            ArgReg::D(DataRegister(0)),
+        ],
+        private: false,
+    },
 ];
 
 #[cfg(test)]
@@ -196,6 +209,7 @@ mod tests {
             ("GetDefDiskObject", -120),
             ("DeleteDiskObject", -138),
             ("ChangeToSelectedIconColor", -198),
+            ("BumpRevisionLength", -204),
         ];
         for (name, lvo) in cases {
             let entry = find_by_name(ICON_LVOS, name)

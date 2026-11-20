@@ -566,13 +566,16 @@ fn match_tool_value_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
-/// `BumpRevision`'s new name for `old`: `copy_of_<old>`, or
-/// `copy_<n+1>_of_<rest>` when `old` is already `copy_<n>_of_<rest>`
-/// with `n` all digits (plain `copy_of_<rest>` counting as `n` = one),
-/// truncated to [`BUMP_REVISION_MAX`]. Matches every example in the autodoc,
-/// including `"copy_0_of_foo"` -> `"copy_1_of_foo"` and `"copy foo"` ->
-/// `"copy_of_copy foo"`.
-fn bump_revision(old: &[u8]) -> Vec<u8> {
+/// The new name for `old`: `copy_of_<old>`, or `copy_<n+1>_of_<rest>`
+/// when `old` is already `copy_<n>_of_<rest>` with `n` all digits (plain
+/// `copy_of_<rest>` counting as `n` = one), truncated to `max` bytes.
+/// Matches every example in the `BumpRevision` autodoc, including
+/// `"copy_0_of_foo"` -> `"copy_1_of_foo"` and `"copy foo"` ->
+/// `"copy_of_copy foo"`. `None` when not even one byte of the old name
+/// fits after the `copy_..._of_` prefix (`BumpRevisionLength`'s "cannot
+/// fit the name even by truncation"; the exact boundary is unverified,
+/// phase 0 of #313).
+fn bump_revision(old: &[u8], max: usize) -> Option<Vec<u8>> {
     let bumped = old
         .strip_prefix(b"copy_of_")
         .map(|rest| (1u64, rest))
@@ -583,20 +586,19 @@ fn bump_revision(old: &[u8]) -> Vec<u8> {
             let n = std::str::from_utf8(&tail[..digits]).ok()?.parse().ok()?;
             Some((n, rest))
         });
-    let mut new = match bumped {
-        Some((n, rest)) => {
-            let mut v = format!("copy_{}_of_", n + 1).into_bytes();
-            v.extend_from_slice(rest);
-            v
-        }
-        None => {
-            let mut v = b"copy_of_".to_vec();
-            v.extend_from_slice(old);
-            v
-        }
+    let (mut new, rest) = match bumped {
+        Some((n, rest)) => (
+            format!("copy_{}_of_", n.saturating_add(1)).into_bytes(),
+            rest,
+        ),
+        None => (b"copy_of_".to_vec(), old),
     };
-    new.truncate(BUMP_REVISION_MAX);
-    new
+    if new.len() >= max && !rest.is_empty() {
+        return None;
+    }
+    new.extend_from_slice(rest);
+    new.truncate(max);
+    Some(new)
 }
 
 /// `BumpRevision` (`A0` = new buffer, at least 31 bytes; `A1` = old
@@ -604,8 +606,34 @@ fn bump_revision(old: &[u8]) -> Vec<u8> {
 fn bump_revision_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let new_buf = ctx.cpu.address_register(AddressRegister(0));
     let old = read_c_string(ctx.mem, ctx.cpu.address_register(AddressRegister(1)));
-    crate::guestmem::write_c_string(ctx.mem, new_buf, &bump_revision(&old));
+    // The longest prefix, `copy_<u64>_of_`, is 29 bytes: always fits.
+    let new = bump_revision(&old, BUMP_REVISION_MAX).expect("the copy prefix fits in 30 bytes");
+    crate::guestmem::write_c_string(ctx.mem, new_buf, &new);
     ctx.cpu.set_data_register(DataRegister(0), new_buf);
+    Ok(())
+}
+
+/// `BumpRevisionLength` (`A0` = new buffer, `A1` = old name, `D0` =
+/// length): `BumpRevision` with the name limit `length` (bytes, not
+/// counting the NUL) instead of 30, so copies of icons with long file
+/// names can be named. `D0` = the new buffer, or `NULL` when even a
+/// truncated copy name does not fit. `length` is taken as the name limit
+/// as the autodoc's "maximal file size" and the V45 prototype's
+/// `maxLength` suggest; whether it counts the NUL is unverified (phase 0
+/// of #313).
+fn bump_revision_length_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    let new_buf = ctx.cpu.address_register(AddressRegister(0));
+    let old = read_c_string(ctx.mem, ctx.cpu.address_register(AddressRegister(1)));
+    let max = ctx.cpu.data_register(DataRegister(0)) as usize;
+    match bump_revision(&old, max) {
+        Some(new) => {
+            crate::guestmem::write_c_string(ctx.mem, new_buf, &new);
+            ctx.cpu.set_data_register(DataRegister(0), new_buf);
+        }
+        None => ctx.cpu.set_data_register(DataRegister(0), 0),
+    }
     Ok(())
 }
 
@@ -640,6 +668,7 @@ pub fn register_icon_handlers<C: Cpu + 'static>(table: &mut LibraryTable<C>, mem
     reg!("FindToolType", find_tool_type_handler::<C>);
     reg!("MatchToolValue", match_tool_value_handler::<C>);
     reg!("BumpRevision", bump_revision_handler::<C>);
+    reg!("BumpRevisionLength", bump_revision_length_handler::<C>);
 }
 
 #[cfg(test)]
@@ -833,6 +862,56 @@ mod tests {
         let (result, rt) = run(&words, &data, Some(tmp.path()));
         let value = result.unwrap() as u32;
         assert_eq!(read_c_string(rt.memory(), value), b"1");
+    }
+
+    /// The tool types of the guest `DiskObject` at `obj`.
+    fn guest_tool_types(rt: &Runtime<M68kCpu>, obj: u32) -> Vec<Vec<u8>> {
+        let mem = rt.memory();
+        let array = mem.read_u32(obj + 54);
+        (0..)
+            .map(|i| mem.read_u32(array + 4 * i))
+            .take_while(|&p| p != 0)
+            .map(|p| read_c_string(mem, p))
+            .collect()
+    }
+
+    #[test]
+    fn color_icon_and_png_data_after_the_classic_part_is_ignored() {
+        // OS 3.5 ColorIcons and PNG icons append `FORM ICON` chunks (the
+        // PNG ones holding a PNG stream); the classic part comes first,
+        // so a 3.1 program sees exactly what it would without them.
+        let tmp = TempDir::new("colouricon");
+        let mut bytes = project_icon().to_bytes();
+        bytes.extend_from_slice(b"FORM\0\0\0\x20ICONFACE\0\0\0\x04\x01\x02\x03\x04");
+        bytes.extend_from_slice(b"IMAG\0\0\0\x0c\x89PNG\r\n\x1a\n\0\0\0\0");
+        fs::write(tmp.path().join("thing.info"), &bytes).unwrap();
+        let (obj, rt, code) = call_with_name("GetDiskObject", b"SYS:thing\0", tmp.path());
+        assert_ne!(obj, 0, "IoErr {code}");
+        assert_eq!(rt.memory().read_u32(obj + 74), 9000);
+        assert_eq!(
+            guest_tool_types(&rt, obj),
+            [b"A=1".to_vec(), b"FLAG".to_vec()]
+        );
+    }
+
+    #[test]
+    fn newicons_image_data_arrives_as_ordinary_tool_types() {
+        // NewIcons keep their pictures in `IM1=...` tool types, which a
+        // program that only wants its own settings must be able to walk
+        // past: they are plain entries of the array.
+        let tmp = TempDir::new("newicons");
+        let mut icon = project_icon();
+        icon.tool_types = Some(vec![
+            b"STACK=9000".to_vec(),
+            b"*** DON'T EDIT THE FOLLOWING LINES!! ***".to_vec(),
+            b"IM1=BB8a8N8e".to_vec(),
+            b"IM2=BB8a8N8e".to_vec(),
+        ]);
+        fs::write(tmp.path().join("thing.info"), icon.to_bytes()).unwrap();
+        let (obj, rt, _) = call_with_name("GetDiskObject", b"SYS:thing\0", tmp.path());
+        let types = guest_tool_types(&rt, obj);
+        assert_eq!(types.len(), 4);
+        assert_eq!(types[2], b"IM1=BB8a8N8e");
     }
 
     #[test]
@@ -1299,13 +1378,75 @@ mod tests {
                 "copy_of_0123456789012345678901",
             ),
         ] {
-            assert_eq!(bump_revision(old.as_bytes()), new.as_bytes(), "{old}");
+            assert_eq!(
+                bump_revision(old.as_bytes(), BUMP_REVISION_MAX).unwrap(),
+                new.as_bytes(),
+                "{old}"
+            );
         }
+    }
+
+    /// `BumpRevisionLength(buf, old, length)` from guest code: the name it
+    /// wrote and `D0` (`0` for `NULL`).
+    fn bump_length(old: &str, length: u32) -> (Option<Vec<u8>>, u32) {
+        const OLD: u32 = DATA;
+        const BUF: u32 = DATA + 0x400;
+        let mut data = old.as_bytes().to_vec();
+        data.push(0);
+        let mut words = Vec::new();
+        push_imm_a(&mut words, 0, BUF);
+        push_imm_a(&mut words, 1, OLD);
+        push_imm_d(&mut words, 0, length);
+        push_jsr_a6(&mut words, "BumpRevisionLength");
+        push_store_d0_then_io_err(&mut words);
+        let (result, rt) = run(&words, &data, None);
+        result.unwrap();
+        let d0 = rt.memory().read_u32(RESULT);
+        let name = (d0 != 0).then(|| read_c_string(rt.memory(), BUF));
+        (name, d0)
+    }
+
+    #[test]
+    fn bump_revision_length_allows_names_longer_than_30() {
+        let long = "a".repeat(60);
+        let (name, d0) = bump_length(&long, 100);
+        assert_eq!(d0, DATA + 0x400, "the buffer");
+        assert_eq!(name.unwrap(), format!("copy_of_{long}").as_bytes());
+        let (name, _) = bump_length(&format!("copy_of_{long}"), 100);
+        assert_eq!(name.unwrap(), format!("copy_2_of_{long}").as_bytes());
+    }
+
+    #[test]
+    fn bump_revision_length_truncates_to_the_given_length() {
+        let (name, _) = bump_length("012345678901234567890123456789", 30);
+        assert_eq!(
+            name.unwrap(),
+            b"copy_of_0123456789012345678901",
+            "30 is BumpRevision"
+        );
+        assert_eq!(bump_length("foo", 11).0.unwrap(), b"copy_of_foo");
+        assert_eq!(bump_length("foo", 10).0.unwrap(), b"copy_of_fo");
+        assert_eq!(bump_length("foo", 9).0.unwrap(), b"copy_of_f");
+    }
+
+    #[test]
+    fn bump_revision_length_is_null_when_not_even_a_truncated_name_fits() {
+        assert_eq!(bump_length("foo", 8), (None, 0));
+        assert_eq!(bump_length("foo", 0), (None, 0));
+        // A numbered copy has a longer prefix.
+        assert_eq!(bump_length("copy_99_of_foo", 12), (None, 0));
+        assert_eq!(
+            bump_length("copy_99_of_foo", 13).0.unwrap(),
+            b"copy_100_of_f"
+        );
     }
 
     #[test]
     fn bump_revision_treats_a_non_numeric_copy_prefix_as_a_plain_name() {
-        assert_eq!(bump_revision(b"copy_x_of_foo"), b"copy_of_copy_x_of_foo");
+        assert_eq!(
+            bump_revision(b"copy_x_of_foo", BUMP_REVISION_MAX).unwrap(),
+            b"copy_of_copy_x_of_foo"
+        );
     }
 
     #[test]

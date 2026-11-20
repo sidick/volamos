@@ -526,6 +526,9 @@ all — so it always opens. Reading icons works; writing them doesn't yet.
   full: case-insensitive tool-type lookup (a bare flag entry like
   `DONOTWAIT` is found), `|`-separated value matching, and
   `copy_of_`/`copy_<n>_of_` renaming truncated to 30 characters.
+  `BumpRevisionLength` (3.1.4 and later) does the same with a limit you
+  pass, so copies of long file names can be named; it returns `NULL` when
+  not even a truncated copy name fits.
 
 The 3.5+ calls (`GetIconTagList`, `PutIconTagList` and friends) aren't
 part of the 3.1 interface and fail the run loudly, naming the call.
