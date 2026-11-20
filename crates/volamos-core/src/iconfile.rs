@@ -41,11 +41,16 @@
 //!    pointer array the strings were in -- `(count + 1) * 4`, the `+ 1`
 //!    being its `NULL` terminator -- then `count` strings as in step 5.
 //!    Then, if `do_ToolWindow` is set, one more string.
-//! 7. If `do_DrawerData` is set and at least six bytes remain that do
-//!    not start a `FORM`, the OS 2.x drawer extension: `dd_Flags`
-//!    (`u32`) and `dd_ViewModes` (`u16`). Workbench 1.3 drawer icons
-//!    simply end after step 6, so the extension is optional and
-//!    [`DrawerData::extension`] records whether it was there.
+//! 7. If `do_DrawerData` is set, the OS 2.x drawer extension:
+//!    `dd_Flags` (`u32`) and `dd_ViewModes` (`u16`). It is recognised
+//!    when exactly six bytes remain, or when a `FORM` starts right
+//!    after those six; any other trailing bytes are not taken for it.
+//!    Workbench 1.3 drawer icons simply end after step 6, so the
+//!    extension is optional and [`DrawerData::extension`] records
+//!    whether it was there. A file cut off partway through its
+//!    extension therefore reads as a 1.3 drawer with unread trailing
+//!    bytes: the format has no length to tell the two apart, so a
+//!    caller that cares compares the bytes used with the file's length.
 //!
 //! Anything after that is not this module's business. OS 3.5 ColorIcons
 //! and PNG icons append an IFF `FORM ICON`, and NewIcons hide their
@@ -254,11 +259,13 @@ impl Default for DiskObjectFile {
 /// How many bytes of bitplane data an `Image` of this size has:
 /// `((width + 15) / 16) * 2 * height * depth`. A negative dimension
 /// counts as `0`, as for a drawing routine that draws nothing for it.
-pub fn plane_data_size(width: i16, height: i16, depth: i16) -> usize {
+/// A `u64`, because three 16-bit dimensions can exceed a 32-bit host's
+/// `usize` (at most ~4.4e12, which `u64` holds).
+pub fn plane_data_size(width: i16, height: i16, depth: i16) -> u64 {
     let (w, h, d) = (
-        width.max(0) as usize,
-        height.max(0) as usize,
-        depth.max(0) as usize,
+        width.max(0) as u64,
+        height.max(0) as u64,
+        depth.max(0) as u64,
     );
     w.div_ceil(16) * 2 * h * d
 }
@@ -332,7 +339,9 @@ impl<'a> Reader<'a> {
         // after it. (Every real file with an image sets it; the
         // NULL case is the loader's reading, not seen in the wild.)
         let data = if image_data != 0 {
-            self.take(plane_data_size(width, height, depth))?.to_vec()
+            // A size a host `usize` cannot hold is more than any file has.
+            let size = usize::try_from(plane_data_size(width, height, depth)).unwrap_or(usize::MAX);
+            self.take(size)?.to_vec()
         } else {
             Vec::new()
         };
@@ -428,7 +437,7 @@ impl DiskObjectFile {
             if count > r.remaining().len() / 4 {
                 return Err(IconFileError::Truncated {
                     offset: r.pos,
-                    needed: count * 4 - r.remaining().len(),
+                    needed: count.saturating_mul(4) - r.remaining().len(),
                 });
             }
             let mut types = Vec::with_capacity(count);
@@ -447,7 +456,11 @@ impl DiskObjectFile {
 
         if let Some(drawer) = drawer.as_mut() {
             let rest = r.remaining();
-            if rest.len() >= DRAWER_EXTENSION_SIZE && !rest.starts_with(b"FORM") {
+            if rest.len() == DRAWER_EXTENSION_SIZE
+                || rest
+                    .get(DRAWER_EXTENSION_SIZE..)
+                    .is_some_and(|t| t.starts_with(b"FORM"))
+            {
                 drawer.extension = Some((r.u32()?, r.u16()?));
             }
         }
@@ -489,7 +502,10 @@ impl DiskObjectFile {
         fn present(set: bool) -> u32 {
             if set { POINTER_PRESENT } else { 0 }
         }
+        // A C string: it ends at its first NUL, as it did in the guest
+        // memory it came from, and as the parser reads it back.
         fn string(out: &mut Vec<u8>, s: &[u8]) {
+            let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
             out.extend_from_slice(&(s.len() as u32 + 1).to_be_bytes());
             out.extend_from_slice(s);
             out.push(0);
@@ -508,7 +524,15 @@ impl DiskObjectFile {
             out.push(img.plane_pick);
             out.push(img.plane_on_off);
             out.extend_from_slice(&0u32.to_be_bytes()); // NextImage
-            out.extend_from_slice(&img.data);
+            // The planes are as long as the dimensions say, whatever
+            // `data` holds, so a reader finds the next field where
+            // it expects it: cut or zero-padded to fit.
+            if !img.data.is_empty() {
+                let size = usize::try_from(plane_data_size(img.width, img.height, img.depth))
+                    .expect("an image this size does not fit in memory");
+                out.extend_from_slice(&img.data[..img.data.len().min(size)]);
+                out.resize(out.len() + size.saturating_sub(img.data.len()), 0);
+            }
         }
 
         let g = &self.gadget;
@@ -584,7 +608,7 @@ mod tests {
             depth,
             plane_pick: (1u8 << depth) - 1,
             plane_on_off: 0,
-            data: (0..plane_data_size(width, height, depth))
+            data: (0..plane_data_size(width, height, depth) as usize)
                 .map(|i| i as u8)
                 .collect(),
         }
@@ -863,6 +887,7 @@ mod tests {
                     Ok((parsed, used)) => {
                         assert!(icon.drawer.is_some(), "len {len}: {parsed:?}");
                         assert_eq!(used, bytes.len() - DRAWER_EXTENSION_SIZE);
+                        assert!(used < len || len == used, "len {len}");
                         assert_eq!(parsed.drawer.unwrap().extension, None);
                     }
                 }
@@ -917,11 +942,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stray_bytes_after_a_drawer_are_not_taken_for_its_extension() {
+        let mut bytes = drawer(None).to_bytes();
+        let classic = bytes.len();
+        bytes.extend_from_slice(&[0xAB; 64]);
+        let (parsed, used) = DiskObjectFile::parse(&bytes).unwrap();
+        assert_eq!(parsed.drawer.unwrap().extension, None);
+        assert_eq!(used, classic);
+    }
+
+    #[test]
+    fn a_cut_off_drawer_extension_is_unread_trailing_bytes() {
+        let mut bytes = drawer(None).to_bytes();
+        let classic = bytes.len();
+        bytes.extend_from_slice(&[1, 2, 3]); // half an extension
+        let (parsed, used) = DiskObjectFile::parse(&bytes).unwrap();
+        assert_eq!(parsed.drawer.unwrap().extension, None);
+        assert_eq!(used, classic, "the caller sees 3 unread bytes");
+    }
+
+    #[test]
+    fn an_images_planes_are_written_at_the_size_its_dimensions_say() {
+        let mut icon = project();
+        let size = plane_data_size(30, 12, 2) as usize;
+        for data in [vec![7u8; size + 10], vec![7u8; size - 4]] {
+            icon.gadget_image.as_mut().unwrap().data = data;
+            let bytes = icon.to_bytes();
+            let (parsed, used) = DiskObjectFile::parse(&bytes).unwrap();
+            assert_eq!(used, bytes.len(), "later fields stay aligned");
+            assert_eq!(parsed.gadget_image.as_ref().unwrap().data.len(), size);
+            assert_eq!(parsed.tool_types, icon.tool_types);
+            assert_eq!(parsed.tool_window, icon.tool_window);
+        }
+    }
+
+    #[test]
+    fn an_image_size_a_32_bit_host_cannot_hold_is_truncation_not_overflow() {
+        assert_eq!(
+            plane_data_size(i16::MAX, i16::MAX, i16::MAX),
+            2048 * 2 * 32767 * 32767, // ~4.4e12: past a 32-bit usize
+        );
+        let mut bytes = project().to_bytes();
+        // GadgetImage's header follows the 78-byte DiskObject; make it
+        // 32767 x 32767 x 32767.
+        for at in [
+            DISK_OBJECT_SIZE + 4,
+            DISK_OBJECT_SIZE + 6,
+            DISK_OBJECT_SIZE + 8,
+        ] {
+            bytes[at..at + 2].copy_from_slice(&i16::MAX.to_be_bytes());
+        }
+        assert!(matches!(
+            DiskObjectFile::parse(&bytes),
+            Err(IconFileError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn a_string_is_written_up_to_its_first_nul() {
+        let icon = DiskObjectFile {
+            default_tool: Some(b"ab\0cd".to_vec()),
+            tool_types: Some(vec![b"X=1\0junk".to_vec()]),
+            ..DiskObjectFile::default()
+        };
+        let (parsed, used) = DiskObjectFile::parse(&icon.to_bytes()).unwrap();
+        assert_eq!(parsed.default_tool.as_deref(), Some(&b"ab"[..]));
+        assert_eq!(parsed.tool_types, Some(vec![b"X=1".to_vec()]));
+        assert_eq!(used, icon.to_bytes().len());
+    }
+
     /// Runs the parser over a directory of real icons, for ground truth
     /// the repository cannot hold (real `.info` files are not ours to
     /// commit): `VOLAMOS_INFO_CORPUS=/some/dir cargo test -p volamos-core
     /// iconfile::tests::real_icons -- --ignored --nocapture`. Every file
-    /// that starts with the magic must parse, and write back stably.
+    /// that starts with the magic must parse and write back stably, and a
+    /// drawer's extension must be recognised (nothing unexplained after it).
     #[test]
     #[ignore = "needs VOLAMOS_INFO_CORPUS=<dir of real .info files>"]
     fn real_icons_parse_and_rewrite_stably() {
@@ -957,6 +1053,18 @@ mod tests {
                 Ok((icon, used)) => {
                     icons += 1;
                     forms += bytes[used..].starts_with(b"FORM") as usize;
+                    // A drawer's extension must have been recognised: what
+                    // is left over is nothing, or a FORM.
+                    if icon.drawer.is_some()
+                        && used != bytes.len()
+                        && !bytes[used..].starts_with(b"FORM")
+                    {
+                        failures.push(format!(
+                            "{}: drawer with {} unexplained trailing bytes",
+                            path.display(),
+                            bytes.len() - used
+                        ));
+                    }
                     let once = icon.to_bytes();
                     let again = DiskObjectFile::parse(&once).map(|(i, _)| i.to_bytes());
                     if again.as_ref() != Ok(&once) {
