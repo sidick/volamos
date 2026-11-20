@@ -78,6 +78,9 @@ GetDiskObject(volume, put)         obj magic=e310 ver=1 type=4 stack=12345 x=-21
                                      gadget l=0 t=0 w=54 h=23 flags=0005 act=0001 type=0001 id=0 render=yes select=no
                                      render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
                                      drawer none
+PutDiskObject(vol:Disk)            TRUE ioerr=0
+volume Disk.info exists            yes
+GetDiskObject(vol:) w/ Disk.info   NULL ioerr=205
 wrote.info exists                  yes
 wrote.info size                    500 bytes
 GetDiskObject(wrote)               obj magic=e310 ver=1 type=4 stack=12345 x=-2147483648 y=-2147483648 tool=SYS:Tools/Edit tt=yes toolwin=no rev=0

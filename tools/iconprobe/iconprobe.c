@@ -210,6 +210,27 @@ int main(int argc, char **argv)
         if (lock) UnLock(lock);
         SetIoErr(777);
         describe("GetDiskObject(volume, put)", GetDiskObject(argv[1]));
+        /* A volume icon under its Workbench name, "<vol>:Disk" -- with the
+         * plain ".info" removed first so only Disk.info can answer. */
+        strcpy(p, argv[1]);
+        strcat(p, ".info");
+        DeleteFile(p);
+        strcpy(p, argv[1]);
+        strcat(p, "Disk");
+        SetIoErr(777);
+        ok = PutDiskObject(p, o);
+        printf("%-34s %s ioerr=%ld\n", "PutDiskObject(vol:Disk)", ok ? "TRUE" : "FALSE", (long)IoErr());
+        strcpy(p, argv[1]);
+        strcat(p, "Disk.info");
+        lock = Lock(p, SHARED_LOCK);
+        printf("%-34s %s\n", "volume Disk.info exists", lock ? "yes" : "no");
+        if (lock) UnLock(lock);
+        SetIoErr(777);
+        {
+            struct DiskObject *g = GetDiskObject(argv[1]);
+            printf("%-34s %s ioerr=%ld\n", "GetDiskObject(vol:) w/ Disk.info", g ? "obj" : "NULL", (long)IoErr());
+            if (g) FreeDiskObject(g);
+        }
         path(p, "wrote.info");
         lock = Lock(p, SHARED_LOCK);
         printf("%-34s %s\n", "wrote.info exists", lock ? "yes" : "no");
