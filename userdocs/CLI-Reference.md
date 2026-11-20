@@ -1525,8 +1525,12 @@ volamos exits with an error. `sm_ToolWindow` is `NULL`.
 - The program is loaded as a seglist (as Workbench does, and as the
   message's `sm_Segment` needs), so `--sanitize` reports for it carry
   addresses but no source locations.
-- Reading tool types from the program's icon needs `.info` files, which
-  `icon.library` does not load yet.
+- A tool reads its tool types the usual way: `GetDiskObject` on the
+  name in `wa_Name` (with `CurrentDir` on `wa_Lock`) loads `<name>.info`
+  from the host, and `FindToolType` works on the result. Put the
+  program's `.info` file beside it. See
+  [`icon.library`](Supported-Libraries.md#iconlibrary) for what is read
+  and written, and [Examples](Examples.md#testing-a-tool-the-way-workbench-starts-it).
 - Not a config-file key: it changes what the arguments after `<program>`
   mean.
 

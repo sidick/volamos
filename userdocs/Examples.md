@@ -161,6 +161,27 @@ See [CLI Reference](CLI-Reference.md#-stack-size) and
 [CLI Reference](CLI-Reference.md#-ram-size) for the exact defaults,
 syntax, and error behavior.
 
+## Testing a tool the way Workbench starts it
+
+A tool that reads its settings from its icon takes a different path
+from a shell start: there is no command line, only a `WBStartup` message,
+and the settings are the icon's tool types. Put the tool's `.info` file
+(copied from an Amiga, or written by the program itself with
+`PutDiskObject`) beside it and start it with
+[`--workbench`](CLI-Reference.md#-workbench):
+
+```sh
+ls assets
+#   mytool  mytool.info  notes.txt
+volamos -V SYS:./assets --workbench ./assets/mytool ./assets/notes.txt
+```
+
+The program finds its own tool types with `GetDiskObject` and
+`FindToolType`, exactly as it would under Workbench, and the project
+file arrives as the second `sm_ArgList` entry. A tool that is missing
+its `.info` gets `NULL` and `IoErr()` back, as on a real machine, so the
+"no icon" branch can be tested the same way by removing the file.
+
 ## Next steps
 
 - [CLI Reference](CLI-Reference.md) for every flag in full detail.
