@@ -2459,6 +2459,9 @@ fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// [`Self::fire_earliest`] is for; see [`wait_handler`]'s retry loop.
 pub struct PendingTimers {
     entries: Vec<PendingTimer>,
+    /// Tasks blocked in `WaitIO`, by the request they wait on (issue
+    /// #295).
+    io_waiters: std::collections::HashMap<u32, u32>,
 }
 
 /// What firing a [`PendingTimer`] actually does -- a real guest
@@ -2529,6 +2532,7 @@ impl PendingTimers {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            io_waiters: std::collections::HashMap::new(),
         }
     }
 
@@ -2606,6 +2610,7 @@ impl PendingTimers {
     /// left to wake). Called from [`task_exit_stub_handler`].
     fn remove_owned_by(&mut self, task: u32) {
         self.entries.retain(|e| e.owner_task != task);
+        self.io_waiters.remove(&task);
     }
 
     /// Whether `ioreq` is still pending (not yet completed) -- used by
@@ -2614,6 +2619,41 @@ impl PendingTimers {
         self.entries
             .iter()
             .any(|e| e.completion == TimerCompletion::Request(ioreq))
+    }
+
+    /// When the still-pending `ioreq` is due, or `None` if it isn't
+    /// pending (never sent, already completed, or aborted).
+    fn request_deadline(&self, ioreq: u32) -> Option<std::time::Instant> {
+        self.entries
+            .iter()
+            .find(|e| e.completion == TimerCompletion::Request(ioreq))
+            .map(|e| e.deadline)
+    }
+
+    /// Records that `task` is blocked in `WaitIO` on `ioreq`, so
+    /// [`abort_io_handler`] can wake it and `WaitIO`'s re-entry knows it
+    /// is finishing a wait rather than starting one (issue #295).
+    fn set_waiter(&mut self, task: u32, ioreq: u32) {
+        self.io_waiters.insert(task, ioreq);
+    }
+
+    /// Whether `task` is blocked in `WaitIO` on `ioreq`.
+    fn is_waiting(&self, task: u32, ioreq: u32) -> bool {
+        self.io_waiters.get(&task) == Some(&ioreq)
+    }
+
+    /// `task`'s `WaitIO` is over (or it never had one).
+    fn clear_waiter(&mut self, task: u32) {
+        self.io_waiters.remove(&task);
+    }
+
+    /// The tasks blocked in `WaitIO` on `ioreq`.
+    fn waiters_of(&self, ioreq: u32) -> Vec<u32> {
+        self.io_waiters
+            .iter()
+            .filter(|&(_, &waited_on)| waited_on == ioreq)
+            .map(|(&task, _)| task)
+            .collect()
     }
 
     /// Removes `ioreq` without completing it (real `AbortIO`'s
@@ -2630,10 +2670,8 @@ impl PendingTimers {
     }
 
     /// Completes and removes `ioreq` right now, regardless of its
-    /// deadline -- real `WaitIO`'s contract is to block until the
-    /// request is actually done, and there is nothing else host-side
-    /// that blocking could usefully wait for in the meantime. A no-op
-    /// if `ioreq` isn't (or is no longer) pending.
+    /// deadline. [`wait_io_handler`] calls it once the request's own
+    /// wait is over; a no-op if `ioreq` isn't (or is no longer) pending.
     fn complete_now<M: AddressSpace>(
         &mut self,
         mem: &mut M,
@@ -2783,7 +2821,14 @@ impl PendingTimers {
 /// are indistinguishable, which is the whole point.
 fn complete_timer_request<M: AddressSpace>(mem: &mut M, tasks: &mut TaskScheduler, ioreq: u32) {
     mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
+    reply_timer_request(mem, tasks, ioreq);
+}
 
+/// Replies `ioreq` onto its reply port and signals the port's task, with
+/// whatever `io_Error` it already holds: `0` for a request that ran its
+/// course ([`complete_timer_request`]), `IOERR_ABORTED` for one
+/// [`abort_io_handler`] cancelled -- real `timer.device` replies both.
+fn reply_timer_request<M: AddressSpace>(mem: &mut M, tasks: &mut TaskScheduler, ioreq: u32) {
     let reply_port = mem.read_u32(ioreq + crate::execlist::MN_REPLYPORT);
     if reply_port == 0 {
         return;
@@ -2898,21 +2943,84 @@ fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispat
 }
 
 /// `exec.library`'s `WaitIO` (LVO -474: `A1` = `struct IORequest*`).
-/// `D0` = `io_Error`. Every request this runtime hands out other than
-/// a `SendIO`'d `TR_ADDREQUEST` is already complete by the time
-/// `SendIO`/`DoIO` returns, so this just reads back `io_Error` for
-/// those. A still-pending timer request genuinely blocks a real
-/// `WaitIO` until it completes; since nothing else host-side could
-/// usefully happen in the meantime either way, this just completes it
-/// immediately (see [`PendingTimers::complete_now`]'s doc) rather than
-/// tracking actual wall-clock elapse.
+/// `D0` = `io_Error`.
+///
+/// Real `WaitIO` waits until the request has been replied, then takes it
+/// off its reply port (`Remove`) -- so a program that sleeps with
+/// `SendIO(TR_ADDREQUEST)` + `WaitIO()` really sleeps, and the port is
+/// empty afterwards (issue #295). For a `SendIO`'d `TR_ADDREQUEST` that is
+/// still pending this suspends only the calling task until the request's
+/// own deadline, the way `DoIO` and `Delay` do (see [`do_io_handler`]), so
+/// other tasks run meanwhile; a request that is already due, or was
+/// already replied, doesn't wait. Having waited, `WaitIO` consumes the
+/// port's signal bit, as the real `Wait` it makes does; a request that
+/// had already been replied leaves the bit as it found it.
+///
+/// Every other request this runtime hands out has completed by the time
+/// `SendIO`/`DoIO` returns and never reaches a reply port, so there is
+/// nothing to wait for or remove: this just reads back `io_Error`. The
+/// reply is only unlinked if it is actually on the port's list, so a
+/// `WaitIO` after the program's own `GetMsg` of the request (which real
+/// exec would turn into a stray `Remove`) is harmless here.
+///
+/// A task blocked here is woken early if another task `AbortIO`s the
+/// request ([`abort_io_handler`]), and returns `IOERR_ABORTED`.
 fn wait_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
-    ctx.timers.complete_now(ctx.mem, ctx.tasks, ioreq);
+    // A task that is already recorded as waiting on this request is
+    // finishing a wait it started on an earlier trap (woken at the
+    // deadline, or by another task's `AbortIO`).
+    let mut waited = ctx.timers.is_waiting(ctx.current_task, ioreq);
+    ctx.timers.fire_due(ctx.mem, ctx.tasks);
+    if let Some(deadline) = ctx.timers.request_deadline(ioreq) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        ctx.timers.set_waiter(ctx.current_task, ioreq);
+        if crate::dosdate::block_current_for(ctx, remaining) {
+            return Ok(());
+        }
+        ctx.timers.complete_now(ctx.mem, ctx.tasks, ioreq);
+        waited = true;
+    }
+    ctx.timers.clear_waiter(ctx.current_task);
+    let reply_port = ctx.mem.read_u32(ioreq + crate::execlist::MN_REPLYPORT);
+    if waited
+        && let Some((task, bit)) = crate::execlist::port_signal_target(ctx.mem, reply_port)
+        && task == ctx.current_task
+    {
+        let recvd = ctx.mem.read_u32(task + TC_SIGRECVD) & !(1u32 << bit);
+        ctx.mem.write_u32(task + TC_SIGRECVD, recvd);
+    }
+    take_reply_off_port(ctx.mem, ioreq);
     let error = ctx.mem.read_u8(ioreq + IO_ERROR_OFFSET);
     ctx.cpu
         .set_data_register(DataRegister(0), error as i8 as i32 as u32);
     Ok(())
+}
+
+/// Unlinks `ioreq` from its reply port's message list if it is on it. A
+/// request that never reached a port (`ln_Type` not `NT_REPLYMSG`) is
+/// left alone without a scan, and the scan is capped so a corrupt list
+/// of the guest's can't hang the host.
+fn take_reply_off_port<M: AddressSpace>(mem: &mut M, ioreq: u32) {
+    const MAX_SCAN: u32 = 1 << 16;
+    let reply_port = mem.read_u32(ioreq + crate::execlist::MN_REPLYPORT);
+    if reply_port == 0
+        || mem.read_u8(ioreq + crate::execlist::LN_TYPE) != crate::execlist::NT_REPLYMSG
+    {
+        return;
+    }
+    let mut node = mem.read_u32(reply_port + crate::execlist::MP_MSGLIST);
+    // The list ends at its tail marker, whose own `ln_Succ` is NULL.
+    for _ in 0..MAX_SCAN {
+        if node == 0 || mem.read_u32(node + crate::execlist::LN_SUCC) == 0 {
+            return;
+        }
+        if node == ioreq {
+            crate::execlist::remove_impl(mem, ioreq);
+            return;
+        }
+        node = mem.read_u32(node + crate::execlist::LN_SUCC);
+    }
 }
 
 /// `exec.library`'s `CheckIO` (LVO -468: `A1` = `struct IORequest*`).
@@ -2936,13 +3044,22 @@ fn check_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
 /// by the time `AbortIO` could possibly be called on it, matching real
 /// `AbortIO`'s documented "no effect on an already-completed request"
 /// behavior. A still-pending timer is genuinely cancelled -- removed
-/// from [`PendingTimers`] without ever completing -- and `io_Error`
-/// set to `IOERR_ABORTED`, matching real `timer.device`.
+/// from [`PendingTimers`] -- and `io_Error` set to `IOERR_ABORTED`,
+/// matching real `timer.device`, which then replies it to its port like
+/// any other finished request (issue #295: the reply used to be
+/// skipped, so a `GetMsg`/`Wait` loop never saw the aborted request).
 fn abort_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
     if ctx.timers.remove(ioreq) {
         ctx.mem
             .write_u8(ioreq + IO_ERROR_OFFSET, IOERR_ABORTED as u8);
+        reply_timer_request(ctx.mem, ctx.tasks, ioreq);
+        // A task blocked in `WaitIO` on this request wakes now, not at
+        // the deadline the request will never reach.
+        for task in ctx.timers.waiters_of(ioreq) {
+            ctx.timers.remove_delay(task);
+            ctx.tasks.wake_task(task);
+        }
     }
     Ok(())
 }
@@ -6242,6 +6359,224 @@ mod tests {
              duration once nothing else is runnable, not fire the timer instantly -- \
              took {wait_elapsed:?} for a {REQUESTED_MS}ms request"
         );
+    }
+
+    /// `OpenDevice(timer.device)`, `SendIO(TR_ADDREQUEST, requested_ms)`
+    /// on a request whose reply port is built by hand (a real signal bit
+    /// 4, owned by the main task), then optionally `AbortIO` and
+    /// `WaitIO`; exits with `WaitIO`'s `D0` (`io_Error`) if it ran. With
+    /// `child_aborts` a `CreateNewProc` child, started after the `SendIO`,
+    /// does the `AbortIO` instead of the main task. Returns the exit code, the runtime, the ioreq and port addresses
+    /// and how long the `WaitIO` dispatch took (`None` without one).
+    fn run_send_io_abort_wait_io(
+        requested_ms: u32,
+        abort: bool,
+        wait_io: bool,
+        child_aborts: bool,
+    ) -> (i32, Runtime<M68kCpu>, u32, u32, Option<std::time::Duration>) {
+        let entry = TRAP_TABLE_END;
+        let name = b"timer.device\0";
+
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(0)); // A0 = name (patched below)
+        let name_idx = words.len();
+        words.extend_from_slice(&[0, 0]);
+        words.push(0x7000); // moveq #0,d0 (unit)
+        words.push(move_imm_to_a(1)); // A1 = ioreq (patched below)
+        let mut ioreq_idxs = vec![words.len()];
+        words.extend_from_slice(&[0, 0]);
+        words.push(0x7200); // moveq #0,d1 (flags)
+        words.extend_from_slice(&jsr_disp16_a6(-444)); // OpenDevice
+        let mut tags_idx = None;
+        for (call, wanted) in [(-462, true), (-480, abort), (-474, wait_io)] {
+            if !wanted {
+                continue;
+            }
+            if call == -474 && child_aborts {
+                words.extend_from_slice(&movea_dos_base_to_a6());
+                words.push(0x223C); // move.l #imm32,D1 = tags (patched below)
+                tags_idx = Some(words.len());
+                words.extend_from_slice(&[0, 0]);
+                words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+                words.extend_from_slice(&movea_exec_base_to_a6());
+            }
+            words.push(move_imm_to_a(1)); // A1 = ioreq
+            ioreq_idxs.push(words.len());
+            words.extend_from_slice(&[0, 0]);
+            words.extend_from_slice(&jsr_disp16_a6(call)); // SendIO/AbortIO/WaitIO
+        }
+        words.push(RTS); // exit code = D0 (WaitIO's io_Error, if it ran)
+        // The child: AbortIO(ioreq), then off the end into the task-exit stub.
+        let child_idx = words.len();
+        if child_aborts {
+            words.extend_from_slice(&movea_exec_base_to_a6());
+            words.push(move_imm_to_a(1)); // A1 = ioreq
+            ioreq_idxs.push(words.len());
+            words.extend_from_slice(&[0, 0]);
+            words.extend_from_slice(&jsr_disp16_a6(-480)); // AbortIO
+            words.push(RTS); // -> TASK_EXIT_STUB_ADDR
+        }
+
+        let name_addr = entry + (movea_exec_base_to_a6().len() + words.len()) as u32 * 2;
+        let ioreq_addr = (name_addr + name.len() as u32 + 3) & !3;
+        let reply_port_addr = ioreq_addr + 64;
+        let tags_addr = reply_port_addr + 64;
+        let load_end = tags_addr + 32;
+        words[name_idx] = (name_addr >> 16) as u16;
+        words[name_idx + 1] = name_addr as u16;
+        if let Some(idx) = tags_idx {
+            words[idx] = (tags_addr >> 16) as u16;
+            words[idx + 1] = tags_addr as u16;
+        }
+        for idx in ioreq_idxs {
+            words[idx] = (ioreq_addr >> 16) as u16;
+            words[idx + 1] = ioreq_addr as u16;
+        }
+
+        let mut full = movea_exec_base_to_a6().to_vec();
+        full.extend_from_slice(&words);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &full);
+        crate::guestmem::write_c_string(&mut mem, name_addr, name);
+        for i in 0..64 {
+            mem.write_u8(ioreq_addr + i, 0);
+            mem.write_u8(reply_port_addr + i, 0);
+        }
+        crate::execlist::init_list_header(&mut mem, reply_port_addr + crate::execlist::MP_MSGLIST);
+        mem.write_u8(reply_port_addr + crate::execlist::MP_SIGBIT, 4);
+        mem.write_u16(ioreq_addr + IO_COMMAND_OFFSET, TR_ADDREQUEST);
+        mem.write_u32(ioreq_addr + crate::execlist::MN_REPLYPORT, reply_port_addr);
+        mem.write_u32(ioreq_addr + TR_TIME_SECS_OFFSET, 0);
+        mem.write_u32(ioreq_addr + TR_TIME_MICRO_OFFSET, requested_ms * 1000);
+        // NP_Entry = the child, TAG_DONE.
+        let child_entry = entry + (movea_exec_base_to_a6().len() + child_idx) as u32 * 2;
+        mem.write_u32(tags_addr, NP_ENTRY);
+        mem.write_u32(tags_addr + 4, child_entry);
+        mem.write_u32(tags_addr + 8, 0);
+        mem.write_u32(tags_addr + 12, 0);
+
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        rt.memory_mut()
+            .write_u32(reply_port_addr + crate::execlist::MP_SIGTASK, parent_task);
+
+        let mut wait_io_started = None;
+        let mut wait_io_elapsed = None;
+        let mut out = Vec::new();
+        let code = rt
+            .run(
+                &mut out,
+                Some(&mut |ev: &TraceEvent| match ev.handler_name.as_str() {
+                    "AbortIO" | "SendIO" => wait_io_started = Some(std::time::Instant::now()),
+                    "WaitIO" => wait_io_elapsed = wait_io_started.map(|t| t.elapsed()),
+                    _ => {}
+                }),
+            )
+            .expect("run should succeed");
+        (code, rt, ioreq_addr, reply_port_addr, wait_io_elapsed)
+    }
+
+    /// Whether `port`'s message list is empty.
+    fn port_is_empty(rt: &Runtime<M68kCpu>, port: u32) -> bool {
+        let list = port + crate::execlist::MP_MSGLIST;
+        rt.memory().read_u32(list + crate::execlist::LH_HEAD) == list + 4
+    }
+
+    #[test]
+    fn wait_io_on_a_pending_timer_request_waits_and_empties_the_port_issue_295() {
+        // codewiz's timersingle: SendIO(0.2 s) + WaitIO must take 0.2 s,
+        // and leave the port empty and its signal bit consumed.
+        let _guard = lock_host_break();
+        let (code, rt, ioreq, port, elapsed) = run_send_io_abort_wait_io(200, false, true, false);
+        let elapsed = elapsed.expect("WaitIO should have been dispatched");
+        assert_eq!(code, 0, "io_Error of a request that ran its course");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(190)
+                && elapsed < std::time::Duration::from_secs(2),
+            "WaitIO must wait out the 200 ms request, not complete it on the spot -- \
+             took {elapsed:?}"
+        );
+        assert!(
+            port_is_empty(&rt, port),
+            "WaitIO takes the reply off the port"
+        );
+        let main = rt.current_task();
+        assert_eq!(
+            rt.memory().read_u32(main + TC_SIGRECVD) & 0x10,
+            0,
+            "having waited, WaitIO has consumed the port's signal bit"
+        );
+        assert_eq!(
+            rt.memory().read_u8(ioreq + crate::execlist::LN_TYPE),
+            crate::execlist::NT_REPLYMSG,
+            "the request is a reply, so CheckIO says it is done"
+        );
+    }
+
+    #[test]
+    fn abort_io_replies_the_request_to_its_port_issue_295() {
+        // SendIO(2 s) + AbortIO: io_Error is IOERR_ABORTED and the request
+        // arrives at the reply port, signalling it, as on real timer.device.
+        let _guard = lock_host_break();
+        let (_code, rt, ioreq, port, _) = run_send_io_abort_wait_io(2_000, true, false, false);
+        assert_eq!(
+            rt.memory().read_u8(ioreq + IO_ERROR_OFFSET),
+            IOERR_ABORTED as u8
+        );
+        let list = port + crate::execlist::MP_MSGLIST;
+        assert_eq!(
+            rt.memory().read_u32(list + crate::execlist::LH_HEAD),
+            ioreq,
+            "the aborted request is the message on the reply port"
+        );
+        assert_eq!(
+            rt.memory().read_u8(ioreq + crate::execlist::LN_TYPE),
+            crate::execlist::NT_REPLYMSG
+        );
+        let main = rt.current_task();
+        assert_ne!(
+            rt.memory().read_u32(main + TC_SIGRECVD) & 0x10,
+            0,
+            "the port's signal bit is set so a Wait loop sees the reply"
+        );
+    }
+
+    #[test]
+    fn wait_io_after_abort_io_returns_at_once_with_ioerr_aborted_issue_295() {
+        let _guard = lock_host_break();
+        let (code, rt, _ioreq, port, elapsed) = run_send_io_abort_wait_io(2_000, true, true, false);
+        assert_eq!(code, i32::from(IOERR_ABORTED), "WaitIO returns io_Error");
+        assert!(
+            elapsed.expect("WaitIO dispatched") < std::time::Duration::from_millis(1_500),
+            "an aborted request must not make WaitIO wait out its 2 s"
+        );
+        assert!(port_is_empty(&rt, port));
+    }
+
+    #[test]
+    fn abort_io_from_another_task_wakes_a_task_blocked_in_wait_io_issue_295() {
+        // The main task blocks in WaitIO on a 20 s request; a child it
+        // started aborts it. The waiter must wake at once with
+        // IOERR_ABORTED, not sleep out the 20 s.
+        let _guard = lock_host_break();
+        let started = std::time::Instant::now();
+        let (code, rt, _ioreq, port, _) = run_send_io_abort_wait_io(20_000, false, true, true);
+        assert_eq!(code, i32::from(IOERR_ABORTED), "WaitIO returns io_Error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the aborted request's waiter must not sleep out its 20 s: {:?}",
+            started.elapsed()
+        );
+        assert!(port_is_empty(&rt, port));
     }
 
     #[test]
