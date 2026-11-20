@@ -260,36 +260,95 @@ impl Default for DiskObjectFile {
 
 impl DiskObjectFile {
     /// What `GetDiskObject(NULL)` hands back: "a DiskObject structure
-    /// allocated for you" with nothing in it but the magic, version and
-    /// revision, and an icon that "does not really live anywhere"
-    /// ([`NO_ICON_POSITION`]). Its type is `0`: the caller sets it. The
-    /// V40 library's own values for these fields are unverified
-    /// (phase 0 of #313).
+    /// allocated for you", which on a real Kickstart 3.1 (icon.library
+    /// 40.1, phase 0 of #313) is all zeros -- version and revision
+    /// `0`, position `0`, type `0` -- even the magic, which the caller
+    /// ([`crate::icon`]) clears after building the object.
     pub fn empty() -> Self {
         DiskObjectFile {
+            version: 0,
+            gadget: GadgetFields::default(),
             object_type: 0,
+            current_x: 0,
+            current_y: 0,
             ..DiskObjectFile::default()
         }
     }
 
-    /// A built-in default icon of `object_type` ([`WBDISK`] to
+    /// The built-in default icon of `object_type` ([`WBDISK`] to
     /// [`WBKICK`]), for `GetDefDiskObject` and `GetDiskObjectNew` when
-    /// no `ENV:Sys/def_<type>.info` exists. It has no images: nothing
-    /// here draws an icon, and a default's pictures are not metadata
-    /// any caller reads. What it does have is what a program branches
-    /// on: the type, a drawer's `DrawerData` (disks, drawers, trashcans and Kickstart
-    /// icons are drawers to Workbench), and a tool's default stack.
+    /// no `ENV:Sys/def_<type>.info` exists. Real Kickstart 3.1 answers
+    /// with a ROM icon here (icon.library 40.1; measured on Copperline,
+    /// phase 0 of #313), so this does too: the gadget size, flags and
+    /// activation, the `NewWindow` of a drawer (`50,50 400x100`, pens
+    /// 255, minimum `90x40`), a disk's default tool
+    /// `SYS:System/DiskCopy` and a drawer's selected image all match
+    /// the real ones. The pictures themselves are blank planes of the
+    /// real size and depth: nothing here draws, and the artwork is
+    /// Commodore's. A trashcan is a drawer, a Kickstart icon is not.
     pub fn builtin_default(object_type: u8) -> Self {
-        let is_drawer = matches!(object_type, WBDISK | WBDRAWER | WBGARBAGE | WBKICK);
+        // (width, height, gadget flags, activation, image height,
+        // has a selected image, is a drawer)
+        let Some((width, height, flags, activation, image_height, selected, drawer)) =
+            (match object_type {
+                WBDISK => Some((35, 18, 4, 3, 17, false, true)),
+                WBDRAWER => Some((57, 14, 6, 3, 14, true, true)),
+                WBTOOL => Some((54, 23, 4, 1, 22, false, false)),
+                WBPROJECT => Some((54, 23, 5, 1, 22, false, false)),
+                WBGARBAGE => Some((51, 31, 6, 3, 31, true, true)),
+                WBKICK => Some((35, 18, 4, 3, 17, false, false)),
+                _ => None,
+            })
+        else {
+            return DiskObjectFile {
+                object_type,
+                ..DiskObjectFile::default()
+            };
+        };
+        let image = || IconImage {
+            width,
+            height: image_height,
+            depth: 2,
+            plane_pick: 3,
+            data: vec![0; plane_data_size(width, image_height, 2) as usize],
+            ..IconImage::default()
+        };
+        let mut new_window = [0u8; NEW_WINDOW_SIZE];
+        let put16 = |w: &mut [u8; NEW_WINDOW_SIZE], at: usize, v: u16| {
+            w[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        };
+        put16(&mut new_window, 0, 50); // LeftEdge
+        put16(&mut new_window, 2, 50); // TopEdge
+        put16(&mut new_window, 4, 400); // Width
+        put16(&mut new_window, 6, 100); // Height
+        new_window[8] = 255; // DetailPen
+        new_window[9] = 255; // BlockPen
+        new_window[14..18].copy_from_slice(&0x0240_027Fu32.to_be_bytes()); // Flags
+        put16(&mut new_window, 38, 90); // MinWidth
+        put16(&mut new_window, 40, 40); // MinHeight
+        put16(&mut new_window, 42, 0xFFFF); // MaxWidth
+        put16(&mut new_window, 44, 0xFFFF); // MaxHeight
+        put16(&mut new_window, 46, 1); // Type: WBENCHSCREEN
         DiskObjectFile {
+            gadget: GadgetFields {
+                width,
+                height,
+                flags,
+                activation,
+                gadget_type: 1, // GTYP_BOOLGADGET
+                user_data: 0,
+                ..GadgetFields::default()
+            },
             object_type,
-            stack_size: if object_type == WBTOOL { 4096 } else { 0 },
-            drawer: is_drawer.then_some(DrawerData {
-                new_window: [0; NEW_WINDOW_SIZE],
+            default_tool: (object_type == WBDISK).then(|| b"SYS:System/DiskCopy".to_vec()),
+            drawer: drawer.then_some(DrawerData {
+                new_window,
                 current_x: 0,
                 current_y: 0,
                 extension: Some((0, 0)),
             }),
+            gadget_image: Some(image()),
+            select_image: selected.then(image),
             ..DiskObjectFile::default()
         }
     }
@@ -1058,17 +1117,60 @@ mod tests {
     }
 
     #[test]
-    fn builtin_defaults_have_drawer_data_only_for_drawer_like_types() {
-        for t in [WBDISK, WBDRAWER, WBGARBAGE, WBKICK] {
-            assert!(DiskObjectFile::builtin_default(t).drawer.is_some(), "{t}");
+    fn builtin_defaults_match_kickstart_31() {
+        // (type, gadget width, height, flags, activation, selected image,
+        // drawer, default tool): measured on icon.library 40.1.
+        for (t, w, h, flags, act, selected, drawer, tool) in [
+            (
+                WBDISK,
+                35,
+                18,
+                4,
+                3,
+                false,
+                true,
+                Some(&b"SYS:System/DiskCopy"[..]),
+            ),
+            (WBDRAWER, 57, 14, 6, 3, true, true, None),
+            (WBTOOL, 54, 23, 4, 1, false, false, None),
+            (WBPROJECT, 54, 23, 5, 1, false, false, None),
+            (WBGARBAGE, 51, 31, 6, 3, true, true, None),
+            (WBKICK, 35, 18, 4, 3, false, false, None),
+        ] {
+            let d = DiskObjectFile::builtin_default(t);
+            assert_eq!(d.object_type, t);
+            assert_eq!(
+                (
+                    d.gadget.width,
+                    d.gadget.height,
+                    d.gadget.flags,
+                    d.gadget.activation
+                ),
+                (w, h, flags, act),
+                "{t}"
+            );
+            assert_eq!(d.select_image.is_some(), selected, "{t}");
+            assert_eq!(d.drawer.is_some(), drawer, "{t}");
+            assert_eq!(d.default_tool.as_deref(), tool, "{t}");
+            assert_eq!(d.stack_size, 0, "no default stack: {t}");
+            assert_eq!(d.gadget.user_data, 0, "revision 0: {t}");
+            let img = d.gadget_image.expect("every default has a picture");
+            assert_eq!(img.width, w, "{t}");
+            assert_eq!((img.depth, img.plane_pick, img.plane_on_off), (2, 3, 0));
+            assert_eq!(
+                img.data.len() as u64,
+                plane_data_size(img.width, img.height, img.depth)
+            );
         }
-        for t in [WBTOOL, WBPROJECT] {
-            assert!(DiskObjectFile::builtin_default(t).drawer.is_none(), "{t}");
-        }
-        assert_eq!(DiskObjectFile::builtin_default(WBTOOL).stack_size, 4096);
+        let drawer = DiskObjectFile::builtin_default(WBDRAWER).drawer.unwrap();
+        let nw = drawer.new_window;
+        assert_eq!(&nw[..8], [0, 50, 0, 50, 1, 0x90, 0, 100]);
+        assert_eq!(drawer.extension, Some((0, 0)));
+        // Parses back from its own bytes, pictures and all.
+        let bytes = DiskObjectFile::builtin_default(WBDRAWER).to_bytes();
         assert_eq!(
-            DiskObjectFile::builtin_default(WBPROJECT).object_type,
-            WBPROJECT
+            DiskObjectFile::parse(&bytes).unwrap().0,
+            DiskObjectFile::builtin_default(WBDRAWER)
         );
     }
 
@@ -1091,13 +1193,13 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_object_is_unplaced_and_untyped() {
+    fn the_empty_object_is_all_zeros_like_kickstart_31s() {
         let e = DiskObjectFile::empty();
-        assert_eq!(e.object_type, 0);
         assert_eq!(
-            (e.current_x, e.current_y),
-            (NO_ICON_POSITION, NO_ICON_POSITION)
+            (e.version, e.object_type, e.current_x, e.current_y),
+            (0, 0, 0, 0)
         );
+        assert_eq!(e.gadget, GadgetFields::default());
         assert!(e.default_tool.is_none() && e.tool_types.is_none() && e.drawer.is_none());
     }
 

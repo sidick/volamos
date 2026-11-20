@@ -493,21 +493,32 @@ all — so it always opens. Reading and writing icons both work.
 - A name with no `name.info` returns `NULL`, with `IoErr()` set to why
   (`ERROR_OBJECT_NOT_FOUND` for a plain missing icon) — the routine
   "does this file have an icon?" question. A file that isn't an icon
-  gives `ERROR_OBJECT_WRONG_TYPE`.
-- `GetDiskObject(NULL)` allocates an empty `DiskObject`.
+  (junk, empty, cut short) gives `NULL` with `IoErr()` `0`, as a real
+  3.1 does; a directory named `name.info` gives
+  `ERROR_OBJECT_WRONG_TYPE`. A volume's icon is `SYS:.info`: the name
+  plus `.info`, with no special `Disk` name.
+- `GetDiskObject(NULL)` allocates an all-zero `DiskObject` (magic and
+  version included), as a real 3.1 does.
 - `GetDefDiskObject` reads `ENV:Sys/def_<type>.info`, and when that file
-  is missing returns a built-in default icon of the type (with no
-  images). A real 3.1 `icon.library` may fail here instead; the
-  fallback is deliberate so a program that just wants an icon gets one.
-  `WBDEVICE`, which 3.1 has no default for, gives `ERROR_BAD_NUMBER`.
+  is missing returns a built-in default icon of the type, as a real 3.1
+  does. It has the real icon's gadget size and flags, a drawer's
+  window (`50,50 400x100`) and a disk's default tool
+  `SYS:System/DiskCopy`; the pictures are blank planes of the right
+  size, because the artwork is Commodore's. `WBDEVICE` gives `NULL`
+  with `ERROR_OBJECT_NOT_FOUND`, and `WBAPPICON` or any other type
+  gives `NULL` with `IoErr()` untouched.
 - `GetDiskObjectNew` falls back to the default for the object's type
   when there is no icon file: a volume root is a disk, any other
-  directory a drawer, an executable a tool, anything else a project.
+  directory a drawer, and a file a tool — unless its execute bit is
+  denied (`Protect +e`, kept in the file's [`.uaem`](Volumes-and-Assigns.md)
+  sidecar), when it is a project. A plain file with no protection bits
+  is therefore a *tool*, whatever it holds; that is what a real 3.1
+  does.
 - `FreeDiskObject`, `FreeFreeList` and `AddFreeList` work on the
   `FreeList` of such an object. `NULL` is ignored. Passing a pointer
   that didn't come from `GetDiskObject` fails the run, naming the call.
-- `PutDiskObject(name, diskobj)` writes `name.info` (`Disk.info` in the
-  root for a volume name like `SYS:`) from the guest `DiskObject`,
+- `PutDiskObject(name, diskobj)` writes `name.info` (`SYS:.info` for a
+  volume) from the guest `DiskObject`,
   replacing any file there: the default tool, tool types, tool window,
   stack, position, drawer data and images, so what `GetDiskObject` read
   is what gets written back. The directory must exist (`FALSE` with
@@ -525,13 +536,15 @@ all — so it always opens. Reading and writing icons both work.
 - `FindToolType`, `MatchToolValue` and `BumpRevision` are implemented in
   full: case-insensitive tool-type lookup (a bare flag entry like
   `DONOTWAIT` is found), `|`-separated value matching, and
-  `copy_of_`/`copy_<n>_of_` renaming truncated to 30 characters.
-  `BumpRevisionLength` (3.1.4 and later) does the same with a limit you
-  pass, so copies of long file names can be named; it returns `NULL` when
-  not even a truncated copy name fits. Whether the limit counts the
-  terminating NUL, and exactly where `NULL` starts, haven't been checked
-  against a real 3.1.4 `icon.library`; the buffer must hold the limit
-  plus the NUL.
+  `Copy_of_`/`Copy_<n>_of_` renaming truncated to 30 characters. Note
+  the capital `C`: the autodoc's examples show `copy_`, but both the
+  3.1 and 3.2 libraries write `Copy_`, and match the old name without
+  regard to case.
+  `BumpRevisionLength` (3.1.4 and later) takes a limit of its own, so
+  copies of long file names can be named, and follows 3.2's
+  `icon.library`: a limit of 9 gives `Copy_of_f`, and it returns `NULL`
+  when the limit is too small (8 or less, or 19 or less when the copy
+  is numbered). The buffer must hold the limit plus the NUL.
 
 The 3.5+ calls (`GetIconTagList`, `PutIconTagList` and friends) aren't
 part of the 3.1 interface and fail the run loudly, naming the call.

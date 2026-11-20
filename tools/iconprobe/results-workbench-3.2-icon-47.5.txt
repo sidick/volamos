@@ -1,0 +1,241 @@
+icon.library 47.5
+GetDefDiskObject(1)                obj magic=e310 ver=1 type=1 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=35 h=17 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=35 h=17 depth=2 pick=3 onoff=0 data=yes
+                                     drawer win=50,50 400x100 cur=0,0 flags=0 viewmodes=0
+                                     newwindow pens=255,255 idcmp=0 flags=240027f first=0 check=0 title=0 screen=0 bitmap=0 min=90,40 max=65535,65535 type=1
+GetDefDiskObject(2)                obj magic=e310 ver=1 type=2 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=57 h=14 flags=0006 act=0001 type=0001 id=0 render=yes select=yes
+                                     render img l=0 t=0 w=57 h=14 depth=2 pick=3 onoff=0 data=yes
+                                     select img l=0 t=0 w=57 h=14 depth=2 pick=3 onoff=0 data=yes
+                                     drawer win=50,50 400x100 cur=0,0 flags=0 viewmodes=0
+                                     newwindow pens=255,255 idcmp=0 flags=240027f first=0 check=0 title=0 screen=0 bitmap=0 min=90,40 max=65535,65535 type=1
+GetDefDiskObject(3)                obj magic=e310 ver=1 type=3 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0004 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDefDiskObject(4)                obj magic=e310 ver=1 type=4 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDefDiskObject(5)                obj magic=e310 ver=1 type=5 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=51 h=31 flags=0006 act=0001 type=0001 id=0 render=yes select=yes
+                                     render img l=0 t=0 w=51 h=31 depth=2 pick=3 onoff=0 data=yes
+                                     select img l=0 t=0 w=51 h=31 depth=2 pick=3 onoff=0 data=yes
+                                     drawer win=50,50 400x100 cur=0,0 flags=0 viewmodes=0
+                                     newwindow pens=255,255 idcmp=0 flags=240027f first=0 check=0 title=0 screen=0 bitmap=0 min=90,40 max=65535,65535 type=1
+GetDefDiskObject(6)                obj magic=e310 ver=1 type=6 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=35 h=17 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=35 h=17 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDefDiskObject(7)                obj magic=e310 ver=1 type=7 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=35 h=17 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=35 h=17 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDefDiskObject(8)                NULL ioerr=212
+GetDefDiskObject(0)                NULL ioerr=212
+GetDefDiskObject(99)               NULL ioerr=212
+GetDiskObject(NULL)                obj magic=0000 ver=0 type=0 stack=0 x=0 y=0 tool=- tt=no toolwin=no rev=0
+                                     gadget l=0 t=0 w=0 h=0 flags=0000 act=0000 type=0000 id=0 render=no select=no
+                                     drawer none
+GetDiskObject(missing)             NULL ioerr=205
+GetDiskObject(junk)                NULL ioerr=212
+GetDiskObject(empty)               NULL ioerr=212
+GetDiskObject(magic only)          NULL ioerr=212
+GetDiskObject(dir.info is a dir)   NULL ioerr=205
+GetDiskObjectNew(text file)        obj magic=e310 ver=1 type=3 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0004 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDiskObjectNew(hunk file)        obj magic=e310 ver=1 type=3 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0004 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDiskObjectNew(directory)        obj magic=e310 ver=1 type=2 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=57 h=14 flags=0006 act=0001 type=0001 id=0 render=yes select=yes
+                                     render img l=0 t=0 w=57 h=14 depth=2 pick=3 onoff=0 data=yes
+                                     select img l=0 t=0 w=57 h=14 depth=2 pick=3 onoff=0 data=yes
+                                     drawer win=50,50 400x100 cur=0,0 flags=0 viewmodes=0
+                                     newwindow pens=255,255 idcmp=0 flags=240027f first=0 check=0 title=0 screen=0 bitmap=0 min=90,40 max=65535,65535 type=1
+GetDiskObjectNew(missing)          NULL ioerr=205
+GetDiskObjectNew(volume)           obj magic=e310 ver=1 type=1 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=35 h=17 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=35 h=17 depth=2 pick=3 onoff=0 data=yes
+                                     drawer win=50,50 400x100 cur=0,0 flags=0 viewmodes=0
+                                     newwindow pens=255,255 idcmp=0 flags=240027f first=0 check=0 title=0 screen=0 bitmap=0 min=90,40 max=65535,65535 type=1
+GetDiskObject(volume)              NULL ioerr=205
+GetDiskObjectNew(text, e denied)   obj magic=e310 ver=1 type=4 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+GetDiskObjectNew(hunk, e denied)   obj magic=e310 ver=1 type=4 stack=0 x=-2147483648 y=-2147483648 tool=- tt=no toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+PutDiskObject(ok)                  TRUE ioerr=0
+PutDiskObject(missing dir)         FALSE ioerr=205
+PutDiskObject(volume)              TRUE ioerr=0
+volume Disk.info exists            no
+volume .info exists                yes
+GetDiskObject(volume, put)         obj magic=e310 ver=1 type=4 stack=12345 x=-2147483648 y=-2147483648 tool=SYS:Tools/Edit tt=yes toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+wrote.info exists                  yes
+wrote.info size                    500 bytes
+GetDiskObject(wrote)               obj magic=e310 ver=1 type=4 stack=12345 x=-2147483648 y=-2147483648 tool=SYS:Tools/Edit tt=yes toolwin=no rev=1
+                                     gadget l=0 t=0 w=54 h=22 flags=0005 act=0001 type=0001 id=0 render=yes select=no
+                                     render img l=0 t=0 w=54 h=22 depth=2 pick=3 onoff=0 data=yes
+                                     drawer none
+FindToolType(FLAG bare)            <empty>
+FindToolType(flag, case)           <empty>
+FindToolType(E=)                   <empty>
+FindToolType(FLAGGED)              2
+FindToolType(FLA prefix)           NULL
+BumpRevision("foo") = "Copy_of_foo"
+BumpRevision("copy_of_foo") = "Copy_2_of_foo"
+BumpRevision("Copy_of_foo") = "Copy_2_of_foo"
+BumpRevision("copy_2_of_foo") = "Copy_3_of_foo"
+BumpRevision("Copy_2_of_foo") = "Copy_3_of_foo"
+BumpRevision("COPY_OF_foo") = "Copy_2_of_foo"
+BumpRevision("copy_0_of_foo") = "Copy_of_foo"
+BumpRevision("012345678901234567890123456789") = "Copy_of_0123456789012345678901"
+BumpRevision("copy_x_of_foo") = "Copy_2_of_x_of_foo"
+BumpRevision("copy foo") = "Copy_2_of_foo"
+BumpRevision("copy_") = "Copy_2_of_"
+BumpRevisionLength("foo",0) = NULL
+BumpRevisionLength("foo",8) = NULL
+BumpRevisionLength("foo",9) = "Copy_of_f"
+BumpRevisionLength("foo",10) = "Copy_of_fo"
+BumpRevisionLength("foo",11) = "Copy_of_foo"
+BumpRevisionLength("foo",12) = "Copy_of_foo"
+BumpRevisionLength("foo",13) = "Copy_of_foo"
+BumpRevisionLength("foo",14) = "Copy_of_foo"
+BumpRevisionLength("foo",15) = "Copy_of_foo"
+BumpRevisionLength("foo",16) = "Copy_of_foo"
+BumpRevisionLength("foo",17) = "Copy_of_foo"
+BumpRevisionLength("foo",18) = "Copy_of_foo"
+BumpRevisionLength("foo",19) = "Copy_of_foo"
+BumpRevisionLength("foo",20) = "Copy_of_foo"
+BumpRevisionLength("foo",30) = "Copy_of_foo"
+BumpRevisionLength("foo",31) = "Copy_of_foo"
+BumpRevisionLength("foo",107) = "Copy_of_foo"
+BumpRevisionLength("copy_99_of_foo",0) = NULL
+BumpRevisionLength("copy_99_of_foo",8) = NULL
+BumpRevisionLength("copy_99_of_foo",9) = NULL
+BumpRevisionLength("copy_99_of_foo",10) = NULL
+BumpRevisionLength("copy_99_of_foo",11) = NULL
+BumpRevisionLength("copy_99_of_foo",12) = NULL
+BumpRevisionLength("copy_99_of_foo",13) = NULL
+BumpRevisionLength("copy_99_of_foo",14) = NULL
+BumpRevisionLength("copy_99_of_foo",15) = NULL
+BumpRevisionLength("copy_99_of_foo",16) = NULL
+BumpRevisionLength("copy_99_of_foo",17) = NULL
+BumpRevisionLength("copy_99_of_foo",18) = NULL
+BumpRevisionLength("copy_99_of_foo",19) = NULL
+BumpRevisionLength("copy_99_of_foo",20) = "Copy_100_of_foo"
+BumpRevisionLength("copy_99_of_foo",30) = "Copy_100_of_foo"
+BumpRevisionLength("copy_99_of_foo",31) = "Copy_100_of_foo"
+BumpRevisionLength("copy_99_of_foo",107) = "Copy_100_of_foo"
+BumpRevisionLength("",0) = NULL
+BumpRevisionLength("",8) = NULL
+BumpRevisionLength("",9) = "Copy_of_"
+BumpRevisionLength("",10) = "Copy_of_"
+BumpRevisionLength("",11) = "Copy_of_"
+BumpRevisionLength("",12) = "Copy_of_"
+BumpRevisionLength("",13) = "Copy_of_"
+BumpRevisionLength("",14) = "Copy_of_"
+BumpRevisionLength("",15) = "Copy_of_"
+BumpRevisionLength("",16) = "Copy_of_"
+BumpRevisionLength("",17) = "Copy_of_"
+BumpRevisionLength("",18) = "Copy_of_"
+BumpRevisionLength("",19) = "Copy_of_"
+BumpRevisionLength("",20) = "Copy_of_"
+BumpRevisionLength("",30) = "Copy_of_"
+BumpRevisionLength("",31) = "Copy_of_"
+BumpRevisionLength("",107) = "Copy_of_"
+BumpRevisionLength("Copy_of_foo",0) = NULL
+BumpRevisionLength("Copy_of_foo",8) = NULL
+BumpRevisionLength("Copy_of_foo",9) = NULL
+BumpRevisionLength("Copy_of_foo",10) = NULL
+BumpRevisionLength("Copy_of_foo",11) = NULL
+BumpRevisionLength("Copy_of_foo",12) = NULL
+BumpRevisionLength("Copy_of_foo",13) = NULL
+BumpRevisionLength("Copy_of_foo",14) = NULL
+BumpRevisionLength("Copy_of_foo",15) = NULL
+BumpRevisionLength("Copy_of_foo",16) = NULL
+BumpRevisionLength("Copy_of_foo",17) = NULL
+BumpRevisionLength("Copy_of_foo",18) = NULL
+BumpRevisionLength("Copy_of_foo",19) = NULL
+BumpRevisionLength("Copy_of_foo",20) = "Copy_2_of_foo"
+BumpRevisionLength("Copy_of_foo",30) = "Copy_2_of_foo"
+BumpRevisionLength("Copy_of_foo",31) = "Copy_2_of_foo"
+BumpRevisionLength("Copy_of_foo",107) = "Copy_2_of_foo"
+BumpRevisionLength("copy_0_of_foo",0) = NULL
+BumpRevisionLength("copy_0_of_foo",8) = NULL
+BumpRevisionLength("copy_0_of_foo",9) = "Copy_of_f"
+BumpRevisionLength("copy_0_of_foo",10) = "Copy_of_fo"
+BumpRevisionLength("copy_0_of_foo",11) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",12) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",13) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",14) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",15) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",16) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",17) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",18) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",19) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",20) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",30) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",31) = "Copy_of_foo"
+BumpRevisionLength("copy_0_of_foo",107) = "Copy_of_foo"
+BumpRevisionLength("copy_x_of_foo",0) = NULL
+BumpRevisionLength("copy_x_of_foo",8) = NULL
+BumpRevisionLength("copy_x_of_foo",9) = NULL
+BumpRevisionLength("copy_x_of_foo",10) = NULL
+BumpRevisionLength("copy_x_of_foo",11) = NULL
+BumpRevisionLength("copy_x_of_foo",12) = NULL
+BumpRevisionLength("copy_x_of_foo",13) = NULL
+BumpRevisionLength("copy_x_of_foo",14) = NULL
+BumpRevisionLength("copy_x_of_foo",15) = NULL
+BumpRevisionLength("copy_x_of_foo",16) = NULL
+BumpRevisionLength("copy_x_of_foo",17) = NULL
+BumpRevisionLength("copy_x_of_foo",18) = NULL
+BumpRevisionLength("copy_x_of_foo",19) = NULL
+BumpRevisionLength("copy_x_of_foo",20) = "Copy_2_of_x_of_foo"
+BumpRevisionLength("copy_x_of_foo",30) = "Copy_2_of_x_of_foo"
+BumpRevisionLength("copy_x_of_foo",31) = "Copy_2_of_x_of_foo"
+BumpRevisionLength("copy_x_of_foo",107) = "Copy_2_of_x_of_foo"
+BumpRevisionLength("copy foo",0) = NULL
+BumpRevisionLength("copy foo",8) = NULL
+BumpRevisionLength("copy foo",9) = NULL
+BumpRevisionLength("copy foo",10) = NULL
+BumpRevisionLength("copy foo",11) = NULL
+BumpRevisionLength("copy foo",12) = NULL
+BumpRevisionLength("copy foo",13) = NULL
+BumpRevisionLength("copy foo",14) = NULL
+BumpRevisionLength("copy foo",15) = NULL
+BumpRevisionLength("copy foo",16) = NULL
+BumpRevisionLength("copy foo",17) = NULL
+BumpRevisionLength("copy foo",18) = NULL
+BumpRevisionLength("copy foo",19) = NULL
+BumpRevisionLength("copy foo",20) = "Copy_2_of_foo"
+BumpRevisionLength("copy foo",30) = "Copy_2_of_foo"
+BumpRevisionLength("copy foo",31) = "Copy_2_of_foo"
+BumpRevisionLength("copy foo",107) = "Copy_2_of_foo"
+BumpRevisionLength("copy_1_of_foo",0) = NULL
+BumpRevisionLength("copy_1_of_foo",8) = NULL
+BumpRevisionLength("copy_1_of_foo",9) = NULL
+BumpRevisionLength("copy_1_of_foo",10) = NULL
+BumpRevisionLength("copy_1_of_foo",11) = NULL
+BumpRevisionLength("copy_1_of_foo",12) = NULL
+BumpRevisionLength("copy_1_of_foo",13) = NULL
+BumpRevisionLength("copy_1_of_foo",14) = NULL
+BumpRevisionLength("copy_1_of_foo",15) = NULL
+BumpRevisionLength("copy_1_of_foo",16) = NULL
+BumpRevisionLength("copy_1_of_foo",17) = NULL
+BumpRevisionLength("copy_1_of_foo",18) = NULL
+BumpRevisionLength("copy_1_of_foo",19) = NULL
+BumpRevisionLength("copy_1_of_foo",20) = "Copy_2_of_foo"
+BumpRevisionLength("copy_1_of_foo",30) = "Copy_2_of_foo"
+BumpRevisionLength("copy_1_of_foo",31) = "Copy_2_of_foo"
+BumpRevisionLength("copy_1_of_foo",107) = "Copy_2_of_foo"

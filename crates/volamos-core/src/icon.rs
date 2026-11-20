@@ -23,25 +23,25 @@
 //!   missing file is `NULL` + `IoErr()` from resolving the path (the
 //!   autodoc: "If the call fails, it will return NULL. The reason for
 //!   the failure may be obtained via IoErr()"); a file that is not an
-//!   icon, or is cut short, is `ERROR_OBJECT_WRONG_TYPE` (**the real
-//!   code is unverified**); a full heap is `ERROR_NO_FREE_STORE`. A
-//!   `NULL` name allocates an empty object ([`DiskObjectFile::empty`]),
-//!   "useful when calling `AddAppIcon()`".
+//!   icon, or is cut short, is `NULL` with `IoErr()` `0` (what real
+//!   Kickstart 3.1 does); a directory where the file should be is
+//!   `ERROR_OBJECT_WRONG_TYPE`; a full heap is `ERROR_NO_FREE_STORE`. A
+//!   `NULL` name allocates an all-zero object
+//!   ([`DiskObjectFile::empty`]), "useful when calling `AddAppIcon()`".
+//!   A volume's icon is `SYS:.info` (the name plus `.info`, no special
+//!   `Disk` name).
 //! - `GetDefDiskObject`: `ENV:Sys/def_<type>.info` the same way, and a
 //!   **built-in default** ([`DiskObjectFile::builtin_default`]) when
-//!   that file is missing. The V40 autodoc describes the call as
-//!   reading the default object "from disk" and names no fallback; V44
-//!   and later (and AROS) answer with built-in images. Which one a real
-//!   3.1 `icon.library` does is **not yet hardware-verified**; the
-//!   fallback is kept deliberately, since a program that wants *an*
-//!   icon is better served by one. A default file that exists but is
-//!   not an icon is still an error.
-//! - `GetDiskObjectNew`: `GetDiskObject`, and on failure the default
-//!   for the object's type -- a volume root is `WBDISK`, another
-//!   directory `WBDRAWER`, an executable `WBTOOL`, any other file
-//!   `WBPROJECT` (executable meaning a `HUNK_HEADER`, since host files
-//!   have no execute bit; **V40's own test is unverified**). An object
-//!   that is not there at all keeps the original failure.
+//!   that file is missing, as real Kickstart 3.1 does (the ROM icon's
+//!   gadget geometry, drawer window and default tool; blank pictures of
+//!   the real size). A default file that exists but is not an icon is
+//!   an error.
+//! - `GetDiskObjectNew`: `GetDiskObject`, and where there is no `.info`
+//!   file the default for the object's type -- a volume root is
+//!   `WBDISK`, another directory `WBDRAWER`, a file `WBTOOL` unless its
+//!   execute bit is denied, when it is `WBPROJECT` (real 3.1's test,
+//!   measured: a plain file with no protection bits is a tool). An
+//!   object that is not there at all keeps the original failure.
 //! - `FreeDiskObject`, `FreeFreeList`, `AddFreeList`: the autodoc's
 //!   `FreeList` just after the `DiskObject`; see [`crate::iconobj`].
 //!   `NULL` is ignored. A pointer that is not such an object fails the
@@ -49,7 +49,7 @@
 //!   heap.
 //! - `PutDiskObject`: reads the guest `DiskObject` back through
 //!   [`crate::iconobj::read_disk_object`] and writes `name.info`
-//!   (`Disk.info` for a volume), replacing any file there; the
+//!   (`SYS:.info` for a volume), replacing any file there; the
 //!   parent directory must exist. A pointer that does not lead to a
 //!   readable `DiskObject` fails the run naming the call. The file is
 //!   replaced atomically. Only the classic part is written: a
@@ -102,9 +102,6 @@ const DEFAULT_ICON_NAMES: [(u32, &str); 6] = [
 /// (currently 30 characters)", so `newbuf` must hold 31 bytes.
 const BUMP_REVISION_MAX: usize = 30;
 
-/// `HUNK_HEADER`: the first longword of an AmigaOS executable.
-const HUNK_HEADER: u32 = 0x0000_03F3;
-
 /// The NUL-terminated guest string at `addr`, as (lossy) UTF-8.
 fn guest_string(mem: &dyn AddressSpace, addr: u32) -> String {
     String::from_utf8_lossy(&read_c_string(mem, addr)).into_owned()
@@ -116,17 +113,17 @@ fn is_missing(err: i32) -> bool {
     err == crate::dosfile::ERROR_OBJECT_NOT_FOUND || err == crate::dosfile::ERROR_DIR_NOT_FOUND
 }
 
-/// The icon file for the object `name`: `name.info`, except that a volume
-/// (a name ending in `:`) keeps its icon in `Disk.info` at the root, so
-/// `SYS:` is `SYS:Disk.info`. The `Disk` rule is from memory of real
-/// Workbench practice, unverified (phase 0 of #313).
+/// The icon file for the object `name`: `name.info`, always -- a volume
+/// `SYS:` is `SYS:.info`, as real Kickstart 3.1 writes it (Workbench's own
+/// disk icon is `GetDiskObject("SYS:Disk")`, a plain name).
 fn info_path(name: &str) -> String {
-    if name.ends_with(':') {
-        format!("{name}Disk.info")
-    } else {
-        format!("{name}.info")
-    }
+    format!("{name}.info")
 }
+
+/// `IoErr()` after a file that is not an icon (junk, empty, cut short):
+/// real Kickstart 3.1 answers `NULL` and leaves `0` there (measured on
+/// icon.library 40.1, phase 0 of #313), not an `ERROR_` code.
+const BAD_ICON_IO_ERR: i32 = 0;
 
 /// The largest `.info` file read: far beyond any real icon (a big
 /// `ColorIcon` is some hundreds of KiB), small enough that a stray huge
@@ -134,9 +131,10 @@ fn info_path(name: &str) -> String {
 const MAX_INFO_FILE_SIZE: u64 = 64 << 20;
 
 /// Reads and parses the icon file at `path` (a full Amiga path, `.info`
-/// included), or says what `IoErr()` should be. A file that is not an
-/// icon, or is cut short, is `ERROR_OBJECT_WRONG_TYPE`; the real
-/// library's code for that is unverified (phase 0 of #313).
+/// included), or says what `IoErr()` should be: a file that is not an
+/// icon, or is cut short, is [`BAD_ICON_IO_ERR`]; a directory (or a file
+/// too big to be an icon) in its place is `ERROR_OBJECT_WRONG_TYPE`, as
+/// `Open` gives.
 fn load_icon(ctx: &HandlerContext<'_, impl Cpu>, path: &str) -> Result<DiskObjectFile, i32> {
     let vfs = ctx
         .dos
@@ -153,7 +151,7 @@ fn load_icon(ctx: &HandlerContext<'_, impl Cpu>, path: &str) -> Result<DiskObjec
     let bytes = std::fs::read(host).map_err(|e| crate::dosfile::map_io_error(&e))?;
     DiskObjectFile::parse(&bytes)
         .map(|(icon, _)| icon)
-        .map_err(|_| crate::dosfile::ERROR_OBJECT_WRONG_TYPE)
+        .map_err(|_| BAD_ICON_IO_ERR)
 }
 
 /// Builds `icon` in guest memory and sets `D0` to it, or to `NULL` with
@@ -165,6 +163,17 @@ fn deliver<C: Cpu>(ctx: &mut HandlerContext<'_, C>, icon: &DiskObjectFile) {
             ctx.dos.set_io_err(crate::dosfile::ERROR_NO_FREE_STORE);
             ctx.cpu.set_data_register(DataRegister(0), 0);
         }
+    }
+}
+
+/// The object `GetDiskObject(NULL)` allocates: all zeros, magic included
+/// ([`DiskObjectFile::empty`]), with a `FreeList` so `FreeDiskObject`
+/// works on it.
+fn deliver_empty<C: Cpu>(ctx: &mut HandlerContext<'_, C>) {
+    deliver(ctx, &DiskObjectFile::empty());
+    let obj = ctx.cpu.data_register(DataRegister(0));
+    if obj != 0 {
+        ctx.mem.write_u16(obj, 0);
     }
 }
 
@@ -181,7 +190,7 @@ fn fail<C: Cpu>(ctx: &mut HandlerContext<'_, C>, code: i32) {
 fn get_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(0));
     if name_ptr == 0 {
-        deliver(ctx, &DiskObjectFile::empty());
+        deliver_empty(ctx);
         return Ok(());
     }
     let info = info_path(&guest_string(ctx.mem, name_ptr));
@@ -194,11 +203,16 @@ fn get_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
 
 /// The `def_type` for an object that has no icon file of its own, for
 /// `GetDiskObjectNew`: a volume root is a disk, any other directory a
-/// drawer, an executable file a tool, anything else a project. `None`
-/// when `name` is not there at all. Executables are recognised by
-/// their `HUNK_HEADER` rather than by a protection bit, which host files
-/// do not have; V40's own test is unverified (phase 0 of #313).
+/// drawer, a file a tool unless its execute bit is denied (`Protect
+/// +e`... that is, `FIBF_EXECUTE` set), when it is a project. That last
+/// test is what real Kickstart 3.1 does (icon.library 40.1, measured on
+/// Copperline, phase 0 of #313): a plain file with no protection bits is a
+/// *tool*, whatever it contains. Host files have no protection bits of
+/// their own; the `.uaem` sidecar's ([`crate::dosmeta`]) are used, `0`
+/// without one. `None` when `name` is not there at all.
 fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8> {
+    /// `FIBF_EXECUTE`: set means the file may *not* be executed.
+    const FIBF_EXECUTE: u32 = 1 << 1;
     let vfs = ctx.dos.vfs.as_ref()?;
     let host = vfs.resolve(name, ResolveMode::MustExist).ok()?;
     if host.is_dir() {
@@ -210,12 +224,12 @@ fn default_type_for(ctx: &HandlerContext<'_, impl Cpu>, name: &str) -> Option<u8
         });
         return Some(if is_root { WBDISK } else { WBDRAWER });
     }
-    let mut magic = [0u8; 4];
-    let is_hunk = std::fs::File::open(&host)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
-        .is_ok()
-        && u32::from_be_bytes(magic) == HUNK_HEADER;
-    Some(if is_hunk { WBTOOL } else { WBPROJECT })
+    let protection = crate::dosmeta::read_sidecar(&host).map_or(0, |meta| meta.prot);
+    Some(if protection & FIBF_EXECUTE == 0 {
+        WBTOOL
+    } else {
+        WBPROJECT
+    })
 }
 
 /// `GetDiskObjectNew` (`A0` = name): `GetDiskObject`, and where there is
@@ -227,7 +241,7 @@ fn get_disk_object_new_handler<C: Cpu>(
 ) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(0));
     if name_ptr == 0 {
-        deliver(ctx, &DiskObjectFile::empty());
+        deliver_empty(ctx);
         return Ok(());
     }
     let name = guest_string(ctx.mem, name_ptr);
@@ -237,7 +251,11 @@ fn get_disk_object_new_handler<C: Cpu>(
         // unreadable one is the caller's to hear about, not to overwrite.
         Err(code) if !is_missing(code) => fail(ctx, code),
         Err(code) => match default_type_for(ctx, &name) {
-            Some(def_type) => match default_icon(ctx, def_type as u32) {
+            Some(def_type) => match default_icon(
+                ctx,
+                def_type as u32,
+                default_icon_name(def_type as u32).expect("a type default_type_for returns"),
+            ) {
                 Ok(icon) => deliver(ctx, &icon),
                 Err(code) => fail(ctx, code),
             },
@@ -247,38 +265,54 @@ fn get_disk_object_new_handler<C: Cpu>(
     Ok(())
 }
 
-/// The default icon of `def_type`: `ENV:Sys/def_<type>.info` if there is
-/// one, else the built-in ([`DiskObjectFile::builtin_default`]). An
-/// `ENV:` file that exists but is not an icon is an error, not a reason
-/// to quietly use the built-in; a type V40 has no default for
-/// (`WBDEVICE`, `WBAPPICON`, anything out of range) is
-/// `ERROR_BAD_NUMBER`. Both `GetDefDiskObject` and `GetDiskObjectNew`
-/// answer through this, so a bad file gets the same outcome from each.
-fn default_icon(ctx: &HandlerContext<'_, impl Cpu>, def_type: u32) -> Result<DiskObjectFile, i32> {
-    let &(_, name) = DEFAULT_ICON_NAMES
-        .iter()
-        .find(|(t, _)| *t == def_type)
-        .ok_or(crate::dosargs::ERROR_BAD_NUMBER)?;
+/// The default icon of `def_type` (one of [`DEFAULT_ICON_NAMES`]'s
+/// types): `ENV:Sys/def_<type>.info` if there is one, else the built-in
+/// ([`DiskObjectFile::builtin_default`]), which is what real Kickstart
+/// 3.1 does too (icon.library 40.1, measured on Copperline, phase 0 of
+/// #313). An `ENV:` file that exists but is not an icon is an error, not
+/// a reason to quietly use the built-in. Both `GetDefDiskObject` and
+/// `GetDiskObjectNew` answer through this, so a bad file gets the same
+/// outcome from each.
+fn default_icon(
+    ctx: &HandlerContext<'_, impl Cpu>,
+    def_type: u32,
+    name: &str,
+) -> Result<DiskObjectFile, i32> {
     match load_icon(ctx, &format!("ENV:Sys/def_{name}.info")) {
         Err(code) if is_missing(code) => Ok(DiskObjectFile::builtin_default(def_type as u8)),
         other => other,
     }
 }
 
+/// `def_type`'s entry in [`DEFAULT_ICON_NAMES`].
+fn default_icon_name(def_type: u32) -> Option<&'static str> {
+    DEFAULT_ICON_NAMES
+        .iter()
+        .find(|(t, _)| *t == def_type)
+        .map(|&(_, name)| name)
+}
+
 /// `GetDefDiskObject` (`D0` = `WBDISK`..`WBKICK`). `ENV:Sys/def_<type>.info`
-/// if it exists, else the built-in default of that type. A type V40 has
-/// no default for (`WBDEVICE`, `WBAPPICON`, anything out of range) is
-/// `NULL` + `ERROR_BAD_NUMBER`; the real library's `IoErr()` for that is
-/// unverified. The built-in fallback is deliberate: V44+ and AROS also
-/// answer with a built-in icon, where the V40 autodoc ("reads ... from
-/// disk") suggests a missing file is an error; which one real V40 does
-/// is a phase 0 check, and the difference is the safer way round for a
-/// program that just wants *an* icon.
+/// if it exists, else the built-in default of that type -- as real
+/// Kickstart 3.1 answers (icon.library 40.1, phase 0 of #313). A type
+/// 3.1 has no default for is `NULL`: `WBDEVICE` with `IoErr()` =
+/// `ERROR_OBJECT_NOT_FOUND`, and `WBAPPICON` or anything out of range
+/// with `IoErr()` left as it was.
 fn get_def_disk_object_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
+    /// `WBDEVICE`: in 3.1's type range, but with no default icon.
+    const WBDEVICE_TYPE: u32 = 6;
     let def_type = ctx.cpu.data_register(DataRegister(0));
-    match default_icon(ctx, def_type) {
+    let Some(name) = default_icon_name(def_type) else {
+        if def_type == WBDEVICE_TYPE {
+            fail(ctx, crate::dosfile::ERROR_OBJECT_NOT_FOUND);
+        } else {
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+        }
+        return Ok(());
+    };
+    match default_icon(ctx, def_type, name) {
         Ok(icon) => deliver(ctx, &icon),
         Err(code) => fail(ctx, code),
     }
@@ -354,7 +388,7 @@ fn finish_put<C: Cpu>(ctx: &mut HandlerContext<'_, C>, result: Result<(), i32>) 
 }
 
 /// `PutDiskObject` (`A0` = name, `A1` = object): writes `name.info`
-/// (`Disk.info` in a volume's root for a name ending `:`) from the
+/// (`SYS:.info` for a volume) from the
 /// guest `DiskObject`, replacing any file there. Workbench is not
 /// notified: there is none.
 fn put_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -549,35 +583,75 @@ fn match_tool_value_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     Ok(())
 }
 
-/// The new name for `old`: `copy_of_<old>`, or `copy_<n+1>_of_<rest>`
-/// when `old` is already `copy_<n>_of_<rest>` with `n` all digits (plain
-/// `copy_of_<rest>` counting as `n` = one), truncated to `max` bytes.
-/// Matches every example in the `BumpRevision` autodoc, including
-/// `"copy_0_of_foo"` -> `"copy_1_of_foo"` and `"copy foo"` ->
-/// `"copy_of_copy foo"`. `None` when not even one byte of the old name
-/// fits after the `copy_..._of_` prefix (`BumpRevisionLength`'s "cannot
-/// fit the name even by truncation"; the exact boundary is unverified,
-/// phase 0 of #313).
-fn bump_revision(old: &[u8], max: usize) -> Option<Vec<u8>> {
-    let bumped = old
-        .strip_prefix(b"copy_of_")
+/// Which library's `BumpRevision` naming rules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BumpStyle {
+    /// Kickstart 3.1's `BumpRevision` (V40).
+    V40,
+    /// `BumpRevisionLength` as 3.2's `icon.library` 47.5 does it.
+    V47,
+}
+
+/// `old` without its first `prefix.len()` bytes, if they spell `prefix`
+/// in any case.
+fn strip_prefix_ci<'a>(old: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    old.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &old[prefix.len()..])
+}
+
+/// The new name for `old`, truncated to `max` bytes, from real
+/// `icon.library` output (Copperline, phase 0 of #313) -- not the
+/// autodoc's examples, which spell the prefix `copy_` where both
+/// libraries write `Copy_`.
+///
+/// Common to both: `Copy_of_<old>`, or `Copy_<n+1>_of_<rest>` when `old`
+/// is already `copy_of_<rest>` (counting as one) or `copy_<n>_of_<rest>`
+/// with `n` all digits, the match ignoring case.
+///
+/// - **V40** (`BumpRevision`): `copy_0_of_foo` -> `Copy_1_of_foo`; any
+///   other `copy...` name, `copy foo` and `copy_x_of_foo` included, is
+///   a plain name: `Copy_of_copy foo`.
+/// - **V47** (`BumpRevisionLength`): a new count of one is written
+///   `Copy_of_` (`copy_0_of_foo` -> `Copy_of_foo`), and a name starting
+///   `copy_` or `copy ` has those five bytes dropped and counts as a
+///   first copy: `copy foo` -> `Copy_2_of_foo`, `copy_x_of_foo` ->
+///   `Copy_2_of_x_of_foo`. It returns `None` unless `max` exceeds the
+///   room the prefix can need: 8 for `Copy_of_`, 19 for a numbered one
+///   whatever the actual number (so `Copy_2_of_foo` is refused at 19,
+///   though it is only 13 bytes long). V40 never returns `None`.
+fn bump_revision(old: &[u8], max: usize, style: BumpStyle) -> Option<Vec<u8>> {
+    let counted = strip_prefix_ci(old, b"copy_of_")
         .map(|rest| (1u64, rest))
         .or_else(|| {
-            let tail = old.strip_prefix(b"copy_")?;
+            let tail = strip_prefix_ci(old, b"copy_")?;
             let digits = tail.iter().take_while(|b| b.is_ascii_digit()).count();
-            let rest = tail[digits..].strip_prefix(b"_of_")?;
+            let rest = strip_prefix_ci(&tail[digits..], b"_of_")?;
             let n = std::str::from_utf8(&tail[..digits]).ok()?.parse().ok()?;
             Some((n, rest))
+        })
+        .or_else(|| {
+            let dropped = old.get(..5).filter(|h| h[4] == b'_' || h[4] == b' ')?;
+            (style == BumpStyle::V47 && dropped[..4].eq_ignore_ascii_case(b"copy"))
+                .then(|| (1u64, &old[5..]))
         });
-    let (mut new, rest) = match bumped {
-        Some((n, rest)) => (
-            format!("copy_{}_of_", n.saturating_add(1)).into_bytes(),
-            rest,
-        ),
-        None => (b"copy_of_".to_vec(), old),
+    let (count, rest) = match counted {
+        Some((n, rest)) => (Some(n.saturating_add(1)), rest),
+        None => (None, old),
     };
-    if new.len() >= max && !rest.is_empty() {
-        return None;
+    let numbered = match (style, count) {
+        (BumpStyle::V47, Some(1)) | (_, None) => None,
+        (_, n) => n,
+    };
+    let mut new = match numbered {
+        Some(n) => format!("Copy_{n}_of_").into_bytes(),
+        None => b"Copy_of_".to_vec(),
+    };
+    if style == BumpStyle::V47 {
+        let room = if numbered.is_some() { 19 } else { new.len() };
+        if max <= room {
+            return None;
+        }
     }
     new.extend_from_slice(rest);
     new.truncate(max);
@@ -589,28 +663,26 @@ fn bump_revision(old: &[u8], max: usize) -> Option<Vec<u8>> {
 fn bump_revision_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let new_buf = ctx.cpu.address_register(AddressRegister(0));
     let old = read_c_string(ctx.mem, ctx.cpu.address_register(AddressRegister(1)));
-    // The longest prefix, `copy_<u64>_of_`, is 29 bytes: always fits.
-    let new = bump_revision(&old, BUMP_REVISION_MAX).expect("the copy prefix fits in 30 bytes");
+    let new = bump_revision(&old, BUMP_REVISION_MAX, BumpStyle::V40).expect("V40 never refuses");
     crate::guestmem::write_c_string(ctx.mem, new_buf, &new);
     ctx.cpu.set_data_register(DataRegister(0), new_buf);
     Ok(())
 }
 
 /// `BumpRevisionLength` (`A0` = new buffer, `A1` = old name, `D0` =
-/// length): `BumpRevision` with the name limit `length` (bytes, not
-/// counting the NUL) instead of 30, so copies of icons with long file
-/// names can be named. `D0` = the new buffer, or `NULL` when even a
-/// truncated copy name does not fit. `length` is taken as the name limit
-/// as the autodoc's "maximal file size" and the V45 prototype's
-/// `maxLength` suggest; whether it counts the NUL is unverified (phase 0
-/// of #313).
+/// length): `BumpRevision` with a name limit of `length` bytes (not
+/// counting the NUL: `length` 9 gives `Copy_of_f`) instead of 30, so
+/// copies of icons with long file names can be named. `D0` = the new
+/// buffer, or `NULL` when `length` is too small for the prefix -- see
+/// [`bump_revision`] for the exact rule, measured on `icon.library`
+/// 47.5 (3.2); a real 3.1.4 (V45) was not available to compare.
 fn bump_revision_length_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
     let new_buf = ctx.cpu.address_register(AddressRegister(0));
     let old = read_c_string(ctx.mem, ctx.cpu.address_register(AddressRegister(1)));
     let max = ctx.cpu.data_register(DataRegister(0)) as usize;
-    match bump_revision(&old, max) {
+    match bump_revision(&old, max, BumpStyle::V47) {
         Some(new) => {
             crate::guestmem::write_c_string(ctx.mem, new_buf, &new);
             ctx.cpu.set_data_register(DataRegister(0), new_buf);
@@ -898,21 +970,21 @@ mod tests {
     }
 
     #[test]
-    fn get_disk_object_on_a_file_that_is_not_an_icon_is_wrong_type() {
+    fn get_disk_object_on_a_file_that_is_not_an_icon_is_null_with_io_err_zero() {
         let tmp = TempDir::new("junk");
         fs::write(tmp.path().join("thing.info"), b"hello, not an icon").unwrap();
         let (obj, _, code) = call_with_name("GetDiskObject", b"SYS:thing\0", tmp.path());
         assert_eq!(obj, 0);
-        assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+        assert_eq!(code, BAD_ICON_IO_ERR, "Kickstart 3.1 leaves IoErr at 0");
     }
 
     #[test]
-    fn a_cut_off_icon_is_wrong_type_too() {
+    fn a_cut_off_icon_fails_like_a_non_icon() {
         let tmp = TempDir::new("short");
         let bytes = project_icon().to_bytes();
         fs::write(tmp.path().join("thing.info"), &bytes[..bytes.len() - 3]).unwrap();
         let (obj, _, code) = call_with_name("GetDiskObject", b"SYS:thing\0", tmp.path());
-        assert_eq!((obj, code), (0, crate::dosfile::ERROR_OBJECT_WRONG_TYPE));
+        assert_eq!((obj, code), (0, BAD_ICON_IO_ERR));
     }
 
     #[test]
@@ -925,9 +997,10 @@ mod tests {
         result.unwrap();
         let obj = rt.memory().read_u32(RESULT);
         assert_ne!(obj, 0);
-        assert_eq!(rt.memory().read_u16(obj), crate::iconfile::WB_DISKMAGIC);
-        assert_eq!(rt.memory().read_u32(obj + 50), 0, "no default tool");
-        assert_eq!(rt.memory().read_u32(obj + 54), 0, "no tool types");
+        // Real Kickstart 3.1: every field zero, even the magic.
+        let all_zero =
+            (0..crate::iconobj::DISK_OBJECT_MEM_SIZE).all(|i| rt.memory().read_u8(obj + i) == 0);
+        assert!(all_zero, "GetDiskObject(NULL) is an all-zero DiskObject");
     }
 
     #[test]
@@ -949,12 +1022,14 @@ mod tests {
 
     #[test]
     fn get_def_disk_object_falls_back_to_a_builtin_when_the_file_is_missing() {
-        // A deliberate difference from the V40 autodoc: see the handler.
-        for (def_type, drawer, stack) in [
-            (WBDISK, true, 0),
-            (WBDRAWER, true, 0),
-            (WBTOOL, false, 4096),
-            (WBPROJECT, false, 0),
+        // As real Kickstart 3.1 does: gadget size, drawer and default tool.
+        for (def_type, width, drawer, tool, selected) in [
+            (WBDISK, 35, true, true, false),
+            (WBDRAWER, 57, true, false, true),
+            (WBTOOL, 54, false, false, false),
+            (WBPROJECT, 54, false, false, false),
+            (crate::iconfile::WBGARBAGE, 51, true, false, true),
+            (crate::iconfile::WBKICK, 35, false, false, false),
         ] {
             let tmp = TempDir::new("nodefault");
             let mut words = Vec::new();
@@ -965,13 +1040,18 @@ mod tests {
             result.unwrap();
             let obj = rt.memory().read_u32(RESULT);
             assert_ne!(obj, 0, "type {def_type}");
-            assert_eq!(rt.memory().read_u8(obj + 48), def_type);
+            let mem = rt.memory();
+            assert_eq!(mem.read_u8(obj + 48), def_type);
             assert_eq!(
-                rt.memory().read_u32(obj + 66) != 0,
-                drawer,
-                "type {def_type}"
+                mem.read_u16(obj + 12),
+                width,
+                "gadget width, type {def_type}"
             );
-            assert_eq!(rt.memory().read_u32(obj + 74), stack, "type {def_type}");
+            assert_ne!(mem.read_u32(obj + 22), 0, "a picture, type {def_type}");
+            assert_eq!(mem.read_u32(obj + 26) != 0, selected, "type {def_type}");
+            assert_eq!(mem.read_u32(obj + 66) != 0, drawer, "type {def_type}");
+            assert_eq!(mem.read_u32(obj + 50) != 0, tool, "type {def_type}");
+            assert_eq!(mem.read_u32(obj + 74), 0, "no stack, type {def_type}");
         }
     }
 
@@ -985,7 +1065,7 @@ mod tests {
         push_jsr_a6(&mut words, "GetDefDiskObject");
         push_store_d0_then_io_err(&mut words);
         let (result, rt) = run(&words, &[], Some(tmp.path()));
-        assert_eq!(result.unwrap(), crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+        assert_eq!(result.unwrap(), BAD_ICON_IO_ERR);
         assert_eq!(rt.memory().read_u32(RESULT), 0);
     }
 
@@ -1006,11 +1086,21 @@ mod tests {
     fn get_disk_object_new_falls_back_to_a_default_of_the_objects_type() {
         let tmp = TempDir::new("new");
         fs::create_dir(tmp.path().join("adrawer")).unwrap();
-        fs::write(tmp.path().join("prog"), [0, 0, 3, 0xF3, 0, 0, 0, 0]).unwrap();
+        fs::write(tmp.path().join("locked"), b"plain text").unwrap();
+        // `Protect locked +e`'s sidecar: FIBF_EXECUTE denied.
+        fs::write(
+            tmp.path().join("locked.uaem"),
+            b"----ts-- 2025-01-01 00:00:00.00 \n",
+        )
+        .unwrap();
         fs::write(tmp.path().join("notes.txt"), b"plain text").unwrap();
         assert_eq!(new_type(&tmp, "adrawer").1, WBDRAWER);
-        assert_eq!(new_type(&tmp, "prog").1, WBTOOL, "an executable");
-        assert_eq!(new_type(&tmp, "notes.txt").1, WBPROJECT);
+        assert_eq!(
+            new_type(&tmp, "notes.txt").1,
+            WBTOOL,
+            "real 3.1: a file with no protection bits is a tool, whatever it holds"
+        );
+        assert_eq!(new_type(&tmp, "locked").1, WBPROJECT, "execute denied");
         assert_eq!(new_type(&tmp, "").1, WBDISK, "a volume root");
     }
 
@@ -1032,21 +1122,23 @@ mod tests {
     fn a_corrupt_default_file_fails_get_disk_object_new_like_get_def_disk_object() {
         let tmp = TempDir::new("newcorruptdef");
         fs::create_dir_all(tmp.path().join("env/Sys")).unwrap();
-        fs::write(tmp.path().join("env/Sys/def_project.info"), b"junk").unwrap();
+        fs::write(tmp.path().join("env/Sys/def_tool.info"), b"junk").unwrap();
         fs::write(tmp.path().join("notes.txt"), b"plain text").unwrap();
         let (obj, _, code) = new_type(&tmp, "notes.txt");
         assert_eq!(obj, 0);
-        assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+        assert_eq!(code, BAD_ICON_IO_ERR);
     }
 
     #[test]
-    fn a_volume_keeps_its_icon_in_disk_info() {
+    fn a_volumes_icon_is_the_name_plus_info() {
+        // Real Kickstart 3.1 writes and reads `SYS:.info` -- there is no
+        // special `Disk` name (Workbench asks for `SYS:Disk`).
         let tmp = TempDir::new("diskinfo");
         let mut icon = project_icon();
         icon.object_type = WBDISK;
-        fs::write(tmp.path().join("Disk.info"), icon.to_bytes()).unwrap();
+        fs::write(tmp.path().join(".info"), icon.to_bytes()).unwrap();
         let (obj, rt, _) = call_with_name("GetDiskObject", b"SYS:\0", tmp.path());
-        assert_ne!(obj, 0, "SYS: reads SYS:Disk.info");
+        assert_ne!(obj, 0, "SYS: reads SYS:.info");
         assert_eq!(rt.memory().read_u8(obj + 48), WBDISK);
         let (obj, rt, _) = call_with_name("GetDiskObjectNew", b"SYS:\0", tmp.path());
         assert_eq!(rt.memory().read_u8(obj + 48), WBDISK);
@@ -1059,7 +1151,7 @@ mod tests {
         fs::write(tmp.path().join("notes.txt.info"), b"junk").unwrap();
         let (obj, _, code) = new_type(&tmp, "notes.txt");
         assert_eq!(obj, 0);
-        assert_eq!(code, crate::dosfile::ERROR_OBJECT_WRONG_TYPE);
+        assert_eq!(code, BAD_ICON_IO_ERR);
     }
 
     #[test]
@@ -1150,12 +1242,12 @@ mod tests {
     }
 
     #[test]
-    fn put_disk_object_for_a_volume_writes_disk_info() {
+    fn put_disk_object_for_a_volume_writes_dot_info() {
         let tmp = TempDir::new("putdisk");
         fs::write(tmp.path().join("src.info"), full_icon().to_bytes()).unwrap();
         let (ok, _) = get_then_put("PutDiskObject", b"SYS:", tmp.path());
         assert_eq!(ok, TRUE);
-        assert!(tmp.path().join("Disk.info").exists());
+        assert!(tmp.path().join(".info").exists());
     }
 
     #[test]
@@ -1193,12 +1285,12 @@ mod tests {
     }
 
     #[test]
-    fn delete_disk_object_for_a_volume_removes_disk_info() {
+    fn delete_disk_object_for_a_volume_removes_dot_info() {
         let tmp = TempDir::new("deldisk");
-        fs::write(tmp.path().join("Disk.info"), b"icon").unwrap();
+        fs::write(tmp.path().join(".info"), b"icon").unwrap();
         let (ok, _, _) = call_with_name("DeleteDiskObject", b"SYS:\0", tmp.path());
         assert_eq!(ok, TRUE);
-        assert!(!tmp.path().join("Disk.info").exists());
+        assert!(!tmp.path().join(".info").exists());
     }
 
     #[test]
@@ -1296,14 +1388,27 @@ mod tests {
     }
 
     #[test]
-    fn get_def_disk_object_rejects_wbdevice_which_v40_has_no_default_for() {
-        let mut words = Vec::new();
-        push_imm_d(&mut words, 0, 6); // WBDEVICE
-        push_jsr_a6(&mut words, "GetDefDiskObject");
-        push_store_d0_then_io_err(&mut words);
-        let (result, rt) = run(&words, &[], None);
-        assert_eq!(result.unwrap(), crate::dosargs::ERROR_BAD_NUMBER);
-        assert_eq!(rt.memory().read_u32(RESULT), 0);
+    fn get_def_disk_object_has_no_default_for_wbdevice_or_out_of_range_types() {
+        // Real 3.1: WBDEVICE is NULL with OBJECT_NOT_FOUND; anything else
+        // is NULL with IoErr() left as it was (here 777).
+        for (def_type, io_err) in [
+            (6, crate::dosfile::ERROR_OBJECT_NOT_FOUND),
+            (8, 777),
+            (0, 777),
+            (99, 777),
+        ] {
+            let mut words = Vec::new();
+            push_imm_a(&mut words, 6, DOS_LIBRARY_BASE);
+            push_imm_d(&mut words, 1, 777);
+            words.extend_from_slice(&[0x4EAE, (-462i32) as u16]); // SetIoErr(d1)
+            push_imm_a(&mut words, 6, ICON_LIBRARY_BASE);
+            push_imm_d(&mut words, 0, def_type);
+            push_jsr_a6(&mut words, "GetDefDiskObject");
+            push_store_d0_then_io_err(&mut words);
+            let (result, rt) = run(&words, &[], None);
+            assert_eq!(result.unwrap(), io_err, "type {def_type}");
+            assert_eq!(rt.memory().read_u32(RESULT), 0);
+        }
     }
 
     #[test]
@@ -1359,21 +1464,29 @@ mod tests {
     }
 
     #[test]
-    fn bump_revision_matches_every_autodoc_example() {
+    fn bump_revision_matches_kickstart_31() {
+        // Every line is what `BumpRevision` printed on a real Kickstart
+        // 3.1 (icon.library 40.1): note the capital `C`, which the
+        // autodoc's examples do not show.
         for (old, new) in [
-            ("foo", "copy_of_foo"),
-            ("copy_of_foo", "copy_2_of_foo"),
-            ("copy_2_of_foo", "copy_3_of_foo"),
-            ("copy_199_of_foo", "copy_200_of_foo"),
-            ("copy foo", "copy_of_copy foo"),
-            ("copy_0_of_foo", "copy_1_of_foo"),
+            ("foo", "Copy_of_foo"),
+            ("copy_of_foo", "Copy_2_of_foo"),
+            ("Copy_of_foo", "Copy_2_of_foo"),
+            ("copy_2_of_foo", "Copy_3_of_foo"),
+            ("Copy_2_of_foo", "Copy_3_of_foo"),
+            ("COPY_OF_foo", "Copy_2_of_foo"),
+            ("copy_0_of_foo", "Copy_1_of_foo"),
+            ("copy_199_of_foo", "Copy_200_of_foo"),
             (
                 "012345678901234567890123456789",
-                "copy_of_0123456789012345678901",
+                "Copy_of_0123456789012345678901",
             ),
+            ("copy_x_of_foo", "Copy_of_copy_x_of_foo"),
+            ("copy foo", "Copy_of_copy foo"),
+            ("copy_", "Copy_of_copy_"),
         ] {
             assert_eq!(
-                bump_revision(old.as_bytes(), BUMP_REVISION_MAX).unwrap(),
+                bump_revision(old.as_bytes(), BUMP_REVISION_MAX, BumpStyle::V40).unwrap(),
                 new.as_bytes(),
                 "{old}"
             );
@@ -1405,42 +1518,50 @@ mod tests {
         let long = "a".repeat(60);
         let (name, d0) = bump_length(&long, 100);
         assert_eq!(d0, DATA + 0x400, "the buffer");
-        assert_eq!(name.unwrap(), format!("copy_of_{long}").as_bytes());
-        let (name, _) = bump_length(&format!("copy_of_{long}"), 100);
-        assert_eq!(name.unwrap(), format!("copy_2_of_{long}").as_bytes());
+        assert_eq!(name.unwrap(), format!("Copy_of_{long}").as_bytes());
+        let (name, _) = bump_length(&format!("Copy_of_{long}"), 100);
+        assert_eq!(name.unwrap(), format!("Copy_2_of_{long}").as_bytes());
     }
 
     #[test]
-    fn bump_revision_length_truncates_to_the_given_length() {
-        let (name, _) = bump_length("012345678901234567890123456789", 30);
-        assert_eq!(
-            name.unwrap(),
-            b"copy_of_0123456789012345678901",
-            "30 is BumpRevision"
-        );
-        assert_eq!(bump_length("foo", 11).0.unwrap(), b"copy_of_foo");
-        assert_eq!(bump_length("foo", 10).0.unwrap(), b"copy_of_fo");
-        assert_eq!(bump_length("foo", 9).0.unwrap(), b"copy_of_f");
+    fn bump_revision_length_matches_icon_library_47() {
+        // Real 3.2 (icon.library 47.5) results; `None` is NULL.
+        let cases: &[(&str, u32, Option<&str>)] = &[
+            ("foo", 8, None),
+            ("foo", 9, Some("Copy_of_f")),
+            ("foo", 10, Some("Copy_of_fo")),
+            ("foo", 11, Some("Copy_of_foo")),
+            ("foo", 107, Some("Copy_of_foo")),
+            ("", 8, None),
+            ("", 9, Some("Copy_of_")),
+            ("copy_0_of_foo", 9, Some("Copy_of_f")),
+            ("copy_0_of_foo", 13, Some("Copy_of_foo")),
+            ("copy_1_of_foo", 19, None),
+            ("copy_1_of_foo", 20, Some("Copy_2_of_foo")),
+            ("Copy_of_foo", 13, None),
+            ("Copy_of_foo", 19, None),
+            ("Copy_of_foo", 20, Some("Copy_2_of_foo")),
+            ("copy_99_of_foo", 18, None),
+            ("copy_99_of_foo", 20, Some("Copy_100_of_foo")),
+            ("copy_x_of_foo", 19, None),
+            ("copy_x_of_foo", 30, Some("Copy_2_of_x_of_foo")),
+            ("copy foo", 18, None),
+            ("copy foo", 30, Some("Copy_2_of_foo")),
+        ];
+        for &(old, length, want) in cases {
+            let (got, d0) = bump_length(old, length);
+            assert_eq!(got.as_deref(), want.map(str::as_bytes), "{old:?} {length}");
+            assert_eq!(d0 == 0, want.is_none(), "{old:?} {length}");
+        }
     }
 
     #[test]
-    fn bump_revision_length_is_null_when_not_even_a_truncated_name_fits() {
-        assert_eq!(bump_length("foo", 8), (None, 0));
-        assert_eq!(bump_length("foo", 0), (None, 0));
-        // A numbered copy has a longer prefix.
-        assert_eq!(bump_length("copy_99_of_foo", 12), (None, 0));
-        assert_eq!(
-            bump_length("copy_99_of_foo", 13).0.unwrap(),
-            b"copy_100_of_f"
-        );
-    }
-
-    #[test]
-    fn bump_revision_treats_a_non_numeric_copy_prefix_as_a_plain_name() {
-        assert_eq!(
-            bump_revision(b"copy_x_of_foo", BUMP_REVISION_MAX).unwrap(),
-            b"copy_of_copy_x_of_foo"
-        );
+    fn bump_revision_v47_numbered_names_are_truncated_once_there_is_room() {
+        let long = "x".repeat(40);
+        let got =
+            bump_revision(format!("copy_2_of_{long}").as_bytes(), 25, BumpStyle::V47).unwrap();
+        assert_eq!(got.len(), 25);
+        assert!(got.starts_with(b"Copy_3_of_"));
     }
 
     #[test]
