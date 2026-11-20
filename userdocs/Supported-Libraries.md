@@ -53,6 +53,25 @@ Changelog.
   succeeds and does nothing, `WaitForChar` answers `FALSE` at once, and
   `ACTION_SCREEN_MODE` is an action not known. On Windows there is no
   terminal control, so that is always the case.
+- The calls an AmigaDOS Shell needs, so that a real Shell runs under
+  [`--shell`](CLI-Reference.md#-shell): `CliInitRun`, which initialises the
+  process's `CommandLineInterface` from the startup packet as a console
+  shell (input and output the host console, prompt `%N> `, fail level 10;
+  it returns `FN_VALID | FN_USERINPUT`); `SetCurrentDirName`,
+  `SetPrompt` and `GetPrompt`, which keep the directory name and prompt in
+  that structure; `ReadItem`, over a
+  `CSource` or the `Input()` stream, with `ReadArgs`' quoting and `*`
+  escapes; and `ReplyPkt`. The resident segment list is real:
+  `AddSegment` copies the name into a `struct Segment`, `FindSegment`
+  compares names case-insensitively and finds regular entries (positive
+  use count) or system and internal ones (negative) by the `system` flag,
+  and `RemSegment` refuses system and internal entries and ones in use.
+  `RunCommand` accepts the segment of an internal command registered that
+  way (a Shell's built-ins), and nothing else `LoadSeg` did not make.
+  `Fault` knows the Shell's own message codes (-100 and below: `Unknown
+  command`, `Process %N ending`, ...). The list's head is host state: a
+  guest that walks `dl_Root->rn_Info->di_ResList` itself would not find
+  it. `LV_ALIAS` variables are not supported.
 - `PIPE:` — named in-memory channels, as libnix's `pipe()` needs:
   `Open("PIPE:name", MODE_NEWFILE)` opens the write end and
   `MODE_OLDFILE` the read end (either may come first). A `Read` waits

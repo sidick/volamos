@@ -182,6 +182,29 @@ file arrives as the second `sm_ArgList` entry. A tool that is missing
 its `.info` gets `NULL` and `IoErr()` back, as on a real machine, so the
 "no icon" branch can be tested the same way by removing the file.
 
+## Running a real AmigaDOS Shell
+
+The Shell of a 3.1.4 Kickstart ROM runs interactively, with your volumes
+as its disks. You need a ROM image of your own: volamos ships none.
+
+```sh
+python3 tools/extract_rom_shell.py kick314.rom Shell-Seg
+volamos --shell --cpu 68020 -V SYS:./wb314 Shell-Seg
+```
+
+```text
+0> prompt "vol> "
+vol> version
+Kickstart 40.10, Workbench 40.10
+vol> dir SYS:S
+Shell-Startup     Startup-Sequence
+vol> echo done >RAM:log
+vol> type RAM:log
+done
+```
+
+`Ctrl+D` at the prompt ends it. See [`--shell`](CLI-Reference.md#-shell).
+
 ## Next steps
 
 - [CLI Reference](CLI-Reference.md) for every flag in full detail.

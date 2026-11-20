@@ -288,6 +288,9 @@ struct Options {
     /// `guest_args` as project files. CLI-only: not a config key, since
     /// it changes what `guest_args` mean.
     workbench: bool,
+    /// `--shell`: run <program> as an AmigaDOS Shell (`L:Shell-Seg`).
+    /// CLI-only, like `--workbench`.
+    shell: bool,
     volumes: Vec<(String, PathBuf)>,
     assigns: Vec<(String, Vec<String>)>,
     cwd: Option<String>,
@@ -560,6 +563,22 @@ struct Cli {
                       as a seglist, so --sanitize reports carry no source locations."
     )]
     workbench: bool,
+
+    /// Run <program> as an AmigaDOS Shell (a real `L:Shell-Seg`)
+    #[arg(
+        long = "shell",
+        conflicts_with = "workbench",
+        action = ArgAction::SetTrue,
+        help_heading = "Machine",
+        long_help = "Run <program> as an AmigaDOS Shell, interactively: <program> is a Shell \
+                      segment (the `shell` module of a Kickstart 3.x ROM, cut out with \
+                      tools/extract_rom_shell.py -- volamos ships none). You get the Shell's \
+                      prompt and can run its built-ins, commands from the volumes you gave, \
+                      scripts and redirection; Ctrl+D at the prompt ends it. The return code \
+                      is the last command's. Experimental: no aliases, `Run`, pipes or \
+                      second Shell yet. See the Command-Line Reference in the docs."
+    )]
+    shell: bool,
 
     /// Log each emulated library call to stderr
     #[arg(
@@ -1950,6 +1969,7 @@ fn resolve(
         program,
         guest_args,
         workbench: false,
+        shell: false,
         volumes: overrides.volumes,
         assigns: overrides.assigns,
         cwd: overrides.cwd,
@@ -2668,7 +2688,7 @@ fn run_nested_program(
     };
 
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = GuestStdout::new(stdout.lock());
     let result = runtime.run(&mut out, None).unwrap_or(-1);
     // Nested runs parse their own executable locally and don't keep the
     // result around; source-location lookup is a top-level nicety, so
@@ -2801,7 +2821,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // runs simply report addresses without source locations.
     let mut loaded: Option<loader::LoadResult> = None;
     // --workbench needs the seglist too: it is the message's sm_Segment.
-    let mut runtime = if hunk_file.overlay.is_some() || opts.workbench {
+    let mut runtime = if hunk_file.overlay.is_some() || opts.workbench || opts.shell {
         // The overlay path loads through the guest heap, not
         // `loader::load`, so its stack was never checked against RAM at
         // all: an oversized `--stack` panicked deep in heap setup instead
@@ -2904,6 +2924,12 @@ fn run(opts: &Options) -> Result<i32, String> {
         build_runtime_with_vfs(opts, cpu, mem, config, vfs_config.clone())?
     };
 
+    if opts.shell {
+        runtime
+            .start_as_shell()
+            .map_err(|e| format!("--shell: {e}"))?;
+    }
+
     if opts.workbench {
         let projects: Vec<PathBuf> = opts.guest_args.iter().map(PathBuf::from).collect();
         runtime
@@ -2953,7 +2979,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     });
 
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = GuestStdout::new(stdout.lock());
 
     let verbose = opts.verbose;
     let snoop = opts.snoop;
@@ -2979,6 +3005,13 @@ fn run(opts: &Options) -> Result<i32, String> {
             opts.program
         );
     }
+    // A Shell's own return value means nothing: it replies its startup
+    // packet with the last command's return code, which is what `--shell`
+    // exits with.
+    let result = match (opts.shell, runtime.shell_return_code(), result) {
+        (true, Some(code), Ok(_)) => Ok(code),
+        (_, _, result) => result,
+    };
     match result {
         Ok(_) if violated => Ok(SANITIZER_EXIT_CODE),
         other => other,
@@ -3228,6 +3261,38 @@ fn format_emulated_cycles(cycles: u64, clock_hz: f64) -> Option<String> {
     ))
 }
 
+/// The host's stdout as the guest's `Output()`, flushed after every write
+/// when it is a terminal. Rust's stdout is line-buffered, so a prompt (`0> `,
+/// `>>> `), which ends without a newline, would otherwise sit unseen until
+/// the next line of output -- after the user has typed the command it was
+/// asking for. Pipes and files stay buffered.
+struct GuestStdout<'a> {
+    out: io::StdoutLock<'a>,
+    interactive: bool,
+}
+
+impl<'a> GuestStdout<'a> {
+    fn new(out: io::StdoutLock<'a>) -> Self {
+        use std::io::IsTerminal;
+        let interactive = io::stdout().is_terminal();
+        Self { out, interactive }
+    }
+}
+
+impl io::Write for GuestStdout<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(buf)?;
+        if self.interactive {
+            self.out.flush()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
 fn main() -> ExitCode {
     // Host SIGINT -> guest SIGBREAKF_CTRL_C (Phase 3 stage 5), with
     // SIGTERM/a second SIGINT forcing immediate termination (issue
@@ -3259,6 +3324,7 @@ fn main() -> ExitCode {
     };
     cli.guest_args = guest_args;
     let workbench = cli.workbench;
+    let shell = cli.shell;
     let (
         cli_overrides,
         sanitize,
@@ -3323,6 +3389,7 @@ fn main() -> ExitCode {
         }
     };
     opts.workbench = workbench;
+    opts.shell = shell;
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same

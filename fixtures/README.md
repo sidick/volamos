@@ -1358,3 +1358,13 @@ it `Wait`s for `SIGBREAKF_CTRL_D` and exits with the signals it
 received, since the console raises the break whatever the guest is
 doing.
 
+## issue #20 fixture: `minishell`
+
+A stand-in for the AmigaDOS Shell, to test how `--shell` starts one
+without a Kickstart ROM. Source of truth: `gen_minishell.py` (no vasm,
+like its siblings). It has the layout of a Shell segment (two header
+longwords, then the BCPL call-in `--shell` starts at), checks that the
+startup packet in `D1` is a regular shell startup (`dp_Type` non-zero,
+`dp_Res1` and `dp_Res2` zero), and replies it with `ReplyPkt`: 7 if so, 99
+if not, which is the exit code. Used by `crates/volamos/tests/shell_e2e.rs`.
+

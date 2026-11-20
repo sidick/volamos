@@ -2573,6 +2573,10 @@ pub struct Runtime<C: Cpu> {
     /// The `WBStartup` message [`Self::start_as_workbench`] posted, `0`
     /// for a shell start -- see [`Self::workbench_message_replied`].
     wb_message: u32,
+    /// The startup `DosPacket` [`Self::start_as_shell`] built (`0` for any
+    /// other start): the Shell replies it as it ends, with the last
+    /// command's return code in `dp_Res1`.
+    shell_packet: u32,
 }
 
 /// One distinct stack region's high-water mark, as reported by
@@ -2847,6 +2851,8 @@ impl<C: Cpu + 'static> Runtime<C> {
 
         // dos.library DoPkt -- see crate::dospkt's module docs.
         crate::dospkt::register_dospkt_handlers(&mut table, &mut mem);
+        crate::doscli::register_cli_handlers(&mut table, &mut mem);
+        crate::dosresident::register_resident_handlers(&mut table, &mut mem);
 
         // dos.library AddPart/FilePart/PathPart (pure path-string
         // helpers) -- see crate::dospath's module docs.
@@ -3400,6 +3406,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             stack_usage: BTreeMap::new(),
             top_seglist: 0,
             wb_message: 0,
+            shell_packet: 0,
         }
     }
 
@@ -3632,6 +3639,105 @@ impl<C: Cpu + 'static> Runtime<C> {
         Ok(())
     }
 
+    /// Starts the loaded program as an AmigaDOS Shell (`L:Shell-Seg`) --
+    /// issue #20 -- instead of as an ordinary command.
+    ///
+    /// A 3.x Shell is a seglist with BCPL linkage: its code starts with
+    /// the obsolete initialisation entry (a call there raises
+    /// `AN_CLIObsolete`, which is what running `Shell-Seg` as a plain
+    /// program does), and the entry a process is meant to start at is
+    /// the BCPL call-in at **+8** into the first segment's code. There
+    /// `D1` is the `BPTR` of the startup parameter packet and `D2` the
+    /// stack size; `A0`/`D0` are unused. (`vamos -x` starts it the same
+    /// way, with `D1` = 0, which a 3.9 Shell accepts; the 3.2 Shell
+    /// treats a null packet as an obsolete call and raises
+    /// `AN_CLIObsolete`, so a packet is built here.)
+    ///
+    /// The packet is a `DosPacket` of type 1 (`ACTION_RUN`) with
+    /// `dp_Res1`/`dp_Res2` zero ("correct startup"), linked to a message
+    /// whose reply port is host-owned with nothing to signal: the Shell
+    /// replies it when it ends, as it would to the process that created
+    /// it. Read off the 3.2 Shell's own startup code.
+    ///
+    /// Must be called after [`Self::load_top_level_program`], before
+    /// [`Self::run`]. The process keeps the CLI the runtime gave it.
+    pub fn start_as_shell(&mut self) -> Result<(), String> {
+        const DOS_PACKET_SIZE: u32 = 48;
+        // `struct Message`: a `Node` (14) + `mn_ReplyPort` (4) + `mn_Length` (2).
+        const MESSAGE_SIZE: u32 = 20;
+        const ACTION_RUN: u32 = 1;
+        let heap_full = || "the guest heap is full".to_string();
+        if self.top_seglist == 0 {
+            return Err("the Shell must be loaded before it is started".to_string());
+        }
+        let code = crate::guestmem::addr_from_bptr(self.top_seglist)
+            .wrapping_add(crate::dosseg::NEXT_SEG_OFFSET);
+        let stack_size = self
+            .mem
+            .read_u32(self.task + exectask::TC_SPUPPER)
+            .wrapping_sub(self.mem.read_u32(self.task + exectask::TC_SPLOWER));
+
+        let reply_port = self
+            .heap
+            .alloc(&mut self.mem, crate::execlist::MSGPORT_SIZE)
+            .map_err(|_| heap_full())?;
+        crate::execlist::init_msg_port_fields(&mut self.mem, reply_port, 0);
+        let msg = self
+            .heap
+            .alloc(&mut self.mem, MESSAGE_SIZE)
+            .map_err(|_| heap_full())?;
+        let packet = self
+            .heap
+            .alloc(&mut self.mem, DOS_PACKET_SIZE)
+            .map_err(|_| heap_full())?;
+        for i in 0..MESSAGE_SIZE {
+            self.mem.write_u8(msg + i, 0);
+        }
+        for i in 0..DOS_PACKET_SIZE {
+            self.mem.write_u8(packet + i, 0);
+        }
+        self.mem
+            .write_u32(msg + crate::execlist::MN_REPLYPORT, reply_port);
+        self.mem.write_u32(msg + crate::execlist::LN_NAME, packet);
+        // dp_Link, dp_Port, dp_Type; dp_Res1/dp_Res2 stay 0.
+        self.mem.write_u32(packet, msg);
+        self.mem.write_u32(packet + 4, reply_port);
+        self.mem.write_u32(packet + 8, ACTION_RUN);
+
+        // pr_SegList: the segment array the Shell rearranges (entry 3 is
+        // the running program, which it moves to entry 4). Eight entries,
+        // zeroed, the first being the count BCPL binding scans (2 for a
+        // C/assembler program, per the AmigaDOS Manual).
+        let segs = self
+            .heap
+            .alloc(&mut self.mem, 8 * 4)
+            .map_err(|_| heap_full())?;
+        for i in 0..8 {
+            self.mem.write_u32(segs + 4 * i, 0);
+        }
+        self.mem.write_u32(segs, 2);
+        self.mem.write_u32(segs + 12, self.top_seglist);
+        self.mem.write_u32(
+            self.task + exectask::PR_SEGLIST_OFFSET,
+            crate::guestmem::bptr_from_addr(segs),
+        );
+
+        // A Shell has no command line: drop the placeholder the runtime
+        // left to be read back from `Input()`, or its first read finds an
+        // empty line.
+        self.dos.input_buf.clear();
+        self.dos.input_pos = 0;
+
+        self.shell_packet = packet;
+        self.cpu.set_pc(code.wrapping_add(8));
+        self.cpu.set_address_register(AddressRegister(0), 0);
+        self.cpu.set_data_register(DataRegister(0), 0);
+        self.cpu
+            .set_data_register(DataRegister(1), crate::guestmem::bptr_from_addr(packet));
+        self.cpu.set_data_register(DataRegister(2), stack_size);
+        Ok(())
+    }
+
     /// Makes this run start the way Workbench starts a program (issue
     /// #345) rather than the way a shell does: no CLI (`pr_CLI` = 0),
     /// no command line (`A0`/`D0` = 0), and a `WBStartup` message
@@ -3777,6 +3883,22 @@ impl<C: Cpu + 'static> Runtime<C> {
         );
         self.wb_message = msg;
         Ok(())
+    }
+
+    /// For a [`Self::start_as_shell`] run: the return code the Shell
+    /// replied its startup packet with (`dp_Res1`: the last command's
+    /// return code, as the AmigaDOS Manual's Shell protocol has it), or
+    /// `None` for any other start or if the Shell never replied.
+    pub fn shell_return_code(&self) -> Option<i32> {
+        const DP_PORT: u32 = 4;
+        const DP_RES1: u32 = 12;
+        if self.shell_packet == 0 {
+            return None;
+        }
+        // The reply swaps `dp_Port` to the replier's own process port.
+        let replied = self.mem.read_u32(self.shell_packet + DP_PORT)
+            == self.task + exectask::PR_MSGPORT_OFFSET;
+        replied.then(|| self.mem.read_u32(self.shell_packet + DP_RES1) as i32)
     }
 
     /// For a [`Self::start_as_workbench`] run: whether the program has

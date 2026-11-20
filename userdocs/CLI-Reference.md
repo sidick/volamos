@@ -8,7 +8,7 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-lowmem] [--sanitize-wild]
         [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
-        [--emu68-debug] [--stack-report] [--net] [--workbench] <program> [args...]
+        [--emu68-debug] [--stack-report] [--net] [--workbench] [--shell] <program> [args...]
 ```
 
 `volamos --help` prints this same reference from the binary itself, and
@@ -1535,6 +1535,46 @@ so `--workbench hello hello.c` works as typed. `sm_ToolWindow` is `NULL`.
   and written, and [Examples](Examples.md#testing-a-tool-the-way-workbench-starts-it).
 - Not a config-file key: it changes what the arguments after `<program>`
   mean.
+
+## `--shell`
+
+Runs `<program>` as an AmigaDOS **Shell**, interactively, instead of as a
+command that runs once and exits. Default: off. Experimental.
+
+```sh
+python3 tools/extract_rom_shell.py kick314.rom Shell-Seg   # once
+volamos --shell --cpu 68020 -V SYS:./wb314 Shell-Seg
+```
+
+You get the real Shell's prompt (`0> `) and can type commands: its
+built-ins (`Echo`, `CD`, `Stack`, `Prompt`, `If`/`Skip`/`Lab`, `Ask`,
+`Failat`, `Why`, `Fault`, ...), commands from `C:` (found on the volumes
+you gave with `-V`/`-a`), `Execute` scripts, and `>` redirection. A
+program waiting at the prompt reads the terminal as it would on an
+Amiga: `Ctrl+D` at the prompt ends the Shell (`Process 0 ending`), and
+`Ctrl+C` interrupts a running command.
+
+**Where the Shell comes from.** volamos ships none. In Kickstart 3.x the
+Shell is not a disk file: it is the resident module `shell`, part of the
+ROM. `tools/extract_rom_shell.py` cuts it out of a ROM image of your own
+and rebuilds the hunk executable it was linked from (the module is the
+same `Shell-Seg` layout that later releases put in `L:`, with its
+addresses already resolved for the ROM, which the script turns back into
+relocations). The 3.1.4 ROM's Shell (`shell 46.10`) is the one this has
+been run with. A `Shell-Seg` from Workbench 3.2 does not run: it needs
+`dos.library` 47 and private functions of it.
+
+- The return code is what the Shell replies its startup packet with: the
+  last command's return code, so `0` after a session whose last command
+  worked and `10` or `20` after one that failed.
+- `<program>` is the extracted Shell, loaded as a seglist, so `--sanitize`
+  reports for it carry addresses but no source locations. `[args...]` are
+  not used.
+- Output is flushed after every write when stdout is a terminal, so the
+  prompt appears before you type (it has no newline to flush it).
+- Not supported yet: aliases (`Alias` fails with `Can't set`),
+  background commands (`Run`) and pipes, which need a second Shell
+  process, and more than one Shell (`NewShell`/`NewCLI`).
 
 ## No flags at all
 
