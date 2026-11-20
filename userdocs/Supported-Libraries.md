@@ -455,7 +455,13 @@ or — once every task is blocked and nothing else could possibly make
 progress first — fired early by actually sleeping out the real
 remaining duration first, so a timed wait still measures its real
 requested duration rather than resolving instantly.
-`WaitIO`/`CheckIO`/`AbortIO` all recognize a still-pending request.
+`WaitIO`, `CheckIO` and `AbortIO` all recognize a still-pending request:
+`WaitIO` waits for it (suspending only the calling task, as `DoIO` does)
+and takes the reply off its port, so `SendIO` + `WaitIO` sleeps for the
+request's time and leaves the port empty; `AbortIO` cancels it with
+`IOERR_ABORTED` and replies it to its port, signalling the port, so a
+`GetMsg`/`Wait` loop sees it. A task blocked in `WaitIO` wakes at once,
+with `IOERR_ABORTED`, if another task aborts its request.
 A synchronous `DoIO(TR_ADDREQUEST)` suspends only the calling task,
 as `Delay()` does: the other tasks run until its time is up, measured
 in microseconds, and a request that is due at once (`{0, 0}`) still

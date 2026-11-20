@@ -213,6 +213,22 @@ pub const PF_ACTION: u8 = 3;
 /// section.
 pub const MSGPORT_SIGBIT_PLACEHOLDER: u8 = 0;
 
+/// The task and signal bit a message arriving at `port` signals: `None`
+/// for a port that doesn't signal (`PA_IGNORE`/`PA_SOFTINT`), one with no
+/// real allocated bit, or no task. Shared by [`signal_port_task`] and
+/// `WaitIO`, which consumes the same bit.
+pub(crate) fn port_signal_target<M: AddressSpace + ?Sized>(
+    mem: &M,
+    port: u32,
+) -> Option<(u32, u8)> {
+    if mem.read_u8(port + MP_FLAGS) & PF_ACTION != PA_SIGNAL {
+        return None;
+    }
+    let task = mem.read_u32(port + MP_SIGTASK);
+    let bit = mem.read_u8(port + MP_SIGBIT);
+    (task != 0 && bit != MSGPORT_SIGBIT_PLACEHOLDER && bit < 32).then_some((task, bit))
+}
+
 /// What real `PutMsg` does after queueing: if the port's action is
 /// [`PA_SIGNAL`] and `mp_SigTask` is set, it `Signal`s that task with
 /// `1 << mp_SigBit`, which is what wakes a task blocked in `Wait` (or
@@ -234,14 +250,9 @@ pub(crate) fn signal_port_task<M: AddressSpace + ?Sized>(
     tasks: &mut crate::taskswitch::TaskScheduler,
     port: u32,
 ) {
-    if mem.read_u8(port + MP_FLAGS) & PF_ACTION != PA_SIGNAL {
+    let Some((task, bit)) = port_signal_target(mem, port) else {
         return;
-    }
-    let task = mem.read_u32(port + MP_SIGTASK);
-    let bit = mem.read_u8(port + MP_SIGBIT);
-    if task == 0 || bit == MSGPORT_SIGBIT_PLACEHOLDER || bit >= 32 {
-        return;
-    }
+    };
     let current = tasks.current();
     if task != current && !tasks.is_known(task) {
         return;
