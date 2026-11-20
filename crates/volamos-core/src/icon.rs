@@ -1145,6 +1145,25 @@ mod tests {
     }
 
     #[test]
+    fn workbenchs_disk_icon_name_reads_disk_info() {
+        // Workbench asks for the disk icon as `<volume>:Disk`; the library
+        // only appends `.info`, so that is `Disk.info` at the root.
+        let tmp = TempDir::new("workbenchdisk");
+        let mut icon = project_icon();
+        icon.object_type = WBDISK;
+        fs::write(tmp.path().join("Disk.info"), icon.to_bytes()).unwrap();
+        let (obj, rt, _) = call_with_name("GetDiskObject", b"SYS:Disk\0", tmp.path());
+        assert_ne!(obj, 0);
+        assert_eq!(rt.memory().read_u8(obj + 48), WBDISK);
+        let (obj, _, code) = call_with_name("GetDiskObject", b"SYS:\0", tmp.path());
+        assert_eq!(
+            (obj, code),
+            (0, crate::dosfile::ERROR_OBJECT_NOT_FOUND),
+            "SYS: alone is the empty name, so `.info`"
+        );
+    }
+
+    #[test]
     fn get_disk_object_new_does_not_hide_a_corrupt_icon_behind_a_default() {
         let tmp = TempDir::new("newcorrupt");
         fs::write(tmp.path().join("notes.txt"), b"plain text").unwrap();
