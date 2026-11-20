@@ -51,7 +51,10 @@
 //!   [`crate::iconobj::read_disk_object`] and writes `name.info`
 //!   (`Disk.info` for a volume), replacing any file there; the
 //!   parent directory must exist. A pointer that does not lead to a
-//!   readable `DiskObject` fails the run naming the call. Workbench
+//!   readable `DiskObject` fails the run naming the call. The file is
+//!   replaced atomically. Only the classic part is written: a
+//!   ColorIcon/PNG icon read and put back loses its extra picture
+//!   data (the guest `DiskObject` has nowhere to carry it). Workbench
 //!   is not notified: there is none.
 //! - `PutDefDiskObject`: the same for `ENV:Sys/def_<type>.info`, where
 //!   `GetDefDiskObject` finds it; `ENV:Sys` is created if missing.
@@ -327,7 +330,17 @@ fn store_icon(
     let host = vfs
         .resolve(path, ResolveMode::ParentMustExist)
         .map_err(|e| map_vfs_error(&e))?;
-    std::fs::write(host, icon.to_bytes()).map_err(|e| crate::dosfile::map_io_error(&e))
+    // Write beside the target and rename over it, so a failed or
+    // interrupted write leaves the old icon intact rather than truncated.
+    let mut tmp = host.clone().into_os_string();
+    tmp.push(".volamos-tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, icon.to_bytes())
+        .and_then(|()| std::fs::rename(&tmp, &host))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            crate::dosfile::map_io_error(&e)
+        })
 }
 
 /// The guest `DiskObject` at `obj`, or the run failing in `handler`: a
@@ -364,6 +377,9 @@ fn finish_put<C: Cpu>(ctx: &mut HandlerContext<'_, C>, result: Result<(), i32>) 
 fn put_disk_object_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(0));
     let obj = ctx.cpu.address_register(AddressRegister(1));
+    if name_ptr == 0 {
+        return Err(handler_failed("PutDiskObject", "name is NULL".to_string()));
+    }
     let icon = read_object(ctx, "PutDiskObject", obj)?;
     let path = info_path(&guest_string(ctx.mem, name_ptr));
     let result = store_icon(ctx, &path, &icon, false);
@@ -399,7 +415,13 @@ fn delete_disk_object_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(0));
-    let info = format!("{}.info", guest_string(ctx.mem, name_ptr));
+    if name_ptr == 0 {
+        return Err(handler_failed(
+            "DeleteDiskObject",
+            "name is NULL".to_string(),
+        ));
+    }
+    let info = info_path(&guest_string(ctx.mem, name_ptr));
     match ctx.dos.delete_file(&info) {
         Ok(()) => ctx.cpu.set_data_register(DataRegister(0), TRUE),
         Err(code) => {
@@ -1095,6 +1117,30 @@ mod tests {
         let (ok, code) = get_then_put("PutDefDiskObject", b"", tmp.path());
         assert_eq!(ok, FALSE);
         assert_eq!(code, crate::dosargs::ERROR_BAD_NUMBER);
+    }
+
+    #[test]
+    fn delete_disk_object_for_a_volume_removes_disk_info() {
+        let tmp = TempDir::new("deldisk");
+        fs::write(tmp.path().join("Disk.info"), b"icon").unwrap();
+        let (ok, _, _) = call_with_name("DeleteDiskObject", b"SYS:\0", tmp.path());
+        assert_eq!(ok, TRUE);
+        assert!(!tmp.path().join("Disk.info").exists());
+    }
+
+    #[test]
+    fn put_disk_object_leaves_no_temp_file_behind() {
+        let tmp = TempDir::new("puttmp");
+        fs::write(tmp.path().join("src.info"), full_icon().to_bytes()).unwrap();
+        get_then_put("PutDiskObject", b"SYS:dst", tmp.path());
+        let names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains("volamos-tmp")),
+            "{names:?}"
+        );
     }
 
     #[test]

@@ -212,7 +212,7 @@ pub fn free_disk_object(
 const MAX_STRING_LEN: u32 = 1 << 20;
 const MAX_TOOL_TYPES: u32 = 1 << 16;
 /// Largest image bitplane block read from the guest.
-const MAX_IMAGE_BYTES: u64 = 16 << 20;
+const MAX_IMAGE_BYTES: u64 = 4 << 20;
 
 fn mapped(mem: &dyn AddressSpace, addr: u32, len: u32, what: &str) -> Result<(), String> {
     if addr != 0 && mem.is_mapped(addr, len) {

@@ -93,6 +93,8 @@ pub const DRAWER_DATA_FILE_SIZE: usize = NEW_WINDOW_SIZE + 8;
 pub const IMAGE_HEADER_SIZE: usize = 20;
 /// Size of the OS 2.x drawer extension, step 7 above.
 pub const DRAWER_EXTENSION_SIZE: usize = 6;
+/// The most bitplane bytes [`DiskObjectFile::to_bytes`] writes for one image.
+const MAX_WRITTEN_IMAGE_BYTES: usize = 64 << 20;
 /// What [`DiskObjectFile::to_bytes`] writes for a pointer field whose
 /// data follows. Any non-zero value would do.
 pub const POINTER_PRESENT: u32 = 1;
@@ -557,16 +559,22 @@ impl DiskObjectFile {
             ] {
                 out.extend_from_slice(&v.to_be_bytes());
             }
-            out.extend_from_slice(&present(!img.data.is_empty()).to_be_bytes());
+            // Planes are written only up to a size no real icon reaches;
+            // an image claiming more (a caller-built `IconImage` with
+            // absurd dimensions) is written without them rather than
+            // allocating terabytes.
+            let size = usize::try_from(plane_data_size(img.width, img.height, img.depth))
+                .ok()
+                .filter(|&n| n <= MAX_WRITTEN_IMAGE_BYTES);
+            let planes = size.filter(|_| !img.data.is_empty());
+            out.extend_from_slice(&present(planes.is_some()).to_be_bytes());
             out.push(img.plane_pick);
             out.push(img.plane_on_off);
             out.extend_from_slice(&0u32.to_be_bytes()); // NextImage
             // The planes are as long as the dimensions say, whatever
             // `data` holds, so a reader finds the next field where
             // it expects it: cut or zero-padded to fit.
-            if !img.data.is_empty() {
-                let size = usize::try_from(plane_data_size(img.width, img.height, img.depth))
-                    .expect("an image this size does not fit in memory");
+            if let Some(size) = planes {
                 out.extend_from_slice(&img.data[..img.data.len().min(size)]);
                 out.resize(out.len() + size.saturating_sub(img.data.len()), 0);
             }
@@ -1062,6 +1070,24 @@ mod tests {
             DiskObjectFile::builtin_default(WBPROJECT).object_type,
             WBPROJECT
         );
+    }
+
+    #[test]
+    fn an_image_with_absurd_dimensions_is_written_without_planes_not_allocated() {
+        let icon = DiskObjectFile {
+            gadget_image: Some(IconImage {
+                width: i16::MAX,
+                height: i16::MAX,
+                depth: i16::MAX,
+                data: vec![1, 2, 3],
+                ..IconImage::default()
+            }),
+            ..DiskObjectFile::default()
+        };
+        let bytes = icon.to_bytes();
+        let (back, used) = DiskObjectFile::parse(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert!(back.gadget_image.unwrap().data.is_empty());
     }
 
     #[test]

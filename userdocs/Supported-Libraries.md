@@ -514,6 +514,9 @@ all — so it always opens. Reading icons works; writing them doesn't yet.
   `IoErr()` otherwise). Workbench isn't notified, as there is none. A
   `DiskObject` pointer that doesn't lead to readable memory fails the
   run, naming the call, rather than writing garbage to the file.
+  The file is replaced atomically. Only the classic part is written:
+  reading an OS 3.5 ColorIcon or PNG icon and putting it back drops its
+  extra picture data, leaving the classic icon.
 - `PutDefDiskObject` writes `ENV:Sys/def_<type>.info` for the object's
   `do_Type` (creating `ENV:Sys` if needed), which `GetDefDiskObject`
   then reads back. It doesn't write `ENVARC:`. `WBDEVICE` and other
