@@ -70,7 +70,8 @@ fn shell_start_still_has_a_cli() {
 }
 
 #[test]
-fn workbench_project_outside_every_volume_is_a_clean_error() {
+fn workbench_project_outside_every_volume_gets_a_volume_of_its_own() {
+    // The project's directory is under no `-V`, so volamos mounts it.
     let vol = Volume::new("outside");
     let elsewhere = Volume::new("elsewhere");
     let out = Command::new(env!("CARGO_BIN_EXE_volamos"))
@@ -81,12 +82,35 @@ fn workbench_project_outside_every_volume_is_a_clean_error() {
         .arg(elsewhere.0.join("notes.txt"))
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not under any volume"),
-        "stderr was: {stderr}"
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "wbtest\nnotes.txt\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn workbench_works_as_typed_with_no_volume_configured() {
+    // No -V at all (and no defaults): the program's own directory and the
+    // project's become volumes, so the command line needs nothing extra.
+    let vol = Volume::new("asis");
+    let out = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg("--no-defaults")
+        .current_dir(&vol.0)
+        .arg("--workbench")
+        .arg("wbtest")
+        .arg("notes.txt")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "wbtest\nnotes.txt\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]

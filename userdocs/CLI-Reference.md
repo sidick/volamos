@@ -1512,9 +1512,11 @@ The words after `<program>` are **project files**, not a command line.
 They become further entries of the message's `sm_ArgList` (entry 0 is
 the program itself), as when you double-click a project icon with the
 tool as its default tool. Each entry's `wa_Lock` is a lock on the
-file's directory and `wa_Name` the file's name, so both directories
-must be under a volume (see [`-V`](#-v-volume-namehostdir)); otherwise
-volamos exits with an error. `sm_ToolWindow` is `NULL`.
+file's directory and `wa_Name` the file's name. A directory that no
+[`-V`](#-v-volume-namehostdir) volume covers gets a volume of its own,
+named after it (see
+[A program's own directory](Volumes-and-Assigns.md#a-programs-own-directory)),
+so `--workbench hello hello.c` works as typed. `sm_ToolWindow` is `NULL`.
 
 - The return code is the program's, as for a shell start. Workbench
   waits for the program to reply to the message, which its startup code

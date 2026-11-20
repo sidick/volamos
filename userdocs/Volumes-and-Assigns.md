@@ -153,6 +153,23 @@ with an `IoErr()`, matching every other case in this page. See
 [CLI Reference](CLI-Reference.md#-defaults-no-defaults) for
 `--defaults`/`--no-defaults`/`--volumes-dir`.
 
+## A program's own directory
+
+A program is started from a host path, not through a volume, so its
+directory may not be under any `-V` volume. When it isn't, volamos mounts
+it as a volume of its own, named after the directory (`hello` for
+`./projects/hello/`; `:` and `/` become `_`, names are cut to 30
+characters, and a name already taken by a volume or assign gets a `_2`,
+`_3`, ... suffix). The program then has a home directory and a
+`PROGDIR:`, as on a real machine, and a
+[`--workbench`](CLI-Reference.md#-workbench) start can lock the
+directories of the program and its project files without any `-V`.
+
+The new volume is added last, so it never becomes the default current
+directory, and a directory already inside a `-V` volume is left as it is.
+With `--no-defaults` and nothing else configured, no volumes are set up
+at all, except by `--workbench`, which needs them.
+
 ## Case sensitivity
 
 Real AmigaOS filesystems are case-insensitive; most host filesystems

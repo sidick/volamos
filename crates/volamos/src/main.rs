@@ -91,7 +91,7 @@
 mod config;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{ArgAction, Parser};
@@ -2046,7 +2046,10 @@ fn default_cwd(opts: &Options) -> String {
 /// anyway ([`crate::dispatch::Runtime`] owns it by value, not by any
 /// handle a closure built before the `Runtime` exists could hold).
 fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
-    if !opts.wants_vfs() {
+    // A `--workbench` start needs locks for the directories of the
+    // program and its project files, so it needs volumes even with none
+    // configured (`--no-defaults`).
+    if !opts.wants_vfs() && !opts.workbench {
         return None;
     }
     let mut volumes = opts.volumes.clone();
@@ -2063,13 +2066,44 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
             dir.clone(),
         ));
     }
-    Some(VfsConfig {
+    let mut config = VfsConfig {
         volumes,
         assigns: opts.assigns.clone(),
         auto_assign_root: opts.auto_assign_root.clone(),
         cwd: default_cwd(opts),
         lazy_volumes: opts.lazy_volumes.clone(),
-    })
+    };
+    // A directory no volume covers gets one of its own, so the program
+    // has a `PROGDIR:` and home directory, and `--workbench` can lock
+    // the directories it passes (see `VfsConfig::cover_host_dir`).
+    let mut dirs: Vec<PathBuf> = vec![dir_of(Path::new(&opts.program))];
+    if opts.workbench {
+        dirs.extend(opts.guest_args.iter().map(|p| dir_of(Path::new(p))));
+    }
+    let mut first_added = None;
+    for dir in dirs {
+        if let Some(name) = config.cover_host_dir(&dir) {
+            first_added.get_or_insert(name);
+        }
+    }
+    // With nothing else configured the default cwd (`root:`) would not
+    // resolve; start in the first volume made here instead.
+    if let Some(name) = first_added
+        && opts.cwd.is_none()
+        && opts.volumes.is_empty()
+        && opts.assigns.is_empty()
+    {
+        config.cwd = format!("{name}:");
+    }
+    Some(config)
+}
+
+/// The directory containing `file` (`.` for a bare name).
+fn dir_of(file: &Path) -> PathBuf {
+    match file.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 /// The host-side `System()`/`Execute()` runner installed on the
