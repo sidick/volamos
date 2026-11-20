@@ -3817,6 +3817,13 @@ impl<C: Cpu + 'static> Runtime<C> {
         &mut self.heap
     }
 
+    /// The guest heap and memory together, for a test that has to allocate
+    /// a guest structure (`heap.alloc` takes the memory) and fill it.
+    #[cfg(test)]
+    pub(crate) fn heap_and_memory_mut(&mut self) -> (&mut GuestHeap, &mut C::Memory) {
+        (&mut self.heap, &mut self.mem)
+    }
+
     /// Replaces the runtime's guest heap wholesale -- e.g. to shrink or
     /// grow it relative to what [`StartConfig::load_end`] implied, or to
     /// swap in a heap with pre-existing allocations for a test. Note

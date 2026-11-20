@@ -174,16 +174,23 @@ Changelog.
 - `CreateNewProc` — a real second task, cooperatively scheduled
   alongside the main one (see `exec.library`'s "Tasks and signals"
   below); unblocks both the libpthread and native-toolchain thread
-  models under `m68k-amigaos-gcc`. `NP_Entry` (required)/`NP_StackSize`/
-  `NP_Name`/`NP_Priority`/`NP_Input`/`NP_Output`/`NP_Error` (and their
-  `NP_Close*` flags)/`NP_ConsoleTask`/`NP_WindowPtr`/`NP_Arguments` are
-  honored, with the defaults `<dos/dostags.h>` documents; the standard
-  handles are stored exactly as given, unchecked, matching real DOS
-  (AmigaPorts' libpthread passes a thread's slot number through
-  `NP_Input`, not a real filehandle, and reads it straight back out of
-  `pr_CIS`). `NP_Seglist` (loading a seglist rather than a bare entry
-  point) isn't supported — every known caller always supplies
-  `NP_Entry`. Each process has its own current directory: it starts in a `DupLock` of its parent's (or in
+  models under `m68k-amigaos-gcc`. `NP_Entry` or `NP_Seglist` (one is
+  required)/`NP_StackSize`/`NP_Name`/`NP_Priority`/`NP_Input`/
+  `NP_Output`/`NP_Error` (and their `NP_Close*` flags)/`NP_ConsoleTask`/
+  `NP_WindowPtr`/`NP_Arguments` are honored, with the defaults
+  `<dos/dostags.h>` documents; the standard handles are stored exactly
+  as given, unchecked, matching real DOS (AmigaPorts' libpthread passes
+  a thread's slot number through `NP_Input`, not a real filehandle, and
+  reads it straight back out of `pr_CIS`). `NP_Seglist` starts the
+  process at the first segment of a seglist from `LoadSeg`, as
+  Workbench and `WBRun`-style launchers do; a value `LoadSeg` never
+  returned stops the run, naming the call. `NP_FreeSeglist` makes the
+  process `UnLoadSeg` it when it ends (a seglist the guest already
+  unloaded stops the run at that point); its default is `FALSE`,
+  whatever `dostags.i` and the V40 autodoc say, since the NDK 3.2
+  autodoc admits the documented `TRUE` was never true.
+
+  Each process has its own current directory: it starts in a `DupLock` of its parent's (or in
   `NP_CurrentDir`'s lock as given), `CurrentDir` in one process no longer
   moves another's, and DOS unlocks it when the process ends. Its home
   directory (`pr_HomeDir`, what `PROGDIR:` resolves to) works the same way:

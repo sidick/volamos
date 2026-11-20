@@ -924,10 +924,19 @@ const TAG_USER: u32 = 0x8000_0000;
 /// `NP_Dummy`, per `<dos/dostags.h>`: `TAG_USER + 1000`. Every other
 /// `NP_*` tag is defined relative to this.
 const NP_DUMMY: u32 = TAG_USER + 1000;
-/// `NP_Entry` (`NP_Dummy + 3`): the child task's entry point. Required
-/// -- see [`create_new_proc_handler`]'s doc for why `NP_Seglist`
-/// (the other, mutually exclusive way real `CreateNewProc` accepts)
-/// isn't supported.
+/// `NP_Seglist` (`NP_Dummy + 1`, `BPTR`): a seglist from `LoadSeg`, whose
+/// first segment's code is the child's entry point. The other, mutually
+/// exclusive, way to say what to run -- see [`NP_ENTRY`].
+const NP_SEGLIST: u32 = NP_DUMMY + 1;
+/// `NP_FreeSeglist` (`NP_Dummy + 2`, `BOOL`): `UnLoadSeg` the
+/// `NP_Seglist` when the process ends. Default **FALSE**: `dostags.i`
+/// and the V40 autodoc say TRUE, but the NDK 3.2 `CreateNewProc`
+/// autodoc's BUGS section states it "was erraneously documented to have
+/// the default TRUE, but the default was always FALSE" (`dostags.h` has
+/// FALSE too).
+const NP_FREESEGLIST: u32 = NP_DUMMY + 2;
+/// `NP_Entry` (`NP_Dummy + 3`): the child task's entry point. One of this
+/// and [`NP_SEGLIST`] is required.
 const NP_ENTRY: u32 = NP_DUMMY + 3;
 /// `NP_Input` (`NP_Dummy + 4`): `pr_CIS`, stored as given. Default: a
 /// new `NIL:` handle.
@@ -1041,7 +1050,7 @@ fn open_nil<C: Cpu>(ctx: &mut HandlerContext<'_, C>, mode: i32) -> u32 {
 /// and `crate::taskswitch`'s module doc for the scheduling this plugs
 /// a new task into.
 ///
-/// Scope: `NP_Entry` (required), `NP_StackSize`, `NP_Name`,
+/// Scope: `NP_Entry` or `NP_Seglist` (one is required), `NP_StackSize`, `NP_Name`,
 /// `NP_Priority`, the standard handles (`NP_Input`/`NP_Output`/
 /// `NP_Error` and their `NP_Close*` flags, which [`task_exit_stub_handler`]
 /// acts on), `NP_ConsoleTask`, `NP_WindowPtr`, `NP_Arguments` and
@@ -1051,14 +1060,20 @@ fn open_nil<C: Cpu>(ctx: &mut HandlerContext<'_, C>, mode: i32) -> u32 {
 /// slot number in `NP_Input` and reads it back from `pr_CIS`.
 /// `NP_CurrentDir`/`NP_HomeDir` are not read, since this runtime has
 /// one current directory for the whole run, not one per process.
-/// `NP_Seglist` -- the other, mutually
-/// exclusive way real `CreateNewProc` accepts what to run (a seglist,
-/// as from `LoadSeg`, rather than a bare function pointer) -- isn't
-/// supported; every known caller that actually needs this runtime's
-/// `CreateNewProc` support (both the libpthread and native toolchain
-/// thread models, per issue #121's thread) always supplies `NP_Entry`.
-/// The remaining tags (`NP_Cli`/`NP_Path`/`NP_CopyVars`/...) are
-/// ignored.
+/// `NP_Seglist` (issue #346) -- the other, mutually exclusive way real
+/// `CreateNewProc` accepts what to run -- takes a seglist from `LoadSeg`
+/// instead of a bare function pointer, as Workbench and `WBRun`-style
+/// launchers do. The child starts at the first segment's code (the
+/// `BPTR`'s address plus 4, as [`crate::dosseg`]'s `RunCommand` computes
+/// it). It must be a live seglist: anything else is a guest bug that
+/// would jump into garbage, so it fails the run naming the call, as
+/// `UnLoadSeg` does. `NP_FreeSeglist` (default FALSE, see
+/// [`NP_FREESEGLIST`]) makes the process `UnLoadSeg` it when it ends; on
+/// failure the caller keeps ownership, and a seglist the guest already
+/// unloaded fails the run at exit rather than panicking. Giving both
+/// `NP_Seglist` and `NP_Entry` is documented as invalid; `NP_Seglist`
+/// wins here, and that choice is not hardware-checked. The remaining
+/// tags (`NP_Cli`/`NP_Path`/`NP_CopyVars`/...) are ignored.
 ///
 /// The child's initial registers: `A7` = the top of its own freshly
 /// allocated stack (with [`crate::dispatch::TASK_EXIT_STUB_ADDR`]
@@ -1070,18 +1085,41 @@ fn open_nil<C: Cpu>(ctx: &mut HandlerContext<'_, C>, mode: i32) -> u32 {
 fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let tags = ctx.cpu.data_register(DataRegister(1));
 
-    let entry_item = crate::utility::find_tag_item_impl(ctx.mem, NP_ENTRY, tags);
-    if entry_item == 0 {
-        return Err(DispatchError::HandlerFailed {
-            library: "dos.library".to_string(),
-            lvo: -498,
-            handler_name: "CreateNewProc".to_string(),
-            message: "NP_Entry is required -- NP_Seglist (the other, mutually exclusive way \
-                      to specify what to run) is not supported"
-                .to_string(),
-        });
-    }
-    let entry = ctx.mem.read_u32(entry_item + 4);
+    let seglist = tag_data(ctx.mem, tags, NP_SEGLIST).filter(|&seg| seg != 0);
+    let (entry, seglist_to_free) = match seglist {
+        Some(seg) => {
+            let Some(first_segment) = ctx
+                .dos
+                .seglists
+                .get(&seg)
+                .and_then(|alloc_addrs| alloc_addrs.first().copied())
+            else {
+                return Err(DispatchError::HandlerFailed {
+                    library: "dos.library".to_string(),
+                    lvo: -498,
+                    handler_name: "CreateNewProc".to_string(),
+                    message: format!(
+                        "NP_Seglist {seg:#x} is not a seglist returned by LoadSeg (or it \
+                         has been unloaded)"
+                    ),
+                });
+            };
+            let entry = first_segment.wrapping_add(crate::dosseg::SEG_HEADER_SIZE);
+            let free = tag_data(ctx.mem, tags, NP_FREESEGLIST).is_some_and(|v| v != 0);
+            (entry, if free { seg } else { 0 })
+        }
+        None => match tag_data(ctx.mem, tags, NP_ENTRY) {
+            Some(entry) => (entry, 0),
+            None => {
+                return Err(DispatchError::HandlerFailed {
+                    library: "dos.library".to_string(),
+                    lvo: -498,
+                    handler_name: "CreateNewProc".to_string(),
+                    message: "one of NP_Entry or NP_Seglist is required".to_string(),
+                });
+            }
+        },
+    };
 
     let stack_size = tag_data(ctx.mem, tags, NP_STACKSIZE).unwrap_or(DEFAULT_NP_STACKSIZE);
 
@@ -1135,7 +1173,7 @@ fn create_new_proc_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
         home_dir: tag_data(ctx.mem, tags, NP_HOMEDIR),
         copy_vars: tag_data(ctx.mem, tags, NP_COPYVARS).is_none_or(|v| v != 0),
         cli_command_name: None,
-        seglist: 0,
+        seglist: seglist_to_free,
     };
     let task = spawn_process(ctx, spec).unwrap_or(0);
     ctx.cpu.set_data_register(DataRegister(0), task);
@@ -1513,10 +1551,18 @@ fn release_exited_task<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
             .free(cli)
             .unwrap_or_else(|e| panic!("exiting task's own CommandLineInterface: {e}"));
     }
-    if let Some(seglist) = ctx.dos.process_seglists.remove(&task) {
-        ctx.dos
-            .unload_seg(ctx.heap, ctx.mem, seglist)
-            .unwrap_or_else(|e| panic!("exiting task's own seglist: {e}"));
+    // `NP_FreeSeglist`: the seglist is the guest's, so it may already be
+    // gone (`UnLoadSeg`'d by the caller, or shared with another child
+    // that freed it) -- a guest bug to report, not a host invariant.
+    if let Some(seglist) = ctx.dos.process_seglists.remove(&task)
+        && let Err(e) = ctx.dos.unload_seg(ctx.heap, ctx.mem, seglist)
+    {
+        return Err(DispatchError::HandlerFailed {
+            library: "dos.library".to_string(),
+            lvo: -498,
+            handler_name: "CreateNewProc".to_string(),
+            message: format!("process ended with NP_FreeSeglist, but its seglist is gone: {e}"),
+        });
     }
     ctx.heap
         .free(task)
@@ -4303,6 +4349,230 @@ mod tests {
             code, 0x2A,
             "the parent should read the marker only the child task's own \
              code could have written, proving the child actually ran"
+        );
+    }
+
+    /// Runs the "child writes a marker, signals the parent" program of
+    /// `create_new_proc_runs_a_second_task_that_signals_the_parent`, but
+    /// with the child's code in a one-segment seglist registered the way
+    /// `LoadSeg` does, started by `NP_Seglist` (issue #346). `free` is
+    /// `NP_FreeSeglist`'s value, or `None` to omit the tag; `bogus_seglist`
+    /// passes a `BPTR` no `LoadSeg` returned; `also_entry` adds an
+    /// `NP_Entry` that would crash if it were chosen; `child_unloads_seglist`
+    /// has the child `UnLoadSeg` its own seglist as its last act (the bytes
+    /// are still there for its final `rts`, as nothing poisons freed
+    /// memory without `--sanitize`). Returns the run's result, the
+    /// runtime afterwards, and the seglist's `BPTR`.
+    fn run_np_seglist_program(
+        free: Option<u32>,
+        bogus_seglist: bool,
+        also_entry: bool,
+        child_unloads_seglist: bool,
+    ) -> (
+        Result<i32, crate::dispatch::RuntimeError>,
+        Runtime<M68kCpu>,
+        u32,
+    ) {
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+        words.push((DOS_LIBRARY_BASE >> 16) as u16);
+        words.push(DOS_LIBRARY_BASE as u16);
+        let tags_imm_idx = words.len();
+        words.push(move_imm_to_d(1)); // D1 = tags (patched below)
+        words.push(0);
+        words.push(0);
+        words.extend_from_slice(&jsr_disp16_a6(-498)); // CreateNewProc
+        words.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        words.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        words.push(EXEC_LIBRARY_BASE as u16);
+        words.push(move_imm_to_d(0)); // D0 = 0x00010000 (the join signal)
+        words.push(0x0001);
+        words.push(0x0000);
+        words.extend_from_slice(&jsr_disp16_a6(-318)); // Wait
+        let marker_imm_idx_parent = words.len();
+        words.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        words.push(0);
+        words.push(0);
+        words.push(move_a_indirect_to_d0(0)); // D0 = *marker_addr
+        words.push(RTS); // -> EXIT_STUB_ADDR, exit code = the marker
+
+        // The child: *marker_addr = 0x2A; Signal(parent, join signal).
+        let mut child = Vec::new();
+        child.push(move_imm_to_a(0)); // A0 = marker_addr (patched below)
+        child.push(0);
+        child.push(0);
+        child.push(move_imm_to_d(0)); // D0 = 0x2A
+        child.push(0);
+        child.push(0x2A);
+        child.push(move_d0_to_a_indirect(0)); // *marker_addr = D0
+        child.push(move_imm_to_a(6)); // A6 = EXEC_LIBRARY_BASE
+        child.push((EXEC_LIBRARY_BASE >> 16) as u16);
+        child.push(EXEC_LIBRARY_BASE as u16);
+        child.push(move_imm_to_a(1)); // A1 = parent task (patched below)
+        child.push(0);
+        child.push(0);
+        child.push(move_imm_to_d(0)); // D0 = 0x00010000
+        child.push(0x0001);
+        child.push(0x0000);
+        child.extend_from_slice(&jsr_disp16_a6(-324)); // Signal
+        let unload_idx = child.len();
+        if child_unloads_seglist {
+            child.push(move_imm_to_a(6)); // A6 = DOS_LIBRARY_BASE
+            child.push((DOS_LIBRARY_BASE >> 16) as u16);
+            child.push(DOS_LIBRARY_BASE as u16);
+            child.push(move_imm_to_d(1)); // D1 = the seglist (patched below)
+            child.push(0);
+            child.push(0);
+            child.extend_from_slice(&jsr_disp16_a6(-156)); // UnLoadSeg
+        }
+        child.push(RTS); // -> TASK_EXIT_STUB_ADDR
+
+        let entry = TRAP_TABLE_END;
+        let code_end = entry + (words.len() as u32) * 2;
+        let marker_addr = code_end + 16;
+        let tags_addr = marker_addr + 16;
+        let load_end = tags_addr + 64;
+        words[tags_imm_idx + 1] = (tags_addr >> 16) as u16;
+        words[tags_imm_idx + 2] = tags_addr as u16;
+        words[marker_imm_idx_parent + 1] = (marker_addr >> 16) as u16;
+        words[marker_imm_idx_parent + 2] = marker_addr as u16;
+        child[1] = (marker_addr >> 16) as u16;
+        child[2] = marker_addr as u16;
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        mem.write_u32(marker_addr, 0);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let parent_task = rt.current_task();
+        child[11] = (parent_task >> 16) as u16;
+        child[12] = parent_task as u16;
+
+        // One segment in the guest heap, laid out as `LoadSeg` does:
+        // `seg_length`, `next_seg` (0), then the code. The `BPTR` points
+        // at `next_seg`.
+        let size = 8 + (child.len() as u32) * 2;
+        let (heap, mem) = rt.heap_and_memory_mut();
+        let seg = heap.alloc(mem, size).expect("heap has room");
+        mem.write_u32(seg, size);
+        mem.write_u32(seg + 4, 0);
+        load_words(mem, seg + 8, &child);
+        let bptr = seg_bptr(seg);
+        if child_unloads_seglist {
+            let at = seg + 8 + ((unload_idx + 4) as u32) * 2;
+            mem.write_u32(at, bptr);
+        }
+        rt.dos.seglists.insert(bptr, vec![seg]);
+
+        let named = if bogus_seglist { 0x1234 } else { bptr };
+        rt.memory_mut().write_u32(tags_addr, NP_SEGLIST);
+        rt.memory_mut().write_u32(tags_addr + 4, named);
+        let mut next = tags_addr + 8;
+        if also_entry {
+            rt.memory_mut().write_u32(next, NP_ENTRY);
+            rt.memory_mut().write_u32(next + 4, 0x1234);
+            next += 8;
+        }
+        if let Some(value) = free {
+            rt.memory_mut().write_u32(next, NP_FREESEGLIST);
+            rt.memory_mut().write_u32(next + 4, value);
+            next += 8;
+        }
+        rt.memory_mut().write_u32(next, 0);
+        rt.memory_mut().write_u32(next + 4, 0);
+
+        let mut out = Vec::new();
+        let result = rt.run(&mut out, None);
+        (result, rt, bptr)
+    }
+
+    fn seg_bptr(seg: u32) -> u32 {
+        crate::guestmem::bptr_from_addr(seg + 4)
+    }
+
+    #[test]
+    fn create_new_proc_np_seglist_runs_the_seglists_first_segment() {
+        let _guard = lock_host_break();
+        let (result, _rt, _bptr) = run_np_seglist_program(None, false, false, false);
+        assert_eq!(
+            result.expect("run should succeed"),
+            0x2A,
+            "the child must start at the first segment's code (BPTR address + 4); \
+             the marker only that code writes is the parent's exit code"
+        );
+    }
+
+    #[test]
+    fn create_new_proc_np_seglist_is_kept_unless_np_freeseglist_is_true() {
+        // The NDK 3.2 autodoc's BUGS: the default was always FALSE.
+        let _guard = lock_host_break();
+        for free in [None, Some(0)] {
+            let (result, rt, bptr) = run_np_seglist_program(free, false, false, false);
+            result.expect("run should succeed");
+            assert!(
+                rt.dos.seglists.contains_key(&bptr),
+                "NP_FreeSeglist {free:?}: the caller still owns the seglist after the \
+                 child exits"
+            );
+        }
+    }
+
+    #[test]
+    fn create_new_proc_np_freeseglist_unloads_the_seglist_when_the_child_exits() {
+        let _guard = lock_host_break();
+        let (result, mut rt, bptr) = run_np_seglist_program(Some(1), false, false, false);
+        result.expect("run should succeed");
+        assert!(
+            !rt.dos.seglists.contains_key(&bptr),
+            "NP_FreeSeglist TRUE: the process UnLoadSegs its seglist as it ends"
+        );
+        let seg = crate::guestmem::addr_from_bptr(bptr) - 4;
+        assert!(
+            rt.heap_mut().size_of_live_alloc(seg).is_none(),
+            "the segment's heap block is released with it"
+        );
+    }
+
+    #[test]
+    fn create_new_proc_np_seglist_wins_over_np_entry() {
+        // Both tags is documented as invalid; which one real DOS prefers
+        // is unchecked, so this only pins the choice made here. The bogus
+        // `NP_Entry` would crash the child if it were used.
+        let _guard = lock_host_break();
+        let (result, _rt, _bptr) = run_np_seglist_program(None, false, true, false);
+        assert_eq!(result.expect("run should succeed"), 0x2A);
+    }
+
+    #[test]
+    fn create_new_proc_np_freeseglist_of_an_already_unloaded_seglist_is_an_error_not_a_panic() {
+        // The seglist is the guest's: it may UnLoadSeg it itself while the
+        // process still owns it for NP_FreeSeglist. The exit must report
+        // that, not take the host down.
+        let _guard = lock_host_break();
+        let (result, _rt, _bptr) = run_np_seglist_program(Some(1), false, false, true);
+        let err = result.expect_err("the exit has nothing left to unload");
+        assert!(
+            err.to_string().contains("NP_FreeSeglist"),
+            "the error should name the tag: {err}"
+        );
+    }
+
+    #[test]
+    fn create_new_proc_np_seglist_that_was_never_loaded_fails_loudly() {
+        let _guard = lock_host_break();
+        let (result, _rt, _bptr) = run_np_seglist_program(None, true, false, false);
+        let err = result.expect_err("a bogus seglist would jump into garbage");
+        assert!(
+            err.to_string().contains("NP_Seglist"),
+            "the error should name the tag: {err}"
         );
     }
 
