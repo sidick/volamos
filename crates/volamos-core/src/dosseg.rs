@@ -1350,14 +1350,21 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     let param_ptr = ctx.cpu.data_register(DataRegister(3));
     let param_len = ctx.cpu.data_register(DataRegister(4));
 
-    let Some(alloc_addrs) = ctx.dos.seglists.get(&seg).cloned() else {
-        ctx.dos.set_io_err(ERROR_OBJECT_NOT_FOUND);
-        ctx.cpu.set_data_register(DataRegister(0), (-1i32) as u32);
-        return Ok(());
-    };
     // Same formula as `SegList::entry`/`build_seglist`: the first
-    // segment's payload address, immediately past its header.
-    let entry = alloc_addrs[0].wrapping_add(SEG_HEADER_SIZE);
+    // segment's payload address, immediately past its header. Or, for the
+    // Shell's own built-in commands (issue #20), the entry of a segment
+    // it registered as internal -- see `dosresident::internal_command_entry`.
+    let entry = match ctx.dos.seglists.get(&seg) {
+        Some(alloc_addrs) => alloc_addrs[0].wrapping_add(SEG_HEADER_SIZE),
+        None => match crate::dosresident::internal_command_entry(&*ctx.mem, ctx.dos, seg) {
+            Some(entry) => entry,
+            None => {
+                ctx.dos.set_io_err(ERROR_OBJECT_NOT_FOUND);
+                ctx.cpu.set_data_register(DataRegister(0), (-1i32) as u32);
+                return Ok(());
+            }
+        },
+    };
 
     // The arguments are copied into the Input() buffer below, so they
     // must lie inside guest memory: a length past it cannot be a real
@@ -1490,18 +1497,6 @@ fn run_command_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
-/// `FindSegment` (`D1` = name `CString*`, `D2` = previous match `BPTR`,
-/// `D3` = system flag). `D0` = `0` (`NULL`), always -- this runtime has
-/// no list of resident segments (no `AddSegment`/`Resident` support),
-/// so nothing can ever be found. Sets `IoErr()` to
-/// [`ERROR_OBJECT_NOT_FOUND`], matching real `FindSegment`'s own
-/// "no matching segment" convention.
-fn find_segment_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
-    ctx.dos.set_io_err(ERROR_OBJECT_NOT_FOUND);
-    ctx.cpu.set_data_register(DataRegister(0), 0);
-    Ok(())
-}
-
 /// Registers `LoadSeg`/`UnLoadSeg`/`SystemTagList`/`Execute` onto
 /// [`DOS_LIBRARY_BASE`], looked up by name through [`DOS_LVOS`] -- same
 /// registration style as `dosfile.rs`'s `register_dos_handlers`. Called
@@ -1530,7 +1525,6 @@ pub fn register_dosseg_handlers<C: Cpu + 'static>(
     reg!("SystemTagList", system_tag_list_handler::<C>);
     reg!("Execute", execute_handler::<C>);
     reg!("RunCommand", run_command_handler::<C>);
-    reg!("FindSegment", find_segment_handler::<C>);
 }
 
 /// The value a relocation adds to the longword already at `loc`: the

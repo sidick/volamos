@@ -542,6 +542,17 @@ pub(crate) const CLI_COMMAND_NAME_OFFSET: u32 = 16;
 /// input was redirected from a non-interactive, non-`Input()` source
 /// even on a plain unredirected CLI invocation.
 pub(crate) const CLI_STANDARD_INPUT_OFFSET: u32 = 28;
+/// `cli_CurrentInput`: `BPTR`, offset 32 (right after `cli_StandardInput`).
+pub(crate) const CLI_CURRENT_INPUT_OFFSET: u32 = 32;
+/// `cli_CurrentOutput`: `BPTR`, offset 48 (`cli_Background` 44, then this).
+pub(crate) const CLI_CURRENT_OUTPUT_OFFSET: u32 = 48;
+/// `cli_StandardOutput`: `BPTR`, offset 56 (`cli_DefaultStack` 52, then
+/// this).
+pub(crate) const CLI_STANDARD_OUTPUT_OFFSET: u32 = 56;
+/// `pr_SegList`: `BPTR` to the process's segment array, offset 128
+/// (`pr_Task` 92 + `pr_MsgPort` 34 + `pr_Pad` 2). Entry 3 holds the
+/// running program's seglist; a Shell moves its own to entry 4.
+pub(crate) const PR_SEGLIST_OFFSET: u32 = 128;
 /// `cli_DefaultStack`: `LONG`, offset 52 within `struct
 /// CommandLineInterface` (`cli_StandardInput` 28, `cli_CurrentInput` 4,
 /// `cli_CommandFile` 4, `cli_Interactive` 4, `cli_Background` 4,

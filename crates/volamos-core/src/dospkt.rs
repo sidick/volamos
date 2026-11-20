@@ -813,6 +813,36 @@ pub fn handle_fs_packet<C: Cpu>(
     Ok(())
 }
 
+/// `ReplyPkt` (`D1` = `struct DosPacket*`, `D2` = `dp_Res1`, `D3` =
+/// `dp_Res2`): sends a packet back to whoever sent it (issue #20: the
+/// Shell replies its startup packet as it ends). The results are stored,
+/// the packet's `dp_Port` -- the reply port the sender named -- is where
+/// its message (`dp_Link`) goes, and `dp_Port` is then set to the
+/// replier's own process port, as the real call does so the receiver can
+/// tell who answered and reply in turn. `D0` is the port it was sent to.
+fn reply_pkt_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    const DP_LINK: u32 = 0;
+    let pkt = ctx.cpu.data_register(DataRegister(1));
+    let res1 = ctx.cpu.data_register(DataRegister(2));
+    let res2 = ctx.cpu.data_register(DataRegister(3));
+    let reply_port = ctx.mem.read_u32(pkt + DP_PORT);
+    let msg = ctx.mem.read_u32(pkt + DP_LINK);
+
+    ctx.mem.write_u32(pkt + DP_RES1, res1);
+    ctx.mem.write_u32(pkt + DP_RES2, res2);
+    ctx.mem.write_u32(
+        pkt + DP_PORT,
+        ctx.current_task + crate::exectask::PR_MSGPORT_OFFSET,
+    );
+    if reply_port != 0 && msg != 0 {
+        ctx.mem.write_u32(msg + crate::execlist::LN_NAME, pkt);
+        crate::execlist::put_msg_impl(ctx.mem, reply_port, msg, crate::execlist::NT_REPLYMSG);
+        crate::execlist::signal_port_task(ctx.mem, ctx.tasks, reply_port);
+    }
+    ctx.cpu.set_data_register(DataRegister(0), reply_port);
+    Ok(())
+}
+
 /// `Info` (`D1` = lock `BPTR`, `D2` = `struct InfoData*`, longword
 /// aligned). `D0` = `DOSTRUE`. Fills the same `InfoData` as
 /// `ACTION_DISK_INFO` (see the module docs), describing the volume the
@@ -854,6 +884,16 @@ pub fn register_dospkt_handlers<C: Cpu + 'static>(
             info_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("Info should be in DOS_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            DOS_LIBRARY_BASE,
+            DOS_LVOS,
+            "dos.library",
+            "ReplyPkt",
+            reply_pkt_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("ReplyPkt should be in DOS_LVOS: {e}"));
 }
 
 #[cfg(test)]

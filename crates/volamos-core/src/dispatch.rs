@@ -2101,6 +2101,44 @@ fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
     open_library_common(ctx, &name, 0)
 }
 
+/// `exec.library`'s `TaggedOpenLibrary` handler (LVO -810, V39: `D0` =
+/// tag): opens one of the ROM's standard libraries by number, without a
+/// name string. Added for issue #20: the Kickstart 3.1 Shell opens
+/// `dos.library` this way (`TaggedOpenLibrary(4)`) as the first thing it
+/// does. It is not in the NDK 3.2 autodocs (it is a private convenience
+/// of the ROM's own modules); the numbers are AROS's, which lists them from
+/// the real function: 1 graphics, 2 layers, 3 intuition, 4 dos, 5 icon,
+/// 6 expansion, 7 utility, 8 keymap, 9 gadtools, 10 workbench -- and the
+/// Shell asking for 4 to get dos is consistent with that. Any other tag
+/// is `NULL`. Otherwise it is `OpenLibrary(name, 0)`.
+fn tagged_open_library_handler<C: Cpu>(
+    ctx: &mut HandlerContext<'_, C>,
+) -> Result<(), DispatchError> {
+    const NAMES: [&str; 10] = [
+        "graphics.library",
+        "layers.library",
+        "intuition.library",
+        "dos.library",
+        "icon.library",
+        "expansion.library",
+        "utility.library",
+        "keymap.library",
+        "gadtools.library",
+        "workbench.library",
+    ];
+    let tag = ctx.cpu.data_register(DataRegister(0));
+    match tag
+        .checked_sub(1)
+        .and_then(|i| NAMES.get(i as usize).copied())
+    {
+        Some(name) => open_library_common(ctx, name, 0),
+        None => {
+            ctx.cpu.set_data_register(DataRegister(0), 0);
+            Ok(())
+        }
+    }
+}
+
 /// Shared `OpenLibrary`/`OldOpenLibrary` implementation
 /// (`library-device-loading-plan.md` §2.3's lookup order):
 ///
@@ -2573,6 +2611,10 @@ pub struct Runtime<C: Cpu> {
     /// The `WBStartup` message [`Self::start_as_workbench`] posted, `0`
     /// for a shell start -- see [`Self::workbench_message_replied`].
     wb_message: u32,
+    /// The startup `DosPacket` [`Self::start_as_shell`] built (`0` for any
+    /// other start): the Shell replies it as it ends, with the last
+    /// command's return code in `dp_Res1`.
+    shell_packet: u32,
 }
 
 /// One distinct stack region's high-water mark, as reported by
@@ -2847,6 +2889,8 @@ impl<C: Cpu + 'static> Runtime<C> {
 
         // dos.library DoPkt -- see crate::dospkt's module docs.
         crate::dospkt::register_dospkt_handlers(&mut table, &mut mem);
+        crate::doscli::register_cli_handlers(&mut table, &mut mem);
+        crate::dosresident::register_resident_handlers(&mut table, &mut mem);
 
         // dos.library AddPart/FilePart/PathPart (pure path-string
         // helpers) -- see crate::dospath's module docs.
@@ -2904,6 +2948,16 @@ impl<C: Cpu + 'static> Runtime<C> {
                 old_open_library_handler::<C>,
             )
             .expect("OldOpenLibrary is in EXEC_LVOS");
+        table
+            .register_by_name(
+                &mut mem,
+                EXEC_LIBRARY_BASE,
+                crate::lvos::exec::EXEC_LVOS,
+                "exec.library",
+                "TaggedOpenLibrary",
+                tagged_open_library_handler::<C>,
+            )
+            .expect("TaggedOpenLibrary is in EXEC_LVOS");
         table
             .register_by_name(
                 &mut mem,
@@ -3400,6 +3454,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             stack_usage: BTreeMap::new(),
             top_seglist: 0,
             wb_message: 0,
+            shell_packet: 0,
         }
     }
 
@@ -3632,6 +3687,112 @@ impl<C: Cpu + 'static> Runtime<C> {
         Ok(())
     }
 
+    /// Starts the loaded program as an AmigaDOS Shell (`L:Shell-Seg`) --
+    /// issue #20 -- instead of as an ordinary command.
+    ///
+    /// A 3.x Shell is a seglist with BCPL linkage: its code starts with
+    /// the obsolete initialisation entry (a call there raises
+    /// `AN_CLIObsolete`, which is what running `Shell-Seg` as a plain
+    /// program does), and the entry a process is meant to start at is
+    /// the BCPL call-in at **+8** into the first segment's code. There
+    /// `D1` is the `BPTR` of the startup parameter packet and `D2` the
+    /// stack size and `A6` the return address (BCPL linkage); `A0`/`D0`
+    /// are unused. (`vamos -x` starts it the same
+    /// way, with `D1` = 0, which a 3.9 Shell accepts; the 3.2 Shell
+    /// treats a null packet as an obsolete call and raises
+    /// `AN_CLIObsolete`, so a packet is built here.)
+    ///
+    /// The packet is a `DosPacket` of type 1 (`ACTION_RUN`) with
+    /// `dp_Res1`/`dp_Res2` zero ("correct startup"), linked to a message
+    /// whose reply port is host-owned with nothing to signal: the Shell
+    /// replies it when it ends, as it would to the process that created
+    /// it. Read off the 3.2 Shell's own startup code.
+    ///
+    /// Must be called after [`Self::load_top_level_program`], before
+    /// [`Self::run`]. The process keeps the CLI the runtime gave it.
+    pub fn start_as_shell(&mut self) -> Result<(), String> {
+        const DOS_PACKET_SIZE: u32 = 48;
+        // `struct Message`: a `Node` (14) + `mn_ReplyPort` (4) + `mn_Length` (2).
+        const MESSAGE_SIZE: u32 = 20;
+        const ACTION_RUN: u32 = 1;
+        let heap_full = || "the guest heap is full".to_string();
+        if self.top_seglist == 0 {
+            return Err("the Shell must be loaded before it is started".to_string());
+        }
+        let code = crate::guestmem::addr_from_bptr(self.top_seglist)
+            .wrapping_add(crate::dosseg::NEXT_SEG_OFFSET);
+        let stack_size = self
+            .mem
+            .read_u32(self.task + exectask::TC_SPUPPER)
+            .wrapping_sub(self.mem.read_u32(self.task + exectask::TC_SPLOWER));
+
+        let reply_port = self
+            .heap
+            .alloc(&mut self.mem, crate::execlist::MSGPORT_SIZE)
+            .map_err(|_| heap_full())?;
+        crate::execlist::init_msg_port_fields(&mut self.mem, reply_port, 0);
+        let msg = self
+            .heap
+            .alloc(&mut self.mem, MESSAGE_SIZE)
+            .map_err(|_| heap_full())?;
+        let packet = self
+            .heap
+            .alloc(&mut self.mem, DOS_PACKET_SIZE)
+            .map_err(|_| heap_full())?;
+        for i in 0..MESSAGE_SIZE {
+            self.mem.write_u8(msg + i, 0);
+        }
+        for i in 0..DOS_PACKET_SIZE {
+            self.mem.write_u8(packet + i, 0);
+        }
+        self.mem
+            .write_u32(msg + crate::execlist::MN_REPLYPORT, reply_port);
+        self.mem.write_u32(msg + crate::execlist::LN_NAME, packet);
+        // dp_Link, dp_Port, dp_Type; dp_Res1/dp_Res2 stay 0.
+        self.mem.write_u32(packet, msg);
+        self.mem.write_u32(packet + 4, reply_port);
+        self.mem.write_u32(packet + 8, ACTION_RUN);
+
+        // pr_SegList: the segment array the Shell rearranges (entry 3 is
+        // the running program, which it moves to entry 4). Eight entries,
+        // zeroed, the first being the count BCPL binding scans (2 for a
+        // C/assembler program, per the AmigaDOS Manual).
+        let segs = self
+            .heap
+            .alloc(&mut self.mem, 8 * 4)
+            .map_err(|_| heap_full())?;
+        for i in 0..8 {
+            self.mem.write_u32(segs + 4 * i, 0);
+        }
+        self.mem.write_u32(segs, 2);
+        self.mem.write_u32(segs + 12, self.top_seglist);
+        self.mem.write_u32(
+            self.task + exectask::PR_SEGLIST_OFFSET,
+            crate::guestmem::bptr_from_addr(segs),
+        );
+
+        // A Shell has no command line: drop the placeholder the runtime
+        // left to be read back from `Input()`, or its first read finds an
+        // empty line.
+        self.dos.input_buf.clear();
+        self.dos.input_pos = 0;
+
+        self.shell_packet = packet;
+        self.cpu.set_pc(code.wrapping_add(8));
+        // BCPL linkage: the call-in is entered with the return address in
+        // `A6`, and the 3.1 Shell's returns with `jmp (a6)` (46.10's with
+        // `rts`, which the initial stack already covers). That is where the
+        // process ends.
+        self.cpu
+            .set_address_register(AddressRegister(6), EXIT_STUB_ADDR);
+        self.cpu.set_address_register(AddressRegister(0), 0);
+        self.cpu.set_data_register(DataRegister(0), 0);
+        self.cpu
+            .set_data_register(DataRegister(1), crate::guestmem::bptr_from_addr(packet));
+        self.cpu.set_data_register(DataRegister(2), stack_size);
+        Ok(())
+    }
+
     /// Makes this run start the way Workbench starts a program (issue
     /// #345) rather than the way a shell does: no CLI (`pr_CLI` = 0),
     /// no command line (`A0`/`D0` = 0), and a `WBStartup` message
@@ -3777,6 +3938,22 @@ impl<C: Cpu + 'static> Runtime<C> {
         );
         self.wb_message = msg;
         Ok(())
+    }
+
+    /// For a [`Self::start_as_shell`] run: the return code the Shell
+    /// replied its startup packet with (`dp_Res1`: the last command's
+    /// return code, as the AmigaDOS Manual's Shell protocol has it), or
+    /// `None` for any other start or if the Shell never replied.
+    pub fn shell_return_code(&self) -> Option<i32> {
+        const DP_PORT: u32 = 4;
+        const DP_RES1: u32 = 12;
+        if self.shell_packet == 0 {
+            return None;
+        }
+        // The reply swaps `dp_Port` to the replier's own process port.
+        let replied = self.mem.read_u32(self.shell_packet + DP_PORT)
+            == self.task + exectask::PR_MSGPORT_OFFSET;
+        replied.then(|| self.mem.read_u32(self.shell_packet + DP_RES1) as i32)
     }
 
     /// For a [`Self::start_as_workbench`] run: whether the program has
@@ -5714,6 +5891,47 @@ mod tests {
     fn push_jsr(words: &mut Vec<u16>, an: u16, disp: i32) {
         words.push(jsr_disp16(an));
         words.push(disp as u16);
+    }
+
+    /// `TaggedOpenLibrary(tag)` (LVO -810) as a guest calls it: exit code =
+    /// the library base it returns.
+    fn run_tagged_open_library(tag: u32) -> u32 {
+        let entry = TRAP_TABLE_END;
+        let mut words = Vec::new();
+        words.push(0x203C); // move.l #tag,d0
+        words.push((tag >> 16) as u16);
+        words.push(tag as u16);
+        push_movea_imm(&mut words, 6, EXEC_LIBRARY_BASE);
+        push_jsr(&mut words, 6, -810);
+        words.push(RTS);
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x40,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed") as u32
+    }
+
+    #[test]
+    fn tagged_open_library_opens_the_libraries_the_tags_name_20() {
+        // The 3.1 Shell's first call: TaggedOpenLibrary(4) is dos.library.
+        assert_eq!(run_tagged_open_library(4), DOS_LIBRARY_BASE);
+        // utility.library is tag 7, and is the same base OpenLibrary gives.
+        assert_eq!(run_tagged_open_library(7), UTILITY_LIBRARY_BASE);
+    }
+
+    #[test]
+    fn tagged_open_library_of_a_tag_it_does_not_know_is_null_20() {
+        assert_eq!(run_tagged_open_library(0), 0);
+        assert_eq!(run_tagged_open_library(11), 0);
     }
 
     #[test]

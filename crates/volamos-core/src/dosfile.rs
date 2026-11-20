@@ -152,9 +152,9 @@ pub const OFFSET_END: i32 = 1;
 
 /// `Close`/boolean-success convention: AmigaOS `BOOL` true is `-1`
 /// (`0xFFFFFFFF` as a 32-bit register value), not `1`.
-const DOSTRUE: u32 = 0xFFFF_FFFF;
+pub(crate) const DOSTRUE: u32 = 0xFFFF_FFFF;
 /// `Close`/boolean-failure convention.
-const DOSFALSE: u32 = 0;
+pub(crate) const DOSFALSE: u32 = 0;
 /// `Read`/`Write`/`Seek` failure sentinel written to `D0`.
 const RESULT_ERROR: u32 = 0xFFFF_FFFF;
 
@@ -591,6 +591,9 @@ pub struct DosState {
     /// freed when it ends. Only processes `SystemTagList` loaded the
     /// program for; see [`crate::dosseg`].
     pub(crate) process_seglists: HashMap<u32, u32>,
+    /// The head of the resident segment list, as a `BPTR` to the first
+    /// `struct Segment` (`0` when empty) -- see [`crate::dosresident`].
+    pub(crate) resident_head: u32,
     /// The bytes a blocked `FGets`/`FRead` has already taken from a
     /// pipe, keyed by `(task, handle address)`. Those calls consume as
     /// they go, and are re-entered from scratch when the pipe has more,
@@ -643,6 +646,7 @@ impl DosState {
             next_pipe_id: 0,
             pipe_write_progress: HashMap::new(),
             process_seglists: HashMap::new(),
+            resident_head: 0,
             stdio_progress: HashMap::new(),
         }
     }
@@ -1121,6 +1125,20 @@ impl DosState {
             return Some(self.input_buf[self.input_pos - 1]);
         }
         None
+    }
+
+    /// Whether `addr` is the current `Input()` handle (the one
+    /// [`Self::input_buf`] belongs to).
+    pub(crate) fn current_input_is(&self, addr: u32) -> bool {
+        self.current_input == Some(addr)
+    }
+
+    /// Puts `bytes` back in front of the unread part of [`Self::input_buf`],
+    /// so the next read of `Input()` sees them first: what `UnReadChar`
+    /// does for the characters `ReadItem` did not use.
+    pub(crate) fn push_back_input(&mut self, bytes: &[u8]) {
+        let at = self.input_pos.min(self.input_buf.len());
+        self.input_buf.splice(at..at, bytes.iter().copied());
     }
 
     /// Whether the handle at `addr` is the host console: the `Input()`

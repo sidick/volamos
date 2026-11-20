@@ -640,6 +640,136 @@ fn free_args(heap: &mut GuestHeap, dos: &mut DosState, rdargs_ptr: u32) {
     }
 }
 
+/// `ITEM_EQUAL`, `ITEM_ERROR`, `ITEM_NOTHING`, `ITEM_UNQUOTED` and
+/// `ITEM_QUOTED`: what `ReadItem` returns (`<dos/dos.h>`).
+const ITEM_EQUAL: i32 = -2;
+const ITEM_ERROR: i32 = -1;
+const ITEM_NOTHING: i32 = 0;
+const ITEM_UNQUOTED: i32 = 1;
+const ITEM_QUOTED: i32 = 2;
+
+/// `ReadItem` (`D1` = buffer, `D2` = size of the buffer, `D3` = `struct
+/// CSource*` or `NULL`). `D0` = an `ITEM_*` code, issue #20 (the Shell
+/// tokenises each command line with it).
+///
+/// It reads one item with the same rules `ReadArgs` uses ([`Reader`]):
+/// leading blanks skipped, an item either unquoted (ends at a blank,
+/// newline, `;` or `=`) or in double quotes with the `*` escapes `*"`,
+/// `*N`, `*E` and `**`; a newline, `;` or the end of the input is
+/// `ITEM_NOTHING` and a lone `=` is `ITEM_EQUAL`. The item is stored
+/// NUL-terminated in the buffer; one that does not fit (with its NUL) is
+/// `ITEM_ERROR`, with `IoErr()` `ERROR_LINE_TOO_LONG` and the buffer
+/// holding what fitted. The character that ends an item is left unread.
+///
+/// With a `CSource` the text is `CS_Buffer[CS_CurChr..CS_Length]` and
+/// `CS_CurChr` is advanced past what was read (`<dos/rdargs.h>`'s
+/// `CS_ReadChar`). With `NULL` it is the `Input()` stream: the rest of the
+/// current line is read, and what the item did not use goes back, as the
+/// real call's `UnReadChar` does.
+fn read_item_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    const CS_BUFFER: u32 = 0;
+    const CS_LENGTH: u32 = 4;
+    const CS_CUR_CHR: u32 = 8;
+    let buffer = ctx.cpu.data_register(DataRegister(1));
+    let max_chars = ctx.cpu.data_register(DataRegister(2)) as i32;
+    let csource = ctx.cpu.data_register(DataRegister(3));
+
+    let (kind, text) = if csource != 0 {
+        let base = ctx.mem.read_u32(csource + CS_BUFFER);
+        let length = ctx.mem.read_u32(csource + CS_LENGTH);
+        let cur = ctx.mem.read_u32(csource + CS_CUR_CHR).min(length);
+        // A length past guest memory cannot be real text, and must not make
+        // the host copy gigabytes.
+        if !ctx.mem.is_mapped(base.wrapping_add(cur), length - cur) {
+            ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+            ctx.cpu
+                .set_data_register(DataRegister(0), ITEM_ERROR as u32);
+            return Ok(());
+        }
+        let bytes: Vec<u8> = (cur..length).map(|i| ctx.mem.read_u8(base + i)).collect();
+        let mut reader = Reader::new(&bytes, 0);
+        let item = reader.read_item();
+        ctx.mem
+            .write_u32(csource + CS_CUR_CHR, cur + reader.pos as u32);
+        item
+    } else {
+        let input = match ctx.dos.input_addr(ctx.heap, ctx.mem) {
+            Ok(addr) => addr,
+            Err(code) => {
+                ctx.dos.set_io_err(code);
+                ctx.cpu
+                    .set_data_register(DataRegister(0), ITEM_ERROR as u32);
+                return Ok(());
+            }
+        };
+        // The rest of this line, kept as bytes the item may not use.
+        let mut line = Vec::new();
+        loop {
+            match ctx.dos.read_buffered_byte(input) {
+                Ok(Some(byte)) => {
+                    line.push(byte);
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(code) => {
+                    // What was read is not lost, but the item cannot be
+                    // trusted to be whole.
+                    if !line.is_empty() && ctx.dos.current_input_is(input) {
+                        ctx.dos.push_back_input(&line);
+                    }
+                    ctx.dos.set_io_err(code);
+                    ctx.cpu
+                        .set_data_register(DataRegister(0), ITEM_ERROR as u32);
+                    return Ok(());
+                }
+            }
+        }
+        let mut reader = Reader::new(&line, 0);
+        let item = reader.read_item();
+        let rest = line[reader.pos..].to_vec();
+        if !rest.is_empty() && ctx.dos.current_input_is(input) {
+            ctx.dos.push_back_input(&rest);
+        }
+        item
+    };
+
+    let result = match kind {
+        ItemKind::Nothing => ITEM_NOTHING,
+        ItemKind::Equal => ITEM_EQUAL,
+        ItemKind::Error => ITEM_ERROR,
+        ItemKind::Unquoted => ITEM_UNQUOTED,
+        ItemKind::Quoted => ITEM_QUOTED,
+    };
+    let result = if matches!(
+        kind,
+        ItemKind::Unquoted | ItemKind::Quoted | ItemKind::Error
+    ) {
+        let room = (max_chars - 1).max(0) as usize;
+        let fits = text.len() <= room;
+        if max_chars > 0 {
+            for (i, byte) in text.iter().take(room).enumerate() {
+                ctx.mem.write_u8(buffer + i as u32, *byte);
+            }
+            ctx.mem.write_u8(buffer + text.len().min(room) as u32, 0);
+        }
+        if !fits {
+            ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+            ITEM_ERROR
+        } else {
+            result
+        }
+    } else {
+        if max_chars > 0 {
+            ctx.mem.write_u8(buffer, 0);
+        }
+        result
+    };
+    ctx.cpu.set_data_register(DataRegister(0), result as u32);
+    Ok(())
+}
+
 /// `ReadArgs` (`D1` = template `CString*`, `D2` = result array `LONG*`,
 /// `D3` = optional `struct RDArgs*`). `D0` = anchor `struct RDArgs*` or
 /// `0` (+ `IoErr()` set).
@@ -740,6 +870,16 @@ pub fn register_dosargs_handlers<C: Cpu + 'static>(
             find_arg_handler::<C>,
         )
         .unwrap_or_else(|e| panic!("FindArg should be in DOS_LVOS: {e}"));
+    table
+        .register_by_name(
+            mem,
+            DOS_LIBRARY_BASE,
+            DOS_LVOS,
+            "dos.library",
+            "ReadItem",
+            read_item_handler::<C>,
+        )
+        .unwrap_or_else(|e| panic!("ReadItem should be in DOS_LVOS: {e}"));
 }
 
 #[cfg(test)]
@@ -1061,6 +1201,85 @@ mod tests {
 
         let dir_ptr = rt.memory().read_u32(array_addr);
         assert_eq!(read_c_string(rt.memory(), dir_ptr), b"SYS:");
+    }
+
+    /// Runs `ReadItem(out, 16, &csource)` once per entry of `calls` over
+    /// `input` and returns, for each, the `ITEM_*` result and the first
+    /// four bytes of the item buffer, plus the final `CS_CurChr`.
+    fn run_read_items(input: &str, calls: usize) -> (Vec<(i32, [u8; 4])>, u32) {
+        // scratch: +0 input, +64 CSource {buffer, length, cur}, +80 out
+        // buffer, +96.. results (result, text) pairs.
+        let scratch = TRAP_TABLE_END + 0x200;
+        let mut words = Vec::new();
+        for i in 0..calls as u32 {
+            push_move_imm_to_d(&mut words, 1, scratch + 80);
+            push_move_imm_to_d(&mut words, 2, 16);
+            push_move_imm_to_d(&mut words, 3, scratch + 64);
+            push_jsr(&mut words, 6, -810); // ReadItem
+            // move.l d0,abs.l: the result
+            words.push(0x23C0);
+            words.push(((scratch + 96 + 8 * i) >> 16) as u16);
+            words.push((scratch + 96 + 8 * i) as u16);
+            // move.l abs.l,d0 ; move.l d0,abs.l: the item's first bytes
+            words.push(0x2039);
+            words.push(((scratch + 80) >> 16) as u16);
+            words.push((scratch + 80) as u16);
+            words.push(0x23C0);
+            words.push(((scratch + 100 + 8 * i) >> 16) as u16);
+            words.push((scratch + 100 + 8 * i) as u16);
+        }
+        words.push(RTS);
+        assert!(words.len() * 2 < 0x200);
+
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, TRAP_TABLE_END, &words);
+        for (i, b) in input.bytes().enumerate() {
+            mem.write_u8(scratch + i as u32, b);
+        }
+        mem.write_u32(scratch + 64, scratch); // CS_Buffer
+        mem.write_u32(scratch + 68, input.len() as u32); // CS_Length
+        mem.write_u32(scratch + 72, 0); // CS_CurChr
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry: TRAP_TABLE_END,
+                load_end: scratch + 0x200,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        let mem = rt.memory();
+        let results = (0..calls as u32)
+            .map(|i| {
+                let text = mem.read_u32(scratch + 100 + 8 * i).to_be_bytes();
+                (mem.read_u32(scratch + 96 + 8 * i) as i32, text)
+            })
+            .collect();
+        (results, mem.read_u32(scratch + 72))
+    }
+
+    #[test]
+    fn read_item_tokenises_a_csource_the_way_the_shell_needs_20() {
+        let (items, cur) = run_read_items("  foo \"a b\" = bar\n", 5);
+        assert_eq!(items[0], (ITEM_UNQUOTED, *b"foo\0"));
+        assert_eq!(items[1], (ITEM_QUOTED, *b"a b\0"));
+        assert_eq!(items[2].0, ITEM_EQUAL);
+        assert_eq!(items[3], (ITEM_UNQUOTED, *b"bar\0"));
+        assert_eq!(items[4].0, ITEM_NOTHING, "the newline ends the line");
+        assert_eq!(
+            cur, 17,
+            "CS_CurChr stops at the newline (index 17), which stays unread"
+        );
+    }
+
+    #[test]
+    fn read_item_reports_an_item_too_long_for_the_buffer_as_an_error_20() {
+        // A 16-byte buffer holds 15 characters and the NUL.
+        let (items, _) = run_read_items("abcdefghijklmnopqrstuvwxyz\n", 1);
+        assert_eq!(items[0].0, ITEM_ERROR);
     }
 
     #[test]
