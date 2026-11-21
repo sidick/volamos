@@ -855,6 +855,70 @@ impl GuestHeap {
         Ok(user_start)
     }
 
+    /// Claims the exact range `[start, start + size)` as a live allocation,
+    /// the way exec's `AllocAbs` does: `Some(start)` when the whole range
+    /// lies in one free block, `None` (changing nothing) when any of it is
+    /// already allocated, reserved, or outside the heap.
+    ///
+    /// Unlike [`Self::reserve_range`] the range is recorded as a live
+    /// allocation, so the guest can `FreeMem` it later (the usual fate of
+    /// `AllocAbs` memory) and `--sanitize` tracks it like any other block.
+    /// `size` is the 4-byte-aligned size to reserve and `requested` the
+    /// caller's true size, as in [`Self::alloc_with_requested`]; `start`
+    /// must be 4-byte aligned. When redzones are enabled they are taken
+    /// from the free space on either side of the range as far as it is
+    /// free and in the same block -- a block right up against another
+    /// allocation simply has a shorter (or no) redzone on that side,
+    /// since the address is not the heap's to choose here.
+    pub fn alloc_abs(
+        &mut self,
+        mem: &mut dyn AddressSpace,
+        start: u32,
+        size: u32,
+        requested: u32,
+    ) -> Option<u32> {
+        if size == 0 || !start.is_multiple_of(4) || !size.is_multiple_of(4) {
+            return None;
+        }
+        let end = start.checked_add(size)?;
+        let idx = self
+            .free
+            .iter()
+            .position(|b| b.start <= start && end <= b.start + b.size)?;
+        let free = self.free[idx];
+        let free_end = free.start + free.size;
+        let block_start = free.start.max(start.saturating_sub(self.redzone_size));
+        let block_end = free_end.min(end.saturating_add(self.redzone_size));
+
+        self.generation += 1;
+        let head = (free.start < block_start).then(|| FreeBlock {
+            start: free.start,
+            size: block_start - free.start,
+        });
+        let tail = (block_end < free_end).then(|| FreeBlock {
+            start: block_end,
+            size: free_end - block_end,
+        });
+        self.free.remove(idx);
+        if let Some(tail) = tail {
+            self.free.insert(idx, tail);
+        }
+        if let Some(head) = head {
+            self.free.insert(idx, head);
+        }
+        self.live.insert(
+            start,
+            LiveAlloc {
+                user_size: size,
+                requested: requested.min(size),
+                block_start,
+                block_end,
+            },
+        );
+        mem.clear_fresh_block(block_start, block_end - block_start);
+        Some(start)
+    }
+
     /// The allocator proper: the bookkeeping half of
     /// [`Self::alloc_with_requested`], with no sanitizer involvement.
     /// Returns `(user_start, block_start, block_end)` so its caller can
@@ -1729,6 +1793,63 @@ mod layout_heap_tests {
         h.reserve_overlapping(8 * MIB, 9 * MIB);
         h.reserve_overlapping(0x9000, 0x9000);
         assert_eq!(h.free_bytes(), before - 0x3_0000 + MEMHEADER_PROLOGUE);
+    }
+
+    #[test]
+    fn alloc_abs_claims_the_exact_range_and_free_gives_it_back() {
+        let mut mem = FlatMemory::new(0x4000);
+        let mut h = GuestHeap::new(0x1000, 0x3000);
+        let before = h.free_bytes();
+        assert_eq!(h.alloc_abs(&mut mem, 0x1800, 0x100, 0xF0), Some(0x1800));
+        assert_eq!(h.free_bytes(), before - 0x100);
+        assert_eq!(h.size_of_live_alloc(0x1800), Some(0x100));
+        // The free list now has a hole: the same range cannot be claimed
+        // again, nor a range that merely touches it.
+        assert_eq!(h.alloc_abs(&mut mem, 0x1800, 0x100, 0x100), None);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1880, 0x100, 0x100), None);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1700, 0x120, 0x120), None);
+        // Either side of the hole is still free and claimable.
+        assert_eq!(h.alloc_abs(&mut mem, 0x1900, 0x40, 0x40), Some(0x1900));
+        assert_eq!(h.alloc_abs(&mut mem, 0x1700, 0x100, 0x100), Some(0x1700));
+        // Freed, they are one free range again.
+        for addr in [0x1800, 0x1900, 0x1700] {
+            h.free(addr).unwrap();
+        }
+        assert_eq!(h.free_bytes(), before);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1000, 0x2000, 0x2000), Some(0x1000));
+    }
+
+    #[test]
+    fn alloc_abs_refuses_what_is_not_free_heap() {
+        let mut mem = FlatMemory::new(0x4000);
+        let mut h = GuestHeap::new(0x1000, 0x2000);
+        let live = h.alloc(&mut mem, 0x100).unwrap();
+        // Overlapping a live allocation, outside the heap, running off
+        // its end, misaligned, and empty ranges all fail and change
+        // nothing.
+        let before = h.free_bytes();
+        assert_eq!(h.alloc_abs(&mut mem, live, 0x10, 0x10), None);
+        assert_eq!(h.alloc_abs(&mut mem, 0x800, 0x10, 0x10), None);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1FF0, 0x20, 0x20), None);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1802, 0x10, 0x10), None);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1800, 0, 0), None);
+        assert_eq!(h.free_bytes(), before);
+    }
+
+    #[test]
+    fn alloc_abs_takes_redzones_from_the_free_space_around_it() {
+        let mut mem = FlatMemory::new(0x4000);
+        let mut h = GuestHeap::new(0x1000, 0x3000).with_redzone_size(32);
+        assert_eq!(h.alloc_abs(&mut mem, 0x1800, 0x100, 0x100), Some(0x1800));
+        let extent = h.extent_of_live_alloc(0x1800).unwrap();
+        assert_eq!((extent.block_start, extent.block_end), (0x17E0, 0x1920));
+        // Right against the start of the heap there is no room for a
+        // leading redzone, which is not a reason to refuse the range.
+        assert_eq!(h.alloc_abs(&mut mem, 0x1000, 0x40, 0x40), Some(0x1000));
+        let extent = h.extent_of_live_alloc(0x1000).unwrap();
+        assert_eq!(extent.block_start, 0x1000);
+        h.free(0x1800).unwrap();
+        h.free(0x1000).unwrap();
     }
 
     #[test]
