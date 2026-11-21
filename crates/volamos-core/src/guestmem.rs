@@ -855,9 +855,77 @@ impl GuestHeap {
         Ok(user_start)
     }
 
+    /// Lets [`Self::alloc_abs`] claim `[start, end)` out of blocks the guest
+    /// freed that the quarantine is still holding, returning them to the
+    /// free list first. Only when the range lies in one memory region and is
+    /// covered *entirely* by free blocks and quarantined ones, which then
+    /// merge into one free block; a claim that cannot succeed leaves the
+    /// quarantine alone. Returns whether any block was released.
+    ///
+    /// Each quarantined block overlapping the range is released whole -- a
+    /// freed block comes back as a unit -- so bytes of it outside the claim
+    /// lose their use-after-free protection a little early too.
+    ///
+    /// This is not a use-after-free: the guest is explicitly asking for
+    /// that memory back. It is also how real code asks for aligned memory
+    /// -- allocate `size + align - 1`, `FreeMem` all of it, `AllocAbs` the
+    /// aligned part (`mmu.library` does exactly this for its page tables)
+    /// -- which under `--sanitize` would otherwise always fail, since the
+    /// block it just freed is held in quarantine rather than free.
+    fn release_quarantined_for(&mut self, start: u32, end: u32) -> bool {
+        let overlapping = |s: u32, e: u32| s < end && e > start;
+        // A failed probe is the common case: nothing quarantined there, so
+        // nothing to do and nothing allocated.
+        if !self
+            .quarantine
+            .iter()
+            .any(|q| overlapping(q.block_start, q.block_end))
+            || !self.same_region(start, end - 1)
+        {
+            return false;
+        }
+        let mut spans: Vec<(u32, u32)> = self
+            .free
+            .iter()
+            .filter(|b| overlapping(b.start, b.start + b.size))
+            .map(|b| (b.start, b.start + b.size))
+            .chain(
+                self.quarantine
+                    .iter()
+                    .filter(|q| overlapping(q.block_start, q.block_end))
+                    .map(|q| (q.block_start, q.block_end)),
+            )
+            .collect();
+        spans.sort_unstable();
+        let mut covered_to = start;
+        for (s, e) in spans {
+            if s > covered_to {
+                break;
+            }
+            covered_to = covered_to.max(e);
+        }
+        if covered_to < end {
+            return false;
+        }
+        let mut released = Vec::new();
+        self.quarantine.retain(|q| {
+            let take = overlapping(q.block_start, q.block_end);
+            if take {
+                released.push((q.block_start, q.block_end));
+            }
+            !take
+        });
+        for (block_start, block_end) in released {
+            self.quarantine_bytes -= block_end - block_start;
+            self.release_block(block_start, block_end);
+        }
+        true
+    }
+
     /// Claims the exact range `[start, start + size)` as a live allocation,
     /// the way exec's `AllocAbs` does: `Some(start)` when the whole range
-    /// lies in one free block, `None` (changing nothing) when any of it is
+    /// lies in one free block (blocks the free quarantine is holding count
+    /// as free here, see [`Self::release_quarantined_for`]), `None` (changing nothing) when any of it is
     /// already allocated, reserved, or outside the heap.
     ///
     /// Unlike [`Self::reserve_range`] the range is recorded as a live
@@ -881,10 +949,16 @@ impl GuestHeap {
             return None;
         }
         let end = start.checked_add(size)?;
-        let idx = self
-            .free
-            .iter()
-            .position(|b| b.start <= start && end <= b.start + b.size)?;
+        let in_one_free_block = |b: &FreeBlock| b.start <= start && end <= b.start + b.size;
+        let idx = match self.free.iter().position(in_one_free_block) {
+            Some(idx) => idx,
+            // Not free yet, but perhaps only because a block the guest
+            // freed is sitting in the quarantine: see `release_quarantined_for`.
+            None if self.release_quarantined_for(start, end) => {
+                self.free.iter().position(in_one_free_block)?
+            }
+            None => return None,
+        };
         let free = self.free[idx];
         let free_end = free.start + free.size;
         let block_start = free.start.max(start.saturating_sub(self.redzone_size));
@@ -1829,6 +1903,68 @@ mod layout_heap_tests {
         assert_eq!(h.alloc_abs(&mut mem, 0x1802, 0x10, 0x10), None);
         assert_eq!(h.alloc_abs(&mut mem, 0x1800, 0, 0), None);
         assert_eq!(h.free_bytes(), before);
+    }
+
+    /// The aligned-allocation idiom: allocate `size + align - 1`, free all
+    /// of it, `AllocAbs` the aligned part. With the quarantine on, the freed
+    /// block is held rather than free, and `AllocAbs` must still get it.
+    #[test]
+    fn alloc_abs_claims_memory_the_quarantine_is_holding() {
+        let mut mem = FlatMemory::new(0x1_0000);
+        let mut h = GuestHeap::new(0x1000, 0x8000)
+            .with_redzone_size(32)
+            .with_quarantine_budget(DEFAULT_QUARANTINE_BUDGET);
+        let block = h.alloc(&mut mem, 0x2000 + 0x3FFF).unwrap();
+        let aligned = (block + 0x3FFF) & !0x3FFF;
+        h.free(block).unwrap();
+        // The freed block is quarantined, not free.
+        assert_eq!(h.quarantine.len(), 1);
+        assert_eq!(
+            h.alloc_abs(&mut mem, aligned, 0x2000, 0x2000),
+            Some(aligned)
+        );
+        assert_eq!(h.size_of_live_alloc(aligned), Some(0x2000));
+        // What is left of the freed block is free again, and the claim can
+        // itself be freed.
+        h.free(aligned).unwrap();
+    }
+
+    /// The mixed case: the range starts in a quarantined block and runs on
+    /// into free memory after it.
+    #[test]
+    fn alloc_abs_claims_across_a_quarantined_block_and_free_memory() {
+        let mut mem = FlatMemory::new(0x1_0000);
+        let mut h = GuestHeap::new(0x1000, 0x8000)
+            .with_redzone_size(32)
+            .with_quarantine_budget(DEFAULT_QUARANTINE_BUDGET);
+        let a = h.alloc(&mut mem, 0x100).unwrap();
+        h.free(a).unwrap();
+        assert_eq!(h.quarantine.len(), 1);
+        // 0x300 bytes from `a`: the freed block, then the free space after.
+        assert_eq!(h.alloc_abs(&mut mem, a, 0x300, 0x300), Some(a));
+        assert!(
+            h.quarantine.is_empty(),
+            "the held block went into the claim"
+        );
+    }
+
+    /// A claim that cannot succeed leaves the quarantine alone: here half of
+    /// the range is a live allocation.
+    #[test]
+    fn a_failed_alloc_abs_does_not_release_the_quarantine() {
+        let mut mem = FlatMemory::new(0x1_0000);
+        let mut h = GuestHeap::new(0x1000, 0x8000)
+            .with_redzone_size(32)
+            .with_quarantine_budget(DEFAULT_QUARANTINE_BUDGET);
+        let a = h.alloc(&mut mem, 0x100).unwrap();
+        let live = h.alloc(&mut mem, 0x100).unwrap();
+        h.free(a).unwrap();
+        let held = h.quarantine.len();
+        assert_eq!(held, 1);
+        // Spans the quarantined block and the live one after it.
+        assert_eq!(h.alloc_abs(&mut mem, a, 0x200, 0x200), None);
+        assert_eq!(h.quarantine.len(), held, "nothing released");
+        assert!(h.size_of_live_alloc(live).is_some());
     }
 
     #[test]
