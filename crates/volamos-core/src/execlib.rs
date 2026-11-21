@@ -477,8 +477,14 @@ fn build_library(
 
     let negsize = round_up_longword(vectors.len() as u32 * LIB_VECTSIZE);
     let total = negsize.saturating_add(d_size);
+    // As real `MakeLibrary` does, through `AllocMem`: the block is rounded
+    // up to exec's 8-byte `MEM_BLOCKSIZE` and sits on an 8-byte boundary.
+    // A plain 4-byte-rounded allocation made the library's own
+    // `FreeMem(base - NegSize, NegSize + PosSize)` -- what every
+    // `Expunge`, and every failed init, does -- a size mismatch whenever
+    // that sum was not a multiple of 8 (the real `68060.library`'s is 418).
     let alloc_addr = heap
-        .alloc(&mut *mem, total)
+        .alloc_aligned_for(&mut *mem, total.saturating_add(7) & !7, total, 0, 8)
         .map_err(MakeLibraryError::Heap)?;
     let base = alloc_addr.wrapping_add(negsize);
 
@@ -1658,6 +1664,27 @@ mod tests {
         );
 
         assert_eq!(find_resident(&mem, first_bptr), Some(resident_addr));
+    }
+
+    /// `MakeLibrary` allocates as `AllocMem` does, so the library's own
+    /// `FreeMem(base - NegSize, NegSize + PosSize)` agrees with what the
+    /// heap recorded: 8-byte rounded, on an 8-byte boundary. With one
+    /// vector (`NegSize` 8) and a 36-byte base the sum is 44, which the
+    /// old 4-byte-rounded allocation recorded as 44 against `FreeMem`'s 48.
+    #[test]
+    fn make_library_blocks_are_sized_and_aligned_as_alloc_mem_makes_them() {
+        let mut mem = FlatMemory::new(0x1_0000);
+        let mut heap = GuestHeap::new(0x1004, 0x8000);
+        let made = build_library(&mut mem, &mut heap, 36, 0, &[0x2000], None).unwrap();
+        assert_eq!(made.alloc_addr % 8, 0, "8-byte boundary");
+        let neg = u32::from(mem.read_u16(made.base + LIB_NEGSIZE_OFFSET));
+        let pos = u32::from(mem.read_u16(made.base + LIB_POSSIZE_OFFSET));
+        assert_eq!((neg, pos), (8, 36));
+        assert_eq!(
+            heap.size_of_live_alloc(made.alloc_addr),
+            Some(48),
+            "what FreeMem(base - NegSize, NegSize + PosSize) rounds 44 to"
+        );
     }
 
     #[test]
