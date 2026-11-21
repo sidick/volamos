@@ -276,7 +276,13 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     bound to TASK_EXIT_SLOT -- every CreateNewProc
 ///                     child task's initial stack return address (issue
 ///                     #121). See crate::taskswitch's module doc.
-/// 0x00C8 .. 0x02CC   unused headroom
+/// 0x00C8 .. 0x0200   unused headroom
+/// 0x0200 ..          VERSION_LIBRARY_BASE's header
+/// 0x0280 .. 0x02AE   SETPATCH_SEMAPHORE_ADDR: the `" SetPatch "` marker
+///                     semaphore on SemaphoreList (see
+///                     crate::execsem::install_setpatch_semaphore);
+///                     its name string follows at 0x02B0
+/// ..    .. 0x02CC   unused headroom
 /// 0x02CC .. 0x0800   dos.library's registered LVOs live here (T10/T11
 ///                     handlers register LVOs as negative as -1356 off
 ///                     DOS_LIBRARY_BASE; 0x0800 - 1356 = 0x02CC)
@@ -3197,6 +3203,10 @@ impl<C: Cpu + 'static> Runtime<C> {
             &mut mem,
             EXEC_LIBRARY_BASE + EXEC_BASE_SEMAPHORELIST_OFFSET,
         );
+        // The " SetPatch " marker semaphore a real system has by the time
+        // any program runs (mmu.library refuses to start without it);
+        // see execsem::install_setpatch_semaphore.
+        crate::execsem::install_setpatch_semaphore(&mut mem);
 
         let mut registry = LibraryRegistry::new();
         registry.register_real("dos.library", DOS_LIBRARY_BASE);

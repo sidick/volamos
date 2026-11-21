@@ -457,6 +457,66 @@ fn semaphore_list_addr() -> u32 {
     EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_SEMAPHORELIST_OFFSET
 }
 
+/// The name of the semaphore real `SetPatch` adds to
+/// `ExecBase.SemaphoreList`: `0xAB " SetPatch " 0xBB` (the Latin-1
+/// guillemets are part of the name). Read off `mmu.library` 47.11's own
+/// `FindSemaphore` call (its data hunk holds exactly these bytes), which
+/// is how that library tells whether `SetPatch` has run -- see
+/// [`install_setpatch_semaphore`].
+pub(crate) const SETPATCH_SEMAPHORE_NAME: &[u8] = b"\xab SetPatch \xbb";
+
+/// `sizeof(struct SignalSemaphore)` (`<exec/semaphores.h>`): `ss_Link`, a
+/// 14-byte `Node`, then `ss_NestCount` (2), `ss_WaitQueue` (12),
+/// `ss_MultipleLink` (12), `ss_Owner` (4) and `ss_QueueCount` (2).
+const SIGNAL_SEMAPHORE_SIZE: u32 = 46;
+
+/// Guest address of the `" SetPatch "` semaphore ([`install_setpatch_semaphore`]),
+/// in the `0x00C8..0x02CC` headroom of the low-memory map in
+/// [`crate::dispatch`]'s docs -- a fixed address, like
+/// `battclock.resource`'s, so no heap allocation shifts every other
+/// block a guest sees. The 46-byte semaphore ends at `0x02AE`.
+pub(crate) const SETPATCH_SEMAPHORE_ADDR: u32 = 0x0280;
+/// Where the semaphore's `ln_Name` string lives: just past it, still
+/// below `dos.library`'s lowest registered vector at `0x02CC`.
+const SETPATCH_SEMAPHORE_NAME_ADDR: u32 = 0x02B0;
+
+/// Adds the public semaphore a real Amiga has by the time any user
+/// program runs: `SetPatch`'s `" SetPatch "` marker, on
+/// `ExecBase.SemaphoreList`.
+///
+/// On real hardware `SetPatch` runs first in the Startup-Sequence, so
+/// every program sees the patched system and this semaphore. Software
+/// that must run after `SetPatch` (the MMULib `mmu.library` and its
+/// tools) refuses to start without it: `mmu.library` 47.11's init does
+/// `FindSemaphore("\xab SetPatch \xbb")` and, when that fails and no
+/// `68030/68040/68060.library` is in `LibList` yet, shows its "MUST be run
+/// AFTER SetPatch" alert and exits. volamos has no boot sequence, so this
+/// is the one piece of that state it can supply honestly: the system a
+/// guest sees *is* a started, patched one, and the semaphore carries no
+/// data beyond its name (nothing in `mmu.library` reads its fields).
+///
+/// `Runtime::new` calls this once `SemaphoreList` has been initialized.
+/// Returns the semaphore's address ([`SETPATCH_SEMAPHORE_ADDR`]).
+pub(crate) fn install_setpatch_semaphore<M: AddressSpace>(mem: &mut M) -> u32 {
+    let sem = SETPATCH_SEMAPHORE_ADDR;
+    for offset in 0..SIGNAL_SEMAPHORE_SIZE {
+        mem.write_u8(sem + offset, 0);
+    }
+    for (i, &byte) in SETPATCH_SEMAPHORE_NAME.iter().enumerate() {
+        mem.write_u8(SETPATCH_SEMAPHORE_NAME_ADDR + i as u32, byte);
+    }
+    mem.write_u8(
+        SETPATCH_SEMAPHORE_NAME_ADDR + SETPATCH_SEMAPHORE_NAME.len() as u32,
+        0,
+    );
+    mem.write_u32(sem + crate::execlist::LN_NAME, SETPATCH_SEMAPHORE_NAME_ADDR);
+    // What `AddSemaphore` does: `InitSemaphore`, then `Enqueue` by
+    // priority onto the public list.
+    init_semaphore_impl(mem, sem);
+    crate::execlist::enqueue_impl(mem, semaphore_list_addr(), sem);
+    sem
+}
+
 /// `FindSemaphore` (LVO -594): `A1` = name (`CString*`). `D0` = the
 /// matching `SignalSemaphore*` on [`semaphore_list_addr`], or `0` if
 /// not found -- traced against AROS's `rom/exec/findsemaphore.c`
@@ -1467,6 +1527,107 @@ mod tests {
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code, 0);
+    }
+
+    /// `mmu.library` refuses to start unless `FindSemaphore` finds
+    /// real `SetPatch`'s marker (or a 680x0 library is already open), so
+    /// a fresh runtime has to answer it: with a non-null semaphore, that
+    /// is free to obtain, rather than a bare name.
+    #[test]
+    fn setpatch_semaphore_is_findable_and_obtainable_from_the_start() {
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(1)); // A1 = NAME_ADDR
+        words.push((NAME_ADDR >> 16) as u16);
+        words.push(NAME_ADDR as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-594)); // FindSemaphore -> D0
+        words.extend_from_slice(&[0x2040]); // movea.l d0,a0
+        words.extend_from_slice(&[0x2648]); // movea.l a0,a3 (keep it)
+        words.extend_from_slice(&jsr_disp16_a6(-564)); // ObtainSemaphore (A0)
+        words.extend_from_slice(&[0x204B]); // movea.l a3,a0
+        words.extend_from_slice(&jsr_disp16_a6(-570)); // ReleaseSemaphore
+        words.extend_from_slice(&[0x200B]); // move.l a3,d0
+        words.push(RTS);
+
+        let mut rt = exec_program_with(&words, |mem| {
+            crate::guestmem::write_c_string(mem, NAME_ADDR, SETPATCH_SEMAPHORE_NAME);
+        });
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_ne!(
+            code, 0,
+            "FindSemaphore of the SetPatch marker found nothing"
+        );
+    }
+
+    #[test]
+    fn setpatch_semaphore_name_is_the_bytes_mmu_library_looks_for() {
+        // 0xAB and 0xBB are the Latin-1 guillemets real SetPatch's
+        // semaphore name is wrapped in, read off mmu.library 47.11.
+        assert_eq!(SETPATCH_SEMAPHORE_NAME, b"\xab SetPatch \xbb");
+    }
+
+    // --- FindResident (exec -96; lives in execlib.rs, tested here with
+    // the harness this module already has) ---
+
+    /// A guest that calls `FindResident(NAME_ADDR)` and returns D0.
+    fn find_resident_words() -> Vec<u16> {
+        let mut words = Vec::new();
+        words.push(move_imm_to_a(1));
+        words.push((NAME_ADDR >> 16) as u16);
+        words.push(NAME_ADDR as u16);
+        words.extend_from_slice(&jsr_disp16_a6(-96)); // FindResident -> D0
+        words.push(RTS);
+        words
+    }
+
+    #[test]
+    fn find_resident_on_the_empty_resmodules_array_is_null() {
+        let mut rt = exec_program_with(&find_resident_words(), |mem| {
+            crate::guestmem::write_c_string(mem, NAME_ADDR, b"exec.library");
+        });
+        let mut out = Vec::new();
+        assert_eq!(rt.run(&mut out, None).expect("run should succeed"), 0);
+    }
+
+    /// `ResModules` is an array of `struct Resident*` where an entry with
+    /// bit 31 set names another array: the module is found past a
+    /// chained array, and a different name still misses.
+    #[test]
+    fn find_resident_walks_chained_resmodules_arrays() {
+        const ARRAY_A: u32 = 0x1_0000;
+        const ARRAY_B: u32 = 0x1_0100;
+        const RES_1: u32 = 0x1_0200;
+        const RES_2: u32 = 0x1_0300;
+        const NAME_1: u32 = 0x1_0400;
+        const NAME_2: u32 = 0x1_0420;
+        let build = |rt: &mut Runtime<M68kCpu>| {
+            let mem = rt.memory_mut();
+            crate::guestmem::write_c_string(mem, NAME_1, b"first.library");
+            crate::guestmem::write_c_string(mem, NAME_2, b"second.library");
+            mem.write_u32(RES_1 + 14, NAME_1);
+            mem.write_u32(RES_2 + 14, NAME_2);
+            mem.write_u32(ARRAY_A, RES_1);
+            mem.write_u32(ARRAY_A + 4, 0x8000_0000 | ARRAY_B);
+            mem.write_u32(ARRAY_B, RES_2);
+            mem.write_u32(ARRAY_B + 4, 0);
+            mem.write_u32(
+                EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_RESMODULES_OFFSET,
+                ARRAY_A,
+            );
+        };
+        for (wanted, expect) in [
+            (&b"second.library"[..], RES_2),
+            (&b"first.library"[..], RES_1),
+            (&b"third.library"[..], 0),
+        ] {
+            let mut rt = exec_program_with(&find_resident_words(), |mem| {
+                crate::guestmem::write_c_string(mem, NAME_ADDR, wanted);
+            });
+            build(&mut rt);
+            let mut out = Vec::new();
+            let code = rt.run(&mut out, None).expect("run should succeed");
+            assert_eq!(code as u32, expect, "FindResident({:?})", wanted);
+        }
     }
 
     // --- ObtainSemaphoreList/ReleaseSemaphoreList ---

@@ -317,6 +317,13 @@ Changelog.
   and a release hands the semaphore to waiters in arrival order.
   `ObtainSemaphoreList`/`ReleaseSemaphoreList` don't implement that
   same block-and-retry dance and still fail loudly on contention.
+  `SemaphoreList` starts with the `« SetPatch »` marker semaphore a real
+  system has by the time a program runs (the name is wrapped in the
+  Latin-1 `«` and `»`, bytes `$AB` and `$BB`), so software that insists
+  on running after `SetPatch` — MMULib's `mmu.library` checks for exactly
+  this — finds it. It is an ordinary free semaphore with no data.
+- `FindResident` walks `ExecBase.ResModules` (chained arrays included).
+  That array is empty, since there is no ROM, so it answers "not found".
 - I/O requests: `OpenDevice`/`CloseDevice`/`DoIO`/`SendIO`/`WaitIO`/
   `CheckIO`/`AbortIO`, `CreateIORequest`/`DeleteIORequest`.
 - `Alert`, `RawDoFmt` (a field width or precision is capped at 4096).
