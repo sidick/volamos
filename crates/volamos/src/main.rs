@@ -717,7 +717,7 @@ struct Cli {
                      library runs as real code: its init needs mmu.library, found the \
                      ordinary way through LIBS: (-a LIBS:DIR, or --libs-dir), and a stand-in \
                      input.device is placed on the device list for it. If the library cannot \
-                     be opened the run ends with an error (exit 20) rather than running the \
+                     be opened the run ends with an error (exit 98) rather than running the \
                      program against a half-set-up CPU. Use with the matching --cpu 68040 or \
                      --cpu 68060; --no-jit is advisable."
     )]
@@ -1873,15 +1873,6 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
     }
 }
 
-/// [`parse_args_raw`]'s return type, factored out purely to satisfy
-/// clippy's `type_complexity` lint -- see that function's doc for what
-/// each element means; `Option<f64>` is `--clock-mhz`'s CLI-only value
-/// (issue #102), threaded alongside `InstrumentationOptions` for the
-/// same reason (see `Options::clock_mhz`'s doc). The first `bool` is
-/// `--cache` (issue #148, see `Options::cache`'s doc); the second is
-/// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc); the
-/// third is `--stack-report` (see `Options::stack_report`'s doc) --
-/// all CLI-only for the same reason.
 /// The internal volume `--cpu-library`'s file is reached through: its
 /// directory, so the library is opened by a path that cannot collide with
 /// a user's own `LIBS:` or other volumes.
@@ -1902,6 +1893,15 @@ fn cpu_library_open_name(file: &Path) -> Result<String, String> {
     Ok(format!("{CPU_LIBRARY_VOLUME}:{name}"))
 }
 
+/// [`parse_args_raw`]'s return type, factored out purely to satisfy
+/// clippy's `type_complexity` lint -- see that function's doc for what
+/// each element means; `Option<f64>` is `--clock-mhz`'s CLI-only value
+/// (issue #102), threaded alongside `InstrumentationOptions` for the
+/// same reason (see `Options::clock_mhz`'s doc). The first `bool` is
+/// `--cache` (issue #148, see `Options::cache`'s doc); the second is
+/// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc); the
+/// third is `--stack-report` (see `Options::stack_report`'s doc) --
+/// all CLI-only for the same reason.
 type RawParsedArgs = (
     config::Overrides,
     InstrumentationOptions,
@@ -2769,6 +2769,12 @@ fn run_nested_program(
     let stdout = io::stdout();
     let mut out = GuestStdout::new(stdout.lock());
     let result = runtime.run(&mut out, None).unwrap_or(-1);
+    if runtime.cpu_library_open_failed() {
+        eprintln!(
+            "volamos: --cpu-library: OpenLibrary failed in the nested run of {}, so it was not run",
+            host_path.display()
+        );
+    }
     // Nested runs parse their own executable locally and don't keep the
     // result around; source-location lookup is a top-level nicety, so
     // these report plain addresses. The return code stays the guest's:

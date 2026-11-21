@@ -3997,8 +3997,8 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// register, calls `OpenLibrary(open_name, 0)`, stores the result in a
     /// cell ([`Self::cpu_library_open_failed`] reads it) and, on success,
     /// restores the registers and jumps to the program's real start. On
-    /// `NULL` it returns from the program's own return address, so the
-    /// guest never runs against a half-set-up CPU; the caller reports it
+    /// `NULL` it ends the run at the exit stub, so the guest never runs
+    /// against a half-set-up CPU; the caller reports it
     /// ([`Self::cpu_library_open_failed`]).
     ///
     /// Also puts an `input.device` node on `ExecBase.DeviceList`, which the
@@ -4064,10 +4064,10 @@ impl<C: Cpu + 'static> Runtime<C> {
         word(cell as u16);
         word(0x4A80); // tst.l d0
         word(0x6608); // bne.s +8: opened
-        word(0x4FEF); // lea 60(sp),sp: drop the saved registers
-        word(0x003C);
         word(0x7014); // moveq #20,d0
-        word(0x4E75); // rts: to the program's own return address
+        word(0x4EF9); // jmp EXIT_STUB_ADDR.l: end the run, whatever the stack holds
+        word((EXIT_STUB_ADDR >> 16) as u16);
+        word(EXIT_STUB_ADDR as u16);
         word(0x4CDF); // movem.l (sp)+,d0-d7/a0-a6
         word(0x7FFF);
         word(0x4EF9); // jmp entry.l
@@ -6807,9 +6807,6 @@ mod tests {
         assert_eq!(rt.mem.read_u8(a0 + d0), 0);
     }
 
-    /// The Shell's reply is recognised by its startup packet's message
-    /// becoming a reply message, not by `dp_Port` naming this task's own
-    /// port -- so a reply sent by any process counts.
     /// `prepare_cpu_library` puts an `input.device` node on the device list
     /// (the real CPU libraries look for it) and starts the program at its
     /// own prologue; the open has not failed until the prologue says so.
@@ -6854,6 +6851,9 @@ mod tests {
         assert_eq!(rt.mem.read_u32(prologue + 44), entry);
     }
 
+    /// The Shell's reply is recognised by its startup packet's message
+    /// becoming a reply message, not by `dp_Port` naming this task's own
+    /// port -- so a reply sent by any process counts.
     #[test]
     fn shell_return_code_follows_the_packets_message_not_the_replying_task() {
         let mut mem = FlatMemory::new(0x2_0000);

@@ -48,6 +48,36 @@ fn the_library_is_opened_before_the_program_starts() {
     assert_eq!(String::from_utf8_lossy(&without.stdout), "open failed\n");
 }
 
+/// `--snoop` names every library open: the prologue's own, before the
+/// program runs, is the first thing it logs. This is the direct evidence
+/// that the library is opened first, whatever the program then does.
+#[test]
+fn the_prologues_open_is_the_first_thing_snoop_sees() {
+    let output = volamos()
+        .args([
+            "-s",
+            "--cpu-library",
+            &fixture("testlib"),
+            &fixture("hello"),
+        ])
+        .output()
+        .expect("failed to run volamos");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first = stderr
+        .lines()
+        .find(|l| l.starts_with("snoop: library"))
+        .unwrap_or_default();
+    assert!(
+        first.contains("CPULIB:testlib"),
+        "the first library open logged should be the prologue's: {stderr}"
+    );
+}
+
 /// A library whose init refuses stops the run with exit 98 and a message
 /// that says why, and the program is never started.
 #[test]
