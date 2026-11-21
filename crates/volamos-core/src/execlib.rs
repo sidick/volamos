@@ -95,7 +95,7 @@ pub const NT_DEVICE: u8 = 3;
 /// `RT_MATCHTAG` (4) + `RT_ENDSKIP` (4) + `RT_FLAGS`/`RT_VERSION`/
 /// `RT_TYPE`/`RT_PRI` (1 each, 4) + `RT_NAME` (4) + `RT_IDSTRING` (4) +
 /// `RT_INIT` (4) = 26.
-const RESIDENT_SIZE: u32 = 26;
+pub(crate) const RESIDENT_SIZE: u32 = 26;
 
 /// `LIB_VECTSIZE` (`exec/libraries.i`): every jump-table entry
 /// `MakeLibrary` builds is a 6-byte `JMP abs.l` instruction.
@@ -1503,10 +1503,17 @@ fn add_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
-/// `RT_NAME` byte offset in `struct Resident` (`exec/resident.i`):
-/// `RT_MATCHWORD` (2) + `RT_MATCHTAG` (4) + `RT_ENDSKIP` (4) +
-/// `RT_FLAGS`/`RT_VERSION`/`RT_TYPE`/`RT_PRI` (1 each, 4).
-const RT_NAME_OFFSET: u32 = 14;
+/// Byte offsets of the `struct Resident` fields (`exec/resident.i`):
+/// `RT_MATCHWORD` (2) at 0, `RT_MATCHTAG` (4), `RT_ENDSKIP` (4),
+/// `RT_FLAGS` (offset 10), `RT_VERSION`/`RT_TYPE`/`RT_PRI` (1 each),
+/// `RT_NAME`, `RT_IDSTRING`, `RT_INIT` (4 each); [`RESIDENT_SIZE`] in all.
+/// Only the offsets something here reads or writes are named.
+pub(crate) const RT_MATCHTAG_OFFSET: u32 = 2;
+pub(crate) const RT_ENDSKIP_OFFSET: u32 = 6;
+pub(crate) const RT_VERSION_OFFSET: u32 = 11;
+pub(crate) const RT_TYPE_OFFSET: u32 = 12;
+pub(crate) const RT_NAME_OFFSET: u32 = 14;
+pub(crate) const RT_IDSTRING_OFFSET: u32 = 18;
 
 /// `FindResident` (LVO -96): `A1` = name (`CString*`). `D0` = the
 /// `struct Resident*` on `ExecBase.ResModules` whose `rt_Name` matches,
@@ -1519,9 +1526,12 @@ const RT_NAME_OFFSET: u32 = 14;
 /// volamos's own `ResModules` is the empty terminated array
 /// [`crate::dispatch::RESMODULES_ARRAY_ADDR`], so this answers `0` for
 /// anything a real ROM would hold -- true to a runtime with no ROM, and
-/// enough for callers (MMULib's `mmu.library` asks for `exec.library`'s
-/// own romtag while deciding whether `SetPatch` ran) that treat `NULL`
-/// as "not found".
+/// enough for callers that treat `NULL` as "not found". The one exception
+/// is `--cpu-library`, whose
+/// [`crate::dispatch::Runtime::prepare_cpu_library`] replaces the array
+/// with two stand-in romtags (`expansion.library`, `exec.library`) because
+/// `mmu.library` wants to know where the ROM is; `FindResident` then finds
+/// those, and only those.
 fn find_resident_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let wanted = read_c_string(ctx.mem, name_ptr);

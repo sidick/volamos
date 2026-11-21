@@ -4009,6 +4009,9 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// there.
     pub fn prepare_cpu_library(&mut self, open_name: &str) -> Result<(), String> {
         const NT_DEVICE: u8 = 3;
+        if self.cpu_library_cell != 0 {
+            return Err("a CPU library is already prepared for this run".to_string());
+        }
         let heap_full = || "the guest heap is full".to_string();
 
         // The DeviceList node: a bare `struct Library` header and its name.
@@ -4095,22 +4098,42 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// does on a booted Amiga. Part of [`Self::prepare_cpu_library`].
     ///
     /// `mmu.library` 47.x has a routine that asks "is this address in the
-    /// Kickstart ROM?": it takes the `expansion.library` romtag's address
-    /// as the ROM's start, `+ 256 KB` as its end, and trims that end to the
-    /// next `ResModules` entry above the start; without the romtag it
+    /// Kickstart ROM?": its ROM *starts* 32 bytes past the
+    /// `expansion.library` romtag and *ends* at the next `ResModules` entry
+    /// above that (or 256 KB on, if there is none); without the romtag it
     /// raises the recoverable alert `0x3e12800a` (and answers "no"). volamos
-    /// has no ROM, so the two residents are placed 64 bytes apart in one
-    /// heap block: the "ROM" the routine then sees is a 32-byte window
-    /// inside this block, with nothing of a guest's or a library's in it,
-    /// and every address it is asked about is correctly "not ROM".
+    /// has no ROM, so the two residents are put [`Self::STAND_IN_GAP`]
+    /// (64) bytes apart at the start of one heap block: the "ROM" the
+    /// routine sees is the 32 bytes from +32 to +64, which hold nothing but
+    /// the first stand-in's own tail. The names and the array follow the
+    /// second resident, outside the window, and every address it is asked
+    /// about is correctly "not ROM".
+    ///
+    /// These are stand-ins and nothing more: bare romtags with a name, a
+    /// version, an id string and no `rt_Init`, so `InitResident` on them
+    /// would do nothing useful. They exist only with `--cpu-library`; a
+    /// plain run keeps its empty array.
     fn install_rom_residents(&mut self) -> Result<(), String> {
-        const RESIDENT_SIZE: u32 = 26;
-        const SECOND_AT: u32 = 0x40;
+        use crate::execlib::{
+            RESIDENT_SIZE, RT_ENDSKIP_OFFSET, RT_IDSTRING_OFFSET, RT_MATCHTAG_OFFSET,
+            RT_NAME_OFFSET, RT_TYPE_OFFSET, RT_VERSION_OFFSET,
+        };
         const NT_LIBRARY: u8 = 9;
         let heap_full = || "the guest heap is full".to_string();
-        let names: [&[u8]; 2] = [b"expansion.library\0", b"exec.library\0"];
-        let names_at = SECOND_AT + RESIDENT_SIZE;
-        let array_at = (names_at + names[0].len() as u32 + names[1].len() as u32 + 3) & !3;
+        // (name, id string): what `Version`-style tools would print.
+        let modules: [(&[u8], &[u8]); 2] = [
+            (
+                b"expansion.library\0",
+                b"expansion 40.2 (volamos stand-in)\r\n\0",
+            ),
+            (b"exec.library\0", b"exec 40.10 (volamos stand-in)\r\n\0"),
+        ];
+        let strings_at = Self::STAND_IN_GAP + RESIDENT_SIZE;
+        let strings_len: u32 = modules
+            .iter()
+            .map(|(n, i)| (n.len() + i.len()) as u32)
+            .sum();
+        let array_at = (strings_at + strings_len + 3) & !3;
         let block = self
             .heap
             .alloc(&mut self.mem, array_at + 12)
@@ -4118,29 +4141,40 @@ impl<C: Cpu + 'static> Runtime<C> {
         for i in 0..array_at + 12 {
             self.mem.write_u8(block + i, 0);
         }
-        let mut name_addr = block + names_at;
-        for (n, name) in names.iter().enumerate() {
-            let resident = block + n as u32 * SECOND_AT;
-            self.mem.write_u16(resident, 0x4AFC); // RTC_MATCHWORD
-            self.mem.write_u32(resident + 2, resident); // rt_MatchTag: itself
-            self.mem.write_u32(resident + 6, resident + RESIDENT_SIZE); // rt_EndSkip
-            self.mem.write_u8(resident + 11, LIBRARY_VERSION as u8); // rt_Version
-            self.mem.write_u8(resident + 12, NT_LIBRARY); // rt_Type
-            self.mem.write_u32(resident + 14, name_addr); // rt_Name
+        let mut string_addr = block + strings_at;
+        for (n, (name, id)) in modules.iter().enumerate() {
+            let resident = block + n as u32 * Self::STAND_IN_GAP;
+            self.mem.write_u16(resident, crate::execlib::RTC_MATCHWORD);
+            self.mem.write_u32(resident + RT_MATCHTAG_OFFSET, resident);
+            self.mem
+                .write_u32(resident + RT_ENDSKIP_OFFSET, resident + RESIDENT_SIZE);
+            self.mem
+                .write_u8(resident + RT_VERSION_OFFSET, LIBRARY_VERSION as u8);
+            self.mem.write_u8(resident + RT_TYPE_OFFSET, NT_LIBRARY);
+            self.mem.write_u32(resident + RT_NAME_OFFSET, string_addr);
             for (i, &b) in name.iter().enumerate() {
-                self.mem.write_u8(name_addr + i as u32, b);
+                self.mem.write_u8(string_addr + i as u32, b);
             }
-            name_addr += name.len() as u32;
+            string_addr += name.len() as u32;
+            self.mem
+                .write_u32(resident + RT_IDSTRING_OFFSET, string_addr);
+            for (i, &b) in id.iter().enumerate() {
+                self.mem.write_u8(string_addr + i as u32, b);
+            }
+            string_addr += id.len() as u32;
         }
         // The array: both residents and the NULL that ends it.
         let array = block + array_at;
         self.mem.write_u32(array, block);
-        self.mem.write_u32(array + 4, block + SECOND_AT);
+        self.mem.write_u32(array + 4, block + Self::STAND_IN_GAP);
         self.mem.write_u32(array + 8, 0);
         self.mem
             .write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_RESMODULES_OFFSET, array);
         Ok(())
     }
+
+    /// Distance between the two stand-in residents ([`Self::install_rom_residents`]).
+    const STAND_IN_GAP: u32 = 0x40;
 
     /// After a [`Self::prepare_cpu_library`] run: whether the library's
     /// `OpenLibrary` returned `NULL` (its init refused, or a library it
@@ -6912,6 +6946,51 @@ mod tests {
             first,
             "rt_MatchTag points at itself"
         );
+        // `FindResident("expansion.library")` finds it, `exec.library`
+        // too, and nothing else (run the program directly, skipping the
+        // prologue, which would try to open a library).
+        let prologue = rt.cpu.pc();
+        let names_at = entry + 0x300;
+        let results_at = entry + 0x340;
+        let wanted: [(&[u8], u32); 3] = [
+            (b"expansion.library", first),
+            (b"exec.library", second),
+            (b"graphics.library", 0),
+        ];
+        let mut words = vec![
+            0x2C7C, // movea.l #EXEC_LIBRARY_BASE,a6
+            (EXEC_LIBRARY_BASE >> 16) as u16,
+            EXEC_LIBRARY_BASE as u16,
+        ];
+        for (i, (name, _)) in wanted.iter().enumerate() {
+            let name_at = names_at + i as u32 * 0x20;
+            let result_at = results_at + i as u32 * 4;
+            crate::guestmem::write_c_string(&mut rt.mem, name_at, name);
+            words.extend_from_slice(&[
+                0x227C, // movea.l #name,a1
+                (name_at >> 16) as u16,
+                name_at as u16,
+                0x4EAE, // jsr FindResident(a6)
+                (-96i16) as u16,
+                0x23C0, // move.l d0,result.l
+                (result_at >> 16) as u16,
+                result_at as u16,
+            ]);
+        }
+        words.push(RTS);
+        load_words(&mut rt.mem, entry, &words);
+        rt.cpu.set_pc(entry);
+        let mut out = Vec::new();
+        rt.run(&mut out, None).expect("run should succeed");
+        for (i, (name, expect)) in wanted.iter().enumerate() {
+            assert_eq!(
+                rt.mem.read_u32(results_at + i as u32 * 4),
+                *expect,
+                "FindResident({:?})",
+                String::from_utf8_lossy(name)
+            );
+        }
+        rt.cpu.set_pc(prologue);
         assert_ne!(rt.cpu.pc(), entry, "starts at the prologue");
         assert!(
             !rt.cpu_library_open_failed(),
@@ -6919,6 +6998,10 @@ mod tests {
         );
         // The prologue ends by jumping to the program's real start.
         let prologue = rt.cpu.pc();
+        assert!(
+            rt.prepare_cpu_library("CPULIB:68060.library").is_err(),
+            "a second CPU library for the same run is refused"
+        );
         assert_eq!(rt.mem.read_u16(prologue + 42), 0x4EF9);
         assert_eq!(rt.mem.read_u32(prologue + 44), entry);
     }
