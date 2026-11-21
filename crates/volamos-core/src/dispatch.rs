@@ -5352,6 +5352,53 @@ mod tests {
         assert_eq!(pc, TRAP_TABLE_END);
     }
 
+    /// A handler installed in a vector table `VBR` points at, rather than
+    /// the one at address 0, is the one an exception runs (what the real
+    /// `68040.library` does to catch the illegal `MOVEC` of its CPU probe).
+    #[test]
+    fn an_exception_handler_is_looked_up_through_vbr() {
+        let entry = TRAP_TABLE_END;
+        let table = entry + 0x200; // inside the program image, clear of the heap
+        let handler_addr = entry + 0x40;
+        let words = [
+            0x207C, // movea.l #table,a0
+            (table >> 16) as u16,
+            table as u16,
+            0x4E7B, // movec a0,vbr
+            0x8801,
+            0x4AFC, // ILLEGAL: vector 4, at table + 0x10
+        ];
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        // moveq #0x42,d0; suba.l a0,a0; movec a0,vbr (back to the table at 0, whose
+        // vector 4 is empty); ILLEGAL -- which now stops the run.
+        load_words(
+            &mut mem,
+            handler_addr,
+            &[0x7042, 0x91C8, 0x4E7B, 0x8801, 0x4AFC],
+        );
+        mem.write_u32(table + 0x10, handler_addr);
+        let mut rt = Runtime::new(
+            M68kCpu::with_config(CpuType::M68020, false),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x400,
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        match rt.run(&mut out, None) {
+            Err(RuntimeError::UnexpectedStop { pc, .. }) => assert_eq!(
+                pc,
+                handler_addr + 8,
+                "the stop should come from the handler VBR names"
+            ),
+            other => panic!("expected the VBR handler's own Illegal trap, got {other:?}"),
+        }
+        assert_eq!(rt.cpu.data_register(DataRegister(0)), 0x42);
+    }
+
     #[test]
     fn guest_installed_fpu_handler_runs_instead_of_the_decline_stub() {
         // issue #167 (second half): a guest program that installs its

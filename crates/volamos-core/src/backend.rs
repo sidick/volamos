@@ -1125,8 +1125,13 @@ impl Cpu for M68kCpu {
         // A `0` entry means the guest never installed a handler for this
         // vector; jumping there would just run off into whatever
         // (probably zeroed) memory sits at address 0, so decline instead
-        // -- see this method's doc comment on `crate::cpu::Cpu`.
-        let handler = AddressSpace::read_u32(mem, vec_num * 4);
+        // -- see this method's doc comment on `crate::cpu::Cpu`. The table
+        // is wherever `VBR` points: `68040.library` and `68060.library`
+        // each point it at a scratch table on their stack to catch the
+        // illegal `MOVEC` of a CPU probe, so reading absolute `vec_num * 4`
+        // found no handler and the exception, which the CPU core takes
+        // through `VBR` correctly, was reported as an unexpected stop.
+        let handler = AddressSpace::read_u32(mem, self.core.vbr.wrapping_add(vec_num * 4));
         if handler == 0 {
             return false;
         }
