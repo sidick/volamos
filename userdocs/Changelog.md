@@ -3,6 +3,21 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.23.0](https://github.com/sidick/volamos/compare/v0.22.0...v0.23.0) (2026-11-21)
+
+
+### Features
+
+* **dos:** CreateNewProc accepts NP_Seglist and NP_FreeSeglist ([#401](https://github.com/sidick/volamos/issues/401)) ([450f8d3](https://github.com/sidick/volamos/commit/450f8d314987f805058e5cd243f17a6aae900917)), closes [#346](https://github.com/sidick/volamos/issues/346)
+* **dos:** Ctrl-D/E/F as breaks in raw mode, and console packets ([#406](https://github.com/sidick/volamos/issues/406)) ([daae23e](https://github.com/sidick/volamos/commit/daae23efc90aa8fa18e9afc815d171ff098393e7))
+* **dos:** SetMode raw mode and WaitForChar on a terminal ([#405](https://github.com/sidick/volamos/issues/405)) ([77b069e](https://github.com/sidick/volamos/commit/77b069e149ecbedd2c9ec70ca7a750c6ad648ba7)), closes [#315](https://github.com/sidick/volamos/issues/315)
+
+
+### Bug Fixes
+
+* **exec:** make timer.device TR_ADDREQUEST follow its unit ([#403](https://github.com/sidick/volamos/issues/403)) ([17d5508](https://github.com/sidick/volamos/commit/17d550861f883294a97c4039d79073aa431a69aa)), closes [#296](https://github.com/sidick/volamos/issues/296)
+* **exec:** make WaitIO wait for a pending timer request and AbortIO reply it ([#404](https://github.com/sidick/volamos/issues/404)) ([d118c4e](https://github.com/sidick/volamos/commit/d118c4eb19d451e840ae1b0e9fc43a12994a9705)), closes [#295](https://github.com/sidick/volamos/issues/295)
+
 ## [0.22.0](https://github.com/sidick/volamos/compare/v0.21.0...v0.22.0) (2026-11-20)
 
 
