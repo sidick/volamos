@@ -891,21 +891,7 @@ impl GuestHeap {
         let block_end = free_end.min(end.saturating_add(self.redzone_size));
 
         self.generation += 1;
-        let head = (free.start < block_start).then(|| FreeBlock {
-            start: free.start,
-            size: block_start - free.start,
-        });
-        let tail = (block_end < free_end).then(|| FreeBlock {
-            start: block_end,
-            size: free_end - block_end,
-        });
-        self.free.remove(idx);
-        if let Some(tail) = tail {
-            self.free.insert(idx, tail);
-        }
-        if let Some(head) = head {
-            self.free.insert(idx, head);
-        }
+        self.carve_free_block(idx, block_start, block_end);
         self.live.insert(
             start,
             LiveAlloc {
@@ -1048,6 +1034,32 @@ impl GuestHeap {
         first_user.wrapping_neg() & (align - 1)
     }
 
+    /// Removes `[start, end)` from the free block at `idx`, which must
+    /// contain it, leaving what remains before and after as free blocks in
+    /// the same place so the list stays sorted by address. The one place
+    /// that splits a free block around a fixed range
+    /// ([`Self::reserve_range`], [`Self::alloc_abs`]).
+    fn carve_free_block(&mut self, idx: usize, start: u32, end: u32) {
+        let block = self.free[idx];
+        let block_end = block.start + block.size;
+        let head = (block.start < start).then(|| FreeBlock {
+            start: block.start,
+            size: start - block.start,
+        });
+        let tail = (end < block_end).then(|| FreeBlock {
+            start: end,
+            size: block_end - end,
+        });
+        self.free.remove(idx);
+        // Insert tail first so head ends up before it at `idx`.
+        if let Some(tail) = tail {
+            self.free.insert(idx, tail);
+        }
+        if let Some(head) = head {
+            self.free.insert(idx, head);
+        }
+    }
+
     /// Permanently removes `[start, start + len)` from the free list so
     /// [`Self::alloc`] can never hand it out -- for fixed guest addresses
     /// that are not ordinary RAM (the `--uae-debug` port, see
@@ -1074,24 +1086,7 @@ impl GuestHeap {
             return false;
         };
         self.generation += 1;
-        let block = self.free[idx];
-        let block_end = block.start + block.size;
-        let head = (block.start < start).then(|| FreeBlock {
-            start: block.start,
-            size: start - block.start,
-        });
-        let tail = (end < block_end).then(|| FreeBlock {
-            start: end,
-            size: block_end - end,
-        });
-        self.free.remove(idx);
-        // Insert tail first so head ends up before it at `idx`.
-        if let Some(tail) = tail {
-            self.free.insert(idx, tail);
-        }
-        if let Some(head) = head {
-            self.free.insert(idx, head);
-        }
+        self.carve_free_block(idx, start, end);
         true
     }
 

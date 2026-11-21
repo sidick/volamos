@@ -480,6 +480,16 @@ pub(crate) const SETPATCH_SEMAPHORE_ADDR: u32 = 0x0280;
 /// below `dos.library`'s lowest registered vector at `0x02CC`.
 const SETPATCH_SEMAPHORE_NAME_ADDR: u32 = 0x02B0;
 
+// The semaphore and its name must stay clear of `version.library`'s header
+// below them and `dos.library`'s lowest vector (`0x02CC`) above them: the
+// low-memory map in `crate::dispatch`'s docs, held to at compile time.
+const _: () = {
+    assert!(crate::dispatch::VERSION_LIBRARY_BASE + 0x40 <= SETPATCH_SEMAPHORE_ADDR);
+    assert!(SETPATCH_SEMAPHORE_ADDR + SIGNAL_SEMAPHORE_SIZE <= SETPATCH_SEMAPHORE_NAME_ADDR);
+    // The name's bytes and their NUL.
+    assert!(SETPATCH_SEMAPHORE_NAME_ADDR + (SETPATCH_SEMAPHORE_NAME.len() as u32) < 0x02CC);
+};
+
 /// Adds the public semaphore a real Amiga has by the time any user
 /// program runs: `SetPatch`'s `" SetPatch "` marker, on
 /// `ExecBase.SemaphoreList`.

@@ -379,7 +379,8 @@ fn alloc_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
 /// is "guaranteed to contain the requested range" -- so the location is
 /// truncated down to an 8-byte [`MEMBLOCKSIZE`] boundary, the size grown by
 /// what was cut off and rounded up to 8, and that truncated address is
-/// what comes back (and what `FreeMem` takes). A zero size fails, as for
+/// what comes back; `FreeMem` takes either that or the original location
+/// (it applies the same truncation). A zero size fails, as for
 /// `AllocMem`. The memory is not cleared, which matches real `AllocAbs`
 /// (it leaves it to the caller), and under `--sanitize` it reads as
 /// uninitialized like any `AllocMem` without `MEMF_CLEAR`.
@@ -395,11 +396,10 @@ fn alloc_abs_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Disp
     let result = byte_size
         .checked_add(skipped)
         .filter(|_| byte_size != 0)
-        .and_then(|grown| grown.checked_next_multiple_of(MEMBLOCKSIZE))
-        .and_then(|rounded| {
-            ctx.heap
-                .alloc_abs(&mut *ctx.mem, start, rounded, byte_size + skipped)
-                .map(|addr| (addr, rounded))
+        .and_then(|grown| {
+            let rounded = grown.checked_next_multiple_of(MEMBLOCKSIZE)?;
+            let addr = ctx.heap.alloc_abs(&mut *ctx.mem, start, rounded, grown)?;
+            Some((addr, rounded))
         });
     match result {
         Some((addr, rounded)) => {
@@ -424,7 +424,22 @@ fn free_mem_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispa
         return Ok(());
     }
 
-    let rounded = round_up_8(byte_size);
+    // An address no block starts at, and that is not 8-aligned, is
+    // treated as exec's `Deallocate` treats every one: cut back to the
+    // 8-byte boundary, the size grown by what was cut and rounded up. That
+    // is how a block `AllocAbs` made at an unaligned location is freed
+    // with the location and size it was asked for. An address that *is* a
+    // live block (a 4-mod-8 `AllocVec` one, say) is taken as it stands.
+    let (addr, rounded) =
+        if ctx.heap.size_of_live_alloc(addr).is_none() && !addr.is_multiple_of(MEMBLOCKSIZE) {
+            let skipped = addr % MEMBLOCKSIZE;
+            (
+                addr - skipped,
+                round_up_8(byte_size.saturating_add(skipped)),
+            )
+        } else {
+            (addr, round_up_8(byte_size))
+        };
     let recorded = ctx.heap.size_of_live_alloc(addr);
     match recorded {
         Some(actual) if actual == rounded => {
@@ -3000,6 +3015,30 @@ mod tests {
     /// What `AllocAbs` returns is a normal block: `FreeMem` takes it back
     /// (with the size the caller asked for), after which the same range
     /// can be claimed again.
+    /// A block made at an unaligned location is freed with that location
+    /// and size, as on exec (whose `Deallocate` cuts the address back and
+    /// grows the size the same way): the whole 8-aligned block is free
+    /// again afterwards.
+    #[test]
+    fn freemem_of_an_unaligned_alloc_abs_location_frees_its_block() {
+        assert_eq!(
+            run_alloc_abs(|w| {
+                alloc_abs_call(w, 0x10, ABS_AT + 4);
+                w.extend_from_slice(&[
+                    move_imm_to_a(1),
+                    ((ABS_AT + 4) >> 16) as u16,
+                    (ABS_AT + 4) as u16,
+                    move_imm_to_d(0),
+                    0,
+                    0x10,
+                ]);
+                w.extend_from_slice(&jsr_disp16_a6(-210)); // FreeMem(location, size)
+                alloc_abs_call(w, 0x18, ABS_AT);
+            }),
+            ABS_AT
+        );
+    }
+
     #[test]
     fn alloc_abs_memory_can_be_freed_and_claimed_again() {
         assert_eq!(
