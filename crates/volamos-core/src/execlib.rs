@@ -3946,8 +3946,10 @@ mod loaded_library_e2e {
         let mut words = Vec::new();
         build_and_add_library(&mut words);
         words.push(movea_an(1, 3)); // A1 = library
-        movea_imm(&mut words, 0, 0x9999); // A0 = new entry
-        words.push(moveq(0, -6i8 as u8)); // D0 = LVO -6
+        // A0.W = funcOffset -6: only the low word counts, sign-extended,
+        // so junk in the high word must not matter.
+        movea_imm(&mut words, 0, 0x1234_FFFA);
+        words.extend_from_slice(&[0x203C, 0, 0x9999]); // D0 = new entry
         jsr(&mut words, 6, -420); // SetFunction
         words.push(move_an_dn(3, 0));
         words.push(RTS);

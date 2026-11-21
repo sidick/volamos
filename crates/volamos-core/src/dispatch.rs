@@ -7156,17 +7156,17 @@ mod tests {
         push_jsr(&mut words, 1, test_lvo); // call original -> D0 = 111
         words.push(move_l_dn_dn(2, 0)); // D2 = D0
 
-        words.push(MOVEQ_D0_0); // D0 = funcOffset (0)
-        let a0_patch_at = words.len();
-        push_movea_imm(&mut words, 0, 0); // A0 = hook (patched below)
+        push_movea_imm(&mut words, 0, 0); // A0 = funcOffset (0)
+        let d0_patch_at = words.len();
+        words.extend_from_slice(&[0x203C, 0, 0]); // D0 = hook (patched below)
         push_jsr(&mut words, 6, -420); // SetFunction -> D0 = old entry
         words.push(move_l_dn_dn(3, 0)); // D3 = D0 (old entry)
 
         push_jsr(&mut words, 1, test_lvo); // call again -> runs the hook
         words.push(move_l_dn_dn(4, 0)); // D4 = D0 (expect 211)
 
-        words.push(MOVEQ_D0_0); // D0 = funcOffset (0)
-        words.push(movea_dn(0, 3)); // A0 = D3 (old entry) -- restore
+        push_movea_imm(&mut words, 0, 0); // A0 = funcOffset (0)
+        words.push(move_l_dn_dn(0, 3)); // D0 = D3 (old entry) -- restore
         push_jsr(&mut words, 6, -420); // SetFunction -> restores original
 
         push_jsr(&mut words, 1, test_lvo); // call a third time -> back to original
@@ -7190,8 +7190,8 @@ mod tests {
         push_addi_l(&mut words, 0, 100); // D0 += 100 -> 211
         words.push(RTS);
 
-        words[a0_patch_at + 1] = (hook_addr >> 16) as u16;
-        words[a0_patch_at + 2] = hook_addr as u16;
+        words[d0_patch_at + 1] = (hook_addr >> 16) as u16;
+        words[d0_patch_at + 2] = hook_addr as u16;
 
         let mut rt = runtime_with_program(&words);
         rt.table.register(

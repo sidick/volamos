@@ -117,13 +117,18 @@ const STUB_POOL_SIZE: u32 = 0x200;
 
 /// Registers `exec.library`'s `SetFunction` (LVO -420).
 ///
-/// Reads `A1` (library base), `A0` (new function entry), `D0` (signed
-/// `funcOffset`, matching `register`'s own `base.wrapping_add(lvo as
-/// u32)` convention for turning an LVO into an address). Always
-/// installs a real 6-byte `JMP abs.l new_entry` at the target address;
-/// returns in `D0` whatever function pointer was effectively being
-/// called there before -- see the module doc for how that's recovered
-/// or synthesized.
+/// Reads `A1` (library base), `A0.W` (the signed `funcOffset`, the low word
+/// sign-extended) and `D0` (the new function entry), as NDK 3.2's
+/// `exec.doc` and `SetFunction(a1,a0,d0)` pragma have them: `oldFunc =
+/// SetFunction(library, funcOffset, funcEntry)` in `D0 = A1, A0.W, D0`.
+/// (This once read the offset from `D0` and the entry from `A0`, the wrong
+/// way round, so a real caller -- the real `68040.library` patching
+/// `utility.library` -- had its offset written as a jump target at an
+/// unrelated address.) The offset becomes an address by
+/// `base.wrapping_add(lvo as u32)`, as `register` does. Always installs a
+/// real 6-byte `JMP abs.l new_entry` at the target address; returns in
+/// `D0` whatever function pointer was effectively being called there
+/// before -- see the module doc for how that's recovered or synthesized.
 pub fn register_execsetfunc_handlers<C: Cpu + 'static>(
     table: &mut LibraryTable<C>,
     mem: &mut C::Memory,
@@ -139,8 +144,10 @@ pub fn register_execsetfunc_handlers<C: Cpu + 'static>(
             "SetFunction",
             move |ctx: &mut HandlerContext<'_, C>| -> Result<(), DispatchError> {
                 let base = ctx.cpu.address_register(AddressRegister(1));
-                let new_entry = ctx.cpu.address_register(AddressRegister(0));
-                let func_offset = ctx.cpu.data_register(DataRegister(0)) as i32;
+                // `A0.W`: only the low word is the offset, sign-extended.
+                let func_offset =
+                    i32::from(ctx.cpu.address_register(AddressRegister(0)) as u16 as i16);
+                let new_entry = ctx.cpu.data_register(DataRegister(0));
                 let target = base.wrapping_add(func_offset as u32);
 
                 let old_entry = if ctx.mem.read_u16(target) == JMP_ABS_L_OPCODE {
