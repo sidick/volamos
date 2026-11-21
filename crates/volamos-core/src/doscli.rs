@@ -46,7 +46,9 @@ use crate::cpu::{Cpu, DataRegister};
 use crate::dispatch::{DOS_LIBRARY_BASE, DispatchError, HandlerContext, LibraryTable};
 use crate::dosfile::{DOSFALSE, DOSTRUE};
 use crate::exectask;
-use crate::guestmem::{addr_from_bptr, bptr_from_addr, read_bstr, read_c_string, write_bstr};
+use crate::guestmem::{
+    GuestHeap, addr_from_bptr, bptr_from_addr, read_bstr, read_c_string, write_bstr,
+};
 use crate::lvos::dos::DOS_LVOS;
 use crate::memory::AddressSpace;
 
@@ -84,7 +86,10 @@ fn cli_init_run_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     // The BSTR buffers: the CLI's own if it has them (a second call, or a
     // CLI made with them), else a fresh one, as `DOS_CLI` makes them. A
     // buffer already there is cleared and reused, not replaced, so a
-    // repeated call leaks nothing.
+    // repeated call leaks nothing. A CLI from `AllocDosObject` can carry
+    // buffers smaller than the default (`ADO_DirLen`, `ADO_PromptLen`,
+    // ...), so what is cleared and written is bounded by the block's real
+    // size ([`buffer_capacity`]), never by [`BUFFER_LEN`].
     let buffer = |ctx: &mut HandlerContext<'_, C>, offset: u32, what: &str| {
         let existing = addr_from_bptr(ctx.mem.read_u32(cli + offset));
         let addr = if existing != 0 {
@@ -94,15 +99,16 @@ fn cli_init_run_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
                 .alloc(&mut *ctx.mem, BUFFER_LEN + 1)
                 .map_err(|_| heap_full(what))?
         };
-        for i in 0..=BUFFER_LEN {
+        let capacity = buffer_capacity(ctx.heap, addr);
+        for i in 0..capacity {
             ctx.mem.write_u8(addr + i, 0);
         }
-        Ok::<u32, DispatchError>(addr)
+        Ok::<(u32, u32), DispatchError>((addr, capacity))
     };
-    let set_name = buffer(ctx, exectask::CLI_SET_NAME_OFFSET, "cli_SetName")?;
-    let command_file = buffer(ctx, exectask::CLI_COMMAND_FILE_OFFSET, "cli_CommandFile")?;
-    let prompt = buffer(ctx, exectask::CLI_PROMPT_OFFSET, "cli_Prompt")?;
-    write_bstr(ctx.mem, prompt, DEFAULT_PROMPT);
+    let (set_name, set_name_cap) = buffer(ctx, exectask::CLI_SET_NAME_OFFSET, "cli_SetName")?;
+    let (command_file, _) = buffer(ctx, exectask::CLI_COMMAND_FILE_OFFSET, "cli_CommandFile")?;
+    let (prompt, prompt_cap) = buffer(ctx, exectask::CLI_PROMPT_OFFSET, "cli_Prompt")?;
+    write_bstr_capped(ctx.mem, prompt, prompt_cap, DEFAULT_PROMPT);
     // `cli_CommandName` already has a buffer from process creation (the
     // program's name); a Shell has none to report.
     let name = addr_from_bptr(ctx.mem.read_u32(cli + exectask::CLI_COMMAND_NAME_OFFSET));
@@ -113,11 +119,7 @@ fn cli_init_run_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     // `cli_SetName`: where the CLI is now.
     let dir_lock = addr_from_bptr(ctx.mem.read_u32(task + exectask::PR_CURRENT_DIR_OFFSET));
     let dir_name = ctx.dos.name_from_lock(dir_lock).unwrap_or_default();
-    write_bstr(
-        ctx.mem,
-        set_name,
-        &dir_name.as_bytes()[..dir_name.len().min(BUFFER_LEN as usize)],
-    );
+    write_bstr_capped(ctx.mem, set_name, set_name_cap, dir_name.as_bytes());
 
     let input = ctx
         .dos
@@ -156,6 +158,27 @@ fn cli_init_run_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
     Ok(())
 }
 
+/// Bytes the guest-heap block at `addr` really holds, which bounds what a
+/// `BSTR` field's buffer may be cleared or written to. An address the heap
+/// does not know (a buffer the guest supplied some other way) has no size
+/// to ask for, so it gets the size a `DOS_CLI` buffer has by default,
+/// [`BUFFER_LEN`] + 1: what this runtime assumed for every buffer before
+/// small ones were honoured.
+fn buffer_capacity(heap: &GuestHeap, addr: u32) -> u32 {
+    heap.size_of_live_alloc(addr).unwrap_or(BUFFER_LEN + 1)
+}
+
+/// [`write_bstr`] into a buffer of `capacity` bytes: the length byte plus
+/// as much of `bytes` as fits (at most 255), and nothing at all when the
+/// buffer cannot even hold the length byte.
+fn write_bstr_capped(mem: &mut dyn AddressSpace, addr: u32, capacity: u32, bytes: &[u8]) {
+    if capacity == 0 {
+        return;
+    }
+    let room = (capacity as usize - 1).min(MAX_FIELD);
+    write_bstr(mem, addr, &bytes[..bytes.len().min(room)]);
+}
+
 /// The calling process's `CommandLineInterface`, or `None` for a process
 /// without one (a Workbench start): these calls then fail, as the real
 /// ones do.
@@ -166,7 +189,7 @@ fn current_cli<C: Cpu>(ctx: &HandlerContext<'_, C>) -> Option<u32> {
 
 /// Longest value the CLI's string fields hold: a `BSTR` is at most 255
 /// bytes, and the buffers made for a CLI are that big.
-const MAX_FIELD: usize = 255;
+const MAX_FIELD: usize = BUFFER_LEN as usize;
 
 /// `SetCurrentDirName`/`SetPrompt`: stores the string `D1` points at in
 /// the `BSTR` field of `pr_CLI` at `offset`. `DOSFALSE` if there is no CLI
@@ -192,10 +215,22 @@ fn set_cli_string<C: Cpu>(
                     }
                 }
             }
-            write_bstr(ctx.mem, buffer, &name);
-            DOSTRUE
+            // A buffer smaller than the string (an `ADO_PromptLen` CLI)
+            // cannot hold it: fail, as for a string over 255, instead of
+            // writing past the block.
+            if name.len() >= buffer_capacity(ctx.heap, buffer) as usize {
+                ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+                DOSFALSE
+            } else {
+                write_bstr(ctx.mem, buffer, &name);
+                DOSTRUE
+            }
         }
-        _ => DOSFALSE,
+        Some(_) => {
+            ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+            DOSFALSE
+        }
+        None => DOSFALSE,
     };
     ctx.cpu.set_data_register(DataRegister(0), result);
     Ok(())
@@ -305,6 +340,23 @@ mod tests {
         init: impl Fn(&mut FlatMemory, u32),
         build: impl Fn(&mut Vec<u16>, u32),
     ) -> (Runtime<M68kCpu>, u32) {
+        run_prepared(|_| {}, init, build)
+    }
+
+    fn cli_of(rt: &Runtime<M68kCpu>) -> u32 {
+        addr_from_bptr(
+            rt.memory()
+                .read_u32(rt.current_task() + exectask::PR_CLI_OFFSET),
+        )
+    }
+
+    /// As [`run`], but `prepare` sees the runtime before the program
+    /// starts -- to give the process's CLI buffers of a chosen size.
+    fn run_prepared(
+        prepare: impl FnOnce(&mut Runtime<M68kCpu>),
+        init: impl Fn(&mut FlatMemory, u32),
+        build: impl Fn(&mut Vec<u16>, u32),
+    ) -> (Runtime<M68kCpu>, u32) {
         let scratch = TRAP_TABLE_END + 0x400;
         let mut words = Vec::new();
         build(&mut words, scratch);
@@ -325,16 +377,98 @@ mod tests {
                 ..StartConfig::default()
             },
         );
+        prepare(&mut rt);
         let mut out = Vec::new();
         rt.run(&mut out, None).expect("run should succeed");
         (rt, scratch)
     }
 
-    fn cli_of(rt: &Runtime<M68kCpu>) -> u32 {
-        addr_from_bptr(
-            rt.memory()
-                .read_u32(rt.current_task() + exectask::PR_CLI_OFFSET),
-        )
+    /// Points `cli_Prompt` and `cli_SetName` at 8-byte heap blocks (what
+    /// `AllocDosObject(DOS_CLI)` makes for `ADO_PromptLen`/`ADO_DirLen` of
+    /// 8) with a 0xAA canary block after each, and returns the two small
+    /// buffers and the canaries.
+    fn small_cli_buffers(rt: &mut Runtime<M68kCpu>) -> [(u32, u32); 2] {
+        let cli = cli_of(rt);
+        let mut made = [(0, 0); 2];
+        for (slot, offset) in [exectask::CLI_PROMPT_OFFSET, exectask::CLI_SET_NAME_OFFSET]
+            .into_iter()
+            .enumerate()
+        {
+            let (heap, mem) = rt.heap_and_memory_mut();
+            let buf = heap.alloc(mem, 8).unwrap();
+            let canary = heap.alloc(mem, 8).unwrap();
+            for i in 0..8 {
+                mem.write_u8(canary + i, 0xAA);
+            }
+            mem.write_u32(cli + offset, bptr_from_addr(buf));
+            made[slot] = (buf, canary);
+        }
+        made
+    }
+
+    /// `AllocDosObject(DOS_CLI)` honours `ADO_PromptLen`/`ADO_DirLen`, so
+    /// a CLI can have buffers far smaller than 256 bytes. `CliInitRun`
+    /// cleared 256 bytes of each regardless, running into whatever the
+    /// heap placed after them.
+    #[test]
+    fn cli_init_run_stays_inside_small_cli_buffers() {
+        let mut made = [(0, 0); 2];
+        let (rt, _) = run_prepared(
+            |rt| made = small_cli_buffers(rt),
+            |_, _| {},
+            |w, s| {
+                w.push(0x207C); // movea.l #imm,a0
+                w.push((s >> 16) as u16);
+                w.push(s as u16);
+                push_jsr_dos(w, -936);
+            },
+        );
+        let mem = rt.memory();
+        for (buf, canary) in made {
+            assert!(canary > buf, "the canary block sits after the buffer");
+            for i in 0..8 {
+                assert_eq!(mem.read_u8(canary + i), 0xAA, "canary byte {i} overwritten");
+            }
+        }
+        // The prompt fits (4 bytes); the directory name is cut to what the
+        // buffer holds rather than written past it.
+        assert_eq!(read_bstr(mem, made[0].0), b"%N> ");
+        assert!(read_bstr(mem, made[1].0).len() <= 7);
+    }
+
+    #[test]
+    fn set_prompt_refuses_a_string_the_small_buffer_cannot_hold() {
+        let mut made = [(0, 0); 2];
+        let (rt, scratch) = run_prepared(
+            |rt| made = small_cli_buffers(rt),
+            |mem, s| {
+                crate::guestmem::write_c_string(mem, s, b"a-prompt-longer-than-eight> ");
+                crate::guestmem::write_c_string(mem, s + 64, b"ok> ");
+            },
+            |w, s| {
+                push_move_imm_to_d(w, 1, s);
+                push_jsr_dos(w, -582); // SetPrompt
+                push_store_d0(w, s + 128);
+                push_jsr_dos(w, -132); // IoErr: why it failed
+                push_store_d0(w, s + 136);
+                push_move_imm_to_d(w, 1, s + 64);
+                push_jsr_dos(w, -582);
+                push_store_d0(w, s + 132);
+            },
+        );
+        let mem = rt.memory();
+        assert_eq!(mem.read_u32(scratch + 128), DOSFALSE, "too long to fit");
+        assert_eq!(
+            mem.read_u32(scratch + 136) as i32,
+            crate::dospattern::ERROR_LINE_TOO_LONG,
+            "and IoErr says why"
+        );
+        assert_eq!(mem.read_u32(scratch + 132), DOSTRUE, "short enough to fit");
+        assert_eq!(read_bstr(mem, made[0].0), b"ok> ");
+        let (_, canary) = made[0];
+        for i in 0..8 {
+            assert_eq!(mem.read_u8(canary + i), 0xAA, "canary byte {i} overwritten");
+        }
     }
 
     #[test]
