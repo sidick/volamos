@@ -524,6 +524,11 @@ What it does, and needs:
   program starts, rather than leaving it to hit an unexplained FPU trap.
 - A program started with `System()`/`Execute()` gets the library opened
   again in its own run, as every invocation starts from a fresh machine.
+- With [`--sanitize`](#-sanitize), what the library's own code does is not
+  reported: it is vendor code standing in for the CPU's microcode (the 68040
+  FPSP, for one, works in the stack below `SP` while it rearranges an
+  exception frame). Violations from the program under test, and from any other
+  library, are reported as usual.
 
 Use it with the matching `--cpu 68040`/`--cpu 68060`. `--no-jit` is
 advisable: every transcendental becomes real guest code reached through

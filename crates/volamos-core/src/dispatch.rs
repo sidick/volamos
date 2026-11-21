@@ -2655,6 +2655,10 @@ pub struct Runtime<C: Cpu> {
     /// the longword the prologue stores `OpenLibrary`'s result in, or `0`
     /// when no CPU library was asked for.
     cpu_library_cell: u32,
+    /// The name [`Runtime::prepare_cpu_library`] opens the CPU library by,
+    /// which is how its segments are found again
+    /// ([`Runtime::exempt_cpu_library_from_sanitizer`]).
+    cpu_library_name: Option<String>,
 }
 
 /// One distinct stack region's high-water mark, as reported by
@@ -3500,6 +3504,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             wb_message: 0,
             shell_packet: 0,
             cpu_library_cell: 0,
+            cpu_library_name: None,
         }
     }
 
@@ -4089,6 +4094,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         self.mem.write_u32(cell, 1); // "not failed" until the open stores its result
 
         self.cpu_library_cell = cell;
+        self.cpu_library_name = Some(open_name.to_string());
         self.cpu.set_pc(block);
         Ok(())
     }
@@ -4175,6 +4181,47 @@ impl<C: Cpu + 'static> Runtime<C> {
 
     /// Distance between the two stand-in residents ([`Self::install_rom_residents`]).
     const STAND_IN_GAP: u32 = 0x40;
+
+    /// The guest address ranges of the CPU library's own code (its loaded
+    /// segments), once it has been opened: empty before, or if it never
+    /// was. For [`Self::exempt_cpu_library_from_sanitizer`].
+    pub fn cpu_library_code_ranges(&self) -> Vec<(u32, u32)> {
+        let Some(name) = &self.cpu_library_name else {
+            return Vec::new();
+        };
+        let Some(library) = self.registry.loaded_library(name) else {
+            return Vec::new();
+        };
+        self.dos
+            .seglists
+            .get(&library.seglist_bptr)
+            .into_iter()
+            .flatten()
+            .filter_map(|&alloc| {
+                self.heap
+                    .size_of_live_alloc(alloc)
+                    .map(|size| (alloc, alloc + size))
+            })
+            .collect()
+    }
+
+    /// Under `--sanitize` with `--cpu-library`: removes from the sanitizer's
+    /// report whatever the CPU library's own code did. That code is vendor
+    /// code written for the real CPU and standing in for its microcode: the
+    /// 68040 FPSP, for one, works in the stack below `SP` while it
+    /// rearranges an exception frame, which the sanitizer rightly reports
+    /// from a program but is not a bug here. Violations from the program
+    /// under test, and from any other library, stay. Returns how many events
+    /// were dropped. Call after the run, before reporting.
+    pub fn exempt_cpu_library_from_sanitizer(&mut self) -> u64 {
+        let ranges = self.cpu_library_code_ranges();
+        if ranges.is_empty() {
+            return 0;
+        }
+        self.mem
+            .shadow()
+            .map_or(0, |shadow| shadow.forget_violations_in(&ranges))
+    }
 
     /// After a [`Self::prepare_cpu_library`] run: whether the library's
     /// `OpenLibrary` returned `NULL` (its init refused, or a library it
@@ -6898,6 +6945,49 @@ mod tests {
     /// `prepare_cpu_library` puts an `input.device` node on the device list
     /// (the real CPU libraries look for it) and starts the program at its
     /// own prologue; the open has not failed until the prologue says so.
+    /// The CPU library's own code ranges are its loaded segments, found
+    /// through the name it was opened by -- nothing before it is opened, and
+    /// no other library's.
+    #[test]
+    fn the_cpu_librarys_code_ranges_are_its_loaded_segments() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[RTS]);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x40,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        assert!(
+            rt.cpu_library_code_ranges().is_empty(),
+            "no CPU library asked for"
+        );
+        rt.prepare_cpu_library("CPULIB:68040.library").unwrap();
+        assert!(rt.cpu_library_code_ranges().is_empty(), "not opened yet");
+
+        // Pretend the library's two segments were loaded, and another
+        // library's one.
+        let (seg_a, seg_b, other) = (
+            rt.heap.alloc(&mut rt.mem, 0x100).unwrap(),
+            rt.heap.alloc(&mut rt.mem, 0x200).unwrap(),
+            rt.heap.alloc(&mut rt.mem, 0x40).unwrap(),
+        );
+        rt.registry
+            .register_loaded("CPULIB:68040.library", 0x9000, 0x1111, None);
+        rt.registry
+            .register_loaded("mmu.library", 0x9100, 0x2222, None);
+        rt.dos.seglists.insert(0x1111, vec![seg_a, seg_b]);
+        rt.dos.seglists.insert(0x2222, vec![other]);
+        let mut ranges = rt.cpu_library_code_ranges();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(seg_a, seg_a + 0x100), (seg_b, seg_b + 0x200)]);
+    }
+
     #[test]
     fn prepare_cpu_library_adds_input_device_and_redirects_the_start() {
         let mut mem = FlatMemory::new(0x2_0000);

@@ -1322,6 +1322,27 @@ impl ShadowMap {
         self.violations.borrow().clone()
     }
 
+    /// Drops every recorded violation whose PC is in one of `ranges`
+    /// (`[start, end)` guest addresses) and returns how many events
+    /// (counting repeats) went. For code that is not the guest's own: a
+    /// real `68040.library`/`68060.library` under `--cpu-library` stands in
+    /// for the CPU's microcode, and its FPSP handlers legitimately work in
+    /// the stack below `SP` while they rearrange an exception frame, so what
+    /// the sanitizer reports from there is not a bug in the program under
+    /// test. Done once at the end of a run, after the ranges are known,
+    /// rather than as a check on every access.
+    pub fn forget_violations_in(&self, ranges: &[(u32, u32)]) -> u64 {
+        let mut dropped = 0;
+        self.violations.borrow_mut().retain(|v| {
+            let inside = ranges.iter().any(|&(s, e)| v.pc >= s && v.pc < e);
+            if inside {
+                dropped += v.hits;
+            }
+            !inside
+        });
+        dropped
+    }
+
     /// Total number of violation events recorded, counting repeats
     /// (i.e. summing every [`Violation::hits`]) but not suppressed
     /// ones. `0` means a clean run.
@@ -3427,6 +3448,23 @@ mod tests {
     }
 
     // -- ignore_pc (issue #68) ------------------------------------------
+
+    #[test]
+    fn forget_violations_in_drops_those_from_a_pc_range_only() {
+        let mut shadow = ShadowMap::new(0x1000);
+        for (pc, addr) in [(0x100, 0x20), (0x104, 0x24), (0x200, 0x28), (0x104, 0x24)] {
+            shadow.set_current_pc(pc);
+            shadow.record(addr, 4, ViolationKind::InvalidWrite, None);
+        }
+        // Two distinct sites in [0x100, 0x108), one of them hit twice.
+        assert_eq!(shadow.violation_count(), 4);
+        assert_eq!(shadow.forget_violations_in(&[(0x100, 0x108)]), 3);
+        let left = shadow.violations();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].pc, 0x200);
+        // The end of a range is exclusive.
+        assert_eq!(shadow.forget_violations_in(&[(0x1F0, 0x200)]), 0);
+    }
 
     #[test]
     fn ignore_pc_suppresses_future_violations_at_that_pc() {

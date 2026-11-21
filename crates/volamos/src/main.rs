@@ -3091,6 +3091,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     let result = runtime
         .run(&mut out, Some(&mut trace))
         .map_err(|e| format!("{}: {e}", opts.program));
+    runtime.exempt_cpu_library_from_sanitizer();
     let violated =
         report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
     report_emulated_cycles(&runtime);
