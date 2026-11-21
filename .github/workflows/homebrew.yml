@@ -7,8 +7,16 @@ name: Homebrew formula
 # mismatch between the formula's install steps and the tagged source archive
 # all fail this job. Scoped to formula changes so it does not run on unrelated
 # commits.
+#
+# It also runs weekly (and on demand), because the formula can go wrong
+# without anyone touching it: a lagging bump after a release, or a tag whose
+# tarball changed. The scheduled run re-audits online (so a checksum that no
+# longer matches fails) and checks the formula is at the latest release.
 
 on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -60,3 +68,26 @@ jobs:
 
       - name: Test installed formula
         run: brew test sidick/volamos/volamos
+
+  current:
+    name: Formula is at the latest release
+    # A release does not update the formula (its checksum cannot exist until
+    # the tag does), so this is the reminder that a bump PR is due.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Compare with the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if ! grep -q "refs/tags/${latest}.tar.gz" Formula/volamos.rb; then
+            echo "::error::Formula/volamos.rb is not at the latest release ${latest}: update its url and sha256 (see CONTRIBUTING.md)"
+            exit 1
+          fi
+          echo "Formula/volamos.rb is at ${latest}"

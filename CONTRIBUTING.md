@@ -97,4 +97,6 @@ curl -fsSL https://github.com/sidick/volamos/archive/refs/tags/vX.Y.Z.tar.gz | s
 
 and land that as an ordinary PR (`chore(release): update the Homebrew
 formula to vX.Y.Z`). The `Homebrew formula` workflow audits, builds and
-tests the formula on that PR, so a wrong checksum fails there.
+tests the formula on that PR, so a wrong checksum fails there. A weekly run of the same
+workflow fails if the formula is behind the latest release, which is the
+reminder that a bump is due.
