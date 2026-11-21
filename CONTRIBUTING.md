@@ -84,3 +84,17 @@ Releases are fully automated: release-please keeps a release PR open
 on `main` that accumulates `feat:`/`fix:` changes; merging that PR
 bumps the crate versions, updates `userdocs/Changelog.md`, tags the
 release, and publishes the binaries, Docker image, and docs.
+
+One step is still manual: the Homebrew formula (`Formula/volamos.rb`,
+this repository is its own tap) pins the release tarball's checksum,
+which cannot exist until the tag does, so release-please cannot write
+it. After a release, update the formula's `url` to the new tag and its
+`sha256` to:
+
+```sh
+curl -fsSL https://github.com/sidick/volamos/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+```
+
+and land that as an ordinary PR (`chore(release): update the Homebrew
+formula to vX.Y.Z`). The `Homebrew formula` workflow audits, builds and
+tests the formula on that PR, so a wrong checksum fails there.

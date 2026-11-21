@@ -1,0 +1,62 @@
+name: Homebrew formula
+
+# The repository doubles as its own Homebrew tap (Formula/volamos.rb). Its
+# url/sha256 are updated by hand after each release (see the formula's header
+# and CONTRIBUTING.md), which is the error-prone step this workflow guards:
+# a stale checksum, an unreachable tarball, deprecated formula syntax, or a
+# mismatch between the formula's install steps and the tagged source archive
+# all fail this job. Scoped to formula changes so it does not run on unrelated
+# commits.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Formula/**"
+      - ".github/workflows/homebrew.yml"
+  pull_request:
+    paths:
+      - "Formula/**"
+      - ".github/workflows/homebrew.yml"
+
+concurrency:
+  group: homebrew-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Style and audit
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # Pinned to a commit: the action has no release tags.
+      - uses: Homebrew/actions/setup-homebrew@63a2d4d8d4193eab3e62b1b782ff3ab8408f5b29 # main, 2026-11-06
+
+      - name: Style
+        run: brew style "$GITHUB_WORKSPACE/Formula/volamos.rb"
+
+      - name: Audit
+        # Tap the checked-out commit by name, trust it as users must (Homebrew
+        # 7 refuses to load formulae from a tap nobody has trusted), then audit
+        # it. --online checks that the release tarball is reachable and its
+        # sha256 matches; this is the part `brew style` alone cannot catch.
+        run: |
+          brew tap sidick/volamos "$GITHUB_WORKSPACE"
+          brew trust sidick/volamos
+          brew audit --strict --online sidick/volamos/volamos
+
+      - name: Install from source
+        # Audit validates metadata but does not execute `def install`. Build
+        # the stable release tarball so everything the formula copies is
+        # checked against the archive users actually receive.
+        run: brew install --build-from-source sidick/volamos/volamos
+
+      - name: Test installed formula
+        run: brew test sidick/volamos/volamos

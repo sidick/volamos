@@ -49,8 +49,8 @@ hardware.
 
 ## Where to start
 
-- [Installation](Installation.md) — prebuilt release binaries, the
-  container image, or building from source.
+- [Installation](Installation.md) — Homebrew, prebuilt release binaries,
+  the container image, or building from source.
 - [Getting Started](Getting-Started.md) — running your first guest
   program, and mapping a real directory onto an Amiga volume.
 - [CLI Reference](CLI-Reference.md) — every flag.
