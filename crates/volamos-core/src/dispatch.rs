@@ -2108,9 +2108,17 @@ fn old_open_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(
 /// does. It is not in the NDK 3.2 autodocs (it is a private convenience
 /// of the ROM's own modules); the numbers are AROS's, which lists them from
 /// the real function: 1 graphics, 2 layers, 3 intuition, 4 dos, 5 icon,
-/// 6 expansion, 7 utility, 8 keymap, 9 gadtools, 10 workbench -- and the
-/// Shell asking for 4 to get dos is consistent with that. Any other tag
-/// is `NULL`. Otherwise it is `OpenLibrary(name, 0)`.
+/// 6 expansion, 7 utility, 8 keymap, 9 gadtools, 10 workbench. Checked
+/// against the Kickstart 3.1 ROM's own callers of this vector (`moveq
+/// #tag,d0` before `jsr -810(a6)`): `console.device` asks for 8, 1 and 2
+/// (keymap, graphics, layers), `layers.library` and `battclock.resource`
+/// for 7 (utility), `icon.library` and `ramlib` for 4 (dos),
+/// `workbench.task` for 10, `syscheck` for 3, 1 and 9 (intuition,
+/// graphics, gadtools), `scsi.device` and `strap` for 6 (expansion) --
+/// every one the library that module uses, and the Shell asking for 4 to
+/// get dos fits. Any other tag is `NULL`. Otherwise it is
+/// `OpenLibrary(name, 0)`, so a library volamos does not implement comes
+/// back the way it would for that name.
 fn tagged_open_library_handler<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
@@ -3945,14 +3953,18 @@ impl<C: Cpu + 'static> Runtime<C> {
     /// return code, as the AmigaDOS Manual's Shell protocol has it), or
     /// `None` for any other start or if the Shell never replied.
     pub fn shell_return_code(&self) -> Option<i32> {
-        const DP_PORT: u32 = 4;
+        const DP_LINK: u32 = 0;
         const DP_RES1: u32 = 12;
         if self.shell_packet == 0 {
             return None;
         }
-        // The reply swaps `dp_Port` to the replier's own process port.
-        let replied = self.mem.read_u32(self.shell_packet + DP_PORT)
-            == self.task + exectask::PR_MSGPORT_OFFSET;
+        // A reply turns the packet's message into a reply message
+        // (`PutMsg` to its reply port, as `ReplyPkt` does), whichever
+        // process sends it: that, not `dp_Port` naming this task's port,
+        // is what says the Shell answered.
+        let msg = self.mem.read_u32(self.shell_packet + DP_LINK);
+        let replied = msg != 0
+            && self.mem.read_u8(msg + crate::execlist::LN_TYPE) == crate::execlist::NT_REPLYMSG;
         replied.then(|| self.mem.read_u32(self.shell_packet + DP_RES1) as i32)
     }
 
@@ -6558,6 +6570,41 @@ mod tests {
         assert_eq!(bytes, b"run cmd");
         // The usual defensive NUL still follows, same as the args-based path.
         assert_eq!(rt.mem.read_u8(a0 + d0), 0);
+    }
+
+    /// The Shell's reply is recognised by its startup packet's message
+    /// becoming a reply message, not by `dp_Port` naming this task's own
+    /// port -- so a reply sent by any process counts.
+    #[test]
+    fn shell_return_code_follows_the_packets_message_not_the_replying_task() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[RTS]);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x40,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        assert_eq!(rt.shell_return_code(), None, "no Shell started");
+
+        const PACKET: u32 = 0x1_0000;
+        const MSG: u32 = 0x1_0100;
+        rt.shell_packet = PACKET;
+        rt.mem.write_u32(PACKET, MSG); // dp_Link
+        rt.mem.write_u32(PACKET + 4, 0x1_0200); // dp_Port: some other task's port
+        rt.mem.write_u32(PACKET + 12, 7); // dp_Res1
+        rt.mem
+            .write_u8(MSG + crate::execlist::LN_TYPE, crate::execlist::NT_MESSAGE);
+        assert_eq!(rt.shell_return_code(), None, "not replied yet");
+
+        rt.mem
+            .write_u8(MSG + crate::execlist::LN_TYPE, crate::execlist::NT_REPLYMSG);
+        assert_eq!(rt.shell_return_code(), Some(7));
     }
 
     #[test]
