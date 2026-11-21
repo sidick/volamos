@@ -5,7 +5,8 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
         [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
-        [--fpu|--no-fpu] [--fpsp-emulate] [--jit|--no-jit] [--clock-mhz N] [--sanitize]
+        [--fpu|--no-fpu] [--fpsp-emulate] [--cpu-library FILE] [--jit|--no-jit]
+        [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-lowmem] [--sanitize-wild]
         [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
         [--emu68-debug] [--stack-report] [--net] [--workbench] [--shell] <program> [args...]
@@ -53,7 +54,8 @@ its own `rts`:
   run through: the program path couldn't be read, didn't parse as a
   valid hunk executable, a config file was malformed, or the run died
   inside the runtime (an unimplemented library call, a stack overflow,
-  an invalid instruction).
+  an invalid instruction), or [`--cpu-library`](#-cpu-library-file)'s
+  library could not be opened.
 
 In every one of those cases volamos prints a `volamos: …` diagnostic to
 stderr naming exactly what went wrong before exiting. `--help` and
@@ -444,21 +446,65 @@ A guest that installs its own handler at the Line-F vector (as
 
 On real hardware, that trap is exactly what lets AmigaOS's
 `68040.library`/`68060.library` install FPSP/ISP software-emulation
-handlers at boot (via `SetPatch`) — which is how an FP-targeted binary
-keeps working on hardware that dropped some of the instructions it
-uses, without ever being recompiled. volamos has no equivalent of that
-persistent, cross-process boot state (every invocation is a single,
-fresh guest process, with no "patch once at boot, every later process
-inherits it" mechanism), so loading a real `68040.library`/
-`68060.library` isn't a viable substitute here — this flag gets you
-the same practical effect for a single run instead, without needing
-any real `68040.library`/`68060.library`/`fpsp.library` file at all.
+handlers at boot (via `SetPatch`). volamos has no persistent,
+cross-process boot state (every invocation is a single, fresh guest
+process), so this flag gets you the same practical effect for a single
+run without needing any real library file at all — or, to run the
+*real* library's handlers instead of volamos's built-in ones, see
+[`--cpu-library`](#-cpu-library-file).
 
 CLI-only: unlike most flags on this page, `--fpsp-emulate` can't be
 set in `~/.volamos`/`.volamos` — silently swapping real hardware
 behavior (a trap) for software emulation is exactly the kind of thing
 a stale config file shouldn't be able to turn on for every future run
 in a directory.
+
+## `--cpu-library FILE`
+
+Opens a real `68040.library` or `68060.library` before the program
+runs, as `SetPatch` does at boot, so *its* FPSP/ISP handlers deal with
+what the CPU left out of silicon, instead of volamos's built-in
+emulation ([`--fpsp-emulate`](#-fpsp-emulate), which this cannot be
+combined with). The library is real 68k code you supply (from your own
+Amiga system, or an archive such as MMULib); nothing is bundled.
+
+```sh
+volamos --cpu 68060 --no-jit --cpu-library 68060.library -V LIBS:~/amiga/libs prog
+volamos --cpu 68040 --no-jit --cpu-library 68040.library -V LIBS:~/amiga/libs prog
+```
+
+What it does, and needs:
+
+- The file is opened by a prologue that runs before the program and
+  jumps to its real start with every register as it was, so the library's
+  init runs as it would on a booted machine: it patches `exec`, creates
+  `fpsp.resource` and installs its handlers in the exception vector
+  table.
+- The libraries from MMULib need `mmu.library` too, found the ordinary
+  way through `LIBS:` (`-V LIBS:DIR`, `-a LIBS:...`, or
+  [`--libs-dir`](Supported-Libraries.md)). A machine without an MMU is
+  fine: the library takes its no-MMU path.
+- They also look for `input.device` on the device list, so a stand-in
+  node is added for the run. It is only a list entry: opening
+  `input.device` still fails as it always has.
+- A library that cannot be opened (its init refuses, or `mmu.library` is
+  missing) ends the run with a `volamos:` error and exit `98` before the
+  program starts, rather than leaving it to hit an unexplained FPU trap.
+- A program started with `System()`/`Execute()` gets the library opened
+  again in its own run, as every invocation starts from a fresh machine.
+
+Use it with the matching `--cpu 68040`/`--cpu 68060`. `--no-jit` is
+advisable: every transcendental becomes real guest code reached through
+a hardware exception, as on a real machine, so it is also slower than
+the built-in emulation. The point is fidelity: the Amiga libraries'
+FPSP does not always agree with Motorola's reference package or with
+volamos's built-in emulation. For example the smallest extended denormal
+through `FATAN` sets only the inexact flag under the real
+`68040.library` 47.1 and `68060.library` 47.2 (as on a real 68882),
+where the built-in emulation also raises underflow.
+
+CLI-only, like `--fpsp-emulate`: running unvalidated 68k code is not
+something a stale `~/.volamos` should switch on.
 
 ## `--jit`, `--no-jit`
 

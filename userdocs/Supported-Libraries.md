@@ -14,7 +14,8 @@ filename (matching the Amiga library name exactly) is found in
 Useful for benchmarking a real library against this runtime's own
 implementation, or testing a replacement library (e.g. a custom
 `graphics.library`) against real guest programs. Opt-in only; see the
-Changelog.
+Changelog. To run a real `68040.library`/`68060.library` (their FPSP, in place
+of the built-in emulation), see [`--cpu-library`](CLI-Reference.md#-cpu-library-file).
 
 ## dos.library
 

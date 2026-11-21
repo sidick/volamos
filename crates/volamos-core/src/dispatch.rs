@@ -649,6 +649,10 @@ pub(crate) const EXEC_BASE_LIBLIST_OFFSET: u32 = 378;
 /// (`crate::execlist`) keep a real, walkable list here.
 pub(crate) const EXEC_BASE_RESOURCELIST_OFFSET: u32 = 336;
 
+/// Byte offset of `ExecBase.DeviceList`: 14 bytes (one `struct List`) past
+/// [`EXEC_BASE_RESOURCELIST_OFFSET`], where the field layout above puts it.
+pub(crate) const EXEC_BASE_DEVICELIST_OFFSET: u32 = EXEC_BASE_RESOURCELIST_OFFSET + 14;
+
 /// Byte offset of `ExecBase.MemList` from [`EXEC_LIBRARY_BASE`]: the
 /// `struct List` just before [`EXEC_BASE_RESOURCELIST_OFFSET`]
 /// (336 - 14). Holds one `MemHeader` per RAM region -- see
@@ -2647,6 +2651,10 @@ pub struct Runtime<C: Cpu> {
     /// other start): the Shell replies it as it ends, with the last
     /// command's return code in `dp_Res1`.
     shell_packet: u32,
+    /// [`Runtime::prepare_cpu_library`]'s result cell: the guest address of
+    /// the longword the prologue stores `OpenLibrary`'s result in, or `0`
+    /// when no CPU library was asked for.
+    cpu_library_cell: u32,
 }
 
 /// One distinct stack region's high-water mark, as reported by
@@ -3491,6 +3499,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             top_seglist: 0,
             wb_message: 0,
             shell_packet: 0,
+            cpu_library_cell: 0,
         }
     }
 
@@ -3974,6 +3983,116 @@ impl<C: Cpu + 'static> Runtime<C> {
         );
         self.wb_message = msg;
         Ok(())
+    }
+
+    /// `--cpu-library`: arranges for the real `68040.library`/
+    /// `68060.library` (or any library) named by `open_name`, a path
+    /// `OpenLibrary` can resolve, to be opened *before the program runs*, as
+    /// `SetPatch` does at boot. Call once, after the program is loaded and
+    /// any `start_as_*` has chosen where it starts, and before [`Self::run`].
+    ///
+    /// A library's init can only run from inside a guest `OpenLibrary`
+    /// (it is guest code, entered through the trampoline), so this plants a
+    /// small prologue in guest memory and starts there. It saves every
+    /// register, calls `OpenLibrary(open_name, 0)`, stores the result in a
+    /// cell ([`Self::cpu_library_open_failed`] reads it) and, on success,
+    /// restores the registers and jumps to the program's real start. On
+    /// `NULL` it returns from the program's own return address, so the
+    /// guest never runs against a half-set-up CPU; the caller reports it
+    /// ([`Self::cpu_library_open_failed`]).
+    ///
+    /// Also puts an `input.device` node on `ExecBase.DeviceList`, which the
+    /// real libraries look for (and `Alert` without) and which volamos has
+    /// no device behind. It is only a list node: `OpenDevice` never
+    /// consults that list, so a guest opening `input.device` still fails as
+    /// before. Added only here so nothing else sees a device that is not
+    /// there.
+    pub fn prepare_cpu_library(&mut self, open_name: &str) -> Result<(), String> {
+        const NT_DEVICE: u8 = 3;
+        let heap_full = || "the guest heap is full".to_string();
+
+        // The DeviceList node: a bare `struct Library` header and its name.
+        let device_name = b"input.device\0";
+        let node = self
+            .heap
+            .alloc(&mut self.mem, LIB_STRUCT_SIZE + device_name.len() as u32)
+            .map_err(|_| heap_full())?;
+        for i in 0..LIB_STRUCT_SIZE + device_name.len() as u32 {
+            self.mem.write_u8(node + i, 0);
+        }
+        self.mem
+            .write_u8(node + crate::execlist::LN_TYPE, NT_DEVICE);
+        for (i, &b) in device_name.iter().enumerate() {
+            self.mem.write_u8(node + LIB_STRUCT_SIZE + i as u32, b);
+        }
+        self.mem
+            .write_u32(node + crate::execlist::LN_NAME, node + LIB_STRUCT_SIZE);
+        crate::execlist::add_tail_impl(
+            &mut self.mem,
+            EXEC_LIBRARY_BASE + EXEC_BASE_DEVICELIST_OFFSET,
+            node,
+        );
+
+        // The prologue (see the method's doc): 48 bytes of code, then the
+        // name, then the result cell, all one heap block.
+        const CODE_LEN: u32 = 48;
+        let name = open_name.as_bytes();
+        let name_len = name.len() as u32 + 1;
+        let cell_offset = (CODE_LEN + name_len + 3) & !3;
+        let block = self
+            .heap
+            .alloc(&mut self.mem, cell_offset + 4)
+            .map_err(|_| heap_full())?;
+        let entry = self.cpu.pc();
+        let name_addr = block + CODE_LEN;
+        let cell = block + cell_offset;
+
+        let mut code: Vec<u8> = Vec::with_capacity(CODE_LEN as usize);
+        let mut word = |w: u16| code.extend_from_slice(&w.to_be_bytes());
+        word(0x48E7); // movem.l d0-d7/a0-a6,-(sp)
+        word(0xFFFE);
+        word(0x2C78); // movea.l 4.w,a6
+        word(0x0004);
+        word(0x43F9); // lea name.l,a1
+        word((name_addr >> 16) as u16);
+        word(name_addr as u16);
+        word(0x7000); // moveq #0,d0
+        word(0x4EAE); // jsr -552(a6): OpenLibrary
+        word(0xFDD8);
+        word(0x23C0); // move.l d0,cell.l
+        word((cell >> 16) as u16);
+        word(cell as u16);
+        word(0x4A80); // tst.l d0
+        word(0x6608); // bne.s +8: opened
+        word(0x4FEF); // lea 60(sp),sp: drop the saved registers
+        word(0x003C);
+        word(0x7014); // moveq #20,d0
+        word(0x4E75); // rts: to the program's own return address
+        word(0x4CDF); // movem.l (sp)+,d0-d7/a0-a6
+        word(0x7FFF);
+        word(0x4EF9); // jmp entry.l
+        word((entry >> 16) as u16);
+        word(entry as u16);
+        debug_assert_eq!(code.len() as u32, CODE_LEN);
+        for (i, &b) in code.iter().enumerate() {
+            self.mem.write_u8(block + i as u32, b);
+        }
+        for (i, &b) in name.iter().enumerate() {
+            self.mem.write_u8(name_addr + i as u32, b);
+        }
+        self.mem.write_u8(name_addr + name.len() as u32, 0);
+        self.mem.write_u32(cell, 1); // "not failed" until the open stores its result
+
+        self.cpu_library_cell = cell;
+        self.cpu.set_pc(block);
+        Ok(())
+    }
+
+    /// After a [`Self::prepare_cpu_library`] run: whether the library's
+    /// `OpenLibrary` returned `NULL` (its init refused, or a library it
+    /// needs, `mmu.library` for the real ones, could not be opened).
+    pub fn cpu_library_open_failed(&self) -> bool {
+        self.cpu_library_cell != 0 && self.mem.read_u32(self.cpu_library_cell) == 0
     }
 
     /// For a [`Self::start_as_shell`] run: the return code the Shell
@@ -6691,6 +6810,50 @@ mod tests {
     /// The Shell's reply is recognised by its startup packet's message
     /// becoming a reply message, not by `dp_Port` naming this task's own
     /// port -- so a reply sent by any process counts.
+    /// `prepare_cpu_library` puts an `input.device` node on the device list
+    /// (the real CPU libraries look for it) and starts the program at its
+    /// own prologue; the open has not failed until the prologue says so.
+    #[test]
+    fn prepare_cpu_library_adds_input_device_and_redirects_the_start() {
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &[RTS]);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x40,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        let device_list = EXEC_LIBRARY_BASE + EXEC_BASE_DEVICELIST_OFFSET;
+        assert_eq!(
+            crate::execlist::find_name_impl(&rt.mem, device_list, b"input.device"),
+            0,
+            "no input.device unless asked for"
+        );
+        assert!(
+            !rt.cpu_library_open_failed(),
+            "nothing asked for, nothing failed"
+        );
+        rt.prepare_cpu_library("CPULIB:68060.library").unwrap();
+        assert_ne!(
+            crate::execlist::find_name_impl(&rt.mem, device_list, b"input.device"),
+            0
+        );
+        assert_ne!(rt.cpu.pc(), entry, "starts at the prologue");
+        assert!(
+            !rt.cpu_library_open_failed(),
+            "not failed before it has run"
+        );
+        // The prologue ends by jumping to the program's real start.
+        let prologue = rt.cpu.pc();
+        assert_eq!(rt.mem.read_u16(prologue + 42), 0x4EF9);
+        assert_eq!(rt.mem.read_u32(prologue + 44), entry);
+    }
+
     #[test]
     fn shell_return_code_follows_the_packets_message_not_the_replying_task() {
         let mut mem = FlatMemory::new(0x2_0000);

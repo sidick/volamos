@@ -303,6 +303,12 @@ struct Options {
     /// `vfs_config_from_opts` mounts it onto
     /// [`volamos_core::dispatch::LIBS_DIR_OVERRIDE_VOLUME`] when set.
     libs_dir: Option<PathBuf>,
+    /// `--cpu-library` (CLI-only, see [`LibraryFlags`]): a real
+    /// `68040.library`/`68060.library` to open before the program runs, as
+    /// `SetPatch` does at boot, in place of the CPU's own FPSP/ISP
+    /// emulation. `vfs_config_from_opts` mounts its directory onto
+    /// [`CPU_LIBRARY_VOLUME`] so `OpenLibrary` can resolve it.
+    cpu_library: Option<PathBuf>,
     stack_size: u32,
     /// Length of the primary RAM segment -- the gap-free run from address
     /// 0, where the guest stack lives (the old `--ram` meaning).
@@ -444,6 +450,7 @@ impl Options {
             || self.cwd.is_some()
             || self.auto_assign_root.is_some()
             || self.libs_dir.is_some()
+            || self.cpu_library.is_some()
     }
 }
 
@@ -695,6 +702,26 @@ struct Cli {
                      programs."
     )]
     libs_dir: Option<PathBuf>,
+
+    /// Open a real 68040/68060 library before the program runs, in place of the built-in FPSP
+    #[arg(
+        long = "cpu-library",
+        value_name = "FILE",
+        conflicts_with = "fpsp_emulate",
+        help_heading = "Machine",
+        long_help = "Open the real 68040.library or 68060.library FILE (68k code, from your \
+                     own Amiga system or an archive such as MMULib) before the program \
+                     starts, as SetPatch does at boot, so its own FPSP/ISP handlers deal with \
+                     what the CPU left out of silicon instead of volamos's built-in emulation \
+                     (compare --fpsp-emulate, which this cannot be combined with). The \
+                     library runs as real code: its init needs mmu.library, found the \
+                     ordinary way through LIBS: (-a LIBS:DIR, or --libs-dir), and a stand-in \
+                     input.device is placed on the device list for it. If the library cannot \
+                     be opened the run ends with an error (exit 20) rather than running the \
+                     program against a half-set-up CPU. Use with the matching --cpu 68040 or \
+                     --cpu 68060; --no-jit is advisable."
+    )]
+    cpu_library: Option<PathBuf>,
 
     /// Guest stack size in bytes (default 65536); may be suffixed K (KiB) or M (MiB)
     #[arg(
@@ -1360,7 +1387,10 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         cli.mem_wait,
         cli.fpsp_emulate,
         cli.stack_report,
-        cli.libs_dir,
+        LibraryFlags {
+            libs_dir: cli.libs_dir,
+            cpu_library: cli.cpu_library,
+        },
         cli.program,
         cli.guest_args,
     )
@@ -1852,6 +1882,26 @@ fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), 
 /// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc); the
 /// third is `--stack-report` (see `Options::stack_report`'s doc) --
 /// all CLI-only for the same reason.
+/// The internal volume `--cpu-library`'s file is reached through: its
+/// directory, so the library is opened by a path that cannot collide with
+/// a user's own `LIBS:` or other volumes.
+const CPU_LIBRARY_VOLUME: &str = "CPULIB";
+
+/// The name `--cpu-library`'s file is opened by: a path through
+/// [`CPU_LIBRARY_VOLUME`], which `vfs_config_from_opts` mounts on the file's
+/// directory. Checked here so a missing file is one clear error before
+/// anything runs.
+fn cpu_library_open_name(file: &Path) -> Result<String, String> {
+    if !file.is_file() {
+        return Err(format!("--cpu-library {}: not a file", file.display()));
+    }
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("--cpu-library {}: not a usable file name", file.display()))?;
+    Ok(format!("{CPU_LIBRARY_VOLUME}:{name}"))
+}
+
 type RawParsedArgs = (
     config::Overrides,
     InstrumentationOptions,
@@ -1860,10 +1910,21 @@ type RawParsedArgs = (
     Option<(f64, f64)>,
     bool,
     bool,
-    Option<PathBuf>,
+    LibraryFlags,
     String,
     Vec<String>,
 );
+
+/// The CLI-only flags that bring in real 68k libraries: `--libs-dir` and
+/// `--cpu-library`. Both are kept out of `config::Overrides` deliberately
+/// -- swapping a native implementation for, or adding, real unvalidated
+/// 68k code is not something a stale `~/.volamos` should switch on for
+/// every run in a directory -- so they ride through [`resolve`] together.
+#[derive(Debug, Default)]
+struct LibraryFlags {
+    libs_dir: Option<PathBuf>,
+    cpu_library: Option<PathBuf>,
+}
 
 /// Parses `args` (a command line's tokens, *not* including argv\[0\]) via
 /// clap's [`Cli`], returning the raw pieces [`resolve`] needs.
@@ -1938,7 +1999,7 @@ fn resolve(
     mem_wait: Option<(f64, f64)>,
     fpsp_emulate: bool,
     stack_report: bool,
-    libs_dir: Option<PathBuf>,
+    libraries: LibraryFlags,
     cli_jit: Option<bool>,
     program: String,
     guest_args: Vec<String>,
@@ -1974,7 +2035,8 @@ fn resolve(
         assigns: overrides.assigns,
         cwd: overrides.cwd,
         auto_assign_root: overrides.auto_assign_root,
-        libs_dir,
+        libs_dir: libraries.libs_dir,
+        cpu_library: libraries.cpu_library,
         stack_size: overrides.stack_size.unwrap_or(DEFAULT_STACK_SIZE),
         ram_size,
         layout,
@@ -2016,7 +2078,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         mem_wait,
         fpsp_emulate,
         stack_report,
-        libs_dir,
+        libraries,
         program,
         guest_args,
     ) = parse_args_raw(args)?;
@@ -2029,7 +2091,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         mem_wait,
         fpsp_emulate,
         stack_report,
-        libs_dir,
+        libraries,
         cli_jit,
         program,
         guest_args,
@@ -2085,6 +2147,15 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
             volamos_core::dispatch::LIBS_DIR_OVERRIDE_VOLUME.to_string(),
             dir.clone(),
         ));
+    }
+    if let Some(file) = &opts.cpu_library {
+        // The directory the library file is in, under an internal volume
+        // of its own, so `prepare_cpu_library` can name the file by path.
+        let dir = file
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        volumes.push((CPU_LIBRARY_VOLUME.to_string(), dir));
     }
     let mut config = VfsConfig {
         volumes,
@@ -2532,6 +2603,7 @@ fn build_nested_runtime(
     stack_report: bool,
     net: bool,
     libs_dir_override: bool,
+    cpu_library: Option<&str>,
 ) -> Option<Runtime<M68kCpu>> {
     let bytes = std::fs::read(host_path).ok()?;
     let hunk_file = loader::parse(&bytes).ok()?;
@@ -2643,6 +2715,11 @@ fn build_nested_runtime(
     if net {
         runtime.enable_bsdsocket();
     }
+    // `--cpu-library` is system-wide on a real machine, so a nested
+    // System()/Execute() run opens it again: its runtime starts with none.
+    if let Some(name) = cpu_library {
+        runtime.prepare_cpu_library(name).ok()?;
+    }
 
     Some(runtime)
 }
@@ -2665,6 +2742,7 @@ fn run_nested_program(
     stack_report: bool,
     net: bool,
     libs_dir_override: bool,
+    cpu_library: Option<String>,
 ) -> i32 {
     let Some(mut runtime) = build_nested_runtime(
         host_path,
@@ -2683,6 +2761,7 @@ fn run_nested_program(
         stack_report,
         net,
         libs_dir_override,
+        cpu_library.as_deref(),
     ) else {
         return -1;
     };
@@ -2957,6 +3036,12 @@ fn run(opts: &Options) -> Result<i32, String> {
 
     let nested_net = opts.net;
     let nested_libs_dir_override = opts.libs_dir.is_some();
+    let cpu_library_name = opts
+        .cpu_library
+        .as_deref()
+        .map(cpu_library_open_name)
+        .transpose()?;
+    let nested_cpu_library = cpu_library_name.clone();
     runtime.set_system_runner(move |req| {
         run_nested_program(
             &req.resolved_program_host_path,
@@ -2975,6 +3060,7 @@ fn run(opts: &Options) -> Result<i32, String> {
             nested_stack_report,
             nested_net,
             nested_libs_dir_override,
+            nested_cpu_library.clone(),
         )
     });
 
@@ -2991,6 +3077,11 @@ fn run(opts: &Options) -> Result<i32, String> {
         }
     };
 
+    // Everything that picks where the program starts has run by now, so the
+    // prologue that opens the CPU library can jump to the right place.
+    if let Some(name) = &cpu_library_name {
+        runtime.prepare_cpu_library(name)?;
+    }
     let result = runtime
         .run(&mut out, Some(&mut trace))
         .map_err(|e| format!("{}: {e}", opts.program));
@@ -3012,6 +3103,18 @@ fn run(opts: &Options) -> Result<i32, String> {
         (true, Some(code), Ok(_)) => Ok(code),
         (_, _, result) => result,
     };
+    // The prologue ended the run with the open's failure, not the program's
+    // own result: volamos's error (98), with what to look at.
+    if runtime.cpu_library_open_failed() {
+        return Err(format!(
+            "--cpu-library {}: OpenLibrary failed, so the program was not run (a real \
+             68040/68060 library needs mmu.library, found through LIBS: -- see -a/-V \
+             -- and may show its own alert above)",
+            opts.cpu_library
+                .as_deref()
+                .map_or_else(String::new, |p| p.display().to_string()),
+        ));
+    }
     match result {
         Ok(_) if violated => Ok(SANITIZER_EXIT_CODE),
         other => other,
@@ -3333,7 +3436,7 @@ fn main() -> ExitCode {
         mem_wait,
         fpsp_emulate,
         stack_report,
-        libs_dir,
+        libraries,
         program,
         guest_args,
     ) = cli_to_raw(cli);
@@ -3377,7 +3480,7 @@ fn main() -> ExitCode {
         mem_wait,
         fpsp_emulate,
         stack_report,
-        libs_dir,
+        libraries,
         cli_jit,
         program,
         guest_args,
@@ -4441,6 +4544,7 @@ mod tests {
             "--sanitize-ignore-pc",
             "--volumes-dir",
             "--libs-dir",
+            "--cpu-library",
         ];
         expected.sort_unstable();
         assert_eq!(spellings, expected);
@@ -5290,6 +5394,7 @@ mod tests {
             false, // stack_report
             false, // net
             false, // libs_dir_override
+            None,  // cpu_library
         );
         let mut runtime = runtime.expect("build_nested_runtime should succeed");
 
