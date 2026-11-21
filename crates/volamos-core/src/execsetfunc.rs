@@ -115,6 +115,12 @@ pub const STUB_POOL_BASE: u32 = 0x2A00;
 /// 0x180`, rounded up to `0x200`).
 const STUB_POOL_SIZE: u32 = 0x200;
 
+/// `funcOffset` from `A0`: `A0.W`, so only the low word counts, and it is
+/// sign-extended (an LVO is negative: `$FF76` is `-138`).
+fn func_offset_of(a0: u32) -> i32 {
+    i32::from(a0 as u16 as i16)
+}
+
 /// Registers `exec.library`'s `SetFunction` (LVO -420).
 ///
 /// Reads `A1` (library base), `A0.W` (the signed `funcOffset`, the low word
@@ -144,9 +150,7 @@ pub fn register_execsetfunc_handlers<C: Cpu + 'static>(
             "SetFunction",
             move |ctx: &mut HandlerContext<'_, C>| -> Result<(), DispatchError> {
                 let base = ctx.cpu.address_register(AddressRegister(1));
-                // `A0.W`: only the low word is the offset, sign-extended.
-                let func_offset =
-                    i32::from(ctx.cpu.address_register(AddressRegister(0)) as u16 as i16);
+                let func_offset = func_offset_of(ctx.cpu.address_register(AddressRegister(0)));
                 let new_entry = ctx.cpu.data_register(DataRegister(0));
                 let target = base.wrapping_add(func_offset as u32);
 
@@ -191,4 +195,24 @@ pub fn register_execsetfunc_handlers<C: Cpu + 'static>(
             },
         )
         .expect("SetFunction is in EXEC_LVOS");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::func_offset_of;
+
+    #[test]
+    fn the_offset_is_a_sign_extended_low_word_of_a0() {
+        assert_eq!(func_offset_of(0), 0);
+        assert_eq!(func_offset_of(0x0000_FFFA), -6);
+        assert_eq!(func_offset_of(0xFFFF_FF76), -138);
+        assert_eq!(func_offset_of(0x0000_FE5C), -420);
+        // Junk in the high word is ignored, whatever the sign of the low one.
+        assert_eq!(func_offset_of(0x1234_FFFA), -6);
+        assert_eq!(func_offset_of(0xABCD_0006), 6);
+        // The limits of a word.
+        assert_eq!(func_offset_of(0x0000_8000), -32768);
+        assert_eq!(func_offset_of(0x1234_8000), -32768);
+        assert_eq!(func_offset_of(0x0000_7FFF), 32767);
+    }
 }

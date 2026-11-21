@@ -332,8 +332,8 @@ Changelog.
   `CheckIO`/`AbortIO`, `CreateIORequest`/`DeleteIORequest`.
 - `Alert`, `RawDoFmt` (a field width or precision is capped at 4096).
 - `SetFunction` (`A1` = library, `A0.W` = the function's offset, `D0` = the
-  new function, as in the NDK) — patches a single library jump-table entry with a real
-  `JMP` to guest code and returns a function pointer standing in for
+  new function, as in the NDK) — patches a single library jump-table
+  entry with a real `JMP` to guest code and returns a function pointer standing in for
   whatever was there before (a synthesized stub for a host-handled
   entry, the real previous target if already patched), so a guest hook
   can chain through to the original behavior exactly like real
