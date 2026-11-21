@@ -514,9 +514,11 @@ What it does, and needs:
   way through `LIBS:` (`-V LIBS:DIR`, `-a LIBS:...`, or
   [`--libs-dir`](Supported-Libraries.md)). A machine without an MMU is
   fine: the library takes its no-MMU path.
-- They also look for `input.device` on the device list, so a stand-in
-  node is added for the run. It is only a list entry: opening
-  `input.device` still fails as it always has.
+- They also look for things a booted machine has: `input.device` on the
+  device list, and `expansion.library` among the ROM modules
+  (`mmu.library` asks where the ROM is), so stand-ins for both are added
+  for the run. They are only list entries: opening `input.device` still
+  fails as it always has, and there is still no ROM.
 - A library that cannot be opened (its init refuses, or `mmu.library` is
   missing) ends the run with a `volamos:` error and exit `98` before the
   program starts, rather than leaving it to hit an unexplained FPU trap.
