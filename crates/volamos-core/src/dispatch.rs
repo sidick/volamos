@@ -5399,6 +5399,46 @@ mod tests {
         assert_eq!(rt.cpu.data_register(DataRegister(0)), 0x42);
     }
 
+    /// With `VBR` pointing at a table whose F-line vector is empty, an
+    /// F-line opcode on a 68020 with no FPU is declined like any other
+    /// unhandled trap: a clean unexpected stop at that instruction, not a
+    /// jump to address 0 (as when the handler was looked up at the absolute
+    /// vector but taken through `VBR`). (The 68060's own unimplemented-FPU
+    /// exception is delivered inside the CPU core and does not come through
+    /// here, so it is outside what this covers.)
+    #[test]
+    fn an_empty_f_line_vector_under_a_moved_vbr_is_declined_cleanly() {
+        let entry = TRAP_TABLE_END;
+        let table = entry + 0x200;
+        let words = [
+            0x207C, // movea.l #table,a0
+            (table >> 16) as u16,
+            table as u16,
+            0x4E7B, // movec a0,vbr
+            0x8801,
+            0xF200, // an F-line opcode: no FPU here
+            0x000A,
+        ];
+        let mut mem = FlatMemory::new(0x2_0000);
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::with_config(CpuType::M68020, false),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x400,
+                ..StartConfig::default()
+            },
+        );
+        let mut out = Vec::new();
+        match rt.run(&mut out, None) {
+            Err(RuntimeError::UnexpectedStop { pc, reason }) => {
+                assert_eq!(pc, entry + 10, "stopped at the F-line opcode: {reason}")
+            }
+            other => panic!("expected a clean unexpected stop, got {other:?}"),
+        }
+    }
+
     #[test]
     fn guest_installed_fpu_handler_runs_instead_of_the_decline_stub() {
         // issue #167 (second half): a guest program that installs its
