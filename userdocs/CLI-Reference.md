@@ -453,6 +453,36 @@ run without needing any real library file at all — or, to run the
 *real* library's handlers instead of volamos's built-in ones, see
 [`--cpu-library`](#-cpu-library-file).
 
+### Built-in emulation or the real libraries?
+
+For most programs the built-in emulation is the better choice, and it is
+what `--fpsp-emulate` gives you: it needs no library files, it runs at
+full speed, and its values are right. The emulation comes from the `m68k`
+crate, whose transcendental functions follow Motorola's reference
+68040/68060 software packages. The libraries real Amiga systems run
+(`68040.library`, `68060.library`) are built from that same reference code
+but are not identical to it, and a real 68882 differs from the reference in
+places too, so the *exception flags* a program reads back can differ even
+when the result value is the same.
+
+The difference found so far, checked against real hardware (a 68882, a
+68060 with `68060.library` 47.2 and a 68040 with `68040.library` 47.1):
+`FATAN` of a denormalized operand (such as 2^-16383, the smallest extended
+denormal). Motorola's reference package raises underflow as well as
+inexact for it, and so does the built-in emulation; the real hardware and
+both libraries set only inexact. The value is the same either way.
+`FTWOTOX(-16384)`, a normal operand whose result underflows, agrees: underflow
+and inexact on all of them.
+
+Only that case has been compared. The reference code handles a denormal
+operand the same way for every function whose result for a tiny operand is
+the operand itself, so others may differ in the same way, but that is not
+confirmed. A program only notices if it reads `FPSR` (or traps on underflow)
+after such an operation; ordinary arithmetic is unaffected.
+
+When you need what the real machine does, exactly, run the real library with
+[`--cpu-library`](#-cpu-library-file) instead.
+
 CLI-only: unlike most flags on this page, `--fpsp-emulate` can't be
 set in `~/.volamos`/`.volamos` — silently swapping real hardware
 behavior (a trap) for software emulation is exactly the kind of thing
@@ -496,11 +526,11 @@ What it does, and needs:
 Use it with the matching `--cpu 68040`/`--cpu 68060`. `--no-jit` is
 advisable: every transcendental becomes real guest code reached through
 a hardware exception, as on a real machine, so it is also slower than
-the built-in emulation. The point is fidelity: the Amiga libraries'
-FPSP does not always agree with Motorola's reference package or with
-volamos's built-in emulation. For example the smallest extended denormal
-through `FATAN` sets only the inexact flag under the real
-`68040.library` 47.1 and `68060.library` 47.2 (as on a real 68882),
+the built-in emulation. The point is exactness, which most programs do not need: the
+built-in emulation is the better default, and [where the two
+differ](#built-in-emulation-or-the-real-libraries) is small: for example
+the smallest extended denormal through `FATAN` sets only the inexact flag under
+the real `68040.library` 47.1 and `68060.library` 47.2 (as on a real 68882),
 where the built-in emulation also raises underflow.
 
 CLI-only, like `--fpsp-emulate`: running unvalidated 68k code is not
