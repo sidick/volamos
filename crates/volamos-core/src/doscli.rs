@@ -159,11 +159,13 @@ fn cli_init_run_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), D
 }
 
 /// Bytes the guest-heap block at `addr` really holds, which bounds what a
-/// `BSTR` field's buffer may be cleared or written to. `0` for an address
-/// the heap does not know (a buffer the guest supplied some other way): no
-/// byte of it is touched, rather than assuming [`BUFFER_LEN`] + 1.
+/// `BSTR` field's buffer may be cleared or written to. An address the heap
+/// does not know (a buffer the guest supplied some other way) has no size
+/// to ask for, so it gets the size a `DOS_CLI` buffer has by default,
+/// [`BUFFER_LEN`] + 1: what this runtime assumed for every buffer before
+/// small ones were honoured.
 fn buffer_capacity(heap: &GuestHeap, addr: u32) -> u32 {
-    heap.size_of_live_alloc(addr).unwrap_or(0)
+    heap.size_of_live_alloc(addr).unwrap_or(BUFFER_LEN + 1)
 }
 
 /// [`write_bstr`] into a buffer of `capacity` bytes: the length byte plus
@@ -187,7 +189,7 @@ fn current_cli<C: Cpu>(ctx: &HandlerContext<'_, C>) -> Option<u32> {
 
 /// Longest value the CLI's string fields hold: a `BSTR` is at most 255
 /// bytes, and the buffers made for a CLI are that big.
-const MAX_FIELD: usize = 255;
+const MAX_FIELD: usize = BUFFER_LEN as usize;
 
 /// `SetCurrentDirName`/`SetPrompt`: stores the string `D1` points at in
 /// the `BSTR` field of `pr_CLI` at `offset`. `DOSFALSE` if there is no CLI
@@ -217,13 +219,18 @@ fn set_cli_string<C: Cpu>(
             // cannot hold it: fail, as for a string over 255, instead of
             // writing past the block.
             if name.len() >= buffer_capacity(ctx.heap, buffer) as usize {
+                ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
                 DOSFALSE
             } else {
                 write_bstr(ctx.mem, buffer, &name);
                 DOSTRUE
             }
         }
-        _ => DOSFALSE,
+        Some(_) => {
+            ctx.dos.set_io_err(crate::dospattern::ERROR_LINE_TOO_LONG);
+            DOSFALSE
+        }
+        None => DOSFALSE,
     };
     ctx.cpu.set_data_register(DataRegister(0), result);
     Ok(())
@@ -333,29 +340,7 @@ mod tests {
         init: impl Fn(&mut FlatMemory, u32),
         build: impl Fn(&mut Vec<u16>, u32),
     ) -> (Runtime<M68kCpu>, u32) {
-        let scratch = TRAP_TABLE_END + 0x400;
-        let mut words = Vec::new();
-        build(&mut words, scratch);
-        words.push(RTS);
-        assert!(words.len() * 2 < 0x400);
-        let mut mem = FlatMemory::new(0x2_0000);
-        for (i, &w) in words.iter().enumerate() {
-            mem.write_u16(TRAP_TABLE_END + 2 * i as u32, w);
-        }
-        init(&mut mem, scratch);
-        let mut rt = Runtime::new(
-            M68kCpu::new(),
-            mem,
-            StartConfig {
-                entry: TRAP_TABLE_END,
-                load_end: scratch + 0x400,
-                args: Vec::new(),
-                ..StartConfig::default()
-            },
-        );
-        let mut out = Vec::new();
-        rt.run(&mut out, None).expect("run should succeed");
-        (rt, scratch)
+        run_prepared(|_| {}, init, build)
     }
 
     fn cli_of(rt: &Runtime<M68kCpu>) -> u32 {
@@ -376,6 +361,7 @@ mod tests {
         let mut words = Vec::new();
         build(&mut words, scratch);
         words.push(RTS);
+        assert!(words.len() * 2 < 0x400);
         let mut mem = FlatMemory::new(0x2_0000);
         for (i, &w) in words.iter().enumerate() {
             mem.write_u16(TRAP_TABLE_END + 2 * i as u32, w);
@@ -463,6 +449,8 @@ mod tests {
                 push_move_imm_to_d(w, 1, s);
                 push_jsr_dos(w, -582); // SetPrompt
                 push_store_d0(w, s + 128);
+                push_jsr_dos(w, -132); // IoErr: why it failed
+                push_store_d0(w, s + 136);
                 push_move_imm_to_d(w, 1, s + 64);
                 push_jsr_dos(w, -582);
                 push_store_d0(w, s + 132);
@@ -470,6 +458,11 @@ mod tests {
         );
         let mem = rt.memory();
         assert_eq!(mem.read_u32(scratch + 128), DOSFALSE, "too long to fit");
+        assert_eq!(
+            mem.read_u32(scratch + 136) as i32,
+            crate::dospattern::ERROR_LINE_TOO_LONG,
+            "and IoErr says why"
+        );
         assert_eq!(mem.read_u32(scratch + 132), DOSTRUE, "short enough to fit");
         assert_eq!(read_bstr(mem, made[0].0), b"ok> ");
         let (_, canary) = made[0];
