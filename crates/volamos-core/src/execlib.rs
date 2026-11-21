@@ -1488,8 +1488,60 @@ fn add_library_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
     Ok(())
 }
 
+/// `RT_NAME` byte offset in `struct Resident` (`exec/resident.i`):
+/// `RT_MATCHWORD` (2) + `RT_MATCHTAG` (4) + `RT_ENDSKIP` (4) +
+/// `RT_FLAGS`/`RT_VERSION`/`RT_TYPE`/`RT_PRI` (1 each, 4).
+const RT_NAME_OFFSET: u32 = 14;
+
+/// `FindResident` (LVO -96): `A1` = name (`CString*`). `D0` = the
+/// `struct Resident*` on `ExecBase.ResModules` whose `rt_Name` matches,
+/// or `0`. Semantics from NDK 3.2 `exec.doc` ("FindResident: Find a
+/// resident module by name") and AROS's `rom/exec/findresident.c`: walk
+/// the `ResModules` array of `struct Resident` pointers up to its
+/// `NULL` terminator, where an entry with bit 31 set is not a module but
+/// the address (bit 31 cleared) of another array to continue in.
+///
+/// volamos's own `ResModules` is the empty terminated array
+/// [`crate::dispatch::RESMODULES_ARRAY_ADDR`], so this answers `0` for
+/// anything a real ROM would hold -- true to a runtime with no ROM, and
+/// enough for callers (MMULib's `mmu.library` asks for `exec.library`'s
+/// own romtag while deciding whether `SetPatch` ran) that treat `NULL`
+/// as "not found".
+fn find_resident_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
+    let name_ptr = ctx.cpu.address_register(AddressRegister(1));
+    let wanted = read_c_string(ctx.mem, name_ptr);
+    let mut slot = ctx
+        .mem
+        .read_u32(EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_RESMODULES_OFFSET);
+    let mut found = 0;
+    // One bound over every entry visited, chained arrays included, so a
+    // corrupt or unterminated array reads as "not found" instead of
+    // walking guest RAM and hanging the host.
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
+        if slot == 0 {
+            break;
+        }
+        let entry = ctx.mem.read_u32(slot);
+        if entry == 0 {
+            break;
+        }
+        if entry & 0x8000_0000 != 0 {
+            slot = entry & 0x7FFF_FFFF;
+            continue;
+        }
+        let name = ctx.mem.read_u32(entry.wrapping_add(RT_NAME_OFFSET));
+        if name != 0 && read_c_string(ctx.mem, name) == wanted {
+            found = entry;
+            break;
+        }
+        slot = slot.wrapping_add(4);
+    }
+    ctx.cpu.set_data_register(DataRegister(0), found);
+    Ok(())
+}
+
 /// Registers `MakeLibrary`, `MakeFunctions`, `InitStruct`, `AddLibrary`,
-/// `SumLibrary` and `RemLibrary` onto [`EXEC_LIBRARY_BASE`], looked up by name through
+/// `SumLibrary`, `RemLibrary` and `FindResident` onto [`EXEC_LIBRARY_BASE`], looked up by name through
 /// [`crate::lvos::exec::EXEC_LVOS`]. Called unconditionally from
 /// [`crate::dispatch::Runtime::new`].
 pub fn register_execlib_handlers<C: Cpu + 'static>(
@@ -1516,6 +1568,7 @@ pub fn register_execlib_handlers<C: Cpu + 'static>(
     reg!("AddLibrary", add_library_handler::<C>);
     reg!("SumLibrary", sum_library_handler::<C>);
     reg!("RemLibrary", rem_library_handler::<C>);
+    reg!("FindResident", find_resident_handler::<C>);
 }
 
 #[cfg(test)]
