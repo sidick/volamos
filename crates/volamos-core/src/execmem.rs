@@ -190,7 +190,7 @@ pub(crate) fn placement(requirements: u32) -> u32 {
 
 /// Size in bytes rounded to on every `AllocMem`/`FreeMem` request, and
 /// used as the `AllocVec`/`FreeVec` header size -- see the module docs.
-const MEMBLOCKSIZE: u32 = 8;
+pub(crate) const MEMBLOCKSIZE: u32 = 8;
 
 /// Rounds `value` up to the nearest multiple of [`MEMBLOCKSIZE`] (8),
 /// matching real `AllocMem`'s own size rounding. Saturates rather than
