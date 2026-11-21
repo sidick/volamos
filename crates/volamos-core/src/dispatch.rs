@@ -4033,6 +4033,8 @@ impl<C: Cpu + 'static> Runtime<C> {
             node,
         );
 
+        self.install_rom_residents()?;
+
         // The prologue (see the method's doc): 48 bytes of code, then the
         // name, then the result cell, all one heap block.
         const CODE_LEN: u32 = 48;
@@ -4085,6 +4087,58 @@ impl<C: Cpu + 'static> Runtime<C> {
 
         self.cpu_library_cell = cell;
         self.cpu.set_pc(block);
+        Ok(())
+    }
+
+    /// Gives `ExecBase.ResModules` the two ROM modules `mmu.library` looks
+    /// for, so `FindResident("expansion.library")` finds something, as it
+    /// does on a booted Amiga. Part of [`Self::prepare_cpu_library`].
+    ///
+    /// `mmu.library` 47.x has a routine that asks "is this address in the
+    /// Kickstart ROM?": it takes the `expansion.library` romtag's address
+    /// as the ROM's start, `+ 256 KB` as its end, and trims that end to the
+    /// next `ResModules` entry above the start; without the romtag it
+    /// raises the recoverable alert `0x3e12800a` (and answers "no"). volamos
+    /// has no ROM, so the two residents are placed 64 bytes apart in one
+    /// heap block: the "ROM" the routine then sees is a 32-byte window
+    /// inside this block, with nothing of a guest's or a library's in it,
+    /// and every address it is asked about is correctly "not ROM".
+    fn install_rom_residents(&mut self) -> Result<(), String> {
+        const RESIDENT_SIZE: u32 = 26;
+        const SECOND_AT: u32 = 0x40;
+        const NT_LIBRARY: u8 = 9;
+        let heap_full = || "the guest heap is full".to_string();
+        let names: [&[u8]; 2] = [b"expansion.library\0", b"exec.library\0"];
+        let names_at = SECOND_AT + RESIDENT_SIZE;
+        let array_at = (names_at + names[0].len() as u32 + names[1].len() as u32 + 3) & !3;
+        let block = self
+            .heap
+            .alloc(&mut self.mem, array_at + 12)
+            .map_err(|_| heap_full())?;
+        for i in 0..array_at + 12 {
+            self.mem.write_u8(block + i, 0);
+        }
+        let mut name_addr = block + names_at;
+        for (n, name) in names.iter().enumerate() {
+            let resident = block + n as u32 * SECOND_AT;
+            self.mem.write_u16(resident, 0x4AFC); // RTC_MATCHWORD
+            self.mem.write_u32(resident + 2, resident); // rt_MatchTag: itself
+            self.mem.write_u32(resident + 6, resident + RESIDENT_SIZE); // rt_EndSkip
+            self.mem.write_u8(resident + 11, LIBRARY_VERSION as u8); // rt_Version
+            self.mem.write_u8(resident + 12, NT_LIBRARY); // rt_Type
+            self.mem.write_u32(resident + 14, name_addr); // rt_Name
+            for (i, &b) in name.iter().enumerate() {
+                self.mem.write_u8(name_addr + i as u32, b);
+            }
+            name_addr += name.len() as u32;
+        }
+        // The array: both residents and the NULL that ends it.
+        let array = block + array_at;
+        self.mem.write_u32(array, block);
+        self.mem.write_u32(array + 4, block + SECOND_AT);
+        self.mem.write_u32(array + 8, 0);
+        self.mem
+            .write_u32(EXEC_LIBRARY_BASE + EXEC_BASE_RESMODULES_OFFSET, array);
         Ok(())
     }
 
@@ -6839,6 +6893,24 @@ mod tests {
         assert_ne!(
             crate::execlist::find_name_impl(&rt.mem, device_list, b"input.device"),
             0
+        );
+        // The ROM modules `mmu.library` looks for: expansion.library found,
+        // with the next module 64 bytes on (a 32-byte "ROM" window).
+        let array = rt
+            .mem
+            .read_u32(EXEC_LIBRARY_BASE + EXEC_BASE_RESMODULES_OFFSET);
+        let (first, second) = (rt.mem.read_u32(array), rt.mem.read_u32(array + 4));
+        assert_eq!(rt.mem.read_u32(array + 8), 0, "the array ends");
+        let name_of =
+            |resident: u32| crate::guestmem::read_c_string(&rt.mem, rt.mem.read_u32(resident + 14));
+        assert_eq!(name_of(first), b"expansion.library");
+        assert_eq!(name_of(second), b"exec.library");
+        assert_eq!(second - first, 0x40);
+        assert_eq!(rt.mem.read_u16(first), 0x4AFC);
+        assert_eq!(
+            rt.mem.read_u32(first + 2),
+            first,
+            "rt_MatchTag points at itself"
         );
         assert_ne!(rt.cpu.pc(), entry, "starts at the prologue");
         assert!(
