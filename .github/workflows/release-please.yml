@@ -408,3 +408,74 @@ jobs:
             fi
             echo "$ref is pullable"
           done
+
+  # Points the Homebrew formula at the new release and opens a PR for it.
+  # It cannot ride in the release PR: the formula pins the checksum of the
+  # tag's source tarball, which does not exist until that PR is merged (and
+  # `brew audit --strict` rejects the checksum-free git-tag form).
+  #
+  # The bump is audited, built and tested here, before the PR exists,
+  # because a PR opened with GITHUB_TOKEN triggers no workflows of its own
+  # (see the header). A failure here leaves the release untouched and the
+  # weekly `Formula is at the latest release` check in homebrew.yml red
+  # until someone bumps by hand with tools/bump_homebrew_formula.sh.
+  homebrew:
+    name: Update the Homebrew formula
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          # The branch push below needs the token.
+          persist-credentials: true
+
+      # Pinned to a commit: the action has no release tags.
+      - uses: Homebrew/actions/setup-homebrew@63a2d4d8d4193eab3e62b1b782ff3ab8408f5b29 # main, 2026-11-06
+
+      - name: Bump the formula
+        id: bump
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          result=$(tools/bump_homebrew_formula.sh "$TAG")
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          if [ "$result" = unchanged ]; then
+            echo "Formula/volamos.rb already points at $TAG"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "chore/homebrew-${TAG}"
+          git commit -am "chore(release): update the Homebrew formula to ${TAG}"
+
+      # Audit the committed formula as a user's tap would see it.
+      - name: Audit, build and test
+        if: ${{ steps.bump.outputs.result == 'changed' }}
+        run: |
+          set -euo pipefail
+          brew tap sidick/volamos "$GITHUB_WORKSPACE"
+          brew trust sidick/volamos
+          brew audit --strict --online sidick/volamos/volamos
+          brew install --build-from-source sidick/volamos/volamos
+          brew test sidick/volamos/volamos
+
+      - name: Open the pull request
+        if: ${{ steps.bump.outputs.result == 'changed' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          git push --force origin "chore/homebrew-${TAG}"
+          gh pr create --base main --head "chore/homebrew-${TAG}" \
+            --title "chore(release): update the Homebrew formula to ${TAG}" \
+            --body "Points \`Formula/volamos.rb\` at ${TAG} and its tarball checksum. Opened by the \`homebrew\` job in \`release-please.yml\`, which has already run \`brew audit --strict --online\`, a source build and \`brew test\` on this exact commit. Merge when ready.
+
+          Docs: n/a — the formula's url and sha256 only, no user-visible surface."

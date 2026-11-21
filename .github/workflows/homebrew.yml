@@ -71,8 +71,8 @@ jobs:
 
   current:
     name: Formula is at the latest release
-    # A release does not update the formula (its checksum cannot exist until
-    # the tag does), so this is the reminder that a bump PR is due.
+    # The release-please workflow opens the bump PR; this catches it failing
+    # or sitting unmerged.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -87,7 +87,7 @@ jobs:
         run: |
           latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
           if ! grep -q "refs/tags/${latest}.tar.gz" Formula/volamos.rb; then
-            echo "::error::Formula/volamos.rb is not at the latest release ${latest}: update its url and sha256 (see CONTRIBUTING.md)"
+            echo "::error::Formula/volamos.rb is not at the latest release ${latest}: merge the bump PR or run tools/bump_homebrew_formula.sh (see CONTRIBUTING.md)"
             exit 1
           fi
           echo "Formula/volamos.rb is at ${latest}"

@@ -16,11 +16,10 @@
 #
 #   brew install --HEAD volamos
 #
-# Releases are cut by release-please, which does not touch this file: after
-# a release, update `url` (the new tag) and `sha256` below. Compute the
-# checksum from the tagged tarball:
-#
-#   curl -fsSL https://github.com/sidick/volamos/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+# Releases are cut by release-please, which cannot write the tarball
+# checksum (the tag does not exist yet). After each release a job in
+# .github/workflows/release-please.yml runs tools/bump_homebrew_formula.sh,
+# which rewrites the `url` and `sha256` lines below, and opens a PR.
 
 class Volamos < Formula
   desc "Wine-style runtime for classic AmigaOS m68k CLI binaries"
