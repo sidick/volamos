@@ -528,7 +528,8 @@ impl fmt::Display for AccessSite {
 
 /// End (exclusive) of the low memory guest data accesses are not allowed
 /// into: `0x000..0x200`, the part of the classic 68000 exception vector
-/// table (`0x000..0x400`) that volamos itself leaves alone.
+/// table (`0x000..0x400`) that volamos itself leaves alone (apart from
+/// the three cells above).
 ///
 /// It stops at [`crate::dispatch::VERSION_LIBRARY_BASE`] because that is
 /// where the runtime starts keeping things a guest legitimately reads:
@@ -539,7 +540,7 @@ impl fmt::Display for AccessSite {
 /// [`crate::dispatch::EXEC_LIBRARY_BASE`]'s "Reserved-region memory
 /// map"). Below it the runtime only keeps the vectors themselves, left
 /// zero for a guest handler, plus a cache-bits cell and two stub opcodes
-/// at `0xC0..0xC8` that no guest reads.
+/// at `0x100..0x108` that no guest reads.
 ///
 /// That still covers what the check is for: a NULL pointer plus any
 /// struct offset under 512 bytes, and LawBreaker's `$0000`/`$0101`/
