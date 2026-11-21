@@ -830,6 +830,8 @@ pub const TASK_EXIT_STUB_ADDR: u32 = 0x0106;
 // 48-55 (`0xC0..0xE0`), which once overwrote the continuation stub and the
 // cache-bits cell (#409).
 const _: () = {
+    // 64 vectors of 4 bytes: every one the 680x0 family defines.
+    assert!(EXCEPTION_VECTOR_TABLE_SIZE == 64 * 4);
     assert!(CACHE_BITS_ADDR >= EXCEPTION_VECTOR_TABLE_SIZE);
     assert!(CONTINUATION_STUB_ADDR >= EXCEPTION_VECTOR_TABLE_SIZE);
     assert!(TASK_EXIT_STUB_ADDR >= EXCEPTION_VECTOR_TABLE_SIZE);
@@ -5058,14 +5060,15 @@ mod tests {
         // confirm the hand-derived mechanism in the PR description: the
         // run ended in `RuntimeError::Dispatch(DispatchError::
         // EmptyContinuationStack { pc: 0x000000c4 })` -- exactly the
-        // reported "continuation stub trapped at 0x00000104 with no
-        // pending continuation" -- confirming that the `m68k` crate's
+        // reported "continuation stub trapped at 0x000000c4 with no
+        // pending continuation" (the stub's address then; it is
+        // CONTINUATION_STUB_ADDR, 0x104, now) -- confirming that the `m68k` crate's
         // internal `take_fp_disabled_060` jumps through vector 11's
         // slot (guest address 0x2C) directly (bypassing
         // `Cpu::take_hardware_exception` entirely), finds it genuinely
         // zero, sets PC to 0, and falls through the deliberately-zeroed
         // low-memory region until PC happens to land on
-        // CONTINUATION_STUB_ADDR (0x104) and executes it directly.
+        // CONTINUATION_STUB_ADDR and executes it directly.
         //
         // After the fix, this asserts the intended clean outcome
         // instead: an attributable `RuntimeError::UnexpectedStop` for an
@@ -6668,6 +6671,13 @@ mod tests {
                 ..StartConfig::default()
             },
         );
+        // Before the guest writes anything, all of vectors 2-63 are
+        // genuinely zero (not the "unknown call" sentinel), up to the
+        // address the runtime's own cells start at.
+        for vector in 2..64u32 {
+            assert_eq!(rt.memory().read_u32(vector * 4), 0, "vector {vector}");
+        }
+        assert_eq!(CACHE_BITS_ADDR, 64 * 4);
         let mut out = Vec::new();
         let code = rt.run(&mut out, None).expect("run should succeed");
         assert_eq!(code as u32, CACHE_BITS_DEFAULT);
