@@ -214,8 +214,10 @@ pub trait Cpu {
     /// [`Cpu::run`] just reported, other than [`TrapKind::ALine`] (this
     /// runtime's own library-call dispatch convention, always handled by
     /// the caller itself, never routed here): reads the guest's real
-    /// exception vector table (at `vector * 4`, matching a plain 68000
-    /// with `VBR` fixed at `0`), and if the guest has installed a
+    /// exception vector table (at `VBR + vector * 4`: `VBR` is `0` on a
+    /// plain 68000, and a 68010 or later guest can move it, as the real
+    /// `68040.library`/`68060.library` do to catch the illegal `MOVEC` of
+    /// a CPU probe), and if the guest has installed a
     /// handler there (a non-`0` entry -- real AmigaOS/well-behaved guest
     /// programs commonly do this for hardware feature detection, e.g.
     /// probing for an FPU by executing a real F-line instruction and
