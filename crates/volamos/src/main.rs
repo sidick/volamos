@@ -2780,6 +2780,7 @@ fn run_nested_program(
     // these report plain addresses. The return code stays the guest's:
     // it goes back to the calling program as System()'s result, not to
     // a host harness.
+    runtime.exempt_cpu_library_from_sanitizer();
     report_sanitizer_violations(&runtime, None);
     result
 }
@@ -3091,7 +3092,13 @@ fn run(opts: &Options) -> Result<i32, String> {
     let result = runtime
         .run(&mut out, Some(&mut trace))
         .map_err(|e| format!("{}: {e}", opts.program));
-    runtime.exempt_cpu_library_from_sanitizer();
+    let exempted = runtime.exempt_cpu_library_from_sanitizer();
+    if exempted > 0 {
+        eprintln!(
+            "volamos: --cpu-library: {exempted} sanitizer event(s) from the library's own \
+             code are not reported (it stands in for the CPU's microcode)"
+        );
+    }
     let violated =
         report_sanitizer_violations(&runtime, loaded.as_ref().map(|load| (&hunk_file, load)));
     report_emulated_cycles(&runtime);

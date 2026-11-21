@@ -6942,9 +6942,6 @@ mod tests {
         assert_eq!(rt.mem.read_u8(a0 + d0), 0);
     }
 
-    /// `prepare_cpu_library` puts an `input.device` node on the device list
-    /// (the real CPU libraries look for it) and starts the program at its
-    /// own prologue; the open has not failed until the prologue says so.
     /// The CPU library's own code ranges are its loaded segments, found
     /// through the name it was opened by -- nothing before it is opened, and
     /// no other library's.
@@ -6988,6 +6985,9 @@ mod tests {
         assert_eq!(ranges, vec![(seg_a, seg_a + 0x100), (seg_b, seg_b + 0x200)]);
     }
 
+    /// `prepare_cpu_library` puts an `input.device` node on the device list
+    /// (the real CPU libraries look for it) and starts the program at its
+    /// own prologue; the open has not failed until the prologue says so.
     #[test]
     fn prepare_cpu_library_adds_input_device_and_redirects_the_start() {
         let mut mem = FlatMemory::new(0x2_0000);

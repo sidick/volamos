@@ -1333,13 +1333,22 @@ impl ShadowMap {
     /// rather than as a check on every access.
     pub fn forget_violations_in(&self, ranges: &[(u32, u32)]) -> u64 {
         let mut dropped = 0;
-        self.violations.borrow_mut().retain(|v| {
+        let mut violations = self.violations.borrow_mut();
+        violations.retain(|v| {
             let inside = ranges.iter().any(|&(s, e)| v.pc >= s && v.pc < e);
             if inside {
                 dropped += v.hits;
             }
             !inside
         });
+        // The index maps each key to its position in the log: positions
+        // moved, so rebuild it from what is left (a dropped key is then
+        // free to be recorded afresh).
+        let mut index = self.index.borrow_mut();
+        index.clear();
+        for (i, v) in violations.iter().enumerate() {
+            index.insert((v.pc, v.addr, v.kind), i);
+        }
         dropped
     }
 
@@ -2086,6 +2095,9 @@ impl ShadowMap {
     /// practice this doesn't matter: callers are expected to set up
     /// their ignore list before a run (or before the interesting part of
     /// one) starts, not mid-run against a log they've already printed.
+    /// ([`Self::forget_violations_in`] is the one thing that does remove
+    /// recorded violations, for a PC *range* that is only known after the
+    /// run -- a `--cpu-library`'s own code.)
     pub fn ignore_pc(&mut self, pc: u32) {
         self.ignored_pcs.insert(pc);
     }
@@ -3464,6 +3476,18 @@ mod tests {
         assert_eq!(left[0].pc, 0x200);
         // The end of a range is exclusive.
         assert_eq!(shadow.forget_violations_in(&[(0x1F0, 0x200)]), 0);
+
+        // The log moved, and its index with it: a repeat of the surviving
+        // site bumps *that* entry, and a repeat of a dropped site is
+        // recorded afresh instead of landing on whatever took its slot.
+        shadow.set_current_pc(0x200);
+        shadow.record(0x28, 4, ViolationKind::InvalidWrite, None);
+        shadow.set_current_pc(0x100);
+        shadow.record(0x20, 4, ViolationKind::InvalidWrite, None);
+        let now = shadow.violations();
+        assert_eq!(now.len(), 2);
+        assert_eq!((now[0].pc, now[0].hits), (0x200, 2));
+        assert_eq!((now[1].pc, now[1].hits), (0x100, 1));
     }
 
     #[test]
