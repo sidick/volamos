@@ -92,9 +92,11 @@ const UNKNOWN_SLOT: u16 = 0;
 /// Size in bytes of the real m68k exception vector table region left
 /// genuinely zeroed rather than prefilled with the "unknown call"
 /// sentinel -- see [`EXEC_LIBRARY_BASE`]'s "Reserved-region memory map"
-/// doc for the full rationale. Covers vectors `0..=47` (`0xC0 / 4`),
-/// i.e. every vector up through `TRAP #15`.
-const EXCEPTION_VECTOR_TABLE_SIZE: u32 = 0xC0;
+/// doc for the full rationale. Covers vectors `0..=63` (`0x100 / 4`), every
+/// vector the 680x0 family defines: through `TRAP #15` (47) and on to the
+/// FPU and MMU ones (48-63), which a real `68040.library`/`68060.library`
+/// fills with its FPSP/ISP handlers.
+const EXCEPTION_VECTOR_TABLE_SIZE: u32 = 0x100;
 
 /// The slot index reserved for the shared fake-library-vector handler
 /// (see [`fake_lib_vector_handler`] and the "vamos escape hatch" module
@@ -243,23 +245,27 @@ pub const LVO_PUTSTR: i32 = -948;
 /// 0x0004 .. 0x0008   AbsExecBase: holds EXEC_LIBRARY_BASE (u32), the
 ///                     value a real program reads via `move.l 4,a6`.
 ///                     Not a jump-table entry -- never executed.
-/// 0x0008 .. 0x00C0   the real m68k exception vector table for vectors
-///                     2-47 (bus error through TRAP #15) -- deliberately
-///                     left genuinely zeroed (excluded from the
-///                     "unknown call" prefill sweep below) rather than
-///                     filled with trap opcodes, so a guest program that
-///                     installs its own handler here (a real, common
-///                     idiom -- e.g. probing for an FPU by executing a
-///                     real F-line instruction and catching the
-///                     resulting exception) gets genuine 68000 exception
-///                     semantics via `Cpu::take_hardware_exception`, not
-///                     a bogus jump into this runtime's own unrelated
-///                     trap-table bytes. `0x00C0` covers every vector a
-///                     CLI program would plausibly use (up through
-///                     `TRAP #15` at vector 47 = `0xBC`) while staying
-///                     comfortably clear of `dos.library`'s own LVO
-///                     region starting at `0x02CC` below.
-/// 0x00C0 .. 0x00C4   CACHE_BITS_ADDR: a plain guest-memory `u32` cell
+/// 0x0008 .. 0x0100   the real m68k exception vector table for vectors
+///                     2-63 (bus error through the MMU/reserved ones) --
+///                     deliberately left genuinely zeroed (excluded from
+///                     the "unknown call" prefill sweep below) rather
+///                     than filled with trap opcodes, so a guest program
+///                     that installs its own handler here (a real,
+///                     common idiom -- e.g. probing for an FPU by
+///                     executing a real F-line instruction and catching
+///                     the resulting exception) gets genuine 68000
+///                     exception semantics via
+///                     `Cpu::take_hardware_exception`, not a bogus jump
+///                     into this runtime's own unrelated trap-table
+///                     bytes. `0x0100` covers every vector the 680x0
+///                     family defines, including 48-55 (the FPU
+///                     exceptions), which the real `68040.library`/
+///                     `68060.library` fill with their FPSP handlers:
+///                     nothing of the runtime's may live there (the
+///                     continuation and task-exit stubs once sat at
+///                     `0xC4`/`0xC6`, and the library's handler pointers
+///                     overwrote them).
+/// 0x0100 .. 0x0104   CACHE_BITS_ADDR: a plain guest-memory `u32` cell
 ///                     holding the current `CACRF_*` cache-control
 ///                     bits (`crate::execmem`'s `CacheControl` handler
 ///                     reads/writes it directly) -- guest memory is the
@@ -267,16 +273,16 @@ pub const LVO_PUTSTR: i32 = -948;
 ///                     "no separate host-side mirror" convention
 ///                     `crate::exectask`'s module docs establish for
 ///                     task/signal state.
-/// 0x00C4 .. 0x00C6   CONTINUATION_STUB_ADDR: a single A-line opcode
+/// 0x0104 .. 0x0106   CONTINUATION_STUB_ADDR: a single A-line opcode
 ///                     word bound to CONTINUATION_SLOT -- the trampoline
 ///                     primitive's fixed "resume here after a
 ///                     trampolined guest subroutine's rts" address. See
 ///                     ContinuationStack's docs for the full mechanism.
-/// 0x00C6 .. 0x00C8   TASK_EXIT_STUB_ADDR: a single A-line opcode word
+/// 0x0106 .. 0x0108   TASK_EXIT_STUB_ADDR: a single A-line opcode word
 ///                     bound to TASK_EXIT_SLOT -- every CreateNewProc
 ///                     child task's initial stack return address (issue
 ///                     #121). See crate::taskswitch's module doc.
-/// 0x00C8 .. 0x0200   unused headroom
+/// 0x0108 .. 0x0200   unused headroom
 /// 0x0200 ..          VERSION_LIBRARY_BASE's header
 /// 0x0280 .. 0x02AE   SETPATCH_SEMAPHORE_ADDR: the `" SetPatch "` marker
 ///                     semaphore on SemaphoreList (see
@@ -787,7 +793,7 @@ pub(crate) const EXEC_BASE_THISTASK_OFFSET: u32 = 276;
 /// Guest address of the `u32` cell holding the current `CACRF_*` cache-
 /// control bits -- see [`EXEC_LIBRARY_BASE`]'s "Reserved-region memory
 /// map" doc.
-pub const CACHE_BITS_ADDR: u32 = 0x00C0;
+pub const CACHE_BITS_ADDR: u32 = 0x0100;
 
 /// [`CACHE_BITS_ADDR`]'s value at `Runtime::new` time: every
 /// documented "enable"/"burst" bit set (`CACRF_EnableI`/`IBE`/
@@ -806,7 +812,7 @@ pub(crate) const CACHE_BITS_DEFAULT: u32 = 0xC000_3111;
 /// region memory map" doc. Sits in the headroom immediately after
 /// [`CACHE_BITS_ADDR`]'s cell, well clear of `dos.library`'s registered
 /// LVOs starting at `0x02CC`.
-pub const CONTINUATION_STUB_ADDR: u32 = 0x00C4;
+pub const CONTINUATION_STUB_ADDR: u32 = 0x0104;
 
 /// Guest address of the task-exit stub (issue #121) -- see
 /// [`crate::taskswitch`]'s module doc and [`crate::exectask::
@@ -817,7 +823,19 @@ pub const CONTINUATION_STUB_ADDR: u32 = 0x00C4;
 /// child that falls off the end of its `NP_Entry` without calling
 /// anything terminal itself traps here instead of resuming into
 /// whatever garbage happens to sit below its stack.
-pub const TASK_EXIT_STUB_ADDR: u32 = 0x00C6;
+pub const TASK_EXIT_STUB_ADDR: u32 = 0x0106;
+
+// None of the runtime's own cells may sit in the exception vector table: a
+// real `68040.library`/`68060.library` writes handler pointers into vectors
+// 48-55 (`0xC0..0xE0`), which once overwrote the continuation stub and the
+// cache-bits cell (#409).
+const _: () = {
+    // 64 vectors of 4 bytes: every one the 680x0 family defines.
+    assert!(EXCEPTION_VECTOR_TABLE_SIZE == 64 * 4);
+    assert!(CACHE_BITS_ADDR >= EXCEPTION_VECTOR_TABLE_SIZE);
+    assert!(CONTINUATION_STUB_ADDR >= EXCEPTION_VECTOR_TABLE_SIZE);
+    assert!(TASK_EXIT_STUB_ADDR >= EXCEPTION_VECTOR_TABLE_SIZE);
+};
 
 /// Guest address of a single `ILLEGAL` (`0x4AFC`) opcode word, pre-seeded
 /// into vector 11's slot (`m68k::core::exceptions::vector::LINE_1111 * 4`
@@ -5043,13 +5061,14 @@ mod tests {
         // run ended in `RuntimeError::Dispatch(DispatchError::
         // EmptyContinuationStack { pc: 0x000000c4 })` -- exactly the
         // reported "continuation stub trapped at 0x000000c4 with no
-        // pending continuation" -- confirming that the `m68k` crate's
+        // pending continuation" (the stub's address then; it is
+        // CONTINUATION_STUB_ADDR, 0x104, now) -- confirming that the `m68k` crate's
         // internal `take_fp_disabled_060` jumps through vector 11's
         // slot (guest address 0x2C) directly (bypassing
         // `Cpu::take_hardware_exception` entirely), finds it genuinely
         // zero, sets PC to 0, and falls through the deliberately-zeroed
         // low-memory region until PC happens to land on
-        // CONTINUATION_STUB_ADDR (0xC4) and executes it directly.
+        // CONTINUATION_STUB_ADDR and executes it directly.
         //
         // After the fix, this asserts the intended clean outcome
         // instead: an attributable `RuntimeError::UnexpectedStop` for an
@@ -6615,6 +6634,60 @@ mod tests {
         rt.mem
             .write_u8(MSG + crate::execlist::LN_TYPE, crate::execlist::NT_REPLYMSG);
         assert_eq!(rt.shell_return_code(), Some(7));
+    }
+
+    /// A guest (or a CPU library) owns all 64 exception vectors, 48-55
+    /// included: filling them must not touch what the runtime keeps below
+    /// `0x200`. `CacheControl` reads its cache bits back from guest memory
+    /// and the continuation stub's opcode must still be in place.
+    #[test]
+    fn filling_every_exception_vector_leaves_the_runtime_cells_intact() {
+        let mut words = vec![
+            0x2C7C, // movea.l #EXEC_LIBRARY_BASE,a6
+            (EXEC_LIBRARY_BASE >> 16) as u16,
+            EXEC_LIBRARY_BASE as u16,
+        ];
+        for vector in 2..64u32 {
+            // move.l #0x0BAD0BAD,<vector*4>.l
+            words.extend_from_slice(&[0x23FC, 0x0BAD, 0x0BAD, 0, (vector * 4) as u16]);
+        }
+        words.extend_from_slice(&[
+            0x7000, // moveq #0,d0   (newBits)
+            0x7200, // moveq #0,d1   (mask: change nothing)
+            0x4EAE, // jsr CacheControl(a6)
+            (-648i16) as u16,
+            RTS,
+        ]);
+        let mut mem = FlatMemory::new(0x2_0000);
+        let entry = TRAP_TABLE_END;
+        load_words(&mut mem, entry, &words);
+        let mut rt = Runtime::new(
+            M68kCpu::new(),
+            mem,
+            StartConfig {
+                entry,
+                load_end: entry + 0x400,
+                args: Vec::new(),
+                ..StartConfig::default()
+            },
+        );
+        // Before the guest writes anything, all of vectors 2-63 are
+        // genuinely zero (not the "unknown call" sentinel), up to the
+        // address the runtime's own cells start at.
+        for vector in 2..64u32 {
+            assert_eq!(rt.memory().read_u32(vector * 4), 0, "vector {vector}");
+        }
+        assert_eq!(CACHE_BITS_ADDR, 64 * 4);
+        let mut out = Vec::new();
+        let code = rt.run(&mut out, None).expect("run should succeed");
+        assert_eq!(code as u32, CACHE_BITS_DEFAULT);
+        let mem = rt.memory();
+        assert_eq!(
+            mem.read_u16(CONTINUATION_STUB_ADDR),
+            0xA000 | CONTINUATION_SLOT
+        );
+        assert_eq!(mem.read_u16(TASK_EXIT_STUB_ADDR), 0xA000 | TASK_EXIT_SLOT);
+        assert_eq!(mem.read_u32(0xDC), 0x0BAD_0BAD, "vector 55 is the guest's");
     }
 
     #[test]
