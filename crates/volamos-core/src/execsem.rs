@@ -1630,6 +1630,24 @@ mod tests {
         }
     }
 
+    /// A chain entry that points back at its own array never ends: the
+    /// walk is bounded, so FindResident reports "not found".
+    #[test]
+    fn find_resident_gives_up_on_a_self_referencing_resmodules_array() {
+        const ARRAY: u32 = 0x1_0000;
+        let mut rt = exec_program_with(&find_resident_words(), |mem| {
+            crate::guestmem::write_c_string(mem, NAME_ADDR, b"exec.library");
+        });
+        let mem = rt.memory_mut();
+        mem.write_u32(ARRAY, 0x8000_0000 | ARRAY);
+        mem.write_u32(
+            EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_RESMODULES_OFFSET,
+            ARRAY,
+        );
+        let mut out = Vec::new();
+        assert_eq!(rt.run(&mut out, None).expect("run should succeed"), 0);
+    }
+
     // --- ObtainSemaphoreList/ReleaseSemaphoreList ---
 
     /// Hand-builds a `struct List` at `LIST_ADDR` containing `SEM_ADDR`

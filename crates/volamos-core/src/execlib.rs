@@ -1510,33 +1510,31 @@ const RT_NAME_OFFSET: u32 = 14;
 fn find_resident_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let name_ptr = ctx.cpu.address_register(AddressRegister(1));
     let wanted = read_c_string(ctx.mem, name_ptr);
-    let mut array = ctx
+    let mut slot = ctx
         .mem
         .read_u32(EXEC_LIBRARY_BASE + crate::dispatch::EXEC_BASE_RESMODULES_OFFSET);
     let mut found = 0;
-    // Bounded, like the other guest-list walks, so a corrupt array reads
-    // as "not found" instead of hanging the host.
-    'walk: for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
-        if array == 0 {
+    // One bound over every entry visited, chained arrays included, so a
+    // corrupt or unterminated array reads as "not found" instead of
+    // walking guest RAM and hanging the host.
+    for _ in 0..crate::guestmem::MAX_GUEST_LIST_WALK {
+        if slot == 0 {
             break;
         }
-        let mut slot = array;
-        loop {
-            let entry = ctx.mem.read_u32(slot);
-            if entry == 0 {
-                break 'walk;
-            }
-            if entry & 0x8000_0000 != 0 {
-                array = entry & 0x7FFF_FFFF;
-                continue 'walk;
-            }
-            let name = ctx.mem.read_u32(entry.wrapping_add(RT_NAME_OFFSET));
-            if name != 0 && read_c_string(ctx.mem, name) == wanted {
-                found = entry;
-                break 'walk;
-            }
-            slot = slot.wrapping_add(4);
+        let entry = ctx.mem.read_u32(slot);
+        if entry == 0 {
+            break;
         }
+        if entry & 0x8000_0000 != 0 {
+            slot = entry & 0x7FFF_FFFF;
+            continue;
+        }
+        let name = ctx.mem.read_u32(entry.wrapping_add(RT_NAME_OFFSET));
+        if name != 0 && read_c_string(ctx.mem, name) == wanted {
+            found = entry;
+            break;
+        }
+        slot = slot.wrapping_add(4);
     }
     ctx.cpu.set_data_register(DataRegister(0), found);
     Ok(())
