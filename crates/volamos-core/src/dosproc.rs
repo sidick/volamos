@@ -129,9 +129,11 @@ impl DosState {
             Some(_) => (None, self.initial_cwd.clone().or(caller_cwd)),
             // Not given: a `DupLock` of the caller's.
             None => {
+                // `dup_lock` returns a BPTR; `lock` is an address.
                 let dup = self
                     .current_dir_lock
                     .and_then(|addr| self.dup_lock(heap, mem, addr).ok())
+                    .map(addr_from_bptr)
                     .filter(|&addr| addr != 0);
                 (dup, caller_cwd)
             }
@@ -146,8 +148,10 @@ impl DosState {
             Some(addr) if addr != 0 => (addr, self.lock_amiga_path(addr)),
             Some(_) => (0, None),
             None => {
+                // `dup_lock` returns a BPTR; `home_lock` is an address.
                 let dup = self
                     .dup_lock(heap, mem, addr_from_bptr(caller_home_dir))
+                    .map(addr_from_bptr)
                     .unwrap_or(0);
                 // `PROGDIR:` and `pr_HomeDir` agree: no lock, no assign.
                 (dup, if dup != 0 { caller_progdir } else { None })
@@ -293,5 +297,57 @@ mod tests {
         dos.switch_process(2, true, 1);
         assert_eq!(dos.io_err(), 5);
         assert!(!dos.parked_procs.contains_key(&2));
+    }
+
+    #[test]
+    fn a_new_processs_default_directory_locks_are_its_own_to_unlock() {
+        // `pr_HomeDir` and `pr_CurrentDir` of a child that got neither
+        // `NP_HomeDir` nor `NP_CurrentDir` are `DupLock`s of its parent's,
+        // which `release_exited_task` unlocks when the child ends: they
+        // have to name the locks, or those are never freed.
+        let root = std::env::temp_dir().join(format!(
+            "volamos-dosproc-test-default-dirs-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("sub")).expect("create temp dir");
+        let vfs = crate::vfs::Vfs::new(crate::vfs::VfsConfig {
+            volumes: vec![("SYS".to_string(), root.clone())],
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .expect("build vfs");
+        let mut heap = GuestHeap::new(0x1000, 0x4000);
+        let mut mem = crate::memory::FlatMemory::new(0x8000);
+        let mut dos = DosState::new(Some(vfs));
+        let parent_home = dos
+            .lock(&mut heap, &mut mem, "SYS:sub", crate::doslock::SHARED_LOCK)
+            .expect("lock should succeed");
+        let parent_cwd = dos
+            .lock(&mut heap, &mut mem, "SYS:sub", crate::doslock::SHARED_LOCK)
+            .expect("lock should succeed");
+        dos.current_dir(addr_from_bptr(parent_cwd))
+            .expect("CurrentDir should succeed");
+        let live_before = heap.live_alloc_count();
+
+        let (state, cwd, home) =
+            dos.new_process_state(&mut heap, &mut mem, None, None, parent_home, false);
+
+        for (name, bptr) in [("pr_CurrentDir", cwd), ("pr_HomeDir", home)] {
+            assert_ne!(bptr, 0, "{name} should be a DupLock of the parent's");
+            assert_eq!(
+                dos.lock_amiga_path(addr_from_bptr(bptr)).as_deref(),
+                Some("SYS:sub"),
+                "{name} should name a lock on the parent's directory"
+            );
+        }
+        assert_eq!(state.current_dir_lock, Some(addr_from_bptr(cwd)));
+        dos.unlock(&mut heap, addr_from_bptr(cwd));
+        dos.unlock(&mut heap, addr_from_bptr(home));
+        assert_eq!(
+            heap.live_alloc_count(),
+            live_before,
+            "unlocking both should free both"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
