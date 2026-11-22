@@ -21,6 +21,30 @@
 
 Pick whichever of these fits your workflow:
 
+### Homebrew (macOS and Linux)
+
+This repository is its own Homebrew tap, so there is nothing to add
+beyond the repository URL:
+
+```sh
+brew tap sidick/volamos https://github.com/sidick/volamos
+brew trust sidick/volamos
+brew install volamos
+```
+
+Homebrew 7 and later load formulae only from taps you have trusted,
+which is what `brew trust` records; on an older Homebrew, leave that
+line out. The formula builds from source (Homebrew installs the `rust`
+build dependency for you, and the build takes a few minutes), so it
+works on Apple Silicon and Intel Macs and on Linux, and the resulting
+binary is compiled on your machine, so macOS Gatekeeper never
+quarantines it. `brew install --HEAD volamos` builds the latest
+development commit instead of the last release.
+
+The formula tracks tagged releases. It is updated after each release is
+published, so a brand-new release can take a short while to reach
+`brew upgrade volamos`.
+
 ### Prebuilt release binary
 
 Each tagged release publishes standalone, statically-linked binaries

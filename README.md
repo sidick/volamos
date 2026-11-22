@@ -31,6 +31,20 @@ system, or any Amiga hardware. A Windows build compiles cleanly too
 though it isn't CI-tested and running it under Windows/Wine hasn't been
 verified.
 
+## Installing
+
+On macOS or Linux with Homebrew (this repository is its own tap):
+
+```sh
+brew tap sidick/volamos https://github.com/sidick/volamos
+brew trust sidick/volamos   # Homebrew 7+
+brew install volamos
+```
+
+Prebuilt binaries and a container image are on the
+[releases page](https://github.com/sidick/volamos/releases); see
+[`userdocs/Installation.md`](userdocs/Installation.md) for all the options.
+
 ## Building
 
 Requires a recent stable Rust toolchain (via [rustup](https://rustup.rs)
