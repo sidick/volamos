@@ -103,6 +103,23 @@ impl DosState {
         }
     }
 
+    /// A `DupLock` of the lock at `addr`, as an *address* (nonzero), or
+    /// `None` if `addr` is `0` or not an open lock.
+    /// [`DosState::dup_lock`] itself returns a BPTR, which is not the
+    /// representation `ProcessState` uses for the locks handled here;
+    /// going through this keeps the two apart.
+    fn dup_lock_addr(
+        &mut self,
+        heap: &mut GuestHeap,
+        mem: &mut dyn AddressSpace,
+        addr: u32,
+    ) -> Option<u32> {
+        self.dup_lock(heap, mem, addr)
+            .ok()
+            .map(addr_from_bptr)
+            .filter(|&addr| addr != 0)
+    }
+
     /// The state a new process starts with, parked until it first runs:
     /// the current directory is `np_current_dir`'s lock as given (`0`: none,
     /// i.e. the starting directory), or a `DupLock` of the caller's (real
@@ -131,8 +148,7 @@ impl DosState {
             None => {
                 let dup = self
                     .current_dir_lock
-                    .and_then(|addr| self.dup_lock(heap, mem, addr).ok())
-                    .filter(|&addr| addr != 0);
+                    .and_then(|addr| self.dup_lock_addr(heap, mem, addr));
                 (dup, caller_cwd)
             }
         };
@@ -146,8 +162,13 @@ impl DosState {
             Some(addr) if addr != 0 => (addr, self.lock_amiga_path(addr)),
             Some(_) => (0, None),
             None => {
+                // A caller with no home lock, or one that is stale (already
+                // unlocked), leaves the child without a home directory and
+                // without a `PROGDIR:` assign. It is not an error of the
+                // call: `CreateNewProc` still starts the child, and the
+                // parent's `IoErr` is not touched.
                 let dup = self
-                    .dup_lock(heap, mem, addr_from_bptr(caller_home_dir))
+                    .dup_lock_addr(heap, mem, addr_from_bptr(caller_home_dir))
                     .unwrap_or(0);
                 // `PROGDIR:` and `pr_HomeDir` agree: no lock, no assign.
                 (dup, if dup != 0 { caller_progdir } else { None })
@@ -293,5 +314,138 @@ mod tests {
         dos.switch_process(2, true, 1);
         assert_eq!(dos.io_err(), 5);
         assert!(!dos.parked_procs.contains_key(&2));
+    }
+
+    /// A unique temp directory with a `sub` directory in it, removed on
+    /// drop so a failing assertion leaves nothing behind.
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("volamos-dosproc-test-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("sub")).expect("create temp dir");
+            TempRoot(root)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A `DosState` over `root` as `SYS:`, with a heap and memory to lock in.
+    fn dos_over(root: &TempRoot) -> (DosState, GuestHeap, crate::memory::FlatMemory) {
+        let vfs = crate::vfs::Vfs::new(crate::vfs::VfsConfig {
+            volumes: vec![("SYS".to_string(), root.0.clone())],
+            cwd: "SYS:".to_string(),
+            ..Default::default()
+        })
+        .expect("build vfs");
+        (
+            DosState::new(Some(vfs)),
+            GuestHeap::new(0x1000, 0x4000),
+            crate::memory::FlatMemory::new(0x8000),
+        )
+    }
+
+    fn lock_sub(
+        dos: &mut DosState,
+        heap: &mut GuestHeap,
+        mem: &mut crate::memory::FlatMemory,
+    ) -> u32 {
+        dos.lock(heap, mem, "SYS:sub", crate::doslock::SHARED_LOCK)
+            .expect("lock should succeed")
+    }
+
+    #[test]
+    fn a_new_process_default_directory_locks_are_its_own_to_unlock() {
+        // `pr_HomeDir` and `pr_CurrentDir` of a child that got neither
+        // `NP_HomeDir` nor `NP_CurrentDir` are `DupLock`s of its parent's,
+        // which `release_exited_task` unlocks when the child ends: they
+        // have to name the locks, or those are never freed.
+        let root = TempRoot::new("default-dirs");
+        let (mut dos, mut heap, mut mem) = dos_over(&root);
+        let parent_home = lock_sub(&mut dos, &mut heap, &mut mem);
+        let parent_cwd = lock_sub(&mut dos, &mut heap, &mut mem);
+        dos.current_dir(addr_from_bptr(parent_cwd))
+            .expect("CurrentDir should succeed");
+        let live_before = heap.live_alloc_count();
+
+        let (state, cwd, home) =
+            dos.new_process_state(&mut heap, &mut mem, None, None, parent_home, false);
+
+        for (name, bptr) in [("pr_CurrentDir", cwd), ("pr_HomeDir", home)] {
+            assert_ne!(bptr, 0, "{name} should be a DupLock of the parent's");
+            assert_eq!(
+                dos.lock_amiga_path(addr_from_bptr(bptr)).as_deref(),
+                Some("SYS:sub"),
+                "{name} should name a lock on the parent's directory"
+            );
+        }
+        assert_eq!(state.current_dir_lock, Some(addr_from_bptr(cwd)));
+        dos.unlock(&mut heap, addr_from_bptr(cwd));
+        dos.unlock(&mut heap, addr_from_bptr(home));
+        assert_eq!(
+            heap.live_alloc_count(),
+            live_before,
+            "unlocking both should free both"
+        );
+    }
+
+    #[test]
+    fn explicit_np_directories_are_used_as_given_not_duplicated() {
+        let root = TempRoot::new("explicit-dirs");
+        let (mut dos, mut heap, mut mem) = dos_over(&root);
+        let given_cwd = lock_sub(&mut dos, &mut heap, &mut mem);
+        let given_home = lock_sub(&mut dos, &mut heap, &mut mem);
+        let live_before = heap.live_alloc_count();
+
+        let (state, cwd, home) = dos.new_process_state(
+            &mut heap,
+            &mut mem,
+            Some(given_cwd),
+            Some(given_home),
+            0,
+            false,
+        );
+
+        assert_eq!((cwd, home), (given_cwd, given_home));
+        assert_eq!(state.current_dir_lock, Some(addr_from_bptr(given_cwd)));
+        assert_eq!(heap.live_alloc_count(), live_before, "nothing duplicated");
+    }
+
+    #[test]
+    fn an_explicit_zero_np_directory_means_none_even_if_the_parent_has_one() {
+        let root = TempRoot::new("zero-dirs");
+        let (mut dos, mut heap, mut mem) = dos_over(&root);
+        let parent_home = lock_sub(&mut dos, &mut heap, &mut mem);
+        let parent_cwd = lock_sub(&mut dos, &mut heap, &mut mem);
+        dos.current_dir(addr_from_bptr(parent_cwd))
+            .expect("CurrentDir should succeed");
+
+        let (state, cwd, home) =
+            dos.new_process_state(&mut heap, &mut mem, Some(0), Some(0), parent_home, false);
+
+        assert_eq!((cwd, home), (0, 0));
+        assert_eq!(state.current_dir_lock, None);
+        assert_eq!(state.progdir, None);
+    }
+
+    #[test]
+    fn a_stale_parent_home_lock_gives_the_child_no_home_directory() {
+        let root = TempRoot::new("stale-home");
+        let (mut dos, mut heap, mut mem) = dos_over(&root);
+        let parent_home = lock_sub(&mut dos, &mut heap, &mut mem);
+        dos.unlock(&mut heap, addr_from_bptr(parent_home));
+        dos.set_io_err(77);
+
+        let (state, _, home) =
+            dos.new_process_state(&mut heap, &mut mem, None, None, parent_home, false);
+
+        assert_eq!(home, 0);
+        assert_eq!(state.progdir, None, "no lock, no PROGDIR:");
+        assert_eq!(dos.io_err(), 77, "the parent's IoErr is left alone");
     }
 }
