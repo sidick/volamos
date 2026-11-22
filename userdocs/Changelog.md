@@ -3,6 +3,36 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.23.0](https://github.com/sidick/volamos/compare/v0.22.0...v0.23.0) (2026-11-22)
+
+
+### Features
+
+* **build:** add a Homebrew formula; the repository is its own tap ([#424](https://github.com/sidick/volamos/issues/424)) ([5e33df1](https://github.com/sidick/volamos/commit/5e33df138f4864cdefe0464881026e3588242929))
+* **cli:** add --cpu-library to run a real 68040/68060 library's FPSP ([#418](https://github.com/sidick/volamos/issues/418)) ([ba13142](https://github.com/sidick/volamos/commit/ba13142eb05ac41db7af24ed2b3227a3eca42228))
+* **cli:** run a real AmigaDOS Shell interactively with --shell ([#407](https://github.com/sidick/volamos/issues/407)) ([1f4089c](https://github.com/sidick/volamos/commit/1f4089cdb5ad84d28c766f1fb412bc8ca4a39100))
+* **dos:** CreateNewProc accepts NP_Seglist and NP_FreeSeglist ([#401](https://github.com/sidick/volamos/issues/401)) ([450f8d3](https://github.com/sidick/volamos/commit/450f8d314987f805058e5cd243f17a6aae900917)), closes [#346](https://github.com/sidick/volamos/issues/346)
+* **dos:** Ctrl-D/E/F as breaks in raw mode, and console packets ([#406](https://github.com/sidick/volamos/issues/406)) ([daae23e](https://github.com/sidick/volamos/commit/daae23efc90aa8fa18e9afc815d171ff098393e7))
+* **dos:** SetMode raw mode and WaitForChar on a terminal ([#405](https://github.com/sidick/volamos/issues/405)) ([77b069e](https://github.com/sidick/volamos/commit/77b069e149ecbedd2c9ec70ca7a750c6ad648ba7)), closes [#315](https://github.com/sidick/volamos/issues/315)
+* **exec:** add AllocAbs ([#412](https://github.com/sidick/volamos/issues/412)) ([1fe5ca4](https://github.com/sidick/volamos/commit/1fe5ca42ee7316e0fe94001713a84cb0cbdd2689))
+* **exec:** add the SetPatch marker semaphore and FindResident ([#410](https://github.com/sidick/volamos/issues/410)) ([3b5c830](https://github.com/sidick/volamos/commit/3b5c8303ada94835c38ac7ce104599dba8507112))
+
+
+### Bug Fixes
+
+* **backend:** look up a guest exception handler through VBR ([#416](https://github.com/sidick/volamos/issues/416)) ([5f1b4d5](https://github.com/sidick/volamos/commit/5f1b4d57a1ecc4f2b2f6e09209820fe7c51b7a89))
+* **cli:** give --cpu-library the ROM modules mmu.library looks for ([#419](https://github.com/sidick/volamos/issues/419)) ([5da9d1d](https://github.com/sidick/volamos/commit/5da9d1d43a71569af4b4760faec46e7181a8bd3b))
+* **deps:** update rust crate m68k to v0.17.2 ([#429](https://github.com/sidick/volamos/issues/429)) ([fcf7df7](https://github.com/sidick/volamos/commit/fcf7df73971bf88adf9c93f85b11a3fa0ff6693c))
+* **dos:** give a new process valid default pr_HomeDir and pr_CurrentDir locks ([#430](https://github.com/sidick/volamos/issues/430)) ([4ad8e4e](https://github.com/sidick/volamos/commit/4ad8e4eec1b909994c1b3e2e6d8439e46db5c0e1))
+* **dos:** keep CliInitRun/SetPrompt inside the CLI's real buffers ([#411](https://github.com/sidick/volamos/issues/411)) ([cd238c2](https://github.com/sidick/volamos/commit/cd238c2f91cb1a18a34377ae9d8fb6bb41939799))
+* **exec:** allocate MakeLibrary blocks the way AllocMem does ([#415](https://github.com/sidick/volamos/issues/415)) ([3e11cd4](https://github.com/sidick/volamos/commit/3e11cd4d84b4c3f74b67c8bc3ee6f508952b9440))
+* **exec:** keep the runtime's cells out of the exception vector table ([#413](https://github.com/sidick/volamos/issues/413)) ([99a4d18](https://github.com/sidick/volamos/commit/99a4d18c99e6e3e679f3810e006b57c598932de9))
+* **exec:** let AllocAbs claim memory the free quarantine is holding ([#420](https://github.com/sidick/volamos/issues/420)) ([d924c3b](https://github.com/sidick/volamos/commit/d924c3b5635e4fdb93d9c2451e19229ff8eae352))
+* **exec:** make timer.device TR_ADDREQUEST follow its unit ([#403](https://github.com/sidick/volamos/issues/403)) ([17d5508](https://github.com/sidick/volamos/commit/17d550861f883294a97c4039d79073aa431a69aa)), closes [#296](https://github.com/sidick/volamos/issues/296)
+* **exec:** make WaitIO wait for a pending timer request and AbortIO reply it ([#404](https://github.com/sidick/volamos/issues/404)) ([d118c4e](https://github.com/sidick/volamos/commit/d118c4eb19d451e840ae1b0e9fc43a12994a9705)), closes [#295](https://github.com/sidick/volamos/issues/295)
+* **exec:** SetFunction takes funcOffset in A0.W and the new function in D0 ([#417](https://github.com/sidick/volamos/issues/417)) ([1d01264](https://github.com/sidick/volamos/commit/1d012641d0cbc25ea1bd3b9f3a5b9cba297600ee))
+* **sanitize:** do not report the --cpu-library's own code ([#421](https://github.com/sidick/volamos/issues/421)) ([bcf4265](https://github.com/sidick/volamos/commit/bcf42651ab47c892dfce179dab8fc577319df19b))
+
 ## [0.22.0](https://github.com/sidick/volamos/compare/v0.21.0...v0.22.0) (2026-11-20)
 
 
