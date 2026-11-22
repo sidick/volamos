@@ -24,8 +24,8 @@
 class Volamos < Formula
   desc "Wine-style runtime for classic AmigaOS m68k CLI binaries"
   homepage "https://sidick.github.io/volamos/"
-  url "https://github.com/sidick/volamos/archive/refs/tags/v0.22.0.tar.gz"
-  sha256 "4713485e61625f0107723feebfd8eb291a3556c0d0225c575a36378571e450e3"
+  url "https://github.com/sidick/volamos/archive/refs/tags/v0.23.0.tar.gz"
+  sha256 "5ac70954045206ab8e8e0cdfcd328d109e2dbdc78fd281621136e2e0db037ff5"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/sidick/volamos.git", branch: "main"
 
