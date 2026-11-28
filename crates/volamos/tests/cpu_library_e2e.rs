@@ -126,7 +126,7 @@ fn a_missing_library_file_is_one_clear_error() {
 fn it_cannot_be_combined_with_fpsp_emulate() {
     let output = volamos()
         .args([
-            "--fpsp-emulate",
+            "--fpsp",
             "--cpu-library",
             &fixture("testlib"),
             &fixture("hello"),

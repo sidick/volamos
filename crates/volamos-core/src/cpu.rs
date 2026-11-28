@@ -163,7 +163,7 @@ pub trait Cpu {
     fn has_fpu(&self) -> bool;
 
     /// Whether the CPU executes what a 68040/68060 dropped from silicon
-    /// (`--fpsp-emulate`) instead of trapping.
+    /// (`--fpsp`) instead of trapping.
     fn fpsp_emulate(&self) -> bool;
 
     /// Reads the program counter.
