@@ -138,7 +138,8 @@ fn systest_without_vfs_fails_cleanly_and_never_reaches_the_success_path() {
 
 /// A `System()`ed command starts with a copy of its caller's local
 /// variables (`NP_CopyVars` defaults TRUE), gets none with `NP_CopyVars,
-/// FALSE`, and its own `SetVar` doesn't reach the caller -- see
+/// FALSE`, an `Execute()`d one gets a copy too, and the command's own
+/// `SetVar` doesn't reach the caller -- see
 /// `fixtures/gen_vartest.py`. Before this, the nested run started with no
 /// variables at all.
 #[test]
@@ -158,5 +159,8 @@ fn system_gives_the_command_a_copy_of_the_callers_local_vars() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(stdout_of(&output), "inherited\nunset\ninherited\n");
+    assert_eq!(
+        stdout_of(&output),
+        "inherited\nunset\ninherited\ninherited\n"
+    );
 }

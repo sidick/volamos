@@ -1158,9 +1158,10 @@ impl DosState {
     /// `Execute()`: returns whether the command was successfully
     /// *invoked* (independent of its own exit code) -- `true` maps to
     /// `D0 = DOSTRUE`, `false` to `D0 = DOSFALSE` with `IoErr()` set, in
-    /// [`execute_handler`]. `Execute()` takes no tags, so the command
-    /// always gets a copy of the caller's local variables, as from a
-    /// `System()` without `NP_CopyVars`.
+    /// [`execute_handler`]. `Execute()` takes no tags and the command
+    /// always gets a copy of the caller's local variables. The autodoc
+    /// doesn't say so; real Kickstart 3.1 (40.63) does it
+    /// (`fixtures/gen_vartest.py`, under Copperline).
     pub fn execute(&mut self, command_line: &str) -> bool {
         match self.resolve_and_run(command_line, true) {
             Ok(_code) => true,
@@ -1252,8 +1253,10 @@ fn system_tag_list_handler<C: Cpu + 'static>(
 
     let asynch =
         crate::exectask::tag_data(ctx.mem, tags, SYS_ASYNCH).is_some_and(|value| value != 0);
+    let copy_vars = crate::exectask::tag_data(ctx.mem, tags, crate::exectask::NP_COPYVARS)
+        .is_none_or(|value| value != 0);
     let code = if asynch {
-        match start_system_child(ctx, &command_line, tags) {
+        match start_system_child(ctx, &command_line, tags, copy_vars) {
             Ok(()) => 0,
             Err(io_err) => {
                 ctx.dos.set_io_err(io_err);
@@ -1261,8 +1264,6 @@ fn system_tag_list_handler<C: Cpu + 'static>(
             }
         }
     } else {
-        let copy_vars = crate::exectask::tag_data(ctx.mem, tags, crate::exectask::NP_COPYVARS)
-            .is_none_or(|value| value != 0);
         ctx.dos.system(&command_line, copy_vars)
     };
     ctx.cpu.set_data_register(DataRegister(0), code as u32);
@@ -1291,6 +1292,7 @@ fn start_system_child<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     command_line: &str,
     tags: u32,
+    copy_vars: bool,
 ) -> Result<(), i32> {
     let trimmed = command_line.trim_start();
     let program = trimmed
@@ -1341,7 +1343,7 @@ fn start_system_child<C: Cpu>(
         exit_data: tag(crate::exectask::NP_EXITDATA).unwrap_or(0),
         current_dir: None,
         home_dir: None,
-        copy_vars: tag(crate::exectask::NP_COPYVARS).is_none_or(|value| value != 0),
+        copy_vars,
         cli_command_name: Some(program.to_string()),
         seglist,
     };

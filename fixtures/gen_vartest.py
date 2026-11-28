@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generates fixtures/vartest: proves a `System()`ed command starts with a
 copy of its caller's local shell variables (`NP_CopyVars`, default TRUE),
-that `NP_CopyVars, FALSE` withholds them, and that nothing the command
-does to its copy reaches the caller.
+that `NP_CopyVars, FALSE` withholds them, that `Execute()` copies them
+too, and that nothing the command does to its copy reaches the caller.
 
 Real `SystemTagList` spawns a shell process through `CreateNewProc()`,
 passing its tags on; `NP_CopyVars` is not among the tags it filters out
@@ -17,12 +17,15 @@ One program plays both parts, chosen by its command line (`A0` at entry):
      `inherited`.
   3. `SystemTagList("TEST:vartest child", [NP_CopyVars, FALSE])`: the
      child should print `unset`.
-  4. Prints its own `VARTEST`, which must still be `inherited`: the first
+  4. `Execute("TEST:vartest child", 0, Output())`: the autodoc doesn't
+     say, but real Kickstart 3.1 copies the variables here too, so the
+     child prints `inherited`.
+  5. Prints its own `VARTEST`, which must still be `inherited`: the first
      child's `SetVar` went to its own copy.
 - **Child** (command line `child`): prints `VARTEST` (or `unset`), then
   `SetVar("VARTEST", "changed", -1, LV_VAR)` on its copy.
 
-So the whole run's stdout is `inherited\\nunset\\ninherited\\n`, exit code
+So the whole run's stdout is `inherited\\nunset\\ninherited\\ninherited\\n`, exit code
 0 -- byte-identical on real Kickstart 3.1 (40.63, A600, 68000, via
 Copperline: the volume mounted as `TEST:`, an empty `ENV:` mounted for
 the second child's fall-through to the global store, and
@@ -42,6 +45,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 OUT_PATH = HERE / "vartest"
 
 # LVOs used (see crates/volamos-core/src/lvos/{dos,exec}.rs):
+LVO_OUTPUT = -60
+LVO_EXECUTE = -222
 LVO_OPENLIBRARY = -552
 LVO_SYSTEMTAGLIST = -606
 LVO_SETVAR = -900
@@ -99,6 +104,13 @@ def build_program() -> bytes:
     code.move_l_label_to_d(D1, "cmd")
     code.move_l_label_to_d(D2, "nocopytags")
     code.jsr_disp16_a(A6, LVO_SYSTEMTAGLIST)
+
+    # Execute("TEST:vartest child", 0, Output())
+    code.jsr_disp16_a(A6, LVO_OUTPUT)
+    code.move_l_d_to_d(D3, D0)
+    code.move_l_label_to_d(D1, "cmd")
+    code.moveq(D2, 0)
+    code.jsr_disp16_a(A6, LVO_EXECUTE)
 
     code.branch(CodeBuilder.BSR, "show")
     code.moveq(D0, 0)
