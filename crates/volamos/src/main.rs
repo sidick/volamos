@@ -2728,6 +2728,7 @@ fn build_nested_runtime(
 fn run_nested_program(
     host_path: &std::path::Path,
     args: &[String],
+    local_vars: &std::collections::HashMap<String, Vec<u8>>,
     vfs_config: Option<VfsConfig>,
     stack_size: u32,
     layout: volamos_core::memmap::MemoryLayout,
@@ -2765,6 +2766,11 @@ fn run_nested_program(
     ) else {
         return -1;
     };
+    // The command's shell starts with a copy of the caller's local
+    // variables (NP_CopyVars, see SystemRequest::local_vars).
+    for (name, value) in local_vars {
+        runtime.set_local_var(name.as_bytes(), value);
+    }
 
     let stdout = io::stdout();
     let mut out = GuestStdout::new(stdout.lock());
@@ -3053,6 +3059,7 @@ fn run(opts: &Options) -> Result<i32, String> {
         run_nested_program(
             &req.resolved_program_host_path,
             &req.args,
+            &req.local_vars,
             vfs_config.clone(),
             nested_stack_size,
             nested_layout.clone(),

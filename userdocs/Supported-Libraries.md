@@ -125,7 +125,10 @@ of the built-in emulation), see [`--cpu-library`](CLI-Reference.md#-cpu-library-
   `struct LocalVar` for a local (`LV_VAR`) variable; a later `SetVar`
   updates it in place and `DeleteVar` frees it. The structures are not linked into
   `pr_LocalVars`, and an `LV_ALIAS` lookup reports "not found". clib2's
-  `setenv()`/`putenv()` need it.
+  `setenv()`/`putenv()` need it. A program started with `System()`,
+  `Execute()` or `CreateNewProc()` gets a copy of its caller's local
+  variables, unless the tag list has `NP_CopyVars, FALSE`. Changes it
+  makes to its copy don't reach the caller.
 - Date/time: `StrToDate`/`DateToStr`/`DateStamp`/`CompareDates`/`Delay`.
 - Process/CLI: `Cli`/`GetProgramName`/`SetProgramName`/`MaxCli`/
   `GetArgStr`/`SetArgStr` (`pr_Arguments`, the same buffer startup

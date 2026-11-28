@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const SYSTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/systest");
 const ECHOARGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/echoargs");
+const VARTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/vartest");
 
 /// `fixtures/systest`'s distinctive success exit code (see
 /// `fixtures/gen_systest.py`'s `SUCCESS_EXIT_CODE`).
@@ -133,4 +134,29 @@ fn systest_without_vfs_fails_cleanly_and_never_reaches_the_success_path() {
         !stdout.contains("after system\n"),
         "the success-path message shouldn't print when SystemTagList failed to run anything"
     );
+}
+
+/// A `System()`ed command starts with a copy of its caller's local
+/// variables (`NP_CopyVars` defaults TRUE), gets none with `NP_CopyVars,
+/// FALSE`, and its own `SetVar` doesn't reach the caller -- see
+/// `fixtures/gen_vartest.py`. Before this, the nested run started with no
+/// variables at all.
+#[test]
+fn system_gives_the_command_a_copy_of_the_callers_local_vars() {
+    let tmp = TempDir::new("vartest");
+    fs::copy(VARTEST_PATH, tmp.path().join("vartest")).expect("copy vartest fixture");
+
+    let output = volamos()
+        .arg("-V")
+        .arg(format!("TEST:{}", tmp.path().display()))
+        .arg(tmp.path().join("vartest"))
+        .output()
+        .expect("failed to run volamos");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "inherited\nunset\ninherited\n");
 }

@@ -4275,6 +4275,18 @@ impl<C: Cpu + 'static> Runtime<C> {
         self.dos.system_runner = Some(Box::new(runner));
     }
 
+    /// Sets a local (`LV_VAR`) variable of the initial process, as a
+    /// guest `SetVar(name, value, len, LV_VAR)` would: the name is
+    /// matched case-insensitively and the value is stored as given.
+    /// Call it before [`Runtime::run`]. A `System()` runner uses it to
+    /// hand a nested program the caller's variables (see
+    /// [`crate::dosseg::SystemRequest::local_vars`]).
+    pub fn set_local_var(&mut self, name: &[u8], value: &[u8]) {
+        self.dos
+            .local_vars
+            .insert(crate::dosvar::local_key(name), value.to_vec());
+    }
+
     /// Mutable access to the library table, so callers can register
     /// additional handlers (or override the default `PutStr`) before
     /// [`Runtime::run`].
