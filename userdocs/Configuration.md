@@ -38,6 +38,7 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 |---|---|---|
 | `VOLUME` | `-V`/`--volume` | `NAME:hostdir`, repeatable |
 | `ASSIGN` | `-a`/`--assign` | `NAME:target[+target...]`, repeatable |
+| `VAR` | `--var` | `NAME=VALUE` (so `VAR=NAME=VALUE`), repeatable |
 | `CWD` | `--cwd` | |
 | `AUTO_ASSIGN` | `--auto-assign` | |
 | `STACK` | `--stack` | same `K`/`M`-suffixed `SIZE` syntax |
@@ -51,8 +52,8 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 | `DEFAULTS` | `--defaults`/`--no-defaults` | `true`/`false`; see [Volumes and Assigns](Volumes-and-Assigns.md#standard-defaults) |
 | `VOLUMES_DIR` | `--volumes-dir` | where the default `SYS:` volume lives |
 
-`VOLUME`/`ASSIGN` are **repeatable** — one line per entry, same as
-giving `-V`/`-a` more than once. Every other key is **singular**: if
+`VOLUME`/`ASSIGN`/`VAR` are **repeatable** — one line per entry, same as
+giving `-V`/`-a`/`--var` more than once. Every other key is **singular**: if
 the same key appears more than once in one file, the last line wins
 (the same rule repeating a CLI flag already follows).
 
@@ -126,6 +127,13 @@ same name wins) while `LIBS:` still resolves to
 `/home/me/amiga/libs` (only the global file mentions it, so it applies
 unchanged). Adding `-V SYS:/tmp/override` on the command line would
 win over both, same as any other flag.
+
+`VAR` works the same way: every source's variables are set, and where
+the same name appears in more than one source, the higher-precedence
+value wins (`--var` over `./.volamos`, and so on down). Within one
+source the last line for a name wins. Leading and trailing whitespace
+around a config-file value is trimmed, so a value that needs it has to
+be given with `--var`.
 
 ## Errors
 

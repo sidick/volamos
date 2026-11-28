@@ -293,6 +293,10 @@ struct Options {
     shell: bool,
     volumes: Vec<(String, PathBuf)>,
     assigns: Vec<(String, Vec<String>)>,
+    /// `--var`/`VAR`: local variables the initial process starts with,
+    /// applied in order so a later entry for the same name wins (see
+    /// `config::merge` for the cross-source order).
+    vars: Vec<(String, String)>,
     cwd: Option<String>,
     auto_assign_root: Option<PathBuf>,
     /// `--libs-dir` (CLI-only, like `sanitize`/`clock_mhz` above --
@@ -469,6 +473,12 @@ fn parse_assign_arg(s: &str) -> Result<(String, Vec<String>), String> {
     ))
 }
 
+/// Parses a `--var NAME=VALUE` argument.
+fn parse_var_arg(s: &str) -> Result<(String, String), String> {
+    let (name, value) = split_var("--var", s)?;
+    Ok((name.to_string(), value.to_string()))
+}
+
 /// Thin `--stack`-flavored wrapper around [`parse_byte_size`], for use as a
 /// clap `value_parser` (which only passes the value string, not a flag
 /// name).
@@ -634,6 +644,21 @@ struct Cli {
                       multi-assign search order (repeatable)."
     )]
     assign: Vec<(String, Vec<String>)>,
+
+    /// Start the program with local shell variable NAME set to VALUE (repeatable)
+    #[arg(
+        long = "var",
+        value_name = "NAME=VALUE",
+        value_parser = parse_var_arg,
+        help_heading = "Environment",
+        long_help = "Start the program with the local shell variable NAME set to VALUE \
+                      (repeatable), as if it had called SetVar(NAME, VALUE, -1, LV_VAR) \
+                      first: GetVar and FindVar see it. The value is everything after the \
+                      first '=', and may be empty. Names are case-insensitive; if a name is \
+                      given more than once, the last one wins. A program it starts with \
+                      System()/Execute() or CreateNewProc gets a copy."
+    )]
+    var: Vec<(String, String)>,
 
     /// Initial guest current directory
     #[arg(
@@ -1341,6 +1366,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         snoop: cli.snoop.then_some(true),
         volumes: cli.volume,
         assigns: cli.assign,
+        vars: cli.var,
         cwd: cli.cwd,
         auto_assign_root: cli.auto_assign,
         stack_size: cli.stack,
@@ -1866,6 +1892,15 @@ fn attn_flags_for(cpu_type: CpuType, fpu: bool) -> u16 {
 /// this is unambiguous even though the `rest` (a host directory, or an
 /// Amiga path target) might rarely contain further `:` characters of
 /// its own.
+/// Splits a `--var`/`VAR` value at its first `=`: the name must not be
+/// empty, the value may be (and may itself contain `=`).
+fn split_var<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), String> {
+    match arg.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Ok((name, value)),
+        _ => Err(format!("{flag} expects NAME=VALUE, got {arg:?}")),
+    }
+}
+
 fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), String> {
     match arg.split_once(':') {
         Some((name, rest)) if !name.is_empty() => Ok((name, rest)),
@@ -2033,6 +2068,7 @@ fn resolve(
         shell: false,
         volumes: overrides.volumes,
         assigns: overrides.assigns,
+        vars: overrides.vars,
         cwd: overrides.cwd,
         auto_assign_root: overrides.auto_assign_root,
         libs_dir: libraries.libs_dir,
@@ -2827,6 +2863,9 @@ fn build_runtime_with_vfs(
         runtime.enable_libs_dir_override();
     }
     runtime.set_program_dir(&dir_of(Path::new(&opts.program)));
+    for (name, value) in &opts.vars {
+        runtime.set_local_var(name.as_bytes(), value.as_bytes());
+    }
     if opts.net {
         runtime.enable_bsdsocket();
     }
@@ -4550,6 +4589,7 @@ mod tests {
             "--volume",
             "-a",
             "--assign",
+            "--var",
             "--cwd",
             "--auto-assign",
             "--stack",
@@ -5432,6 +5472,36 @@ mod tests {
                 );
             }
             other => panic!("expected a clean UnexpectedStop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn var_flag_is_repeatable_and_keeps_everything_after_the_first_equals() {
+        let opts = parse_args(args(&[
+            "--var",
+            "A=1",
+            "--var=B=x=y",
+            "--var",
+            "EMPTY=",
+            "prog",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.vars,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "x=y".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(opts.program, "prog");
+    }
+
+    #[test]
+    fn var_flag_needs_a_name_and_an_equals() {
+        for bad in ["NOEQUALS", "=value"] {
+            let err = parse_args(args(&["--var", bad, "prog"])).unwrap_err();
+            assert!(err.contains("--var expects NAME=VALUE"), "{bad}: {err}");
         }
     }
 
