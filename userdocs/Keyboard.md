@@ -44,7 +44,7 @@ terminals share, and each key is recognized in all the forms listed.
 | Page Up | `ESC [ 5~` | Page Up | `$9B 41~` | `$9B 51~` |
 | Page Down | `ESC [ 6~` | Page Down | `$9B 42~` | `$9B 52~` |
 | Backspace | `$7F` | Backspace | `$08` | `$08` |
-| Shift+Tab | `ESC [ Z` | Shift+Tab | — | `$9B Z` |
+| Tab, Shift+Tab | `$09`, `ESC [ Z` | Tab | `$09` | `$9B Z` |
 | Esc | `ESC` | Esc | `$1B` | |
 
 Insert, Page Up, Page Down, Home, End, F11 and F12 aren't on classic
@@ -52,7 +52,8 @@ Amiga keyboards, but Kickstart 3.1's keymap already defines them, so
 software that knows them gets them.
 
 Shift is the only modifier passed on. The terminal reports it with
-xterm's modifier parameter: Shift+Up is `ESC [ 1;2 A`. A key with Ctrl
+xterm's modifier parameter: Shift+Up is `ESC [ 1;2 A`, and Shift+F1 is
+`ESC [ 1;2 P` or `ESC O 2 P`. A key with Ctrl
 or Alt, F13 and above, and any sequence volamos doesn't recognize is
 dropped, since no Amiga key would produce it.
 

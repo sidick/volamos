@@ -22,14 +22,14 @@
 //! | Insert, Delete | `ESC [ 2 ~`, `ESC [ 3 ~` | `INSERT`, `DEL` |
 //! | Home, End | `ESC [ H`/`F`, `ESC O H`/`F`, `ESC [ 1 ~`/`4 ~` (also `7 ~`/`8 ~`) | `HOME`, `END` |
 //! | Page Up, Page Down | `ESC [ 5 ~`, `ESC [ 6 ~` | `PAGEUP`, `PAGEDOWN` |
-//! | Shift+Tab | `ESC [ Z` | Shift+`TAB` |
+//! | Tab, Shift+Tab | `$09`, `ESC [ Z` | `TAB`, Shift+`TAB` |
 //! | Backspace | `$7F` | `BACKSPACE` (`$08`) |
 //!
 //! `INSERT`, `PAGEUP`, `PAGEDOWN`, `F11`, `F12`, `HOME` and `END` are
 //! "not on classic keyboards" (NDK 3.2 `libraries/keymap.h`'s
 //! `RAWKEY_*` list), but Kickstart 3.1's default keymap already has
 //! sequences for them. Shift with any of these (xterm's modifier
-//! parameter `2`, as in `ESC [ 1 ; 2 A`) gives the Amiga key with Shift.
+//! parameter `2`, as in `ESC [ 1 ; 2 A` or `ESC O 2 P`) gives the Amiga key with Shift.
 //! The key the Amiga has and a PC keyboard doesn't, Help, has no default:
 //! every common host key already stands for a real Amiga key. A
 //! [`KeyMap`] built from the user's `--key` settings can give it one, or
@@ -64,7 +64,8 @@
 //! works. A character split between two reads is held until the rest
 //! arrives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const ESC: u8 = 0x1B;
 const CSI: u8 = 0x9B;
@@ -72,6 +73,21 @@ const DEL: u8 = 0x7F;
 
 /// Longest host key sequence kept while waiting for its final byte.
 const MAX_SEQUENCE: usize = 16;
+
+/// How long the terminal has to answer a cursor position request before
+/// a matching sequence is a key again (Shift+F3 is `ESC [ 1 ; 2 R`). A
+/// terminal answers at once; one that ignores the request never does.
+const CURSOR_REPORT_WAIT: Duration = Duration::from_secs(1);
+
+/// The Latin-1 byte for `c`, or `?` for a character Latin-1 lacks.
+pub fn latin1(c: char) -> u8 {
+    u8::try_from(u32::from(c)).unwrap_or(b'?')
+}
+
+/// `text` in Latin-1, a character it lacks as `?`.
+pub fn to_latin1(text: &str) -> Vec<u8> {
+    text.chars().map(latin1).collect()
+}
 
 /// The Amiga raw keys a host key can stand for, by their NDK 3.2
 /// `RAWKEY_*` names (`libraries/keymap.h`) without the prefix.
@@ -173,6 +189,9 @@ fn split_shift(name: &str) -> (bool, &str) {
 #[derive(Debug, Clone)]
 pub struct KeyMap {
     keys: HashMap<(&'static str, bool), (u8, bool)>,
+    /// The Shift forms a `Shift+` setting set, which an unshifted setting
+    /// for the same key then leaves alone.
+    shift_set: HashSet<&'static str>,
 }
 
 impl Default for KeyMap {
@@ -184,7 +203,10 @@ impl Default for KeyMap {
                 keys.insert((host, true), (code, true));
             }
         }
-        Self { keys }
+        Self {
+            keys,
+            shift_set: HashSet::new(),
+        }
     }
 }
 
@@ -214,7 +236,9 @@ impl KeyMap {
             )
         })?;
         self.keys.insert((host, host_shift), (code, amiga_shift));
-        if !host_shift {
+        if host_shift {
+            self.shift_set.insert(host);
+        } else if !self.shift_set.contains(host) {
             self.keys.insert((host, true), (code, true));
         }
         Ok(())
@@ -235,8 +259,11 @@ enum State {
     Escape,
     /// After `ESC [`; the parameters so far are in [`TermInput::seq`].
     Csi,
-    /// After `ESC O`.
+    /// After `ESC O`; a modifier digit so far is in [`TermInput::seq`].
     Ss3,
+    /// The rest of a sequence no key sends (an intermediate byte, or
+    /// overlong), dropped up to its final byte.
+    Discard,
     /// Part way through a UTF-8 character, its bytes in
     /// [`TermInput::seq`], `usize` more to come.
     Utf8(usize),
@@ -252,6 +279,11 @@ pub struct TermInput {
     state: State,
     seq: Vec<u8>,
     cursor_reports_expected: u32,
+    /// When the last cursor report was asked for; see
+    /// [`CURSOR_REPORT_WAIT`].
+    cursor_report_asked: Option<Instant>,
+    /// When the bytes now held started being held.
+    held_since: Option<Instant>,
 }
 
 impl TermInput {
@@ -265,6 +297,8 @@ impl TermInput {
             state: State::Ground,
             seq: Vec::new(),
             cursor_reports_expected: 0,
+            cursor_report_asked: None,
+            held_since: None,
         }
     }
 
@@ -282,6 +316,18 @@ impl TermInput {
     /// answer is on its way: read the next `ESC [ r ; c R` as that.
     pub fn expect_cursor_report(&mut self) {
         self.cursor_reports_expected += 1;
+        self.cursor_report_asked = Some(Instant::now());
+    }
+
+    /// Whether an answer is still expected: one was asked for, recently.
+    fn cursor_report_due(&mut self) -> bool {
+        let recent = self
+            .cursor_report_asked
+            .is_some_and(|asked| asked.elapsed() < CURSOR_REPORT_WAIT);
+        if !recent {
+            self.cursor_reports_expected = 0;
+        }
+        self.cursor_reports_expected > 0
     }
 
     /// Whether some bytes are held, waiting for the rest of a sequence
@@ -290,11 +336,25 @@ impl TermInput {
         self.state != State::Ground
     }
 
+    /// How long the bytes now held have been held, if any are.
+    pub fn held_for(&self) -> Option<Duration> {
+        self.held_since.map(|since| since.elapsed())
+    }
+
     /// Appends the translation of `input` to `out`. `raw`: the console is
     /// in raw mode, so keys are translated (if that is on).
     pub fn feed(&mut self, input: &[u8], raw: bool, out: &mut Vec<u8>) {
+        if !raw {
+            // An answer read in cooked mode reaches the guest as typed.
+            self.cursor_reports_expected = 0;
+        }
         for &byte in input {
             self.byte(byte, raw && self.keys, out);
+        }
+        if self.state == State::Ground {
+            self.held_since = None;
+        } else if self.held_since.is_none() {
+            self.held_since = Some(Instant::now());
         }
     }
 
@@ -306,10 +366,11 @@ impl TermInput {
         match self.state {
             State::Escape => out.push(ESC),
             State::Utf8(_) => out.extend_from_slice(&self.seq),
-            State::Ground | State::Csi | State::Ss3 => {}
+            State::Ground | State::Csi | State::Ss3 | State::Discard => {}
         }
         self.state = State::Ground;
         self.seq.clear();
+        self.held_since = None;
     }
 
     fn byte(&mut self, byte: u8, keys: bool, out: &mut Vec<u8>) {
@@ -320,7 +381,10 @@ impl TermInput {
                     self.seq.clear();
                     self.state = State::Csi;
                 }
-                b'O' => self.state = State::Ss3,
+                b'O' => {
+                    self.seq.clear();
+                    self.state = State::Ss3;
+                }
                 ESC => out.push(ESC),
                 _ => {
                     // Not a key sequence: the Esc key, then whatever
@@ -332,28 +396,52 @@ impl TermInput {
             },
             State::Csi => match byte {
                 0x30..=0x3F if self.seq.len() < MAX_SEQUENCE => self.seq.push(byte),
+                // An intermediate byte (no key sends one), or overlong:
+                // the rest is dropped too.
+                0x20..=0x3F => self.state = State::Discard,
                 0x40..=0x7E => {
                     self.state = State::Ground;
                     self.csi_key(byte, out);
                 }
-                // Malformed or overlong: dropped, and the byte handled
-                // afresh.
+                // Malformed: dropped, and the byte handled afresh.
                 _ => {
                     self.state = State::Ground;
                     self.ground(byte, keys, out);
                 }
             },
-            State::Ss3 => {
-                self.state = State::Ground;
-                let key = match byte {
-                    b'A'..=b'D' | b'H' | b'F' => cursor_key(byte),
-                    b'P'..=b'S' => Some(["F1", "F2", "F3", "F4"][usize::from(byte - b'P')]),
-                    _ => None,
-                };
-                if let Some(bytes) = key.and_then(|k| self.map.bytes(k, false)) {
-                    out.extend_from_slice(bytes);
+            State::Ss3 => match byte {
+                // Some terminals put the modifier here: `ESC O 2 P` is
+                // Shift+F1.
+                b'0'..=b'9' if self.seq.len() < MAX_SEQUENCE => self.seq.push(byte),
+                0x40..=0x7E => {
+                    self.state = State::Ground;
+                    let shift = match self.seq.as_slice() {
+                        b"" | b"1" => false,
+                        b"2" => true,
+                        _ => return,
+                    };
+                    let key = match byte {
+                        b'A'..=b'D' | b'H' | b'F' => cursor_key(byte),
+                        b'P'..=b'S' => Some(["F1", "F2", "F3", "F4"][usize::from(byte - b'P')]),
+                        _ => None,
+                    };
+                    if let Some(bytes) = key.and_then(|k| self.map.bytes(k, shift)) {
+                        out.extend_from_slice(bytes);
+                    }
                 }
-            }
+                _ => {
+                    self.state = State::Ground;
+                    self.ground(byte, keys, out);
+                }
+            },
+            State::Discard => match byte {
+                0x20..=0x3F => {}
+                0x40..=0x7E => self.state = State::Ground,
+                _ => {
+                    self.state = State::Ground;
+                    self.ground(byte, keys, out);
+                }
+            },
             State::Utf8(more) => {
                 if byte & 0xC0 == 0x80 {
                     self.seq.push(byte);
@@ -380,6 +468,10 @@ impl TermInput {
                 Some(bytes) => out.extend_from_slice(bytes),
                 None => out.push(DEL),
             },
+            b'\t' if keys => match self.map.bytes("Tab", false) {
+                Some(bytes) => out.extend_from_slice(bytes),
+                None => out.push(byte),
+            },
             0xC2..=0xF4 if self.charset => {
                 self.seq.clear();
                 self.seq.push(byte);
@@ -398,7 +490,7 @@ impl TermInput {
             .ok()
             .and_then(|s| s.chars().next())
         {
-            Some(c) => out.push(u8::try_from(u32::from(c)).unwrap_or(b'?')),
+            Some(c) => out.push(latin1(c)),
             // Overlong or a surrogate: not UTF-8 after all.
             None => out.extend_from_slice(&self.seq),
         }
@@ -408,6 +500,7 @@ impl TermInput {
     /// `ESC [` + [`Self::seq`] + `last`: a key, a cursor position report,
     /// or nothing.
     fn csi_key(&mut self, last: u8, out: &mut Vec<u8>) {
+        let report_due = last == b'R' && self.cursor_report_due();
         let params = std::str::from_utf8(&self.seq).unwrap_or("");
         let mut fields = params.split(';');
         let first = fields.next().unwrap_or("");
@@ -415,7 +508,7 @@ impl TermInput {
         if fields.next().is_some() {
             return;
         }
-        if last == b'R' && self.cursor_reports_expected > 0 {
+        if report_due {
             if let Some(col) = second
                 && !first.is_empty()
                 && first.bytes().chain(col.bytes()).all(|b| b.is_ascii_digit())
@@ -623,6 +716,50 @@ mod tests {
         // Help, Shift+Help (from the unshifted setting), Shift+F1, and
         // unshifted F13 still has no mapping.
         assert_eq!(out, b"\x9b?~\x9b?~\x9b10~");
+    }
+
+    #[test]
+    fn a_shift_setting_survives_a_later_unshifted_one() {
+        let mut map = KeyMap::default();
+        map.set("Shift+F12=BREAK").unwrap();
+        map.set("F12=HELP").unwrap();
+        map.set("Tab=ESC").unwrap();
+        let mut t = TermInput::new(true, true, map);
+        let mut out = Vec::new();
+        t.feed(b"\x1b[24~\x1b[24;2~\t", true, &mut out);
+        // Help; Break as Shift+F12 said (Break unshifted), not Shift+Help;
+        // and a plain Tab byte mapped too.
+        assert_eq!(out, b"\x9b?~\x9b43~\x1b");
+    }
+
+    #[test]
+    fn a_cursor_report_read_cooked_is_no_longer_expected() {
+        let mut t = TermInput::new(true, true, KeyMap::default());
+        let mut out = Vec::new();
+        t.expect_cursor_report();
+        t.feed(b"\x1b[12;5R", false, &mut out);
+        out.clear();
+        t.feed(b"\x1b[1;2R", true, &mut out);
+        assert_eq!(out, b"\x9b12~", "Shift+F3, not a report");
+    }
+
+    #[test]
+    fn ss3_with_a_modifier_and_odd_csi_sequences_leak_nothing() {
+        // ESC O 2 P is Shift+F1; ESC [ 1 SP ~ and an overlong sequence
+        // are dropped whole.
+        assert_eq!(raw(b"\x1bO2Pa\x1b[1 ~b"), b"\x9b10~ab");
+        assert_eq!(raw(b"\x1b[11111111111111111111111~c"), b"c");
+    }
+
+    #[test]
+    fn held_input_reports_how_long_it_has_waited() {
+        let mut t = TermInput::new(true, true, KeyMap::default());
+        let mut out = Vec::new();
+        assert!(t.held_for().is_none());
+        t.feed(b"\x1b", true, &mut out);
+        assert!(t.held_for().is_some());
+        t.flush(&mut out);
+        assert!(t.held_for().is_none());
     }
 
     #[test]

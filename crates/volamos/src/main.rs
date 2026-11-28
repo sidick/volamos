@@ -283,6 +283,9 @@ struct Options {
     verbose: bool,
     snoop: bool,
     program: String,
+    /// The program's arguments, lossily as text: what the parsing tests
+    /// check. The run itself uses [`Self::guest_args_os`].
+    #[cfg_attr(not(test), allow(dead_code))]
     guest_args: Vec<String>,
     /// `--workbench`: start the program as Workbench does, with
     /// `guest_args` as project files. CLI-only: not a config key, since
@@ -2294,7 +2297,7 @@ fn vfs_config_from_opts(opts: &Options) -> Option<VfsConfig> {
     // the directories it passes (see `VfsConfig::cover_host_dir`).
     let mut dirs: Vec<PathBuf> = vec![dir_of(Path::new(&opts.program))];
     if opts.workbench {
-        dirs.extend(opts.guest_args.iter().map(|p| dir_of(Path::new(p))));
+        dirs.extend(opts.guest_args_os.iter().map(|p| dir_of(Path::new(p))));
     }
     let mut first_added = None;
     for dir in dirs {
@@ -3152,7 +3155,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     }
 
     if opts.workbench {
-        let projects: Vec<PathBuf> = opts.guest_args.iter().map(PathBuf::from).collect();
+        let projects: Vec<PathBuf> = opts.guest_args_os.iter().map(PathBuf::from).collect();
         runtime
             .start_as_workbench(std::path::Path::new(&opts.program), &projects)
             .map_err(|e| format!("--workbench: {e}"))?;
@@ -3578,10 +3581,7 @@ fn guest_command_line(opts: &Options) -> Vec<u8> {
 /// One guest argument's bytes; see [`guest_command_line`].
 fn guest_arg_bytes(arg: &std::ffi::OsStr, convert: bool) -> Vec<u8> {
     match arg.to_str() {
-        Some(text) if convert => text
-            .chars()
-            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
-            .collect(),
+        Some(text) if convert => volamos_core::termin::to_latin1(text),
         _ => arg.as_encoded_bytes().to_vec(),
     }
 }
@@ -3640,7 +3640,11 @@ impl io::Write for GuestStdout<'_> {
         let mut filter = terminal_filter();
         let n = if filter.is_active() {
             self.scratch.clear();
-            filter.set_cursor_reports(volamos_core::hostterm::cursor_reports_readable());
+            // Only a write that may hold a request needs to know (this
+            // costs a system call).
+            if buf.iter().any(|&b| b == 0x9B || b == 0x1B) {
+                filter.set_cursor_reports(volamos_core::hostterm::cursor_reports_readable());
+            }
             filter.filter(buf, &mut self.scratch);
             // Before the write: the terminal may answer at once.
             let requests = filter.take_requests();

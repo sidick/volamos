@@ -114,6 +114,9 @@ pub(crate) const HELD_INPUT_WAIT: Duration = Duration::from_millis(50);
 /// docs. `None` until [`set_input_translation`] runs: nothing changes.
 static INPUT: Mutex<Option<TermInput>> = Mutex::new(None);
 
+/// Whether [`INPUT`] changes anything, without taking its lock.
+static INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 fn with_input<R>(f: impl FnOnce(&mut TermInput) -> R) -> R {
     let mut input = INPUT.lock().unwrap_or_else(|e| e.into_inner());
     f(input.get_or_insert_with(|| TermInput::new(false, false, KeyMap::default())))
@@ -123,12 +126,14 @@ fn with_input<R>(f: impl FnOnce(&mut TermInput) -> R) -> R {
 /// translates key sequences in raw mode, `charset` converts UTF-8 to
 /// Latin-1, `map` is the key mapping. For the CLI, once, before the run.
 pub fn set_input_translation(keys: bool, charset: bool, map: KeyMap) {
-    *INPUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(TermInput::new(keys, charset, map));
+    let input = TermInput::new(keys, charset, map);
+    INPUT_ACTIVE.store(input.is_active(), Ordering::Relaxed);
+    *INPUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
 }
 
 /// Whether host input is translated at all.
 pub(crate) fn input_translates() -> bool {
-    with_input(|t| t.is_active())
+    INPUT_ACTIVE.load(Ordering::Relaxed)
 }
 
 /// `bytes`, just read from the host, translated onto the end of `ahead`.
@@ -145,8 +150,10 @@ fn flush_input(ahead: &mut std::collections::VecDeque<u8>) {
     ahead.extend(out);
 }
 
-fn input_pending() -> bool {
-    with_input(|t| t.has_pending())
+/// How much longer held input waits before it is let go: `None` when
+/// nothing is held, zero when it has waited long enough.
+fn held_input_wait() -> Option<Duration> {
+    with_input(|t| t.held_for()).map(|held| HELD_INPUT_WAIT.saturating_sub(held))
 }
 
 /// Whether a cursor position request the guest sends can be answered: the
@@ -199,7 +206,7 @@ pub(crate) fn read_piped_stdin(buf: &mut [u8]) -> std::io::Result<usize> {
             }
             return Ok(n);
         }
-        let mut chunk = vec![0u8; buf.len().max(4)];
+        let mut chunk = [0u8; 4096];
         let n = std::io::stdin().read(&mut chunk)?;
         if n == 0 {
             flush_input(&mut ahead);
@@ -574,7 +581,7 @@ mod unix {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut chunk = vec![0u8; buf.len()];
+        let mut chunk = [0u8; 4096];
         loop {
             {
                 let mut ahead = lookahead();
@@ -586,7 +593,9 @@ mod unix {
                     return Ok(n);
                 }
             }
-            if super::input_pending() && !stdin_ready(super::HELD_INPUT_WAIT) {
+            if let Some(wait) = super::held_input_wait()
+                && !stdin_ready(wait)
+            {
                 super::flush_input(&mut lookahead());
                 continue;
             }
@@ -726,17 +735,23 @@ mod unix {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             pump_console_breaks_now();
-            if super::input_pending()
-                && lookahead().is_empty()
-                && !stdin_ready(super::HELD_INPUT_WAIT)
-            {
+            let held = super::held_input_wait();
+            if held == Some(Duration::ZERO) {
+                // Held long enough (a lone Esc): it is a key now.
                 super::flush_input(&mut lookahead());
             }
             if !lookahead().is_empty() {
                 return true;
             }
             let now = std::time::Instant::now();
-            if now >= deadline || !stdin_ready(deadline - now) {
+            if now >= deadline {
+                return false;
+            }
+            // Wake for whichever comes first: input, the end of the
+            // timeout, or the held input's moment being up -- never past
+            // the caller's timeout, so WaitForChar(fh, 0) doesn't block.
+            let wait = held.map_or(deadline - now, |h| h.min(deadline - now));
+            if !stdin_ready(wait) && held.is_none() {
                 return false;
             }
         }
