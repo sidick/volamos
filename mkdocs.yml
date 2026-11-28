@@ -50,6 +50,7 @@ nav:
   - Using volamos:
       - CLI Reference: CLI-Reference.md
       - Configuration Files: Configuration.md
+      - Keyboard and Terminal Input: Keyboard.md
       - Volumes and Assigns: Volumes-and-Assigns.md
       - Supported Libraries: Supported-Libraries.md
       - Differences from vamos: Differences-from-vamos.md

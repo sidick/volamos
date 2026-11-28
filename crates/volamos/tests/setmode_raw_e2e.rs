@@ -111,8 +111,15 @@ impl Pty {
     }
 
     fn spawn(&self, program: &str) -> Child {
+        self.spawn_with(&[], program)
+    }
+
+    /// [`Self::spawn`] with volamos `flags`, on a UTF-8 locale.
+    fn spawn_with(&self, flags: &[&str], program: &str) -> Child {
         let stdio = || Stdio::from(self.slave.try_clone().expect("dup the slave"));
         Command::new(env!("CARGO_BIN_EXE_volamos"))
+            .env("LC_ALL", "en_US.UTF-8")
+            .args(flags)
             .arg(program)
             .stdin(stdio())
             .stdout(stdio())
@@ -237,4 +244,45 @@ fn a_break_key_reaches_a_guest_already_blocked_in_wait() {
 #[test]
 fn a_break_key_typed_before_the_guest_waits_is_not_lost() {
     rawwait_with_key_typed_after(Duration::ZERO);
+}
+
+/// The first byte `rawtest` reads when `typed` is typed, with `flags`.
+fn first_raw_byte(flags: &[&str], typed: &[u8]) -> i32 {
+    let pty = open_pty();
+    let mut child = pty.spawn_with(flags, RAWTEST_PATH);
+    pty.read_until("READY");
+    pty.write(typed);
+    wait_for_exit(&mut child).code().expect("an exit code")
+}
+
+#[test]
+fn a_host_cursor_key_arrives_as_the_amiga_csi_sequence() {
+    // ESC [ A is the Amiga's 9B 41 (issue #426): the first byte is CSI.
+    assert_eq!(first_raw_byte(&[], b"\x1b[A"), 0x9B);
+    // Untranslated, the guest sees the host's ESC.
+    assert_eq!(first_raw_byte(&["--term-escapes", "off"], b"\x1b[A"), 0x1B);
+}
+
+#[test]
+fn a_lone_esc_is_the_esc_key_after_a_moment() {
+    // Held in case a sequence follows, then let go.
+    assert_eq!(first_raw_byte(&[], b"\x1b"), 0x1B);
+}
+
+#[test]
+fn utf8_typed_in_raw_mode_arrives_as_latin1() {
+    assert_eq!(first_raw_byte(&[], "é".as_bytes()), 0xE9);
+    assert_eq!(
+        first_raw_byte(&["--term-charset", "off"], "é".as_bytes()),
+        0xC3
+    );
+}
+
+#[test]
+fn a_mapped_key_types_the_amiga_key() {
+    // F12 is Amiga F12 (9B 21 7E) by default; mapped to Backspace it is 08.
+    assert_eq!(
+        first_raw_byte(&["--key", "F12=BACKSPACE"], b"\x1b[24~"),
+        0x08
+    );
 }

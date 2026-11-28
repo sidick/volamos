@@ -428,6 +428,13 @@ struct Options {
     /// what `auto` means once, for every run in the process.
     term_escapes: config::TermSetting,
     term_charset: config::TermSetting,
+    /// `--key`/`KEY` settings (`HOSTKEY=AMIGAKEY`), in order, applied
+    /// over the default key mapping: see `volamos_core::termin::KeyMap`.
+    keys: Vec<String>,
+    /// [`Self::guest_args`] exactly as the OS passed them (issue #449),
+    /// which needn't be UTF-8. Filled from `guest_args` by [`resolve`];
+    /// `main` replaces it with the real thing.
+    guest_args_os: Vec<std::ffi::OsString>,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
     /// to [`vfs_config_from_opts`]'s `VfsConfig`. Empty whenever
@@ -486,6 +493,13 @@ fn parse_term_escapes_arg(s: &str) -> Result<config::TermSetting, String> {
 /// Parses a `--term-charset` value.
 fn parse_term_charset_arg(s: &str) -> Result<config::TermSetting, String> {
     config::parse_term_setting("--term-charset", s)
+}
+
+/// Checks a `--key HOSTKEY=AMIGAKEY` setting (it is applied later, in
+/// order, by `volamos_core::termin::KeyMap::set`).
+fn parse_key_arg(s: &str) -> Result<String, String> {
+    volamos_core::termin::KeyMap::default().set(s)?;
+    Ok(s.to_string())
 }
 
 /// Parses a `--var NAME=VALUE` argument.
@@ -703,6 +717,21 @@ struct Cli {
                       byte-exact; on always does; off never does."
     )]
     term_charset: Option<config::TermSetting>,
+
+    /// Map a host terminal key to an Amiga key, e.g. F12=HELP (repeatable)
+    #[arg(
+        long = "key",
+        value_name = "HOSTKEY=AMIGAKEY",
+        value_parser = parse_key_arg,
+        help_heading = "Terminal",
+        long_help = "Make a host terminal key type an Amiga key in raw mode (repeatable), \
+                      e.g. --key F12=HELP for the Help key a PC keyboard lacks. Either side \
+                      can have a Shift+ prefix. Host keys: Up, Down, Right, Left, Home, End, \
+                      Insert, Delete, PageUp, PageDown, Tab, Backspace, F1-F20. Amiga keys \
+                      are the NDK's RAWKEY_ names without the prefix, such as HELP, F11, \
+                      CRSRUP, DEL. Needs --term-escapes."
+    )]
+    key: Vec<String>,
 
     /// Initial guest current directory
     #[arg(
@@ -1433,6 +1462,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         jit,
         term_escapes: cli.term_escapes,
         term_charset: cli.term_charset,
+        keys: cli.key,
         net: cli.net.then_some(true),
         standard_volumes,
         volumes_dir: cli.volumes_dir,
@@ -2113,6 +2143,7 @@ fn resolve(
     } else {
         JitSource::ConfigFile
     };
+    let guest_args_os = guest_args.iter().map(Into::into).collect();
     Ok(Options {
         verbose: overrides.verbose.unwrap_or(false),
         snoop: overrides.snoop.unwrap_or(false),
@@ -2144,6 +2175,8 @@ fn resolve(
         net: overrides.net.unwrap_or(false),
         term_escapes: overrides.term_escapes.unwrap_or_default(),
         term_charset: overrides.term_charset.unwrap_or_default(),
+        keys: overrides.keys,
+        guest_args_os,
         // Only ever non-empty when `overrides` already includes
         // `config::built_in_defaults`'s own layer -- `main` merges that
         // in before calling `resolve`; `parse_args` (CLI-only, no
@@ -2941,7 +2974,7 @@ fn build_runtime_with_vfs(
 }
 
 fn run(opts: &Options) -> Result<i32, String> {
-    set_terminal_filter(opts.term_escapes, opts.term_charset);
+    set_terminal_filter(opts)?;
     // Before anything is read or loaded: these depend only on the
     // flags, and a run that violates any of them fails much later in a
     // way that does not point at them. --jit is checked before
@@ -3050,8 +3083,8 @@ fn run(opts: &Options) -> Result<i32, String> {
         let config = StartConfig {
             entry: 0, // overridden by load_top_level_program below
             load_end: TRAP_TABLE_END,
-            args: opts.guest_args.clone(),
-            raw_command_line: None,
+            args: Vec::new(),
+            raw_command_line: Some(guest_command_line(opts)),
             stack_size: opts.stack_size,
             attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
             program_name,
@@ -3102,8 +3135,8 @@ fn run(opts: &Options) -> Result<i32, String> {
         let config = StartConfig {
             entry: load_result.entry,
             load_end: load_result.end,
-            args: opts.guest_args.clone(),
-            raw_command_line: None,
+            args: Vec::new(),
+            raw_command_line: Some(guest_command_line(opts)),
             stack_size: opts.stack_size,
             attn_flags: attn_flags_for(opts.cpu_type, opts.fpu),
             program_name,
@@ -3490,23 +3523,67 @@ fn format_emulated_cycles(cycles: u64, clock_hz: f64) -> Option<String> {
 static TERMINAL_FILTER: std::sync::OnceLock<std::sync::Mutex<volamos_core::termout::TermFilter>> =
     std::sync::OnceLock::new();
 
-/// Resolves `--term-escapes`/`--term-charset` against the host: `auto`
-/// means "when stdout is a terminal", and for the character conversion
-/// also "on a UTF-8 locale". The first call wins.
-fn set_terminal_filter(escapes: config::TermSetting, charset: config::TermSetting) {
+/// Resolves `--term-escapes`/`--term-charset` against the host and sets
+/// up both directions (issues #426/#427): `auto` means "when the stream
+/// is a terminal" -- stdout for output, stdin for input -- and for the
+/// character conversion also "on a UTF-8 locale". The first call wins.
+/// `Err` if a `--key`/`KEY` setting doesn't parse.
+fn set_terminal_filter(opts: &Options) -> Result<(), String> {
     use std::io::IsTerminal;
-    let tty = io::stdout().is_terminal();
-    let resolve = |setting, auto: bool| match setting {
+    let utf8 = locale_is_utf8(|name| std::env::var(name).ok());
+    let resolve = |setting, tty: bool, needs_utf8: bool| match setting {
         config::TermSetting::On => true,
         config::TermSetting::Off => false,
-        config::TermSetting::Auto => auto,
+        config::TermSetting::Auto => tty && (utf8 || !needs_utf8),
     };
-    let utf8 = locale_is_utf8(|name| std::env::var(name).ok());
+    let (stdout_tty, stdin_tty) = (io::stdout().is_terminal(), io::stdin().is_terminal());
     let filter = volamos_core::termout::TermFilter::new(
-        resolve(escapes, tty),
-        resolve(charset, tty && utf8),
+        resolve(opts.term_escapes, stdout_tty, false),
+        resolve(opts.term_charset, stdout_tty, true),
+    );
+    let mut map = volamos_core::termin::KeyMap::default();
+    for setting in &opts.keys {
+        map.set(setting)
+            .map_err(|e| format!("--key {setting}: {e}"))?;
+    }
+    volamos_core::hostterm::set_input_translation(
+        resolve(opts.term_escapes, stdin_tty, false),
+        resolve(opts.term_charset, stdin_tty, true),
+        map,
     );
     let _ = TERMINAL_FILTER.set(std::sync::Mutex::new(filter));
+    Ok(())
+}
+
+/// The program's command line (issue #449): its arguments' exact bytes,
+/// except that with `--term-charset` on -- or `auto` on a UTF-8 locale,
+/// which is how the shell will have encoded them, terminal or not -- an
+/// argument that is UTF-8 is converted to Latin-1, the Amiga's character
+/// set (a character beyond U+00FF becomes `?`). One that isn't UTF-8 is
+/// passed as it is.
+fn guest_command_line(opts: &Options) -> Vec<u8> {
+    let convert = match opts.term_charset {
+        config::TermSetting::On => true,
+        config::TermSetting::Off => false,
+        config::TermSetting::Auto => locale_is_utf8(|name| std::env::var(name).ok()),
+    };
+    let args: Vec<Vec<u8>> = opts
+        .guest_args_os
+        .iter()
+        .map(|arg| guest_arg_bytes(arg, convert))
+        .collect();
+    volamos_core::dispatch::command_line(&args)
+}
+
+/// One guest argument's bytes; see [`guest_command_line`].
+fn guest_arg_bytes(arg: &std::ffi::OsStr, convert: bool) -> Vec<u8> {
+    match arg.to_str() {
+        Some(text) if convert => text
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .collect(),
+        _ => arg.as_encoded_bytes().to_vec(),
+    }
 }
 
 /// The process's filter; one that changes nothing if
@@ -3563,7 +3640,16 @@ impl io::Write for GuestStdout<'_> {
         let mut filter = terminal_filter();
         let n = if filter.is_active() {
             self.scratch.clear();
+            filter.set_cursor_reports(volamos_core::hostterm::cursor_reports_readable());
             filter.filter(buf, &mut self.scratch);
+            // Before the write: the terminal may answer at once.
+            let requests = filter.take_requests();
+            for _ in 0..requests.cursor_position {
+                volamos_core::hostterm::expect_cursor_report();
+            }
+            for _ in 0..requests.window_status {
+                volamos_core::hostterm::answer_window_status();
+            }
             self.out.write_all(&self.scratch)?;
             buf.len()
         } else {
@@ -3595,9 +3681,26 @@ fn main() -> ExitCode {
     // clap's `trailing_var_arg` alone doesn't stop it from matching a
     // recognized flag spelling (e.g. `--stack`) anywhere in the whole
     // argument list, only an unrecognized one.
-    let mut argv0_args = std::env::args();
-    let _argv0 = argv0_args.next();
-    let (before, guest_args) = split_program_boundary(argv0_args);
+    // Arguments as the OS gave them (issue #449): a guest argument may be
+    // any bytes (Latin-1, say), so `std::env::args`, which panics on one
+    // that isn't UTF-8, won't do. The boundary is found on lossy copies;
+    // everything up to and including <program> is volamos's own and must
+    // be UTF-8, and the guest's are kept exactly (see `guest_arg_bytes`).
+    let os_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let lossy = os_args.iter().map(|a| a.to_string_lossy().into_owned());
+    let (before, guest_args) = split_program_boundary(lossy);
+    if let Some(bad) = os_args[..before.len()]
+        .iter()
+        .find(|a| a.to_str().is_none())
+    {
+        eprintln!(
+            "volamos: {} is not valid UTF-8 (a volamos argument or <program> must be; \
+             only the program's own arguments may be other bytes)",
+            bad.to_string_lossy()
+        );
+        return ExitCode::from(2);
+    }
+    let guest_args_os = os_args[before.len()..].to_vec();
 
     // -h/--help, --version, and any CLI parse error short-circuit here,
     // before ~/.volamos/.volamos are even read -- none of them are
@@ -3683,6 +3786,7 @@ fn main() -> ExitCode {
     };
     opts.workbench = workbench;
     opts.shell = shell;
+    opts.guest_args_os = guest_args_os;
 
     // Cleanup happens here, once, after `run` (and every nested
     // System()/Execute() it spawned, all sharing this same
@@ -4747,6 +4851,7 @@ mod tests {
             "--var",
             "--term-escapes",
             "--term-charset",
+            "--key",
             "--cwd",
             "--auto-assign",
             "--stack",

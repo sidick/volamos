@@ -77,11 +77,21 @@
 //! Amiga's `30`..`37` pick palette pens, not fixed colours, so they come
 //! out in the host terminal's colours instead.
 //!
-//! A sequence the guest waits for an answer to (` q`, the window status
-//! request, and `n`, the device status report) is dropped here.
-//! Answering it needs the input side, which is not done yet; passing `n`
-//! on would make the host terminal type its own `ESC [` reply into the
-//! guest's input, in a form an Amiga program doesn't expect.
+//! Two sequences ask the console for an answer in the guest's input.
+//! [`TermFilter`] doesn't answer them itself; it tells its caller
+//! ([`TermFilter::take_requests`]), which knows the input side
+//! ([`crate::hostterm`], issue #426):
+//!
+//! - ` q` (aWSR, the window status request, with no parameter or `0`)
+//!   is dropped from the output and counted, for the caller to answer
+//!   with a window bounds report made from the terminal's size.
+//! - `6n` (the device status report request) is passed on as `ESC [6n`
+//!   only when the caller says the terminal's answer can be read back
+//!   ([`TermFilter::set_cursor_reports`]: raw mode, with key translation
+//!   to turn `ESC [ row ; col R` into the Amiga's form), and counted so
+//!   the input side expects it. Otherwise it is dropped: the answer
+//!   would arrive in a cooked read, or in a form an Amiga program
+//!   doesn't expect. Any other `n` is dropped.
 //!
 //! `SO`/`SI` are control functions, so they belong to escape translation:
 //! with only character conversion on, they pass through unchanged like
@@ -134,6 +144,18 @@ pub struct TermFilter {
     /// The control sequence being collected, reused between sequences.
     seq: Vec<u8>,
     shifted: bool,
+    cursor_reports: bool,
+    requests: Requests,
+}
+
+/// The console requests a [`TermFilter`] saw since the last
+/// [`TermFilter::take_requests`]; see the module docs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Requests {
+    /// Cursor position requests passed on to the terminal.
+    pub cursor_position: u32,
+    /// Window status requests, for the caller to answer.
+    pub window_status: u32,
 }
 
 impl TermFilter {
@@ -146,7 +168,20 @@ impl TermFilter {
             state: State::Ground,
             seq: Vec::with_capacity(MAX_SEQUENCE),
             shifted: false,
+            cursor_reports: false,
+            requests: Requests::default(),
         }
+    }
+
+    /// Whether the terminal's answer to a cursor position request can be
+    /// read back now, so the request is passed on rather than dropped.
+    pub fn set_cursor_reports(&mut self, readable: bool) {
+        self.cursor_reports = readable;
+    }
+
+    /// The requests seen since the last call.
+    pub fn take_requests(&mut self) -> Requests {
+        std::mem::take(&mut self.requests)
     }
 
     /// Whether this filter changes anything at all.
@@ -200,7 +235,8 @@ impl TermFilter {
                 0x20..=0x3F if self.seq.len() < MAX_SEQUENCE => self.seq.push(byte),
                 0x20..=0x3F => self.state = State::Discard,
                 0x40..=0x7E => {
-                    emit_sequence(&self.seq, byte, out);
+                    let (seq, cursor_reports) = (&self.seq, self.cursor_reports);
+                    emit_sequence(seq, byte, cursor_reports, &mut self.requests, out);
                     self.state = State::Ground;
                 }
                 _ => self.inside_sequence(byte, out),
@@ -257,8 +293,14 @@ impl TermFilter {
 }
 
 /// Writes the host form of the control sequence `params` + `last`, or
-/// nothing (see the module docs' table).
-fn emit_sequence(params: &[u8], last: u8, out: &mut Vec<u8>) {
+/// nothing (see the module docs' table), noting any request it makes.
+fn emit_sequence(
+    params: &[u8],
+    last: u8,
+    cursor_reports: bool,
+    requests: &mut Requests,
+    out: &mut Vec<u8>,
+) {
     let split = params
         .iter()
         .position(|b| (0x20..=0x2F).contains(b))
@@ -305,6 +347,11 @@ fn emit_sequence(params: &[u8], last: u8, out: &mut Vec<u8>) {
             b"" => csi(b"?25h"),
             _ => {}
         },
+        (b" ", b'q') if matches!(numbers, b"" | b"0") => requests.window_status += 1,
+        ([], b'n') if numbers == b"6" && cursor_reports => {
+            csi(b"6n");
+            requests.cursor_position += 1;
+        }
         _ => {}
     }
 }
@@ -394,7 +441,7 @@ mod tests {
             b"\x9b4y",
             b"\x9b1;2{",
             b"\x9b1}",
-            b"\x9b q",
+            b"\x9b5 q",
             b"\x9b s",
             b"\x9b1;1;24;80 r",
             b"\x9b0 v",
@@ -405,6 +452,24 @@ mod tests {
         ] {
             assert_eq!(both(&[b"<", seq, b">"].concat()), b"<>", "{seq:?}");
         }
+    }
+
+    #[test]
+    fn requests_for_an_answer_are_counted_for_the_caller() {
+        let mut filter = TermFilter::new(true, true);
+        let mut out = Vec::new();
+        filter.filter(b"a\x9b q\x9b0 q\x9b6nb", &mut out);
+        // Both window requests counted; the cursor one dropped, since its
+        // answer couldn't be read back.
+        assert_eq!(out, b"ab");
+        let requests = filter.take_requests();
+        assert_eq!((requests.window_status, requests.cursor_position), (2, 0));
+        filter.set_cursor_reports(true);
+        out.clear();
+        filter.filter(b"\x9b6n\x9b5n", &mut out);
+        assert_eq!(out, b"\x1b[6n");
+        assert_eq!(filter.take_requests().cursor_position, 1);
+        assert_eq!(filter.take_requests(), Requests::default());
     }
 
     #[test]

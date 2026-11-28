@@ -16,6 +16,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const TERMTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/termtest");
+const ECHOARGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/echoargs");
+const RAWTEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/rawtest");
 
 /// What `termtest` writes, untouched.
 const RAW: &[u8] = b"ab\x9bKcd\x9b1;32m caf\xe9 \x0ei\x0f\x9b0 p\n";
@@ -31,7 +33,10 @@ impl TempDir {
         let pid = std::process::id();
         let path = std::env::temp_dir().join(format!("volamos-term-e2e-{tag}-{pid}-{n}"));
         fs::create_dir_all(&path).expect("create temp dir");
-        fs::copy(TERMTEST_PATH, path.join("termtest")).expect("copy termtest fixture");
+        for fixture in [TERMTEST_PATH, ECHOARGS_PATH, RAWTEST_PATH] {
+            let name = Path::new(fixture).file_name().unwrap();
+            fs::copy(fixture, path.join(name)).expect("copy fixture");
+        }
         TempDir { path }
     }
 
@@ -141,4 +146,102 @@ fn a_bad_setting_is_a_usage_error() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("auto, on or off"), "{stderr}");
     }
+}
+
+/// Runs fixture `program` with `flags` before it and `args` after, on a
+/// UTF-8 locale, with `stdin` piped in.
+fn run_program(
+    dir: &TempDir,
+    flags: &[&str],
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    stdin: &[u8],
+) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .env("HOME", dir.path())
+        .env("LC_ALL", "en_US.UTF-8")
+        .current_dir(dir.path())
+        .args(flags)
+        .arg(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run volamos");
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    child.wait_with_output().expect("wait for volamos")
+}
+
+#[test]
+fn utf8_arguments_reach_the_guest_as_latin1() {
+    let dir = TempDir::new("args");
+    let arg = std::ffi::OsStr::new("café €");
+    let out = stdout_of(run_program(&dir, &[], "echoargs", &[arg], b""));
+    // Quoted for the space; the euro sign has no Latin-1 byte.
+    assert_eq!(out, b"\"caf\xe9 ?\" \n");
+    let out = stdout_of(run_program(
+        &dir,
+        &["--term-charset", "off"],
+        "echoargs",
+        &[arg],
+        b"",
+    ));
+    assert_eq!(out, "\"café €\" \n".as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_argument_that_is_not_utf8_passes_through_unchanged() {
+    // Issue #449: this used to panic in std::env::args.
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("latin1-arg");
+    let arg = std::ffi::OsStr::from_bytes(b"caf\xe9");
+    let out = stdout_of(run_program(&dir, &[], "echoargs", &[arg], b""));
+    assert_eq!(out, b"caf\xe9 \n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_volamos_argument_that_is_not_utf8_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("bad-own-arg");
+    let output = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .env("HOME", dir.path())
+        .current_dir(dir.path())
+        .arg(std::ffi::OsStr::from_bytes(b"caf\xe9"))
+        .output()
+        .expect("failed to run volamos");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not valid UTF-8"), "{stderr}");
+}
+
+#[test]
+fn piped_utf8_input_is_converted_only_when_charset_is_on() {
+    // rawtest exits with the first byte it reads. A pipe isn't a
+    // terminal, so `auto` leaves the input alone.
+    let dir = TempDir::new("stdin");
+    let code = |flags: &[&str]| {
+        run_program(&dir, flags, "rawtest", &[], "é".as_bytes())
+            .status
+            .code()
+    };
+    assert_eq!(code(&[]), Some(0xC3));
+    assert_eq!(code(&["--term-charset", "on"]), Some(0xE9));
+}
+
+#[test]
+fn a_bad_key_setting_is_rejected() {
+    let dir = TempDir::new("bad-key");
+    let output = run(&dir, &["--key", "F12=NOPE"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown Amiga key"), "{stderr}");
+    fs::write(dir.path().join(".volamos"), "KEY=Nope=HELP\n").unwrap();
+    let output = run(&dir, &[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown host key"), "{stderr}");
 }
