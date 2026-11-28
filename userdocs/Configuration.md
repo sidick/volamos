@@ -49,6 +49,8 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 | `JIT` | `--jit`/`--no-jit` | `true`/`false` |
 | `VERBOSE` | `-v`/`--verbose` | `true`/`false` |
 | `SNOOP` | `-s`/`--snoop` | `true`/`false` |
+| `TERM_ESCAPES` | `--term-escapes` | `auto`/`on`/`off` |
+| `TERM_CHARSET` | `--term-charset` | `auto`/`on`/`off` |
 | `DEFAULTS` | `--defaults`/`--no-defaults` | `true`/`false`; see [Volumes and Assigns](Volumes-and-Assigns.md#standard-defaults) |
 | `VOLUMES_DIR` | `--volumes-dir` | where the default `SYS:` volume lives |
 

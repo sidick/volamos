@@ -423,6 +423,11 @@ struct Options {
     /// `~/.volamos`/`.volamos` should be able to silently turn on.
     stack_report: bool,
     net: bool,
+    /// `--term-escapes`/`TERM_ESCAPES` and `--term-charset`/
+    /// `TERM_CHARSET`, still unresolved: [`set_terminal_filter`] decides
+    /// what `auto` means once, for every run in the process.
+    term_escapes: config::TermSetting,
+    term_charset: config::TermSetting,
     /// The built-in defaults layer's own lazy-creation bookkeeping
     /// (issue #43), if that layer is active -- passed straight through
     /// to [`vfs_config_from_opts`]'s `VfsConfig`. Empty whenever
@@ -474,6 +479,14 @@ fn parse_assign_arg(s: &str) -> Result<(String, Vec<String>), String> {
 }
 
 /// Parses a `--var NAME=VALUE` argument.
+fn parse_term_escapes_arg(s: &str) -> Result<config::TermSetting, String> {
+    config::parse_term_setting("--term-escapes", s)
+}
+
+fn parse_term_charset_arg(s: &str) -> Result<config::TermSetting, String> {
+    config::parse_term_setting("--term-charset", s)
+}
+
 fn parse_var_arg(s: &str) -> Result<(String, String), String> {
     let (name, value) = split_var("--var", s)?;
     Ok((name.to_string(), value.to_string()))
@@ -659,6 +672,35 @@ struct Cli {
                       System()/Execute() or CreateNewProc gets a copy."
     )]
     var: Vec<(String, String)>,
+
+    /// Translate the program's Amiga console control sequences for the terminal
+    #[arg(
+        long = "term-escapes",
+        value_name = "auto|on|off",
+        value_parser = parse_term_escapes_arg,
+        help_heading = "Terminal",
+        long_help = "Translate the Amiga console control sequences in the program's output \
+                      (the single-byte CSI 0x9B and ESC [) into what a host terminal \
+                      understands, and drop the Amiga-only ones, so cursor movement, erasing \
+                      and colours work instead of showing as garbage. auto (the default) does \
+                      this only when stdout is a terminal, so redirected output stays \
+                      byte-exact; on always does; off never does."
+    )]
+    term_escapes: Option<config::TermSetting>,
+
+    /// Convert the program's Latin-1 console output to UTF-8
+    #[arg(
+        long = "term-charset",
+        value_name = "auto|on|off",
+        value_parser = parse_term_charset_arg,
+        help_heading = "Terminal",
+        long_help = "Convert the program's output from the Amiga's ISO-8859-1 (Latin-1) to \
+                      UTF-8, so accented letters and symbols show correctly. auto (the \
+                      default) does this only when stdout is a terminal and the locale \
+                      (LC_ALL, LC_CTYPE or LANG) is UTF-8, so redirected output stays \
+                      byte-exact; on always does; off never does."
+    )]
+    term_charset: Option<config::TermSetting>,
 
     /// Initial guest current directory
     #[arg(
@@ -1387,6 +1429,8 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         cpu_type: cli.cpu,
         fpu,
         jit,
+        term_escapes: cli.term_escapes,
+        term_charset: cli.term_charset,
         net: cli.net.then_some(true),
         standard_volumes,
         volumes_dir: cli.volumes_dir,
@@ -2096,6 +2140,8 @@ fn resolve(
         fpsp_emulate,
         stack_report,
         net: overrides.net.unwrap_or(false),
+        term_escapes: overrides.term_escapes.unwrap_or_default(),
+        term_charset: overrides.term_charset.unwrap_or_default(),
         // Only ever non-empty when `overrides` already includes
         // `config::built_in_defaults`'s own layer -- `main` merges that
         // in before calling `resolve`; `parse_args` (CLI-only, no
@@ -2893,6 +2939,7 @@ fn build_runtime_with_vfs(
 }
 
 fn run(opts: &Options) -> Result<i32, String> {
+    set_terminal_filter(opts.term_escapes, opts.term_charset);
     // Before anything is read or loaded: these depend only on the
     // flags, and a run that violates any of them fails much later in a
     // way that does not point at them. --jit is checked before
@@ -3432,27 +3479,87 @@ fn format_emulated_cycles(cycles: u64, clock_hz: f64) -> Option<String> {
     ))
 }
 
+/// Whether guest console output has its control sequences translated
+/// and its Latin-1 converted (issues #426/#427), as `(escapes,
+/// charset)`, resolved once by [`set_terminal_filter`]. Process-wide
+/// rather than per-run because it describes the host terminal, which
+/// every nested `System()` run shares.
+static TERMINAL_FILTER: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+
+/// Resolves `--term-escapes`/`--term-charset` against the host: `auto`
+/// means "when stdout is a terminal", and for the character conversion
+/// also "on a UTF-8 locale". The first call wins.
+fn set_terminal_filter(escapes: config::TermSetting, charset: config::TermSetting) {
+    use std::io::IsTerminal;
+    let tty = io::stdout().is_terminal();
+    let resolve = |setting, auto: bool| match setting {
+        config::TermSetting::On => true,
+        config::TermSetting::Off => false,
+        config::TermSetting::Auto => auto,
+    };
+    let utf8 = locale_is_utf8(|name| std::env::var(name).ok());
+    let _ = TERMINAL_FILTER.set((resolve(escapes, tty), resolve(charset, tty && utf8)));
+}
+
+/// A filter with the settings [`set_terminal_filter`] chose; both off if
+/// it never ran.
+fn terminal_filter() -> volamos_core::termout::TermFilter {
+    let (escapes, charset) = TERMINAL_FILTER.get().copied().unwrap_or_default();
+    volamos_core::termout::TermFilter::new(escapes, charset)
+}
+
+/// Whether the locale's character set is UTF-8, by the POSIX precedence:
+/// the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set and not empty.
+fn locale_is_utf8(var: impl Fn(&str) -> Option<String>) -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|name| var(name).filter(|value| !value.is_empty()))
+        .is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("utf-8") || value.contains("utf8")
+        })
+}
+
 /// The host's stdout as the guest's `Output()`, flushed after every write
 /// when it is a terminal. Rust's stdout is line-buffered, so a prompt (`0> `,
 /// `>>> `), which ends without a newline, would otherwise sit unseen until
 /// the next line of output -- after the user has typed the command it was
 /// asking for. Pipes and files stay buffered.
+///
+/// Every write also goes through [`terminal_filter`]'s translation. A
+/// write always reports the guest's whole buffer as written, so
+/// `Write()`'s result stays a count of Amiga bytes however long the
+/// translation came out.
 struct GuestStdout<'a> {
     out: io::StdoutLock<'a>,
     interactive: bool,
+    filter: volamos_core::termout::TermFilter,
+    scratch: Vec<u8>,
 }
 
 impl<'a> GuestStdout<'a> {
     fn new(out: io::StdoutLock<'a>) -> Self {
         use std::io::IsTerminal;
         let interactive = io::stdout().is_terminal();
-        Self { out, interactive }
+        Self {
+            out,
+            interactive,
+            filter: terminal_filter(),
+            scratch: Vec::new(),
+        }
     }
 }
 
 impl io::Write for GuestStdout<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.out.write(buf)?;
+        let n = if self.filter.is_active() {
+            self.scratch.clear();
+            self.filter.filter(buf, &mut self.scratch);
+            self.out.write_all(&self.scratch)?;
+            buf.len()
+        } else {
+            self.out.write(buf)?
+        };
         if self.interactive {
             self.out.flush()?;
         }
@@ -3597,6 +3704,31 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locale_is_utf8_follows_posix_precedence() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(locale_is_utf8(env(&[("LANG", "en_GB.UTF-8")])));
+        assert!(locale_is_utf8(env(&[("LC_CTYPE", "C.utf8")])));
+        // LC_ALL wins over LANG; an empty one is skipped.
+        assert!(!locale_is_utf8(env(&[
+            ("LC_ALL", "C"),
+            ("LANG", "en_GB.UTF-8")
+        ])));
+        assert!(locale_is_utf8(env(&[
+            ("LC_ALL", ""),
+            ("LANG", "en_GB.UTF-8")
+        ])));
+        assert!(!locale_is_utf8(env(&[("LANG", "de_DE.ISO8859-1")])));
+        assert!(!locale_is_utf8(env(&[])));
+    }
 
     fn args(items: &[&str]) -> impl Iterator<Item = String> {
         items
@@ -4604,6 +4736,8 @@ mod tests {
             "-a",
             "--assign",
             "--var",
+            "--term-escapes",
+            "--term-charset",
             "--cwd",
             "--auto-assign",
             "--stack",

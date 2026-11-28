@@ -1395,3 +1395,14 @@ result: stdout `Hi!\n`, exit 0 (20, 10 or 11 for the failure it hit),
 the same as on real Kickstart 3.1. Used by
 `crates/volamos/tests/console_e2e.rs`.
 
+
+## Terminal output fixture: `termtest`
+
+Writes Amiga console output a host terminal can't show as it is
+(issues #426/#427): single-byte CSI (`$9B`) control sequences, an
+Amiga-only one (cursor off, `CSI 0 SP p`), `SO`/`SI` shifting and
+Latin-1 text, in two `Write(Output(), ...)` calls that split one
+sequence between them. Source of truth: `gen_termtest.py` (no vasm).
+Exits 0 if each `Write` returned its own length, 10 otherwise. Used by
+`crates/volamos/tests/term_e2e.rs` with `--term-escapes` and
+`--term-charset`.

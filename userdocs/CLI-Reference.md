@@ -2,7 +2,8 @@
 
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
-        [--var NAME=VALUE]... [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
+        [--var NAME=VALUE]... [--term-escapes auto|on|off] [--term-charset auto|on|off]
+        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
         [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp] [--cpu-library FILE] [--jit|--no-jit]
@@ -153,6 +154,55 @@ volamos --var GREETING="hello there" --var DEBUG= myprog
 
 The `.volamos` key is `VAR` (see
 [Configuration Files](Configuration.md)).
+
+## `--term-escapes auto|on|off`
+
+Amiga console programs move the cursor, erase and set colours with
+control sequences introduced by the single byte `$9B` (or `ESC [`), and
+some of those sequences exist only on the Amiga. A host terminal shows
+a lone `$9B` as garbage. With this on, volamos rewrites the program's
+output for the terminal:
+
+- `$9B` becomes `ESC [`, for the sequences that mean the same on a host
+  terminal: cursor movement and positioning, inserting and deleting
+  characters and lines, scrolling, tabs, colours and text styles
+  (`SGR`), auto-wrap (`?7h`/`?7l`), and the device status request.
+- Erase in display/line (`J`/`K`) always erases to the end, as it does on
+  the Amiga, whatever parameter the program gave.
+- Cursor off and on (`CSI 0 SP p` / `CSI SP p`) become the host's
+  `ESC [?25l` / `ESC [?25h`.
+- Amiga-only sequences are dropped: page and line length, offsets, raw
+  input events, the window status request, the Amiga-only `>`
+  background-colour parameter of `SGR`, and the `SO`/`SI` shift into
+  the Latin-1 upper half (the shifted characters themselves are kept).
+- Colour numbers pass through unchanged. On the Amiga they pick palette
+  pens rather than fixed colours, so expect your terminal's colours.
+
+A sequence split across two `Write` calls is handled, and `Write` still
+returns the number of bytes the program wrote. A program that waits for
+an answer to the window status request (`CSI SP q`) gets none yet.
+
+- `auto` (the default) translates only when stdout is a terminal, so
+  output redirected to a file or a pipe stays byte-exact.
+- `on` always translates, for example into `less -R`.
+- `off` never does.
+
+The `.volamos` key is `TERM_ESCAPES`.
+
+## `--term-charset auto|on|off`
+
+Amiga text is ISO-8859-1 (Latin-1), so on a UTF-8 terminal an `é`
+(`$E9`) or a `£` (`$A3`) shows as garbage. With this on, volamos
+converts the program's output from Latin-1 to UTF-8. Only the
+characters `$A0`–`$FF` change; the control codes `$80`–`$9F` are left
+to `--term-escapes`, so the two can be switched separately.
+
+- `auto` (the default) converts only when stdout is a terminal and the
+  locale is UTF-8 (the first of `LC_ALL`, `LC_CTYPE` and `LANG` that is
+  set), so output redirected to a file or a pipe stays byte-exact.
+- `on` always converts; `off` never does.
+
+The `.volamos` key is `TERM_CHARSET`.
 
 ## `--cwd AMIGAPATH`
 
