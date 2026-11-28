@@ -609,8 +609,8 @@ fn old_fpsp_emulate_spelling_works_with_a_note_and_fpsp_has_none() {
         String::from_utf8_lossy(&new.stderr)
     );
 
-    // A guest argument that happens to read --fpsp-emulate is the guest's
-    // business, not a volamos flag.
+    // A guest argument, or a program named --fpsp-emulate (after `--`),
+    // is not the volamos flag: no note for either.
     let guest = Command::new(env!("CARGO_BIN_EXE_volamos"))
         .arg(HELLO_PATH)
         .arg("--fpsp-emulate")
@@ -621,5 +621,28 @@ fn old_fpsp_emulate_spelling_works_with_a_note_and_fpsp_has_none() {
         guest.stderr.is_empty(),
         "{:?}",
         String::from_utf8_lossy(&guest.stderr)
+    );
+
+    let home = FakeHome::new("fpsp-program-name");
+    std::fs::copy(HELLO_PATH, home.path.join("--fpsp-emulate")).unwrap();
+    let program = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .env("HOME", &home.path)
+        .current_dir(&home.path)
+        .args(["--", "--fpsp-emulate"])
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(
+        program.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&program.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(program.stdout).unwrap(),
+        "Hello from volamos\n"
+    );
+    assert!(
+        program.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&program.stderr)
     );
 }

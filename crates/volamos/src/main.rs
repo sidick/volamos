@@ -732,7 +732,7 @@ struct Cli {
     #[arg(
         long = "cpu-library",
         value_name = "FILE",
-        conflicts_with = "fpsp_emulate",
+        conflicts_with_all = ["fpsp_emulate", "fpsp_emulate_old_spelling"],
         help_heading = "Machine",
         long_help = "Open the real 68040.library or 68060.library FILE (68k code, from your \
                      own Amiga system or an archive such as MMULib) before the program \
@@ -880,9 +880,6 @@ struct Cli {
     /// Software-emulate 68040/68060-unimplemented instructions instead of trapping (off by default)
     #[arg(
         long = "fpsp",
-        // The flag's original name (issue #129), kept working but out of
-        // --help.
-        alias = "fpsp-emulate",
         action = ArgAction::SetTrue,
         help_heading = "Machine",
         long_help = "Software-emulate the instructions a real 68040/68060 removed from silicon \
@@ -902,6 +899,14 @@ struct Cli {
                       given."
     )]
     fpsp_emulate: bool,
+
+    /// `--fpsp-emulate`, `--fpsp`'s original name (issue #129): still
+    /// accepted, out of `--help`, and noted on stderr by `main`. A flag
+    /// of its own rather than a clap alias so the two spellings stay
+    /// distinguishable after parsing, and so a conflict error names the
+    /// spelling the user actually typed.
+    #[arg(long = "fpsp-emulate", action = ArgAction::SetTrue, hide = true)]
+    fpsp_emulate_old_spelling: bool,
 
     /// Batch-execute guest code via the trace JIT (default: no JIT)
     #[arg(
@@ -1414,7 +1419,7 @@ fn cli_to_raw(cli: Cli) -> RawParsedArgs {
         cli.clock_mhz,
         cli.cache,
         cli.mem_wait,
-        cli.fpsp_emulate,
+        cli.fpsp_emulate || cli.fpsp_emulate_old_spelling,
         cli.stack_report,
         LibraryFlags {
             libs_dir: cli.libs_dir,
@@ -3484,15 +3489,11 @@ fn main() -> ExitCode {
     // own fully-formatted help/usage/error text to the right stream and
     // exits with clap's own convention: 0 for `--help`/`--version`, 2 for
     // an actual parse error.
-    // `--fpsp-emulate` is a hidden clap alias of `--fpsp`, so the parsed
-    // `Cli` can't tell the spellings apart: look at the raw flags (only
-    // volamos's own, before `<program>`).
-    let old_fpsp_spelling = before.iter().any(|arg| arg == "--fpsp-emulate");
     let mut cli = match Cli::try_parse_from(std::iter::once("volamos".to_string()).chain(before)) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
-    if old_fpsp_spelling {
+    if cli.fpsp_emulate_old_spelling {
         eprintln!(
             "volamos: --fpsp-emulate is now called --fpsp (the old name still works) -- \
              pass --fpsp to avoid this note"
@@ -5095,6 +5096,18 @@ mod tests {
         let opts = parse_args(args(&["--fpsp-emulate", "prog"])).unwrap();
         assert!(opts.fpsp_emulate);
         assert_eq!(opts.program, "prog");
+    }
+
+    #[test]
+    fn fpsp_emulate_old_spelling_conflicts_with_cpu_library_by_its_own_name() {
+        let err = parse_args(args(&[
+            "--fpsp-emulate",
+            "--cpu-library",
+            "x.library",
+            "prog",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--fpsp-emulate"), "{err}");
     }
 
     #[test]
