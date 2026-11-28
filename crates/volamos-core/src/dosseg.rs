@@ -281,6 +281,7 @@
 //! `Execute()` -- a guest `RunCommand` call failing to invoke anything at
 //! all is an expected, guest-visible outcome, not a host-side bug.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
@@ -703,6 +704,19 @@ pub struct SystemRequest {
     /// splitting -- no quoting/escaping support, matching this module's
     /// documented scope cuts.
     pub args: Vec<String>,
+    /// The calling process's local (`LV_VAR`) variables, keyed the way
+    /// [`DosState::local_vars`] keys them, for the runner to give the
+    /// nested program's process (see
+    /// [`crate::dispatch::Runtime::set_local_var`]). Real `System()`
+    /// starts the command in a new shell process through
+    /// `CreateNewProc()`, passing the caller's tags on; `NP_CopyVars` is
+    /// not among the tags it filters out and defaults to TRUE ("Copy
+    /// local shell variables if they exist", NDK 3.2 `dos.doc`
+    /// `SystemTagList`/`CreateNewProc`), so the shell starts with a copy
+    /// of the caller's variables. Empty when the caller passed
+    /// `NP_CopyVars, FALSE`. A copy, not a share: nothing the nested
+    /// program sets or deletes reaches the caller.
+    pub local_vars: HashMap<String, Vec<u8>>,
 }
 
 /// The host-side `System()`/`Execute()` runner callback's type -- what
@@ -1103,8 +1117,10 @@ impl DosState {
     /// path, or no runner installed -- all folded into the same
     /// [`ERROR_OBJECT_NOT_FOUND`] "couldn't run it" bucket, per the
     /// module docs' scope-cut note on why this is a clean failure rather
-    /// than a loud one).
-    fn resolve_and_run(&mut self, command_line: &str) -> Result<i32, i32> {
+    /// than a loud one). `copy_vars` is `NP_CopyVars`: whether the
+    /// request carries the caller's local variables (see
+    /// [`SystemRequest::local_vars`]).
+    fn resolve_and_run(&mut self, command_line: &str, copy_vars: bool) -> Result<i32, i32> {
         let mut parts = command_line.split_whitespace();
         let program = parts.next().ok_or(ERROR_OBJECT_NOT_FOUND)?;
         let args: Vec<String> = parts.map(str::to_string).collect();
@@ -1116,15 +1132,21 @@ impl DosState {
             command_line: command_line.to_string(),
             resolved_program_host_path: host_path,
             args,
+            local_vars: if copy_vars {
+                self.local_vars.clone()
+            } else {
+                HashMap::new()
+            },
         };
         Ok(runner(&request))
     }
 
     /// `System()`/`SystemTagList()`: returns the invoked command's exit
     /// code, or `-1` with `IoErr()` set if it couldn't be run at all
-    /// (see [`Self::resolve_and_run`]).
-    pub fn system(&mut self, command_line: &str) -> i32 {
-        match self.resolve_and_run(command_line) {
+    /// (see [`Self::resolve_and_run`]). `copy_vars` is the tag list's
+    /// `NP_CopyVars` (default TRUE).
+    pub fn system(&mut self, command_line: &str, copy_vars: bool) -> i32 {
+        match self.resolve_and_run(command_line, copy_vars) {
             Ok(code) => code,
             Err(io_err) => {
                 self.set_io_err(io_err);
@@ -1136,9 +1158,12 @@ impl DosState {
     /// `Execute()`: returns whether the command was successfully
     /// *invoked* (independent of its own exit code) -- `true` maps to
     /// `D0 = DOSTRUE`, `false` to `D0 = DOSFALSE` with `IoErr()` set, in
-    /// [`execute_handler`].
+    /// [`execute_handler`]. `Execute()` takes no tags and the command
+    /// always gets a copy of the caller's local variables. The autodoc
+    /// doesn't say so; real Kickstart 3.1 (40.63) does it
+    /// (`fixtures/gen_vartest.py`, under Copperline).
     pub fn execute(&mut self, command_line: &str) -> bool {
-        match self.resolve_and_run(command_line) {
+        match self.resolve_and_run(command_line, true) {
             Ok(_code) => true,
             Err(io_err) => {
                 self.set_io_err(io_err);
@@ -1215,7 +1240,10 @@ const SYS_ERROR: u32 = SYS_DUMMY + 6;
 /// runtime, concurrent with the caller ([`start_system_child`]).
 /// Everything else still takes the synchronous nested-runtime path the
 /// module docs describe, with the tag list read but not acted on --
-/// including a synchronous `SYS_Input`/`SYS_Output`.
+/// including a synchronous `SYS_Input`/`SYS_Output`. Both paths honor
+/// `NP_CopyVars`, which real `SystemTagList` passes on to
+/// `CreateNewProc()`: the command gets a copy of the caller's local
+/// variables unless it is FALSE.
 fn system_tag_list_handler<C: Cpu + 'static>(
     ctx: &mut HandlerContext<'_, C>,
 ) -> Result<(), DispatchError> {
@@ -1225,8 +1253,10 @@ fn system_tag_list_handler<C: Cpu + 'static>(
 
     let asynch =
         crate::exectask::tag_data(ctx.mem, tags, SYS_ASYNCH).is_some_and(|value| value != 0);
+    let copy_vars = crate::exectask::tag_data(ctx.mem, tags, crate::exectask::NP_COPYVARS)
+        .is_none_or(|value| value != 0);
     let code = if asynch {
-        match start_system_child(ctx, &command_line, tags) {
+        match start_system_child(ctx, &command_line, tags, copy_vars) {
             Ok(()) => 0,
             Err(io_err) => {
                 ctx.dos.set_io_err(io_err);
@@ -1234,7 +1264,7 @@ fn system_tag_list_handler<C: Cpu + 'static>(
             }
         }
     } else {
-        ctx.dos.system(&command_line)
+        ctx.dos.system(&command_line, copy_vars)
     };
     ctx.cpu.set_data_register(DataRegister(0), code as u32);
     Ok(())
@@ -1254,7 +1284,7 @@ fn system_tag_list_handler<C: Cpu + 'static>(
 /// command. A handle not given is the caller's own, left open. The
 /// tag list also reaches `CreateNewProc`: `NP_ExitCode`/`NP_ExitData`
 /// are honored, so the caller learns when the command ends and how
-/// (`cli_ReturnCode`).
+/// (`cli_ReturnCode`), and so is `NP_CopyVars`.
 ///
 /// On failure nothing the caller passed in is closed: it still owns the
 /// handles.
@@ -1262,6 +1292,7 @@ fn start_system_child<C: Cpu>(
     ctx: &mut HandlerContext<'_, C>,
     command_line: &str,
     tags: u32,
+    copy_vars: bool,
 ) -> Result<(), i32> {
     let trimmed = command_line.trim_start();
     let program = trimmed
@@ -1312,7 +1343,7 @@ fn start_system_child<C: Cpu>(
         exit_data: tag(crate::exectask::NP_EXITDATA).unwrap_or(0),
         current_dir: None,
         home_dir: None,
-        copy_vars: true,
+        copy_vars,
         cli_command_name: Some(program.to_string()),
         seglist,
     };
@@ -2061,7 +2092,7 @@ mod tests {
         let tmp = TempDir::new("system-no-runner");
         fs::write(tmp.path().join("prog"), tiny_single_hunk_file()).unwrap();
         let mut dos = DosState::new(Some(vfs_over(tmp.path())));
-        let code = dos.system("SYS:prog");
+        let code = dos.system("SYS:prog", true);
         assert_eq!(code, -1);
         assert_eq!(dos.io_err(), ERROR_OBJECT_NOT_FOUND);
     }
@@ -2069,7 +2100,7 @@ mod tests {
     #[test]
     fn system_unresolvable_program_returns_minus_one() {
         let mut dos = DosState::new(None);
-        let code = dos.system("SYS:nope");
+        let code = dos.system("SYS:nope", true);
         assert_eq!(code, -1);
         assert_eq!(dos.io_err(), ERROR_OBJECT_NOT_FOUND);
     }
@@ -2084,7 +2115,7 @@ mod tests {
             assert_eq!(req.args, vec!["one".to_string(), "two".to_string()]);
             42
         }));
-        let code = dos.system("SYS:prog one two");
+        let code = dos.system("SYS:prog one two", true);
         assert_eq!(code, 42);
     }
 
@@ -2094,6 +2125,50 @@ mod tests {
         fs::write(tmp.path().join("prog"), tiny_single_hunk_file()).unwrap();
         let mut dos = DosState::new(Some(vfs_over(tmp.path())));
         dos.system_runner = Some(Box::new(|_req: &SystemRequest| 7));
+        assert!(dos.execute("SYS:prog"));
+    }
+
+    #[test]
+    fn system_hands_the_runner_a_copy_of_the_callers_local_vars() {
+        let tmp = TempDir::new("system-copies-vars");
+        fs::write(tmp.path().join("prog"), tiny_single_hunk_file()).unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.local_vars.insert("V".to_string(), b"x".to_vec());
+        dos.system_runner = Some(Box::new(|req: &SystemRequest| {
+            assert_eq!(req.local_vars.get("V").map(Vec::as_slice), Some(&b"x"[..]));
+            0
+        }));
+        assert_eq!(dos.system("SYS:prog", true), 0);
+    }
+
+    #[test]
+    fn system_with_np_copyvars_false_hands_the_runner_no_vars() {
+        let tmp = TempDir::new("system-no-copy-vars");
+        fs::write(tmp.path().join("prog"), tiny_single_hunk_file()).unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.local_vars.insert("V".to_string(), b"x".to_vec());
+        dos.system_runner = Some(Box::new(|req: &SystemRequest| {
+            assert!(req.local_vars.is_empty());
+            0
+        }));
+        assert_eq!(dos.system("SYS:prog", false), 0);
+        assert_eq!(
+            dos.local_vars.get("V").map(Vec::as_slice),
+            Some(&b"x"[..]),
+            "the caller keeps its own variables"
+        );
+    }
+
+    #[test]
+    fn execute_hands_the_runner_the_callers_local_vars() {
+        let tmp = TempDir::new("execute-copies-vars");
+        fs::write(tmp.path().join("prog"), tiny_single_hunk_file()).unwrap();
+        let mut dos = DosState::new(Some(vfs_over(tmp.path())));
+        dos.local_vars.insert("V".to_string(), b"x".to_vec());
+        dos.system_runner = Some(Box::new(|req: &SystemRequest| {
+            assert_eq!(req.local_vars.get("V").map(Vec::as_slice), Some(&b"x"[..]));
+            0
+        }));
         assert!(dos.execute("SYS:prog"));
     }
 

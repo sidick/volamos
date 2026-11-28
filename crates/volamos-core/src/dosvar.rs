@@ -35,6 +35,11 @@
 //! request, not a crash) -- neither has come up in the real binaries
 //! this runtime has been tested against yet.
 //!
+//! A new process starts with a copy of its creator's local variables
+//! unless `NP_CopyVars` is FALSE: in-runtime ones via
+//! [`crate::dosproc`]'s process state, a `System()`/`Execute()` nested
+//! run via [`crate::dosseg::SystemRequest::local_vars`].
+//!
 //! `FindVar` returns a guest `struct LocalVar` (`<dos/var.h>`: a 14-byte
 //! `struct Node`, `lv_Flags` at 14, `lv_Value` at 16, `lv_Len` at 20), which
 //! the host-side store has no use for, so one is built on the first
@@ -70,7 +75,7 @@ use crate::memory::AddressSpace;
 use crate::vfs::{ResolveMode, Vfs};
 
 /// The key a local variable is stored under: names are case-insensitive.
-fn local_key(raw_name: &[u8]) -> String {
+pub(crate) fn local_key(raw_name: &[u8]) -> String {
     String::from_utf8_lossy(raw_name).to_ascii_uppercase()
 }
 

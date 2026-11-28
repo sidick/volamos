@@ -1368,3 +1368,18 @@ startup packet in `D1` is a regular shell startup (`dp_Type` non-zero,
 `dp_Res1` and `dp_Res2` zero), and replies it with `ReplyPkt`: 7 if so, 99
 if not, which is the exit code. Used by `crates/volamos/tests/shell_e2e.rs`.
 
+## `System()` local-variables fixture: `vartest`
+
+Proves a `System()`ed command starts with a copy of its caller's local
+variables (`NP_CopyVars`, default TRUE), gets none with `NP_CopyVars,
+FALSE`, that `Execute()` copies them too, and that the command can't
+change the caller's. Source of truth: `gen_vartest.py`
+(no vasm). One program plays both parts. As the parent it sets
+`VARTEST=inherited`, runs `TEST:vartest child` three times (`System()`
+with no tags, `System()` with `NP_CopyVars, FALSE`, then `Execute()`),
+then prints its own `VARTEST`. As the
+child (command line `child`) it prints `VARTEST` or `unset`, then sets
+its copy to `changed`. Expected stdout: `inherited\nunset\ninherited\ninherited\n`,
+exit 0, the same as on real Kickstart 3.1 (see the generator's
+docstring for the Copperline setup). Used by
+`crates/volamos/tests/dosseg_e2e.rs`.

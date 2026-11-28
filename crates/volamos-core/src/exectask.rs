@@ -992,7 +992,7 @@ const NP_STACKSIZE: u32 = NP_DUMMY + 11;
 const NP_HOMEDIR: u32 = NP_DUMMY + 16;
 /// `NP_CopyVars` (`NP_Dummy + 17`, `BOOL`): copy the caller's local
 /// shell variables to the new process. Default TRUE.
-const NP_COPYVARS: u32 = NP_DUMMY + 17;
+pub(crate) const NP_COPYVARS: u32 = NP_DUMMY + 17;
 /// `NP_Name` (`NP_Dummy + 12`): process name, a plain NUL-terminated C
 /// string per the autodoc (not a `BSTR`).
 const NP_NAME: u32 = NP_DUMMY + 12;
