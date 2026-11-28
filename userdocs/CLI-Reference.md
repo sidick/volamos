@@ -3,6 +3,7 @@
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
         [--var NAME=VALUE]... [--term-escapes auto|on|off] [--term-charset auto|on|off]
+        [--key HOSTKEY=AMIGAKEY]...
         [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
         [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
@@ -182,12 +183,18 @@ output for the terminal:
 
 A sequence split across two `Write` calls is handled, including one a
 program started and a command it ran with `System()` finished, and
-`Write` still returns the number of bytes the program wrote. The window
-status request (`CSI SP q`) and the device status request (`CSI 6 n`)
-are dropped too: a program that waits for the answer gets none yet.
+`Write` still returns the number of bytes the program wrote.
 
-- `auto` (the default) translates only when stdout is a terminal, so
-  output redirected to a file or a pipe stays byte-exact.
+The same setting covers input. In raw mode, host key sequences become
+the Amiga's: cursor up `ESC [ A` arrives as `$9B A`. The window size
+request (`CSI SP q`) is answered from the terminal's size, and the
+cursor position request (`CSI 6 n`) is passed to the terminal with its
+answer translated back. See
+[Keyboard and Terminal Input](Keyboard.md) for the full key map.
+
+- `auto` (the default) translates output only when stdout is a
+  terminal, so output redirected to a file or a pipe stays byte-exact,
+  and keys only when stdin is a terminal.
 - `on` always translates, for example into `less -R`.
 - `off` never does.
 
@@ -202,13 +209,30 @@ characters `$A0`–`$FF` change; the control codes `$80`–`$9F`, and the
 `SO`/`SI` shift, are left to `--term-escapes`, so the two can be switched
 separately.
 
-- `auto` (the default) converts only when stdout is a terminal and the
-  locale is UTF-8 (the first of `LC_ALL`, `LC_CTYPE` and `LANG` that is
-  set), so output redirected to a file or a pipe stays byte-exact. On
-  a host that doesn't set these, such as Windows, pass `on`.
-- `on` always converts; `off` never does.
+It also covers input. UTF-8 typed at the terminal is converted to
+Latin-1, and a character Latin-1 lacks becomes `?`. The program's
+arguments are converted the same way, so `volamos echoargs café` passes
+`caf$E9`; an argument that isn't UTF-8 is passed unchanged.
+
+- `auto` (the default) converts only when the locale is UTF-8 (the first
+  of `LC_ALL`, `LC_CTYPE` and `LANG` that is set). Output is converted
+  only when stdout is a terminal, so output redirected to a file or a
+  pipe stays byte-exact. Typed input is converted only when stdin is a
+  terminal. Arguments are converted whenever the locale is UTF-8. On a
+  host that doesn't set these variables, such as Windows, pass `on`.
+- `on` always converts, piped stdin included; `off` never does.
 
 The `.volamos` key is `TERM_CHARSET`.
+
+## `--key HOSTKEY=AMIGAKEY`
+
+Makes a host terminal key type an Amiga key in raw mode, for example
+`--key F12=HELP` for the Help key a PC keyboard lacks. The option is
+repeatable, either side can have a `Shift+` prefix, and it needs
+`--term-escapes`. [Keyboard and Terminal Input](Keyboard.md) lists the
+key names and the default map.
+
+The `.volamos` key is `KEY`, one line per mapping.
 
 ## `--cwd AMIGAPATH`
 

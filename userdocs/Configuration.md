@@ -51,11 +51,12 @@ Each key mirrors a [CLI Reference](CLI-Reference.md) flag directly:
 | `SNOOP` | `-s`/`--snoop` | `true`/`false` |
 | `TERM_ESCAPES` | `--term-escapes` | `auto`/`on`/`off` |
 | `TERM_CHARSET` | `--term-charset` | `auto`/`on`/`off` |
+| `KEY` | `--key` | `HOSTKEY=AMIGAKEY` (so `KEY=F12=HELP`), repeatable; see [Keyboard and Terminal Input](Keyboard.md) |
 | `DEFAULTS` | `--defaults`/`--no-defaults` | `true`/`false`; see [Volumes and Assigns](Volumes-and-Assigns.md#standard-defaults) |
 | `VOLUMES_DIR` | `--volumes-dir` | where the default `SYS:` volume lives |
 
-`VOLUME`/`ASSIGN`/`VAR` are **repeatable** — one line per entry, same as
-giving `-V`/`-a`/`--var` more than once. Every other key is **singular**: if
+`VOLUME`/`ASSIGN`/`VAR`/`KEY` are **repeatable** — one line per entry, same as
+giving `-V`/`-a`/`--var`/`--key` more than once. Every other key is **singular**: if
 the same key appears more than once in one file, the last line wins
 (the same rule repeating a CLI flag already follows).
 

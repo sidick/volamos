@@ -1181,6 +1181,8 @@ impl DosState {
                 // bytes the guest will (see `crate::hostterm`).
                 let n = if crate::hostterm::stdin_is_tty() {
                     crate::hostterm::read_stdin(&mut buf).map_err(|e| map_io_error(&e))?
+                } else if crate::hostterm::input_translates() {
+                    crate::hostterm::read_piped_stdin(&mut buf).map_err(|e| map_io_error(&e))?
                 } else {
                     std::io::stdin()
                         .read(&mut buf)

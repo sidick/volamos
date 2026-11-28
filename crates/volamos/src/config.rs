@@ -17,7 +17,8 @@
 //! `-a`), `VAR` (repeatable, `NAME=VALUE` like `--var`, whitespace
 //! around its own `=` trimmed too), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM`
 //! (same `K`/`M`-suffixed syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
-//! `false`), `TERM_ESCAPES`/`TERM_CHARSET` (`auto`/`on`/`off`). A repeated *singular* key within one file follows the same
+//! `false`), `TERM_ESCAPES`/`TERM_CHARSET` (`auto`/`on`/`off`), `KEY`
+//! (repeatable, `HOSTKEY=AMIGAKEY` like `--key`). A repeated *singular* key within one file follows the same
 //! "last one wins" rule repeating a CLI flag already has. Relative
 //! `VOLUME`/`AUTO_ASSIGN` host directories resolve against **the
 //! config file's own directory** (uniformly, for all three sources --
@@ -85,6 +86,10 @@ pub(crate) struct Overrides {
     /// for the host terminal. See [`TermSetting`].
     pub(crate) term_escapes: Option<TermSetting>,
     pub(crate) term_charset: Option<TermSetting>,
+    /// `KEY`/`--key`: repeatable `HOSTKEY=AMIGAKEY` key mappings, applied
+    /// in order, so merged like [`Self::vars`] (a higher source's come
+    /// later and win).
+    pub(crate) keys: Vec<String>,
     /// `--net`: enables `bsdsocket.library` (real host network access for
     /// the guest). Deliberately **not** a recognized `~/.volamos`/
     /// `.volamos` config key (see `crate::config`'s module doc and
@@ -234,6 +239,12 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
                 overrides.term_escapes =
                     Some(parse_term_setting("TERM_ESCAPES", value).map_err(with_line)?);
             }
+            "KEY" => {
+                volamos_core::termin::KeyMap::default()
+                    .set(value)
+                    .map_err(|e| with_line(format!("KEY {value}: {e}")))?;
+                overrides.keys.push(value.to_string());
+            }
             "TERM_CHARSET" => {
                 overrides.term_charset =
                     Some(parse_term_setting("TERM_CHARSET", value).map_err(with_line)?);
@@ -328,6 +339,7 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         jit: higher.jit.or(lower.jit),
         term_escapes: higher.term_escapes.or(lower.term_escapes),
         term_charset: higher.term_charset.or(lower.term_charset),
+        keys: lower.keys.into_iter().chain(higher.keys).collect(),
         // net is deliberately CLI-only (see Overrides::net's doc) -- a
         // config file layer's `net` is always None, so this is really
         // just "the CLI's own value passes through unchanged", not a

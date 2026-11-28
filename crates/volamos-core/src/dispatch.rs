@@ -2721,8 +2721,9 @@ impl StackUsageEntry {
 /// so a CLI's `--verbose` flag can log it.
 pub type TraceEvent = CallInfo;
 
-/// Wraps `arg` in AmigaDOS `ReadArgs`-syntax double quotes (escaping `"`
-/// as `*"`, `*` as `**`, and a literal newline as `*n`, matching
+/// Appends `arg` to `out`, wrapped in AmigaDOS `ReadArgs`-syntax double
+/// quotes (escaping `"` as `*"`, `*` as `**`, and a literal newline as
+/// `*n`, matching
 /// `crate::dosargs`'s own quoted-item decoder exactly) if it contains
 /// any character that would otherwise split it into multiple tokens or
 /// be misread (whitespace, `;`, `"`, `*`) or if it's empty (an empty
@@ -2731,26 +2732,44 @@ pub type TraceEvent = CallInfo;
 /// arguments are unaffected. `=` alone does not quote: `KEY=value`
 /// typed into a shell is a keyword and its value, and a host argument
 /// spelled the same means the same.
-fn quote_arg_if_needed(arg: &str) -> String {
+///
+/// An argument is Latin-1 by the time it reaches the guest (see
+/// [`command_line`]), not necessarily UTF-8, so this works on bytes.
+fn quote_arg_bytes(arg: &[u8], out: &mut Vec<u8>) {
     let needs_quoting = arg.is_empty()
         || arg
-            .chars()
-            .any(|c| matches!(c, ' ' | '\t' | '\n' | ';' | '"' | '*'));
+            .iter()
+            .any(|b| matches!(b, b' ' | b'\t' | b'\n' | b';' | b'"' | b'*'));
     if !needs_quoting {
-        return arg.to_string();
+        out.extend_from_slice(arg);
+        return;
     }
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('"');
-    for c in arg.chars() {
-        match c {
-            '"' => out.push_str("*\""),
-            '*' => out.push_str("**"),
-            '\n' => out.push_str("*n"),
-            _ => out.push(c),
+    out.push(b'"');
+    for &b in arg {
+        match b {
+            b'"' => out.extend_from_slice(b"*\""),
+            b'*' => out.extend_from_slice(b"**"),
+            b'\n' => out.extend_from_slice(b"*n"),
+            _ => out.push(b),
         }
     }
-    out.push('"');
-    out
+    out.push(b'"');
+}
+
+/// The command-line buffer a program started with `args` gets: each one
+/// quoted if it needs it ([`quote_arg_bytes`]), joined with spaces,
+/// with one more space after the last and a newline -- see
+/// [`Runtime::new`]'s doc. Exactly what [`StartConfig::args`] produces,
+/// for a caller that has the arguments as bytes and passes the result as
+/// [`StartConfig::raw_command_line`].
+pub fn command_line<A: AsRef<[u8]>>(args: &[A]) -> Vec<u8> {
+    let mut line = Vec::new();
+    for arg in args {
+        quote_arg_bytes(arg.as_ref(), &mut line);
+        line.push(b' ');
+    }
+    line.push(b'\n');
+    line
 }
 
 /// The shared tail of every task switch (issue #237): commits the
@@ -3415,7 +3434,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         // no-argument command line has no leading space either way
         // (just `"\n"`), which volamos already produced correctly.
         //
-        // Each `config.args` element is re-quoted with `quote_arg_if_needed`
+        // Each `config.args` element is re-quoted with `quote_arg_bytes`
         // before joining -- the host shell has already split argv into
         // separate elements and stripped ITS OWN quoting, so an element
         // containing whitespace (e.g. a multi-word `Filenote ... COMMENT
@@ -3433,14 +3452,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         let line = if let Some(raw) = &config.raw_command_line {
             raw.clone()
         } else {
-            let quoted_args: Vec<String> =
-                config.args.iter().map(|a| quote_arg_if_needed(a)).collect();
-            let mut line = quoted_args.join(" ").into_bytes();
-            if !quoted_args.is_empty() {
-                line.push(b' ');
-            }
-            line.push(b'\n');
-            line
+            command_line(&config.args)
         };
         let line_len = line.len() as u32;
         let args_addr = heap
@@ -6835,6 +6847,24 @@ mod tests {
         assert_eq!(bytes, b"foo bar \n");
         // A defensive NUL immediately follows, not counted in D0.
         assert_eq!(rt.mem.read_u8(a0 + d0), 0);
+    }
+
+    #[test]
+    fn command_line_quotes_and_frames_byte_arguments() {
+        assert_eq!(command_line::<&[u8]>(&[]), b"\n");
+        // A Latin-1 argument stays one byte per character.
+        assert_eq!(
+            command_line(&[&b"caf\xe9"[..], b"two words", b""]),
+            b"caf\xe9 \"two words\" \"\" \n"
+        );
+        assert_eq!(command_line(&["a*b"]), b"\"a**b\" \n");
+    }
+
+    /// [`quote_arg_bytes`] on a string, for these tests.
+    fn quote_arg_if_needed(arg: &str) -> String {
+        let mut out = Vec::new();
+        quote_arg_bytes(arg.as_bytes(), &mut out);
+        String::from_utf8(out).expect("quoting only adds ASCII")
     }
 
     #[test]

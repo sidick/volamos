@@ -335,6 +335,14 @@ fn convert(class: u8, code: u16, qualifier: u16, prev1: (u8, u8)) -> Result<&'st
     })
 }
 
+/// The bytes raw key `code` gives on the default keymap, unshifted or
+/// with Shift, as measured on Kickstart 3.1: what the console's read
+/// stream carries for that key. For [`crate::termin`]'s host-key mapping.
+pub(crate) fn key_bytes(code: u8, shift: bool) -> &'static [u8] {
+    let key = &KEYS[usize::from(code & 0x7F)];
+    if shift { key.shift } else { key.plain }
+}
+
 /// What `code` becomes after the dead key in `prev1`, if that is a dead
 /// key and `code` one of the keys it changes; `None` otherwise.
 fn compose(

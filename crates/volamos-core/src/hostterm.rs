@@ -73,14 +73,151 @@
 //! own buffer. Non-TTY stdin keeps `std`'s buffered reads, which matter
 //! for a piped guest reading it a byte at a time.
 //!
+//! # Translation
+//!
+//! Every byte read from the terminal, by a guest read or by the
+//! break-key pump, goes through one [`crate::termin::TermInput`]
+//! before it reaches [`LOOKAHEAD`](unix): host keys become Amiga key
+//! sequences in raw mode, and UTF-8 becomes Latin-1, as the CLI's
+//! `--term-escapes`/`--term-charset` say ([`set_input_translation`]).
+//! A key sequence or character cut off at the end of a read is held;
+//! if nothing more arrives within [`HELD_INPUT_WAIT`] it is let go (a
+//! lone `ESC` is the Esc key). With both settings off the translator
+//! passes every byte through, and reads behave as they did before.
+//!
+//! The console's answers to the guest's own requests are put into the
+//! same queue ([`inject_console_input`]): the window bounds report, which
+//! volamos makes from the terminal's size ([`terminal_size`]), and the
+//! cursor position report, which the terminal sends itself.
+//!
+//! A piped stdin is read through `std`'s buffer as before, and only
+//! translated when `--term-charset on` asks for it ([`read_piped_stdin`]).
+//!
 //! # Other platforms
 //!
 //! There is no termios outside Unix. Elsewhere stdin is never a TTY as
 //! far as this module is concerned, so `SetMode` and `WaitForChar` keep
 //! their old answers.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
+
+use crate::termin::{KeyMap, TermInput};
+
+/// How long a key sequence or character cut off at the end of a read is
+/// held for the rest, before it is let go. A terminal sends one key's
+/// bytes in a single burst, so this only matters for the Esc key itself.
+pub(crate) const HELD_INPUT_WAIT: Duration = Duration::from_millis(50);
+
+/// The translation input from the host goes through; see the module
+/// docs. `None` until [`set_input_translation`] runs: nothing changes.
+static INPUT: Mutex<Option<TermInput>> = Mutex::new(None);
+
+/// Whether [`INPUT`] changes anything, without taking its lock.
+static INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn with_input<R>(f: impl FnOnce(&mut TermInput) -> R) -> R {
+    let mut input = INPUT.lock().unwrap_or_else(|e| e.into_inner());
+    f(input.get_or_insert_with(|| TermInput::new(false, false, KeyMap::default())))
+}
+
+/// Sets how host input is translated for the guest (issue #426): `keys`
+/// translates key sequences in raw mode, `charset` converts UTF-8 to
+/// Latin-1, `map` is the key mapping. For the CLI, once, before the run.
+pub fn set_input_translation(keys: bool, charset: bool, map: KeyMap) {
+    let input = TermInput::new(keys, charset, map);
+    INPUT_ACTIVE.store(input.is_active(), Ordering::Relaxed);
+    *INPUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
+}
+
+/// Whether host input is translated at all.
+pub(crate) fn input_translates() -> bool {
+    INPUT_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// `bytes`, just read from the host, translated onto the end of `ahead`.
+fn ingest(bytes: &[u8], raw: bool, ahead: &mut std::collections::VecDeque<u8>) {
+    let mut out = Vec::with_capacity(bytes.len());
+    with_input(|t| t.feed(bytes, raw, &mut out));
+    ahead.extend(out);
+}
+
+/// Lets go of held input onto the end of `ahead`.
+fn flush_input(ahead: &mut std::collections::VecDeque<u8>) {
+    let mut out = Vec::new();
+    with_input(|t| t.flush(&mut out));
+    ahead.extend(out);
+}
+
+/// How much longer held input waits before it is let go: `None` when
+/// nothing is held, zero when it has waited long enough.
+fn held_input_wait() -> Option<Duration> {
+    with_input(|t| t.held_for()).map(|held| HELD_INPUT_WAIT.saturating_sub(held))
+}
+
+/// Whether a cursor position request the guest sends can be answered: the
+/// terminal's answer arrives on stdin, so it has to be a terminal, in raw
+/// mode (a cooked read would hold the answer until Return), with key
+/// translation on to turn the answer into the Amiga's form.
+pub fn cursor_reports_readable() -> bool {
+    stdin_is_tty() && stdin_is_raw() && with_input(|t| t.translates_keys())
+}
+
+/// The guest asked for the cursor position and the request went to the
+/// terminal: read its answer as one.
+pub fn expect_cursor_report() {
+    with_input(|t| t.expect_cursor_report());
+}
+
+/// Answers the guest's window status request (`CSI SP q`) with the
+/// window bounds report the RKRM Devices console chapter gives ("for a
+/// window that holds 20 lines with 60 characters per line ... `9B 31 3B
+/// 31 3B 32 30 3B 36 30 20 72`"), from the terminal's size. Nothing when
+/// stdin isn't a terminal, or the size can't be had.
+pub fn answer_window_status() {
+    if !stdin_is_tty() {
+        return;
+    }
+    if let Some((rows, cols)) = terminal_size() {
+        inject_console_input(format!("\u{9b}1;1;{rows};{cols} r").as_bytes());
+    }
+}
+
+/// Bytes for a piped stdin read ahead and already translated: see
+/// [`read_piped_stdin`].
+static PIPED_AHEAD: Mutex<std::collections::VecDeque<u8>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// A read of a stdin that isn't a terminal, translated (only the
+/// character conversion can apply: keys need raw mode, which needs a
+/// terminal). For when [`input_translates`]; otherwise a plain read does.
+pub(crate) fn read_piped_stdin(buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let mut ahead = PIPED_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if !ahead.is_empty() {
+            let n = buf.len().min(ahead.len());
+            for (slot, byte) in buf.iter_mut().zip(ahead.drain(..n)) {
+                *slot = byte;
+            }
+            return Ok(n);
+        }
+        let mut chunk = [0u8; 4096];
+        let n = std::io::stdin().read(&mut chunk)?;
+        if n == 0 {
+            flush_input(&mut ahead);
+            if ahead.is_empty() {
+                return Ok(0);
+            }
+        } else {
+            ingest(&chunk[..n], false, &mut ahead);
+        }
+    }
+}
 
 /// Whether `SetMode` has the console in raw mode right now.
 static RAW: AtomicBool = AtomicBool::new(false);
@@ -170,6 +307,8 @@ mod tests {
 #[cfg(unix)]
 pub use unix::restore_stdin_mode;
 #[cfg(unix)]
+pub use unix::{inject_console_input, terminal_size};
+#[cfg(unix)]
 pub(crate) use unix::{
     pump_console_breaks, pump_console_breaks_now, read_stdin, set_stdin_raw, stdin_has_key,
     stdin_is_tty, stdio_is_console, wait_for_console_input_until,
@@ -201,9 +340,14 @@ mod fallback {
     pub(crate) fn read_stdin(_buf: &mut [u8]) -> std::io::Result<usize> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
+    /// Nowhere to put it: stdin is never a terminal here.
+    pub fn inject_console_input(_bytes: &[u8]) {}
+    pub fn terminal_size() -> Option<(u16, u16)> {
+        None
+    }
 }
 #[cfg(not(unix))]
-pub use fallback::restore_stdin_mode;
+pub use fallback::{inject_console_input, restore_stdin_mode, terminal_size};
 #[cfg(not(unix))]
 pub(crate) use fallback::{
     pump_console_breaks, pump_console_breaks_now, read_stdin, set_stdin_raw, stdin_has_key,
@@ -426,27 +570,71 @@ mod unix {
     /// ([`super::strip_console_breaks`]), so a read that finds only those
     /// goes on waiting for a key; keys [`pump_console_breaks`] already read
     /// ahead come first.
+    ///
+    /// What is read goes through [`super::ingest`]'s translation into
+    /// [`LOOKAHEAD`] and is handed out from there, so a key whose
+    /// translation is longer than what was read leaves the rest for the
+    /// next read. Input held back at the end of a read (an `ESC` that may
+    /// start a key sequence) is let go if nothing follows within
+    /// [`super::HELD_INPUT_WAIT`].
     pub(crate) fn read_stdin(buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut chunk = [0u8; 4096];
         loop {
             {
                 let mut ahead = lookahead();
-                if !ahead.is_empty() && !buf.is_empty() {
+                if !ahead.is_empty() {
                     let n = buf.len().min(ahead.len());
-                    for slot in &mut buf[..n] {
-                        *slot = ahead.pop_front().unwrap_or(0);
+                    for (slot, byte) in buf.iter_mut().zip(ahead.drain(..n)) {
+                        *slot = byte;
                     }
                     return Ok(n);
                 }
             }
-            let n = read_fd(libc::STDIN_FILENO, buf)?;
-            if n == 0 || !super::stdin_is_raw() {
-                return Ok(n);
+            if let Some(wait) = super::held_input_wait()
+                && !stdin_ready(wait)
+            {
+                super::flush_input(&mut lookahead());
+                continue;
             }
-            let kept = super::strip_console_breaks(&mut buf[..n]);
-            if kept > 0 {
-                return Ok(kept);
+            let n = read_fd(libc::STDIN_FILENO, &mut chunk)?;
+            if n == 0 {
+                let mut ahead = lookahead();
+                super::flush_input(&mut ahead);
+                if ahead.is_empty() {
+                    return Ok(0);
+                }
+                continue;
             }
+            let raw = super::stdin_is_raw();
+            let kept = if raw {
+                super::strip_console_breaks(&mut chunk[..n])
+            } else {
+                n
+            };
+            super::ingest(&chunk[..kept], raw, &mut lookahead());
         }
+    }
+
+    /// Puts `bytes` at the end of the console's input, as the console
+    /// does with its reports (see the module docs).
+    pub fn inject_console_input(bytes: &[u8]) {
+        lookahead().extend(bytes);
+    }
+
+    /// The terminal's size as `(rows, columns)`, from `TIOCGWINSZ` on
+    /// stdout, or stdin if stdout isn't one; `None` if neither says.
+    pub fn terminal_size() -> Option<(u16, u16)> {
+        [libc::STDOUT_FILENO, libc::STDIN_FILENO]
+            .into_iter()
+            .find_map(|fd| {
+                // SAFETY: an all-zero winsize is a valid out-parameter.
+                let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+                let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0;
+                (ok && size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+            })
     }
 
     /// In raw mode, reads whatever is waiting on `fd` into `ahead` with
@@ -461,7 +649,7 @@ mod unix {
             return 0;
         };
         let (kept, raised) = super::strip_breaks(&mut buf[..n]);
-        ahead.extend(&buf[..kept]);
+        super::ingest(&buf[..kept], true, ahead);
         raised
     }
 
@@ -538,17 +726,32 @@ mod unix {
     /// `timeout`. In raw mode a `Ctrl+D`/`E`/`F` is a break signal, not a
     /// key, so those do not count (and are raised as they are noticed).
     pub(crate) fn stdin_has_key(timeout: Duration) -> bool {
+        if !lookahead().is_empty() {
+            return true;
+        }
         if !super::stdin_is_raw() {
             return stdin_ready(timeout);
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             pump_console_breaks_now();
+            let held = super::held_input_wait();
+            if held == Some(Duration::ZERO) {
+                // Held long enough (a lone Esc): it is a key now.
+                super::flush_input(&mut lookahead());
+            }
             if !lookahead().is_empty() {
                 return true;
             }
             let now = std::time::Instant::now();
-            if now >= deadline || !stdin_ready(deadline - now) {
+            if now >= deadline {
+                return false;
+            }
+            // Wake for whichever comes first: input, the end of the
+            // timeout, or the held input's moment being up -- never past
+            // the caller's timeout, so WaitForChar(fh, 0) doesn't block.
+            let wait = held.map_or(deadline - now, |h| h.min(deadline - now));
+            if !stdin_ready(wait) && held.is_none() {
                 return false;
             }
         }
