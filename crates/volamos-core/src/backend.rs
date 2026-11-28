@@ -107,8 +107,9 @@ pub const TRAP_TABLE_BASE: u32 = 0x0000;
 /// `struct ExpansionBase` is the largest header this runtime builds, so
 /// its base sits lower in its chunk than the others' do -- and once more
 /// from `0x3004` for `icon.library`'s real base (see
-/// `crate::dispatch::ICON_LIBRARY_BASE`).
-pub const TRAP_TABLE_SIZE: u32 = 0x3204;
+/// `crate::dispatch::ICON_LIBRARY_BASE`), and once more from `0x3204`
+/// for `console.device`'s (see `crate::dispatch::CONSOLE_DEVICE_BASE`).
+pub const TRAP_TABLE_SIZE: u32 = 0x3404;
 
 /// First guest address *after* the reserved trap table region
 /// (exclusive). Guest code, data, and stack should live at or above this

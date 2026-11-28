@@ -533,6 +533,45 @@ which only advances while the guest runs, but a request still waits out
 host time (as `Delay()` does), so a `UNIT_WAITECLOCK` request can come
 back before the emulated counter reaches its target.
 
+## console.device
+
+Only the library unit: `OpenDevice("console.device", -1, ...)`
+(`CONU_LIBRARY`) opens without a window and returns the device base in
+`io_Device`, as programs such as the Amiga Installer expect, and
+`RawKeyConvert` works through it. The window units (`0`, `1`, `3`) still
+fail to open with `IOERR_OPENFAIL`: there is no display to put a console
+in.
+
+`RawKeyConvert` converts one key event with the default (usa) keymap.
+Its output was checked against real Kickstart 3.1 for every raw key
+under no qualifier, each Shift, Caps Lock, Ctrl, each Alt, each Amiga
+key, the numeric-pad qualifier, key repeat, and some combinations of
+these:
+
+- Function, cursor and Help keys give their `CSI` sequences.
+- Caps Lock only affects letters.
+- A key that doesn't repeat gives nothing with `IEQUALIFIER_REPEAT`.
+- Dead keys work: Alt+`F`/`G`/`H`/`J`/`K` give nothing themselves, and
+  if the event's `ie_Prev1DownCode`/`ie_Prev1DownQual` name one, the
+  next vowel, `y`, `n` or space comes out accented in Latin-1, with or
+  without Shift.
+- A key-up event, an `ie_Code` above `$FF`, or an event that isn't
+  `IECLASS_RAWKEY` gives 0 bytes.
+- If the result won't fit in the buffer, it returns -1 and writes
+  nothing.
+
+These fail the run with an error naming the call, rather than return
+bytes volamos can't vouch for:
+
+- An event chain (`ie_NextEvent` set). Real Kickstart 3.1 handles
+  chains erratically, and hangs on some.
+- A keymap other than the default (`keyMap` not `NULL`).
+- A dead key followed by a key it changes, with any qualifier but
+  Shift.
+- Alt together with Ctrl or Caps Lock.
+- `CDInputHandler`, which feeds input to console windows, and `DoIO` or
+  `SendIO` of any command on the unit -1 request.
+
 ## expansion.library
 
 The Zorro autoconfig bookkeeping library — and here, the truthful
