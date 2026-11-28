@@ -71,6 +71,7 @@ pub mod memmap;
 pub mod memory;
 pub mod sanitize;
 pub mod taskswitch;
+pub mod termout;
 pub mod uaedebug;
 pub mod uaelibdebug;
 pub mod utility;

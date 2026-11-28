@@ -92,6 +92,13 @@ class DataBuilder:
         for v in values:
             self.bytes += u32(v)
 
+    def raw(self, name: str, data: bytes) -> None:
+        """Bytes exactly as given, no terminator -- output a fixture
+        writes with `Write` whose bytes aren't ASCII (Latin-1 text,
+        console control sequences), first needed by `gen_termtest.py`."""
+        self.label(name)
+        self.bytes += data
+
     def align4(self) -> None:
         while len(self.bytes) % 4:
             self.bytes.append(0)

@@ -17,7 +17,7 @@
 //! `-a`), `VAR` (repeatable, `NAME=VALUE` like `--var`, whitespace
 //! around its own `=` trimmed too), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM`
 //! (same `K`/`M`-suffixed syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
-//! `false`). A repeated *singular* key within one file follows the same
+//! `false`), `TERM_ESCAPES`/`TERM_CHARSET` (`auto`/`on`/`off`). A repeated *singular* key within one file follows the same
 //! "last one wins" rule repeating a CLI flag already has. Relative
 //! `VOLUME`/`AUTO_ASSIGN` host directories resolve against **the
 //! config file's own directory** (uniformly, for all three sources --
@@ -79,6 +79,12 @@ pub(crate) struct Overrides {
     pub(crate) cpu_type: Option<CpuType>,
     pub(crate) fpu: Option<bool>,
     pub(crate) jit: Option<bool>,
+    /// `TERM_ESCAPES`/`--term-escapes` and `TERM_CHARSET`/
+    /// `--term-charset`: whether the guest's console output gets its
+    /// control sequences translated, and its Latin-1 converted to UTF-8,
+    /// for the host terminal. See [`TermSetting`].
+    pub(crate) term_escapes: Option<TermSetting>,
+    pub(crate) term_charset: Option<TermSetting>,
     /// `--net`: enables `bsdsocket.library` (real host network access for
     /// the guest). Deliberately **not** a recognized `~/.volamos`/
     /// `.volamos` config key (see `crate::config`'s module doc and
@@ -118,6 +124,30 @@ pub(crate) struct Overrides {
     /// [`crate::Options::ephemeral_dirs`]. Same "only the defaults layer
     /// ever sets this" reasoning as [`Self::lazy_volumes`].
     pub(crate) ephemeral_dirs: Vec<PathBuf>,
+}
+
+/// `auto`/`on`/`off`, for `--term-escapes`/`--term-charset` (issues
+/// #426/#427): `auto` (the default) translates only when stdout is a
+/// terminal -- and, for the character conversion, one on a UTF-8
+/// locale -- so redirected output stays byte-exact; `on` always does,
+/// for a pager or a test; `off` never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TermSetting {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Parses a [`TermSetting`] (case-insensitive); `what` names the flag
+/// or key for the error.
+pub(crate) fn parse_term_setting(what: &str, s: &str) -> Result<TermSetting, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(TermSetting::Auto),
+        "on" => Ok(TermSetting::On),
+        "off" => Ok(TermSetting::Off),
+        _ => Err(format!("{what} expects auto, on or off, got {s:?}")),
+    }
 }
 
 /// Parses a `true`/`false` value (case-insensitive), for the `FPU`/
@@ -200,6 +230,14 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
             "JIT" => overrides.jit = Some(parse_bool("JIT", value).map_err(with_line)?),
             "VERBOSE" => overrides.verbose = Some(parse_bool("VERBOSE", value).map_err(with_line)?),
             "SNOOP" => overrides.snoop = Some(parse_bool("SNOOP", value).map_err(with_line)?),
+            "TERM_ESCAPES" => {
+                overrides.term_escapes =
+                    Some(parse_term_setting("TERM_ESCAPES", value).map_err(with_line)?);
+            }
+            "TERM_CHARSET" => {
+                overrides.term_charset =
+                    Some(parse_term_setting("TERM_CHARSET", value).map_err(with_line)?);
+            }
             "DEFAULTS" => {
                 overrides.standard_volumes = Some(parse_bool("DEFAULTS", value).map_err(with_line)?)
             }
@@ -288,6 +326,8 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         cpu_type: higher.cpu_type.or(lower.cpu_type),
         fpu: higher.fpu.or(lower.fpu),
         jit: higher.jit.or(lower.jit),
+        term_escapes: higher.term_escapes.or(lower.term_escapes),
+        term_charset: higher.term_charset.or(lower.term_charset),
         // net is deliberately CLI-only (see Overrides::net's doc) -- a
         // config file layer's `net` is always None, so this is really
         // just "the CLI's own value passes through unchanged", not a
@@ -792,6 +832,24 @@ mod tests {
     fn malformed_bool_is_an_error() {
         let err = parse("FPU=yes\n").unwrap_err();
         assert!(err.contains("line 1"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn term_keys_parse() {
+        let overrides = parse("TERM_ESCAPES=off\nTERM_CHARSET = On\n").unwrap();
+        assert_eq!(overrides.term_escapes, Some(TermSetting::Off));
+        assert_eq!(overrides.term_charset, Some(TermSetting::On));
+        let err = parse("TERM_CHARSET=yes\n").unwrap_err();
+        assert!(err.contains("auto, on or off"), "{err}");
+    }
+
+    #[test]
+    fn term_keys_merge_higher_wins() {
+        let lower = parse("TERM_ESCAPES=off\nTERM_CHARSET=off\n").unwrap();
+        let higher = parse("TERM_ESCAPES=on\n").unwrap();
+        let merged = merge(higher, lower);
+        assert_eq!(merged.term_escapes, Some(TermSetting::On));
+        assert_eq!(merged.term_charset, Some(TermSetting::Off));
     }
 
     #[test]
