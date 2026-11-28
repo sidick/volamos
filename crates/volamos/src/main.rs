@@ -1892,19 +1892,19 @@ fn attn_flags_for(cpu_type: CpuType, fpu: bool) -> u16 {
 /// this is unambiguous even though the `rest` (a host directory, or an
 /// Amiga path target) might rarely contain further `:` characters of
 /// its own.
+fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), String> {
+    match arg.split_once(':') {
+        Some((name, rest)) if !name.is_empty() => Ok((name, rest)),
+        _ => Err(format!("{flag} expects NAME:VALUE, got {arg:?}")),
+    }
+}
+
 /// Splits a `--var`/`VAR` value at its first `=`: the name must not be
 /// empty, the value may be (and may itself contain `=`).
 fn split_var<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), String> {
     match arg.split_once('=') {
         Some((name, value)) if !name.is_empty() => Ok((name, value)),
         _ => Err(format!("{flag} expects NAME=VALUE, got {arg:?}")),
-    }
-}
-
-fn split_name_value<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), String> {
-    match arg.split_once(':') {
-        Some((name, rest)) if !name.is_empty() => Ok((name, rest)),
-        _ => Err(format!("{flag} expects NAME:VALUE, got {arg:?}")),
     }
 }
 

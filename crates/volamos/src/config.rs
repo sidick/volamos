@@ -14,8 +14,9 @@
 //! **Grammar**: `KEY=VALUE` per line, blank lines and `#`-comment lines
 //! ignored, whitespace around `=` trimmed. Keys mirror the CLI flags:
 //! `VOLUME`/`ASSIGN` (repeatable, same `NAME:value` grammar as `-V`/
-//! `-a`), `VAR` (repeatable, `NAME=VALUE` like `--var`), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM` (same `K`/`M`-suffixed
-//! syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
+//! `-a`), `VAR` (repeatable, `NAME=VALUE` like `--var`, whitespace
+//! around its own `=` trimmed too), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM`
+//! (same `K`/`M`-suffixed syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
 //! `false`). A repeated *singular* key within one file follows the same
 //! "last one wins" rule repeating a CLI flag already has. Relative
 //! `VOLUME`/`AUTO_ASSIGN` host directories resolve against **the
@@ -162,8 +163,16 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
                 overrides.assigns.push((name.to_string(), targets));
             }
             "VAR" => {
-                let (name, value) = split_var("VAR", value).map_err(with_line)?;
-                overrides.vars.push((name.to_string(), value.to_string()));
+                // Trimmed like the outer `KEY = VALUE`, so `VAR = A = 1`
+                // sets `A` to `1` rather than `A ` to ` 1`.
+                let (name, var_value) = split_var("VAR", value).map_err(with_line)?;
+                let name = name.trim_end();
+                if name.is_empty() {
+                    return Err(with_line(format!("VAR expects NAME=VALUE, got {value:?}")));
+                }
+                overrides
+                    .vars
+                    .push((name.to_string(), var_value.trim_start().to_string()));
             }
             "CWD" => overrides.cwd = Some(value.to_string()),
             "AUTO_ASSIGN" => overrides.auto_assign_root = Some(PathBuf::from(value)),
@@ -676,7 +685,7 @@ mod tests {
 
     #[test]
     fn var_is_repeatable_and_splits_at_the_first_equals() {
-        let overrides = parse("VAR=A=1\nVAR = B=x=y\nVAR=EMPTY=\n").unwrap();
+        let overrides = parse("VAR=A=1\nVAR = B = x=y\nVAR=EMPTY=\n").unwrap();
         assert_eq!(
             overrides.vars,
             vec![
@@ -695,6 +704,8 @@ mod tests {
             "{err}"
         );
         assert!(parse("VAR==value\n").is_err());
+        let err = parse("VAR =  = value\n").unwrap_err();
+        assert!(err.contains("got \"= value\""), "{err}");
     }
 
     #[test]
