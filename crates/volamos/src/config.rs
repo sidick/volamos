@@ -14,8 +14,9 @@
 //! **Grammar**: `KEY=VALUE` per line, blank lines and `#`-comment lines
 //! ignored, whitespace around `=` trimmed. Keys mirror the CLI flags:
 //! `VOLUME`/`ASSIGN` (repeatable, same `NAME:value` grammar as `-V`/
-//! `-a`), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM` (same `K`/`M`-suffixed
-//! syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
+//! `-a`), `VAR` (repeatable, `NAME=VALUE` like `--var`, whitespace
+//! around its own `=` trimmed too), `CWD`, `AUTO_ASSIGN`, `STACK`/`RAM`
+//! (same `K`/`M`-suffixed syntax as the flags), `CPU`, `FPU`/`JIT`/`VERBOSE`/`SNOOP` (`true`/
 //! `false`). A repeated *singular* key within one file follows the same
 //! "last one wins" rule repeating a CLI flag already has. Relative
 //! `VOLUME`/`AUTO_ASSIGN` host directories resolve against **the
@@ -47,7 +48,7 @@ use std::path::{Path, PathBuf};
 use volamos_core::backend::CpuType;
 use volamos_core::vfs::LazyVolume;
 
-use crate::{parse_byte_size, parse_cpu_type, split_name_value};
+use crate::{parse_byte_size, parse_cpu_type, split_name_value, split_var};
 
 /// A partial set of CLI-equivalent settings from one source (a config
 /// file, or the CLI itself via [`crate::parse_args_raw`]) -- singular
@@ -60,6 +61,9 @@ pub(crate) struct Overrides {
     pub(crate) snoop: Option<bool>,
     pub(crate) volumes: Vec<(String, PathBuf)>,
     pub(crate) assigns: Vec<(String, Vec<String>)>,
+    /// `VAR`/`--var`: repeatable like `volumes`/`assigns`, but merged
+    /// the other way round -- see [`merge`].
+    pub(crate) vars: Vec<(String, String)>,
     pub(crate) cwd: Option<String>,
     pub(crate) auto_assign_root: Option<PathBuf>,
     pub(crate) stack_size: Option<u32>,
@@ -158,6 +162,18 @@ pub(crate) fn parse(source: &str) -> Result<Overrides, String> {
                 let targets: Vec<String> = targets.split('+').map(str::to_string).collect();
                 overrides.assigns.push((name.to_string(), targets));
             }
+            "VAR" => {
+                // Trimmed like the outer `KEY = VALUE`, so `VAR = A = 1`
+                // sets `A` to `1` rather than `A ` to ` 1`.
+                let (name, var_value) = split_var("VAR", value).map_err(with_line)?;
+                let name = name.trim_end();
+                if name.is_empty() {
+                    return Err(with_line(format!("VAR expects NAME=VALUE, got {value:?}")));
+                }
+                overrides
+                    .vars
+                    .push((name.to_string(), var_value.trim_start().to_string()));
+            }
             "CWD" => overrides.cwd = Some(value.to_string()),
             "AUTO_ASSIGN" => overrides.auto_assign_root = Some(PathBuf::from(value)),
             "STACK" => {
@@ -221,6 +237,11 @@ impl Overrides {
 /// exactly "override on conflict, otherwise both apply" without any
 /// special-casing here or in `volamos-core`.
 ///
+/// `vars` concatenates the other way, `lower ++ higher`: they are
+/// applied in order with `SetVar` semantics, so the *last* entry for a
+/// name wins. That puts a higher source's value last, and keeps "repeat
+/// the flag, the last one wins" within one source.
+///
 /// The memory map has one exception to the plain field-by-field rule:
 /// see the `ram_size` comment in the body.
 pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
@@ -243,6 +264,7 @@ pub(crate) fn merge(higher: Overrides, lower: Overrides) -> Overrides {
         snoop: higher.snoop.or(lower.snoop),
         volumes: higher.volumes.into_iter().chain(lower.volumes).collect(),
         assigns: higher.assigns.into_iter().chain(lower.assigns).collect(),
+        vars: lower.vars.into_iter().chain(higher.vars).collect(),
         cwd: higher.cwd.or(lower.cwd),
         auto_assign_root: higher.auto_assign_root.or(lower.auto_assign_root),
         stack_size: higher.stack_size.or(lower.stack_size),
@@ -657,6 +679,56 @@ mod tests {
             vec![
                 ("SYS".to_string(), PathBuf::from("/host/sys")),
                 ("WORK".to_string(), PathBuf::from("/host/work")),
+            ]
+        );
+    }
+
+    #[test]
+    fn var_is_repeatable_and_splits_at_the_first_equals() {
+        let overrides = parse("VAR=A=1\nVAR = B = x=y\nVAR=EMPTY=\n").unwrap();
+        assert_eq!(
+            overrides.vars,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "x=y".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_var_is_an_error() {
+        let err = parse("VAR=NOEQUALS\n").unwrap_err();
+        assert!(
+            err.contains("line 1") && err.contains("VAR expects NAME=VALUE"),
+            "{err}"
+        );
+        assert!(parse("VAR==value\n").is_err());
+        let err = parse("VAR =  = value\n").unwrap_err();
+        assert!(err.contains("got \"= value\""), "{err}");
+    }
+
+    #[test]
+    fn merge_puts_higher_vars_last_so_they_win() {
+        let higher = Overrides {
+            vars: vec![("V".to_string(), "cli".to_string())],
+            ..Overrides::default()
+        };
+        let lower = Overrides {
+            vars: vec![
+                ("V".to_string(), "file".to_string()),
+                ("W".to_string(), "file".to_string()),
+            ],
+            ..Overrides::default()
+        };
+        // Applied in order with SetVar semantics: V ends up "cli", W
+        // (only in the lower source) still applies.
+        assert_eq!(
+            merge(higher, lower).vars,
+            vec![
+                ("V".to_string(), "file".to_string()),
+                ("W".to_string(), "file".to_string()),
+                ("V".to_string(), "cli".to_string()),
             ]
         );
     }

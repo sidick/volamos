@@ -2,7 +2,7 @@
 
 ```
 volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target...]]...
-        [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
+        [--var NAME=VALUE]... [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
         [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
         [--fpu|--no-fpu] [--fpsp-emulate] [--cpu-library FILE] [--jit|--no-jit]
@@ -128,6 +128,31 @@ order and recursive-assign semantics, with worked examples.
 ```sh
 volamos -V SYS:/home/me/amiga -a LIBS:SYS:libsA+SYS:libsB fixtures/hello
 ```
+
+## `--var NAME=VALUE`
+
+Starts the program with the local shell variable `NAME` set to `VALUE`,
+as if it had called `SetVar(NAME, VALUE, -1, LV_VAR)` itself before
+doing anything else: `GetVar` and `FindVar` see it. Repeatable. Useful for tools that read their
+configuration from variables, which would otherwise need a wrapper
+script just to call `SetVar`.
+
+- The value is everything after the first `=`, so it can contain `=`
+  and can be empty (`--var NAME=`). Nothing is unescaped beyond what
+  your shell does.
+- Names are case-insensitive, as in AmigaOS. If a name is given more
+  than once, the last one wins.
+- A program it starts with `System()`, `Execute()` or `CreateNewProc()`
+  gets a copy of the variables, as on AmigaOS.
+- Only local variables. For a global one (`GVF_GLOBAL_ONLY`), put a
+  file named after the variable in the directory `ENV:` points at.
+
+```sh
+volamos --var GREETING="hello there" --var DEBUG= myprog
+```
+
+The `.volamos` key is `VAR` (see
+[Configuration Files](Configuration.md)).
 
 ## `--cwd AMIGAPATH`
 
