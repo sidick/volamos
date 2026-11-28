@@ -400,7 +400,7 @@ impl M68kCpu {
     }
 
     /// Flips the `m68k` crate's `CpuCore::emulate_unimplemented_060` flag
-    /// -- the CLI's `--fpsp-emulate` (issue #129). `false` (this struct's
+    /// -- the CLI's `--fpsp` (issue #129). `false` (this struct's
     /// default, via [`Self::new`]/[`Self::with_config`]) matches real
     /// 68060 hardware: the instructions a real 68060 removed from
     /// silicon -- most FPU transcendentals (FSIN/FCOS/FATAN/FETOX/FLOGN/
@@ -1615,7 +1615,7 @@ mod tests {
         );
     }
 
-    // --- --fpsp-emulate (issue #129) ---
+    // --- --fpsp (issue #129) ---
     //
     // MOVEP is one of the instructions a real 68060 removed from
     // silicon (see `M68kCpu::set_emulate_unimplemented_060`'s doc);
@@ -1676,7 +1676,7 @@ mod tests {
 
     #[test]
     fn movep_executes_natively_on_m68060_with_emulate_unimplemented_060() {
-        // Opt-in `--fpsp-emulate`: the same instruction now executes
+        // Opt-in `--fpsp`: the same instruction now executes
         // for real instead of trapping.
         let mut cpu = M68kCpu::with_config(CpuType::M68060, false);
         cpu.set_emulate_unimplemented_060(true);
@@ -1712,7 +1712,7 @@ mod tests {
         );
     }
 
-    // --- --fpsp-emulate, extended to --cpu 68040 (issue #217) ---
+    // --- --fpsp, extended to --cpu 68040 (issue #217) ---
     //
     // FINT is one of the opmodes `trap_unimpl_040` traps for real 68040
     // fidelity -- unlike MOVEP above, this is a genuine F-line
@@ -1788,7 +1788,7 @@ mod tests {
 
     #[test]
     fn fint_executes_natively_on_m68040_with_emulate_unimplemented_040_true() {
-        // Opt-in `--fpsp-emulate`: the same instruction now executes
+        // Opt-in `--fpsp`: the same instruction now executes
         // for real instead of trapping.
         let mut cpu = M68kCpu::with_config(CpuType::M68040, true);
         cpu.set_emulate_unimplemented_040(true);
