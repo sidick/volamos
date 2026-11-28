@@ -52,15 +52,19 @@
 //!   and back on the Amiga. On a host terminal they would select a
 //!   different character set (often line drawing), so they are consumed,
 //!   and while shifted, `$20`..`$7E` are written as `$A0`..`$FE`.
-//! - `ESC c` (RIS, "reset the console display") passes through.
+//! - `ESC c` (RIS, "reset the console display") passes through. Any
+//!   other `ESC` sequence (`ESC (`, `ESC 7`, ...) is one the Amiga doesn't
+//!   define, and is dropped, as an unknown control sequence is: passed on,
+//!   it could change the host terminal's state (`ESC ( 0` selects line
+//!   drawing).
 //!
 //! Control sequences, by final byte:
 //!
 //! | Amiga | Written out as |
 //! | --- | --- |
-//! | `@ A B C D E F H I L M P S T W Z f g n` | `ESC [`, same numeric parameters |
+//! | `@ A B C D E F H I L M P S T W Z f g` | `ESC [`, same numeric parameters |
 //! | `J` (ED), `K` (EL) | `ESC [J` / `ESC [K`: the Amiga erases "only to end of display/line", whatever the parameter |
-//! | `m` (SGR) | `ESC [`, the numeric parameters; the Amiga-only `>`*n* (background colour) ones are removed, and if nothing is left the sequence is dropped, so it doesn't become a reset |
+//! | `m` (SGR) | `ESC [`, the numeric parameters; the Amiga-only `>`*n* (background colour) ones are removed, and if no parameter is left at all the sequence is dropped, so it doesn't become a reset |
 //! | `h`, `l` (SM/RM) | only `?7` (auto-wrap, same as DEC's) is kept; `20` (LNM) and `>1` (auto-scroll) are dropped |
 //! | ` p` (aSCR) | `0` hides the cursor (`ESC [?25l`), no parameter shows it (`ESC [?25h`) |
 //! | anything else | dropped |
@@ -74,8 +78,17 @@
 //! out in the host terminal's colours instead.
 //!
 //! A sequence the guest waits for an answer to (` q`, the window status
-//! request) is dropped here. Answering it needs the input side, which is
-//! not done yet.
+//! request, and `n`, the device status report) is dropped here.
+//! Answering it needs the input side, which is not done yet; passing `n`
+//! on would make the host terminal type its own `ESC [` reply into the
+//! guest's input, in a form an Amiga program doesn't expect.
+//!
+//! `SO`/`SI` are control functions, so they belong to escape translation:
+//! with only character conversion on, they pass through unchanged like
+//! every other control byte.
+//!
+//! An unfinished sequence still held when the program exits is dropped,
+//! as it would show nothing on the Amiga console either.
 //!
 //! Following ECMA-48, a C0 control inside a sequence is carried out at
 //! once without ending the sequence; `CAN` (`$18`) or `SUB` (`$1A`) ends
@@ -95,14 +108,17 @@ const SI: u8 = 0x0F;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1A;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum State {
     Ground,
     /// After `ESC`.
     Escape,
-    /// In a control sequence: the parameter and intermediate bytes so
-    /// far.
-    Sequence(Vec<u8>),
+    /// In an `ESC` sequence the Amiga doesn't define (`ESC` plus
+    /// intermediates, e.g. `ESC ( 0`): skipping to its final byte.
+    EscapeDiscard,
+    /// In a control sequence; its parameter and intermediate bytes so far
+    /// are in [`TermFilter::seq`].
+    Sequence,
     /// In a control sequence that grew past [`MAX_SEQUENCE`]: skipping
     /// to its final byte.
     Discard,
@@ -115,6 +131,8 @@ pub struct TermFilter {
     escapes: bool,
     charset: bool,
     state: State,
+    /// The control sequence being collected, reused between sequences.
+    seq: Vec<u8>,
     shifted: bool,
 }
 
@@ -126,6 +144,7 @@ impl TermFilter {
             escapes,
             charset,
             state: State::Ground,
+            seq: Vec::with_capacity(MAX_SEQUENCE),
             shifted: false,
         }
     }
@@ -136,7 +155,8 @@ impl TermFilter {
     }
 
     /// Appends the translation of `input` to `out`. An unfinished
-    /// sequence at the end of `input` is held until the next call.
+    /// sequence at the end of `input` is held until the next call (and
+    /// dropped if none comes: see the module docs).
     pub fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
         for &byte in input {
             if self.escapes {
@@ -158,51 +178,71 @@ impl TermFilter {
     }
 
     fn escape_byte(&mut self, byte: u8, out: &mut Vec<u8>) {
-        match std::mem::replace(&mut self.state, State::Ground) {
+        match self.state {
             State::Ground => self.ground(byte, out),
             State::Escape => match byte {
-                b'[' => self.state = State::Sequence(Vec::new()),
-                b'c' | b'D' | b'E' | b'H' | b'M' => out.extend_from_slice(&[ESC, byte]),
-                // Not an Amiga escape sequence: leave it as it was.
-                _ if (0x20..0x7F).contains(&byte) => out.extend_from_slice(&[ESC, byte]),
-                _ => {
-                    out.push(ESC);
-                    self.ground(byte, out);
+                b'[' => self.start_sequence(),
+                b'c' | b'D' | b'E' | b'H' | b'M' => {
+                    out.extend_from_slice(&[ESC, byte]);
+                    self.state = State::Ground;
                 }
+                0x20..=0x2F => self.state = State::EscapeDiscard,
+                // Not an Amiga escape sequence: dropped.
+                0x30..=0x7E => self.state = State::Ground,
+                _ => self.inside_sequence(byte, out),
+            },
+            State::EscapeDiscard => match byte {
+                0x20..=0x2F => {}
+                0x30..=0x7E => self.state = State::Ground,
+                _ => self.inside_sequence(byte, out),
+            },
+            State::Sequence => match byte {
+                0x20..=0x3F if self.seq.len() < MAX_SEQUENCE => self.seq.push(byte),
+                0x20..=0x3F => self.state = State::Discard,
+                0x40..=0x7E => {
+                    emit_sequence(&self.seq, byte, out);
+                    self.state = State::Ground;
+                }
+                _ => self.inside_sequence(byte, out),
             },
             State::Discard => match byte {
-                0x20..=0x3F | 0x7F => self.state = State::Discard,
-                0x40..=0x7E | CAN | SUB => {}
-                0x00..=0x1F if byte != ESC => {
-                    self.ground(byte, out);
-                    self.state = State::Discard;
-                }
-                _ => self.ground(byte, out),
-            },
-            State::Sequence(mut seq) => match byte {
-                0x20..=0x3F if seq.len() < MAX_SEQUENCE => {
-                    seq.push(byte);
-                    self.state = State::Sequence(seq);
-                }
-                0x20..=0x3F => self.state = State::Discard,
-                0x40..=0x7E => emit_sequence(&seq, byte, out),
-                CAN | SUB => {}
-                ESC | CSI => self.ground(byte, out),
-                0x00..=0x1F => {
-                    self.ground(byte, out);
-                    self.state = State::Sequence(seq);
-                }
-                // DEL inside a sequence is ignored, as in ECMA-48.
-                0x7F => self.state = State::Sequence(seq),
-                _ => self.ground(byte, out),
+                0x20..=0x3F => {}
+                0x40..=0x7E => self.state = State::Ground,
+                _ => self.inside_sequence(byte, out),
             },
         }
+    }
+
+    /// A byte that isn't part of the sequence in progress, by ECMA-48: a
+    /// C0 control runs at once and the sequence carries on; `CAN`/`SUB`
+    /// end it; `ESC`/`$9B` start a new one; DEL is ignored; anything from
+    /// `$80` up ends it and is handled as ordinary output.
+    fn inside_sequence(&mut self, byte: u8, out: &mut Vec<u8>) {
+        match byte {
+            CAN | SUB => self.state = State::Ground,
+            ESC | CSI => self.ground(byte, out),
+            0x00..=0x1F => {
+                let state = self.state;
+                self.ground(byte, out);
+                self.state = state;
+            }
+            0x7F => {}
+            _ => {
+                self.state = State::Ground;
+                self.ground(byte, out);
+            }
+        }
+    }
+
+    fn start_sequence(&mut self) {
+        self.seq.clear();
+        self.state = State::Sequence;
     }
 
     fn ground(&mut self, byte: u8, out: &mut Vec<u8>) {
         match byte {
             ESC => self.state = State::Escape,
-            CSI => self.state = State::Sequence(Vec::new()),
+            CSI => self.start_sequence(),
             SO => self.shifted = true,
             SI => self.shifted = false,
             0x84 => out.extend_from_slice(&[ESC, b'D']),
@@ -231,7 +271,7 @@ fn emit_sequence(params: &[u8], last: u8, out: &mut Vec<u8>) {
     };
     match (intermediates, last) {
         ([], b'@' | b'A'..=b'I' | b'L' | b'M' | b'P' | b'S' | b'T' | b'W' | b'Z')
-        | ([], b'f' | b'g' | b'n')
+        | ([], b'f' | b'g')
             if plain =>
         {
             csi(numbers);
@@ -247,8 +287,9 @@ fn emit_sequence(params: &[u8], last: u8, out: &mut Vec<u8>) {
                 .filter(|p| !p.starts_with(b">"))
                 .collect();
             let all_plain = kept.iter().all(|p| p.iter().all(u8::is_ascii_digit));
-            let dropped_all = !numbers.is_empty() && kept.iter().all(|p| p.is_empty());
-            if all_plain && !dropped_all {
+            // `>3m` alone is dropped rather than sent as a bare reset; an
+            // empty parameter is a real 0 (`;>3m` still resets).
+            if all_plain && !kept.is_empty() {
                 csi(&kept.join(&b';'));
                 out.push(b'm');
             }
@@ -327,6 +368,8 @@ mod tests {
         // Only Amiga-only parameters: dropped, not turned into a reset.
         assert_eq!(both(b"\x9b>3mx"), b"x");
         assert_eq!(both(b"\x9bm"), b"\x1b[m");
+        // An empty parameter is a 0, so this still resets.
+        assert_eq!(both(b"\x9b;>3m"), b"\x1b[m");
     }
 
     #[test]
@@ -358,6 +401,7 @@ mod tests {
             b"\x9b1;1R",
             b"\x9b0~",
             b"\x9b?1A",
+            b"\x9b6n",
         ] {
             assert_eq!(both(&[b"<", seq, b">"].concat()), b"<>", "{seq:?}");
         }
@@ -404,8 +448,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_escapes_pass_through() {
-        assert_eq!(both(b"\x1b(B"), b"\x1b(B");
-        assert_eq!(both(b"\x1b\nx"), b"\x1b\nx");
+    fn escape_sequences_the_amiga_does_not_define_are_dropped() {
+        // ESC ( 0 would switch the host to line drawing.
+        assert_eq!(both(b"a\x1b(0b\x1b7c\x1b#8d"), b"abcd");
+        // A C0 control inside runs at once and the sequence carries on,
+        // so the x is its final byte.
+        assert_eq!(both(b"\x1b\nxy"), b"\ny");
+        assert_eq!(both(b"\x1b(\x18x"), b"x");
+    }
+
+    #[test]
+    fn a_sequence_split_across_filters_does_not_leak() {
+        // State is per filter: what one holds never shows up in another.
+        let mut first = TermFilter::new(true, true);
+        let mut out = Vec::new();
+        first.filter(b"a\x9b1;3", &mut out);
+        TermFilter::new(true, true).filter(b"2mb", &mut out);
+        assert_eq!(out, b"a2mb");
     }
 }

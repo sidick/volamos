@@ -478,15 +478,17 @@ fn parse_assign_arg(s: &str) -> Result<(String, Vec<String>), String> {
     ))
 }
 
-/// Parses a `--var NAME=VALUE` argument.
+/// Parses a `--term-escapes` value.
 fn parse_term_escapes_arg(s: &str) -> Result<config::TermSetting, String> {
     config::parse_term_setting("--term-escapes", s)
 }
 
+/// Parses a `--term-charset` value.
 fn parse_term_charset_arg(s: &str) -> Result<config::TermSetting, String> {
     config::parse_term_setting("--term-charset", s)
 }
 
+/// Parses a `--var NAME=VALUE` argument.
 fn parse_var_arg(s: &str) -> Result<(String, String), String> {
     let (name, value) = split_var("--var", s)?;
     Ok((name.to_string(), value.to_string()))
@@ -3479,12 +3481,14 @@ fn format_emulated_cycles(cycles: u64, clock_hz: f64) -> Option<String> {
     ))
 }
 
-/// Whether guest console output has its control sequences translated
-/// and its Latin-1 converted (issues #426/#427), as `(escapes,
-/// charset)`, resolved once by [`set_terminal_filter`]. Process-wide
-/// rather than per-run because it describes the host terminal, which
-/// every nested `System()` run shares.
-static TERMINAL_FILTER: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+/// The translation guest console output goes through (issues #426/#427),
+/// set up once by [`set_terminal_filter`]. One for the whole process,
+/// not one per run, because every nested `System()` run writes to the
+/// same host terminal: a parent's `SO` shift, or a sequence it left half
+/// written, carries over into its child's output as it would on one
+/// Amiga console.
+static TERMINAL_FILTER: std::sync::OnceLock<std::sync::Mutex<volamos_core::termout::TermFilter>> =
+    std::sync::OnceLock::new();
 
 /// Resolves `--term-escapes`/`--term-charset` against the host: `auto`
 /// means "when stdout is a terminal", and for the character conversion
@@ -3498,14 +3502,20 @@ fn set_terminal_filter(escapes: config::TermSetting, charset: config::TermSettin
         config::TermSetting::Auto => auto,
     };
     let utf8 = locale_is_utf8(|name| std::env::var(name).ok());
-    let _ = TERMINAL_FILTER.set((resolve(escapes, tty), resolve(charset, tty && utf8)));
+    let filter = volamos_core::termout::TermFilter::new(
+        resolve(escapes, tty),
+        resolve(charset, tty && utf8),
+    );
+    let _ = TERMINAL_FILTER.set(std::sync::Mutex::new(filter));
 }
 
-/// A filter with the settings [`set_terminal_filter`] chose; both off if
-/// it never ran.
-fn terminal_filter() -> volamos_core::termout::TermFilter {
-    let (escapes, charset) = TERMINAL_FILTER.get().copied().unwrap_or_default();
-    volamos_core::termout::TermFilter::new(escapes, charset)
+/// The process's filter; one that changes nothing if
+/// [`set_terminal_filter`] never ran.
+fn terminal_filter() -> std::sync::MutexGuard<'static, volamos_core::termout::TermFilter> {
+    TERMINAL_FILTER
+        .get_or_init(|| std::sync::Mutex::new(volamos_core::termout::TermFilter::new(false, false)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether the locale's character set is UTF-8, by the POSIX precedence:
@@ -3533,7 +3543,6 @@ fn locale_is_utf8(var: impl Fn(&str) -> Option<String>) -> bool {
 struct GuestStdout<'a> {
     out: io::StdoutLock<'a>,
     interactive: bool,
-    filter: volamos_core::termout::TermFilter,
     scratch: Vec<u8>,
 }
 
@@ -3544,7 +3553,6 @@ impl<'a> GuestStdout<'a> {
         Self {
             out,
             interactive,
-            filter: terminal_filter(),
             scratch: Vec::new(),
         }
     }
@@ -3552,9 +3560,10 @@ impl<'a> GuestStdout<'a> {
 
 impl io::Write for GuestStdout<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = if self.filter.is_active() {
+        let mut filter = terminal_filter();
+        let n = if filter.is_active() {
             self.scratch.clear();
-            self.filter.filter(buf, &mut self.scratch);
+            filter.filter(buf, &mut self.scratch);
             self.out.write_all(&self.scratch)?;
             buf.len()
         } else {

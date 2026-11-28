@@ -166,21 +166,25 @@ output for the terminal:
 - `$9B` becomes `ESC [`, for the sequences that mean the same on a host
   terminal: cursor movement and positioning, inserting and deleting
   characters and lines, scrolling, tabs, colours and text styles
-  (`SGR`), auto-wrap (`?7h`/`?7l`), and the device status request.
+  (`SGR`), and auto-wrap (`?7h`/`?7l`).
 - Erase in display/line (`J`/`K`) always erases to the end, as it does on
   the Amiga, whatever parameter the program gave.
 - Cursor off and on (`CSI 0 SP p` / `CSI SP p`) become the host's
   `ESC [?25l` / `ESC [?25h`.
 - Amiga-only sequences are dropped: page and line length, offsets, raw
-  input events, the window status request, the Amiga-only `>`
-  background-colour parameter of `SGR`, and the `SO`/`SI` shift into
-  the Latin-1 upper half (the shifted characters themselves are kept).
+  input events, the Amiga-only `>` background-colour parameter of `SGR`,
+  and the `SO`/`SI` shift into the Latin-1 upper half (the shifted
+  characters themselves are kept). So are `ESC` sequences the Amiga
+  doesn't define, such as `ESC ( 0`, which would switch the host
+  terminal to line drawing.
 - Colour numbers pass through unchanged. On the Amiga they pick palette
   pens rather than fixed colours, so expect your terminal's colours.
 
-A sequence split across two `Write` calls is handled, and `Write` still
-returns the number of bytes the program wrote. A program that waits for
-an answer to the window status request (`CSI SP q`) gets none yet.
+A sequence split across two `Write` calls is handled, including one a
+program started and a command it ran with `System()` finished, and
+`Write` still returns the number of bytes the program wrote. The window
+status request (`CSI SP q`) and the device status request (`CSI 6 n`)
+are dropped too: a program that waits for the answer gets none yet.
 
 - `auto` (the default) translates only when stdout is a terminal, so
   output redirected to a file or a pipe stays byte-exact.
@@ -194,12 +198,14 @@ The `.volamos` key is `TERM_ESCAPES`.
 Amiga text is ISO-8859-1 (Latin-1), so on a UTF-8 terminal an `é`
 (`$E9`) or a `£` (`$A3`) shows as garbage. With this on, volamos
 converts the program's output from Latin-1 to UTF-8. Only the
-characters `$A0`–`$FF` change; the control codes `$80`–`$9F` are left
-to `--term-escapes`, so the two can be switched separately.
+characters `$A0`–`$FF` change; the control codes `$80`–`$9F`, and the
+`SO`/`SI` shift, are left to `--term-escapes`, so the two can be switched
+separately.
 
 - `auto` (the default) converts only when stdout is a terminal and the
   locale is UTF-8 (the first of `LC_ALL`, `LC_CTYPE` and `LANG` that is
-  set), so output redirected to a file or a pipe stays byte-exact.
+  set), so output redirected to a file or a pipe stays byte-exact. On
+  a host that doesn't set these, such as Windows, pass `on`.
 - `on` always converts; `off` never does.
 
 The `.volamos` key is `TERM_CHARSET`.
