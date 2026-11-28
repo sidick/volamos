@@ -2417,7 +2417,7 @@ pub(crate) const ECLOCK_PAL_HZ: u32 = 709_379;
 /// too broad. `timer.device` -- specifically, only its `TR_GETSYSTIME`/
 /// `TR_SETSYSTIME`/`TR_ADDREQUEST` commands ([`do_io_handler`]) -- has
 /// simple, fully host-implementable semantics (wall clock + sleep),
-/// unlike every other device (`console.device`/hardware devices/...),
+/// unlike every other device (a console window, hardware devices...),
 /// which would need real drivers this runtime doesn't have (same "no
 /// real handler processes" scope boundary `crate::dospkt`'s `DoPkt`
 /// and `crate::dosdevproc`'s `GetDeviceProc` establish for
@@ -2492,8 +2492,10 @@ fn close_device_handler<C: Cpu>(_ctx: &mut HandlerContext<'_, C>) -> Result<(), 
 /// [`TIMER_DEVICE_BASE`]): dispatches on `io_Command`, writes the
 /// result into the request, and returns the `io_Error` value. Any
 /// `io_Device` this runtime doesn't recognize (shouldn't happen for a
-/// well-behaved caller, since only `timer.device` ever opens
-/// successfully) fails with [`IOERR_NOCMD`] rather than panicking.
+/// well-behaved caller: the only other device that opens is
+/// `console.device`'s library unit, and `DoIO`/`SendIO` reject that
+/// first, in [`reject_console_io`]) fails with [`IOERR_NOCMD`] rather
+/// than panicking.
 /// Tracks `TR_ADDREQUEST` requests [`send_io_handler`] handed back
 /// immediately but which haven't reached their deadline yet (issue
 /// #237, sub-problem #2). `DoIO` suspends only its caller until its
@@ -2943,6 +2945,31 @@ fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
     }
 }
 
+/// `DoIO`/`SendIO` on a `console.device` request (issue #425): only the
+/// library unit opens, and it has no console to read or write, so a
+/// command sent to it fails the run instead of quietly returning
+/// `IOERR_NOCMD`.
+fn reject_console_io(
+    mem: &dyn AddressSpace,
+    ioreq: u32,
+    lvo: i32,
+    handler: &str,
+) -> Result<(), DispatchError> {
+    if mem.read_u32(ioreq + IO_DEVICE_OFFSET) != crate::dispatch::CONSOLE_DEVICE_BASE {
+        return Ok(());
+    }
+    Err(DispatchError::HandlerFailed {
+        library: "exec.library".to_string(),
+        lvo,
+        handler_name: handler.to_string(),
+        message: format!(
+            "command {} on console.device: only its library unit (-1) opens, for \
+             RawKeyConvert, and it has no console to send commands to",
+            mem.read_u16(ioreq + IO_COMMAND_OFFSET)
+        ),
+    })
+}
+
 /// `exec.library`'s `DoIO` (LVO -456: `A1` = `struct IORequest*`).
 /// `D0` = `io_Error` (also written into the request itself, matching
 /// real `DoIO`). Found missing while running the real `PhxAss`
@@ -2962,6 +2989,7 @@ fn run_io_request(mem: &mut dyn AddressSpace, ioreq: u32) -> i8 {
 /// [`run_io_request`].
 fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    reject_console_io(ctx.mem, ioreq, -456, "DoIO")?;
     let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {
@@ -2998,6 +3026,7 @@ fn do_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Dispatch
 /// that.
 fn send_io_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
     let ioreq = ctx.cpu.address_register(AddressRegister(1));
+    reject_console_io(ctx.mem, ioreq, -462, "SendIO")?;
     let device = ctx.mem.read_u32(ioreq + IO_DEVICE_OFFSET);
     let command = ctx.mem.read_u16(ioreq + IO_COMMAND_OFFSET);
     if device == TIMER_DEVICE_BASE && command == TR_ADDREQUEST {

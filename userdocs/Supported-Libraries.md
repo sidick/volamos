@@ -542,16 +542,21 @@ Only the library unit: `OpenDevice("console.device", -1, ...)`
 fail to open with `IOERR_OPENFAIL`: there is no display to put a console
 in.
 
-`RawKeyConvert` converts one key event with the default (usa) keymap,
-and matches real Kickstart 3.1 for every raw key under Shift, Caps Lock,
-Ctrl, Alt, Alt+Shift, the Amiga and numeric-pad qualifiers and key
-repeat:
+`RawKeyConvert` converts one key event with the default (usa) keymap.
+Its output was checked against real Kickstart 3.1 for every raw key
+under no qualifier, each Shift, Caps Lock, Ctrl, each Alt, each Amiga
+key, the numeric-pad qualifier, key repeat, and some combinations of
+these:
 
 - Function, cursor and Help keys give their `CSI` sequences.
 - Caps Lock only affects letters.
 - A key that doesn't repeat gives nothing with `IEQUALIFIER_REPEAT`.
-- A key-up event, or an event that isn't `IECLASS_RAWKEY`, gives 0
-  bytes.
+- Dead keys work: Alt+`F`/`G`/`H`/`J`/`K` give nothing themselves, and
+  if the event's `ie_Prev1DownCode`/`ie_Prev1DownQual` name one, the
+  next vowel, `y`, `n` or space comes out accented in Latin-1, with or
+  without Shift.
+- A key-up event, an `ie_Code` above `$FF`, or an event that isn't
+  `IECLASS_RAWKEY` gives 0 bytes.
 - If the result won't fit in the buffer, it returns -1 and writes
   nothing.
 
@@ -561,11 +566,11 @@ bytes volamos can't vouch for:
 - An event chain (`ie_NextEvent` set). Real Kickstart 3.1 handles
   chains erratically, and hangs on some.
 - A keymap other than the default (`keyMap` not `NULL`).
-- Dead-key composition: a key whose previous-key fields
-  (`ie_Prev1DownCode`/`ie_Prev2DownCode`) name an Alt+`F`/`G`/`H`/`J`/`K`
-  dead key.
+- A dead key followed by a key it changes, with any qualifier but
+  Shift.
 - Alt together with Ctrl or Caps Lock.
-- `CDInputHandler`, which feeds input to console windows.
+- `CDInputHandler`, which feeds input to console windows, and `DoIO` or
+  `SendIO` of any command on the unit -1 request.
 
 ## expansion.library
 

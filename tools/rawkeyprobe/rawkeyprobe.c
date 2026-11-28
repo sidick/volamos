@@ -32,6 +32,7 @@ static void show(const char *label, LONG actual, int dumplen)
     for (i = 0; i < dumplen; i++)
         printf(" %02x", buf[i]);
     printf("\n");
+    fflush(stdout);
 }
 
 static void key(struct InputEvent *ie, UBYTE cls, UWORD code, UWORD qual)
@@ -64,11 +65,19 @@ int main(void)
         IEQUALIFIER_LCOMMAND,
         IEQUALIFIER_NUMERICPAD,
         IEQUALIFIER_REPEAT,
+        IEQUALIFIER_RALT,
+        IEQUALIFIER_RALT | IEQUALIFIER_LSHIFT,
+        IEQUALIFIER_RCOMMAND,
+        IEQUALIFIER_REPEAT | IEQUALIFIER_LSHIFT,
+        IEQUALIFIER_REPEAT | IEQUALIFIER_CONTROL,
+        IEQUALIFIER_REPEAT | IEQUALIFIER_CAPSLOCK,
+        IEQUALIFIER_REPEAT | IEQUALIFIER_LSHIFT | IEQUALIFIER_CONTROL,
     };
+    static const UWORD hicodes[] = { 0x0120, 0x01a0, 0x2120, 0xff20 };
     struct IOStdReq ior;
     struct InputEvent e1, e2;
     char label[32];
-    unsigned q, code;
+    unsigned q, code, dk, sh;
     LONG n;
 
     memset(&ior, 0, sizeof(ior));
@@ -87,6 +96,52 @@ int main(void)
             sprintf(label, "k%02x/q%04x", code, quals[q]);
             show(label, n, n > 0 ? n : 0);
         }
+    }
+
+    /* The previous key a dead key (Alt+F/G/H/J/K on the usa keymap),
+     * as ie_Prev1DownCode/Qual, then every raw code, unshifted and
+     * shifted. */
+    for (dk = 0x23; dk <= 0x27; dk++) {
+        for (sh = 0; sh < 2; sh++) {
+            for (code = 0; code < 0x80; code++) {
+                key(&e1, IECLASS_RAWKEY, code, sh);
+                e1.ie_position.ie_dead.ie_prev1DownCode = dk;
+                e1.ie_position.ie_dead.ie_prev1DownQual = IEQUALIFIER_LALT;
+                n = convert(&e1, sizeof(buf));
+                sprintf(label, "d%02x/k%02x/q%04x", dk, code, sh);
+                show(label, n, n > 0 ? n : 0);
+            }
+        }
+    }
+
+    /* Alt+F before 'e', varied: in ie_Prev2 only; with Right Alt; in both
+     * Prev1 and Prev2; with Shift+Alt; and a non-dead Alt+A instead. */
+    key(&e1, IECLASS_RAWKEY, 0x12, 0);
+    e1.ie_position.ie_dead.ie_prev2DownCode = 0x23;
+    e1.ie_position.ie_dead.ie_prev2DownQual = IEQUALIFIER_LALT;
+    show("prev2-d23-e", convert(&e1, sizeof(buf)), 4);
+    key(&e1, IECLASS_RAWKEY, 0x12, 0);
+    e1.ie_position.ie_dead.ie_prev1DownCode = 0x23;
+    e1.ie_position.ie_dead.ie_prev1DownQual = IEQUALIFIER_RALT;
+    show("ralt-d23-e", convert(&e1, sizeof(buf)), 4);
+    e1.ie_position.ie_dead.ie_prev1DownQual = IEQUALIFIER_LALT;
+    e1.ie_position.ie_dead.ie_prev2DownCode = 0x23;
+    e1.ie_position.ie_dead.ie_prev2DownQual = IEQUALIFIER_LALT;
+    show("double-d23-e", convert(&e1, sizeof(buf)), 4);
+    key(&e1, IECLASS_RAWKEY, 0x12, 0);
+    e1.ie_position.ie_dead.ie_prev1DownCode = 0x23;
+    e1.ie_position.ie_dead.ie_prev1DownQual = IEQUALIFIER_LALT | IEQUALIFIER_LSHIFT;
+    show("shiftalt-d23-e", convert(&e1, sizeof(buf)), 4);
+    key(&e1, IECLASS_RAWKEY, 0x12, 0);
+    e1.ie_position.ie_dead.ie_prev1DownCode = 0x20;
+    e1.ie_position.ie_dead.ie_prev1DownQual = IEQUALIFIER_LALT;
+    show("alta-e", convert(&e1, sizeof(buf)), 4);
+
+    /* ie_Code above 0xFF. */
+    for (q = 0; q < sizeof(hicodes) / sizeof(hicodes[0]); q++) {
+        key(&e1, IECLASS_RAWKEY, hicodes[q], 0);
+        sprintf(label, "hi%04x", hicodes[q]);
+        show(label, convert(&e1, sizeof(buf)), 4);
     }
 
     /* Does it walk ie_NextEvent? 'a' -> 'b'. */

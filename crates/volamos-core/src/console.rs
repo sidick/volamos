@@ -26,9 +26,9 @@
 //! `tests/data/console-rawkeyconvert-ks31.txt`, and this module's tests
 //! check [`KEYS`] against every row of it. What it showed:
 //!
-//! - A key-up event (`ie_Code` with `IECODE_UP_PREFIX`) or an event of any
-//!   class other than `IECLASS_RAWKEY` gives `0` bytes. `ie_SubClass` is
-//!   ignored.
+//! - A key-up event (`ie_Code` with `IECODE_UP_PREFIX`), any `ie_Code`
+//!   above `$FF`, or an event of any class other than `IECLASS_RAWKEY`
+//!   gives `0` bytes. `ie_SubClass` is ignored.
 //! - Capacity is checked before anything is written: `F1` (`CSI 0 ~`,
 //!   three bytes) into a one- or two-byte buffer returns `-1` with the
 //!   buffer untouched.
@@ -38,13 +38,22 @@
 //!   Ctrl+`` ` `` is `$00`, and Ctrl+`1` is still `1`.
 //! - With `IEQUALIFIER_REPEAT`, a key that isn't repeatable
 //!   (`km_LoRepeatable`: Return, Enter, Esc, Help, some function keys)
-//!   gives nothing.
-//! - Right Shift acts as Left Shift; Left Amiga and the numeric-pad
-//!   qualifier change nothing.
+//!   gives nothing; a repeatable one gives what it would without it.
+//! - Right Shift acts as Left Shift and Right Alt as Left Alt; the Amiga
+//!   keys and the numeric-pad qualifier change nothing.
+//! - Alt+`F`/`G`/`H`/`J`/`K` are dead keys: they give nothing themselves,
+//!   and when the event's `ie_Prev1DownCode`/`ie_Prev1DownQual` name one
+//!   (with either Alt), the next vowel, `y`, `n` or space comes out
+//!   accented in Latin-1 (`'` then `e` is `$E9`, `é`). Every other key is
+//!   unchanged, and `ie_Prev2DownCode`/`ie_Prev2DownQual` don't matter on
+//!   this keymap: a dead key there alone does nothing, and two acute dead
+//!   keys in a row still give one `é`.
 //!
 //! [`KEYS`] holds, per raw code, what the probe recorded for no
 //! qualifier, Shift, Ctrl, Shift+Ctrl, Alt and Alt+Shift, plus whether
 //! Caps Lock and key repeat apply; [`convert`] picks the column.
+//! [`DEAD_KEYS`] holds what each dead key does to the keys it changes,
+//! with and without Shift.
 //!
 //! # What fails the run instead
 //!
@@ -59,16 +68,14 @@
 //!   the machine. No program can depend on that, so this fails loudly
 //!   rather than imitate it.
 //! - **A keymap other than the default** (`keyMap` non-`NULL`).
-//! - **Dead-key composition.** On the default keymap, Alt+`F`/`G`/`H`/
-//!   `J`/`K` are dead keys (they produce nothing themselves) and modify
-//!   the next key, read from the event's `ie_Prev1DownCode`/
-//!   `ie_Prev2DownCode` pairs. An event whose previous-down pairs name
-//!   one of them fails rather than coming out uncomposed.
-//! - **Alt together with Ctrl or Caps Lock**, which the probe didn't
+//! - **A dead key followed by a key it changes, with any qualifier but
+//!   Shift** (Caps Lock, Ctrl, Alt, repeat...), which the probe didn't
 //!   measure.
+//! - **Alt together with Ctrl or Caps Lock**, likewise.
 //!
 //! `CDInputHandler` (LVO -42) feeds input to console *windows*, so it
-//! has nothing to act on here and fails as well.
+//! has nothing to act on here and fails as well, as does `DoIO`/`SendIO`
+//! of any command on the unit -1 request (see `crate::exectask`).
 
 use crate::cpu::{AddressRegister, Cpu, DataRegister};
 use crate::dispatch::{CONSOLE_DEVICE_BASE, DispatchError, HandlerContext, LibraryTable};
@@ -91,21 +98,17 @@ const IE_NEXT_EVENT: u32 = 0;
 const IE_CLASS: u32 = 4;
 const IE_CODE: u32 = 6;
 const IE_QUALIFIER: u32 = 8;
-/// `ie_Prev1DownCode`, `ie_Prev1DownQual`, `ie_Prev2DownCode`,
-/// `ie_Prev2DownQual`: the `ie_position` union's dead-key bytes.
-const IE_PREV_DOWN: u32 = 10;
+/// `ie_Prev1DownCode` and `ie_Prev1DownQual`, the first two of the
+/// `ie_position` union's dead-key bytes.
+const IE_PREV1_DOWN_CODE: u32 = 10;
+const IE_PREV1_DOWN_QUAL: u32 = 11;
 
 const IECLASS_RAWKEY: u8 = 0x01;
-const IECODE_UP_PREFIX: u16 = 0x80;
 const IEQUALIFIER_SHIFT: u16 = 0x0001 | 0x0002;
 const IEQUALIFIER_CAPSLOCK: u16 = 0x0004;
 const IEQUALIFIER_CONTROL: u16 = 0x0008;
 const IEQUALIFIER_ALT: u16 = 0x0010 | 0x0020;
 const IEQUALIFIER_REPEAT: u16 = 0x0200;
-
-/// The default keymap's dead keys: Alt with `F`, `G`, `H`, `J`, `K`, the
-/// raw codes that produced nothing with Alt in the probe.
-const DEAD_KEY_CODES: std::ops::RangeInclusive<u8> = 0x23..=0x27;
 
 /// One raw key in the default keymap: its bytes under each measured
 /// qualifier set, and whether Caps Lock and key repeat apply to it.
@@ -281,32 +284,38 @@ const KEYS: [Key; 0x80] = [
     NONE, // 0x7f
 ];
 
+/// A key a dead key changes: its raw code, then what it becomes without
+/// and with Shift.
+type Composed = (u8, &'static [u8], &'static [u8]);
+
+/// The default keymap's dead keys (Alt with the raw code in the first
+/// field: `F` acute, `G` grave, `H` circumflex, `J` tilde, `K`
+/// diaeresis) and, for each key one changes, what it becomes without and
+/// with Shift, as measured on Kickstart 3.1. Keys not listed are
+/// unchanged by a dead key.
+#[rustfmt::skip]
+const DEAD_KEYS: [(u8, &[Composed]); 5] = [
+    (0x23, &[(0x12, b"\xe9", b"\xc9"), (0x15, b"\xfd", b"\xdd"), (0x16, b"\xfa", b"\xda"), (0x17, b"\xed", b"\xcd"), (0x18, b"\xf3", b"\xd3"), (0x20, b"\xe1", b"\xc1"), (0x40, b"\xb4", b"\xb4")]),
+    (0x24, &[(0x12, b"\xe8", b"\xc8"), (0x16, b"\xf9", b"\xd9"), (0x17, b"\xec", b"\xcc"), (0x18, b"\xf2", b"\xd2"), (0x20, b"\xe0", b"\xc0"), (0x40, b"`", b"`")]),
+    (0x25, &[(0x12, b"\xea", b"\xca"), (0x16, b"\xfb", b"\xdb"), (0x17, b"\xee", b"\xce"), (0x18, b"\xf4", b"\xd4"), (0x20, b"\xe2", b"\xc2"), (0x40, b"^", b"^")]),
+    (0x26, &[(0x18, b"\xf5", b"\xd5"), (0x20, b"\xe3", b"\xc3"), (0x36, b"\xf1", b"\xd1"), (0x40, b"~", b"~")]),
+    (0x27, &[(0x12, b"\xeb", b"\xcb"), (0x15, b"\xff", b"Y"), (0x16, b"\xfc", b"\xdc"), (0x17, b"\xef", b"\xcf"), (0x18, b"\xf6", b"\xd6"), (0x20, b"\xe4", b"\xc4"), (0x40, b"\xa8", b"\xa8")]),
+];
+
 /// The bytes `RawKeyConvert` gives a single event, or why volamos won't
-/// convert it (see the module docs). `prev_down` is the event's
-/// `ie_Prev1DownCode`, `ie_Prev1DownQual`, `ie_Prev2DownCode`,
-/// `ie_Prev2DownQual`.
-fn convert(
-    class: u8,
-    code: u16,
-    qualifier: u16,
-    prev_down: [u8; 4],
-) -> Result<&'static [u8], String> {
-    if class != IECLASS_RAWKEY || code & IECODE_UP_PREFIX != 0 {
+/// convert it (see the module docs). `prev1` is the event's
+/// `ie_Prev1DownCode` and `ie_Prev1DownQual`.
+fn convert(class: u8, code: u16, qualifier: u16, prev1: (u8, u8)) -> Result<&'static [u8], String> {
+    // Codes from IECODE_UP_PREFIX ($80) up are key-ups, or not keys at all.
+    if class != IECLASS_RAWKEY || code >= 0x80 {
         return Ok(b"");
     }
-    let Some(key) = KEYS.get(usize::from(code)) else {
-        return Err(format!("ie_Code {code:#06x} is not a raw key code"));
-    };
+    if let Some(composed) = compose(code as u8, qualifier, prev1)? {
+        return Ok(composed);
+    }
+    let key = &KEYS[usize::from(code)];
     if qualifier & IEQUALIFIER_REPEAT != 0 && !key.repeatable {
         return Ok(b"");
-    }
-    for pair in prev_down.chunks(2) {
-        let (code, qual) = (pair[0], u16::from(pair[1]));
-        if qual & IEQUALIFIER_ALT != 0 && DEAD_KEY_CODES.contains(&code) {
-            return Err(format!(
-                "dead-key composition (a previous Alt+raw key {code:#04x}) is not implemented"
-            ));
-        }
     }
     let alt = qualifier & IEQUALIFIER_ALT != 0;
     if alt && qualifier & (IEQUALIFIER_CONTROL | IEQUALIFIER_CAPSLOCK) != 0 {
@@ -324,6 +333,35 @@ fn convert(
         (false, false, false) => key.plain,
         (false, false, true) => key.shift,
     })
+}
+
+/// What `code` becomes after the dead key in `prev1`, if that is a dead
+/// key and `code` one of the keys it changes; `None` otherwise.
+fn compose(
+    code: u8,
+    qualifier: u16,
+    (prev_code, prev_qual): (u8, u8),
+) -> Result<Option<&'static [u8]>, String> {
+    if u16::from(prev_qual) & IEQUALIFIER_ALT == 0 {
+        return Ok(None);
+    }
+    let Some((_, keys)) = DEAD_KEYS.iter().find(|(dead, _)| *dead == prev_code) else {
+        return Ok(None);
+    };
+    let Some(&(_, plain, shifted)) = keys.iter().find(|(key, ..)| *key == code) else {
+        return Ok(None);
+    };
+    if qualifier & !IEQUALIFIER_SHIFT != 0 {
+        return Err(format!(
+            "raw key {code:#04x} after dead key {prev_code:#04x} with qualifier \
+             {qualifier:#06x}: only Shift is implemented with a dead key"
+        ));
+    }
+    Ok(Some(if qualifier & IEQUALIFIER_SHIFT != 0 {
+        shifted
+    } else {
+        plain
+    }))
 }
 
 /// A failure of `handler`, as the call that hit it.
@@ -361,12 +399,15 @@ fn raw_key_convert_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<()
              is not implemented (real Kickstart 3.1 returns -1 for one, or hangs)"
         )));
     }
-    let prev_down = std::array::from_fn(|i| ctx.mem.read_u8(event + IE_PREV_DOWN + i as u32));
+    let prev1 = (
+        ctx.mem.read_u8(event + IE_PREV1_DOWN_CODE),
+        ctx.mem.read_u8(event + IE_PREV1_DOWN_QUAL),
+    );
     let bytes = convert(
         ctx.mem.read_u8(event + IE_CLASS),
         ctx.mem.read_u16(event + IE_CODE),
         ctx.mem.read_u16(event + IE_QUALIFIER),
-        prev_down,
+        prev1,
     )
     .map_err(fail)?;
 
@@ -427,62 +468,104 @@ mod tests {
     /// The probe's output on real Kickstart 3.1 (see the module docs).
     const KS31: &str = include_str!("../tests/data/console-rawkeyconvert-ks31.txt");
 
-    /// Every single-key row of the probe: (code, qualifier, bytes).
-    fn measured_keys() -> Vec<(u16, u16, Vec<u8>)> {
+    /// Every row of the probe, by label: the bytes it wrote (only the
+    /// first `actual`; some rows dump more), or `None` for `-1`.
+    fn measured() -> std::collections::HashMap<&'static str, Option<Vec<u8>>> {
         KS31.lines()
+            .filter(|line| !line.starts_with('#'))
             .filter_map(|line| {
-                let rest = line.strip_prefix('k')?;
-                let (code, rest) = rest.split_once("/q")?;
-                let mut fields = rest.split(' ');
-                let qualifier = fields.next()?;
+                let mut fields = line.split(' ');
+                let label = fields.next()?;
                 let actual: i32 = fields.next()?.parse().ok()?;
-                let bytes: Vec<u8> = fields.map(|b| u8::from_str_radix(b, 16).unwrap()).collect();
-                assert_eq!(bytes.len() as i32, actual.max(0), "{line}");
-                Some((
-                    u16::from_str_radix(code, 16).unwrap(),
-                    u16::from_str_radix(qualifier, 16).unwrap(),
-                    bytes,
-                ))
+                let bytes = fields.map(|b| u8::from_str_radix(b, 16).unwrap());
+                let written = usize::try_from(actual)
+                    .ok()
+                    .map(|n| bytes.take(n).collect());
+                Some((label, written))
             })
             .collect()
     }
 
+    fn hex(field: &str) -> u16 {
+        u16::from_str_radix(field, 16).unwrap()
+    }
+
     #[test]
     fn every_measured_key_and_qualifier_converts_as_on_kickstart_3_1() {
-        let rows = measured_keys();
-        assert_eq!(rows.len(), 0x80 * 13, "the whole probe table");
-        for (code, qualifier, want) in rows {
-            let got = convert(IECLASS_RAWKEY, code, qualifier, [0; 4])
-                .unwrap_or_else(|e| panic!("k{code:02x}/q{qualifier:04x}: {e}"));
-            assert_eq!(got, want.as_slice(), "k{code:02x}/q{qualifier:04x}");
+        let mut checked = 0;
+        for (label, want) in measured() {
+            // kCC/qQQQQ, or dDD/kCC/qQQQQ after dead key DD.
+            let fields: Vec<&str> = label.split('/').collect();
+            let (prev1, code, qualifier) = match fields[..] {
+                [k, q] if k.starts_with('k') && q.starts_with('q') => {
+                    ((0, 0), hex(&k[1..]), hex(&q[1..]))
+                }
+                [d, k, q] if d.starts_with('d') => {
+                    ((hex(&d[1..]) as u8, 0x10), hex(&k[1..]), hex(&q[1..]))
+                }
+                _ => continue,
+            };
+            let got = convert(IECLASS_RAWKEY, code, qualifier, prev1)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(Some(got.to_vec()), want, "{label}");
+            checked += 1;
         }
+        // 20 qualifier sets and 5 dead keys x 2, each x 128 raw codes.
+        assert_eq!(checked, 0x80 * 30, "the whole probe table");
     }
 
     #[test]
-    fn key_up_and_non_key_events_give_nothing() {
+    fn dead_key_variants_compose_as_on_kickstart_3_1() {
+        let rows = measured();
+        let e = |label: &str, prev1| {
+            let got = convert(IECLASS_RAWKEY, 0x12, 0, prev1).unwrap();
+            assert_eq!(Some(got.to_vec()), rows[label], "{label}");
+        };
+        e("ralt-d23-e", (0x23, 0x20));
+        e("shiftalt-d23-e", (0x23, 0x11));
+        // Only ie_Prev1 counts: Prev2 alone, or both, act as Prev1 alone.
+        e("prev2-d23-e", (0, 0));
+        e("double-d23-e", (0x23, 0x10));
+        e("alta-e", (0x20, 0x10));
+    }
+
+    #[test]
+    fn key_up_high_byte_and_non_key_events_give_nothing() {
+        let rows = measured();
+        for code in [0x0120, 0x01a0, 0x2120, 0xff20] {
+            let got = convert(IECLASS_RAWKEY, code, 0, (0, 0)).unwrap();
+            assert_eq!(Some(got.to_vec()), rows[format!("hi{code:04x}").as_str()]);
+        }
+        assert_eq!(rows["up-a"], Some(vec![]));
         assert_eq!(
-            convert(IECLASS_RAWKEY, 0x20 | 0x80, 0, [0; 4]),
+            convert(IECLASS_RAWKEY, 0x20 | 0x80, 0, (0, 0)),
             Ok(&b""[..])
         );
-        assert_eq!(convert(0x00, 0x20, 0, [0; 4]), Ok(&b""[..]));
+        assert_eq!(rows["null-a"], Some(vec![]));
+        assert_eq!(convert(0x00, 0x20, 0, (0, 0)), Ok(&b""[..]));
     }
 
     #[test]
-    fn a_previous_dead_key_fails_instead_of_composing() {
-        // Alt+F (0x23) pressed before 'e' (0x12).
-        let err = convert(IECLASS_RAWKEY, 0x12, 0, [0x23, 0x10, 0, 0]).unwrap_err();
-        assert!(err.contains("dead-key"), "{err}");
-        // A previous key that isn't a dead key changes nothing.
+    fn a_dead_key_with_an_unmeasured_qualifier_fails() {
+        // Alt+F, then Caps Lock+e: not measured.
+        let err = convert(IECLASS_RAWKEY, 0x12, 0x0004, (0x23, 0x10)).unwrap_err();
+        assert!(err.contains("dead key"), "{err}");
+        // A key the dead key doesn't change converts normally whatever
+        // the qualifier, as does any key after a non-dead Alt key.
         assert_eq!(
-            convert(IECLASS_RAWKEY, 0x12, 0, [0x23, 0, 0, 0]),
-            Ok(&b"e"[..])
+            convert(IECLASS_RAWKEY, 0x01, 0x0008, (0x23, 0x10)),
+            Ok(&b"1"[..])
+        );
+        assert_eq!(
+            convert(IECLASS_RAWKEY, 0x12, 0x0004, (0x20, 0x10)),
+            Ok(&b"E"[..])
         );
     }
 
     #[test]
     fn alt_with_ctrl_or_caps_lock_fails() {
         for qualifier in [0x0010 | 0x0008, 0x0020 | 0x0004] {
-            assert!(convert(IECLASS_RAWKEY, 0x20, qualifier, [0; 4]).is_err());
+            assert!(convert(IECLASS_RAWKEY, 0x20, qualifier, (0, 0)).is_err());
         }
     }
 
@@ -632,6 +715,18 @@ mod tests {
         let (result, _) = run(&words, 0x20, 0);
         let message = failure_message(result, "RawKeyConvert");
         assert!(message.contains("ie_NextEvent"), "{message}");
+    }
+
+    #[test]
+    fn a_command_on_the_library_unit_fails_the_run() {
+        let mut words = program(CONU_LIBRARY, None);
+        words.pop(); // rts
+        // movea.l #IOREQ,a1; jsr DoIO(a6); rts -- A6 is still exec.
+        words.extend([0x227C, (IOREQ >> 16) as u16, IOREQ as u16]);
+        words.extend([0x4EAE, (-456i16) as u16, 0x4E75]);
+        let (result, _) = run(&words, 0, 0);
+        let message = failure_message(result, "DoIO");
+        assert!(message.contains("console.device"), "{message}");
     }
 
     #[test]

@@ -1,10 +1,11 @@
 # rawkeyprobe
 
 A small C program that records what `console.device`'s `RawKeyConvert` does
-(issue #425): every raw key code under thirteen qualifier sets (none, each
-Shift, Caps Lock, Ctrl, Alt, the Amiga and numeric-pad qualifiers, key repeat
-and some combinations), key-up and non-key events, buffer overflow, and three
-`ie_NextEvent` chains. Run the same binary on a real Kickstart and under
+(issue #425): every raw key code under twenty qualifier sets (none, each
+Shift, Caps Lock, Ctrl, each Alt, each Amiga key, the numeric-pad qualifier,
+key repeat and some combinations), every raw code after each of the five dead
+keys with and without Shift, key-up, non-key and out-of-range events, buffer
+overflow, and three `ie_NextEvent` chains. Run the same binary on a real Kickstart and under
 volamos and compare.
 
 ```sh
