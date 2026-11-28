@@ -575,3 +575,51 @@ fn no_defaults_flag_disables_the_standard_volumes_layer() {
     );
     assert!(!home.path.join(".volamos.d").exists());
 }
+
+#[test]
+fn old_fpsp_emulate_spelling_works_with_a_note_and_fpsp_has_none() {
+    let run = |flag: &str| {
+        Command::new(env!("CARGO_BIN_EXE_volamos"))
+            .arg(flag)
+            .arg(HELLO_PATH)
+            .output()
+            .expect("failed to run the volamos binary")
+    };
+    let old = run("--fpsp-emulate");
+    assert!(old.status.success());
+    assert_eq!(
+        String::from_utf8(old.stdout).unwrap(),
+        "Hello from volamos\n"
+    );
+    let stderr = String::from_utf8(old.stderr).unwrap();
+    assert!(
+        stderr.contains("--fpsp-emulate is now called --fpsp"),
+        "{stderr}"
+    );
+
+    let new = run("--fpsp");
+    assert!(new.status.success());
+    assert_eq!(
+        String::from_utf8(new.stdout).unwrap(),
+        "Hello from volamos\n"
+    );
+    assert!(
+        new.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&new.stderr)
+    );
+
+    // A guest argument that happens to read --fpsp-emulate is the guest's
+    // business, not a volamos flag.
+    let guest = Command::new(env!("CARGO_BIN_EXE_volamos"))
+        .arg(HELLO_PATH)
+        .arg("--fpsp-emulate")
+        .output()
+        .expect("failed to run the volamos binary");
+    assert!(guest.status.success());
+    assert!(
+        guest.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}

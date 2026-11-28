@@ -852,7 +852,7 @@ const _: () = {
 /// delivers through vector 11 on its own: the 68060's FPU-disabled
 /// exception (the original reason, below), and -- since #217 -- the
 /// unimplemented-FPU-instruction exception of a 68040/68060 whose FPU
-/// is on but has no `--fpsp-emulate`. Those chips deliver what they
+/// is on but has no `--fpsp`. Those chips deliver what they
 /// dropped from silicon the same way through vectors 55, 60 and 61, so
 /// the stub sits in those slots too. All of these are raised inside the
 /// `m68k` crate and jump straight through the slot, so without a stub a
@@ -957,7 +957,7 @@ pub fn install_line_f_decline_stub<C: Cpu>(
     use m68k::core::exceptions::vector;
 
     // The 68040 and 68060 take the same internal jump, with an FPU too,
-    // for what they dropped from silicon unless --fpsp-emulate executes
+    // for what they dropped from silicon unless --fpsp executes
     // it: FPU instructions, data types and addressing forms (vectors 11,
     // 55, 60) and on the 68060 integer instructions (61).
     if !matches!(
@@ -4658,8 +4658,7 @@ impl<C: Cpu + 'static> Runtime<C> {
             )
         };
         if !no_fpu && !self.cpu.fpsp_emulate() {
-            reason
-                .push_str("\nhint: --fpsp-emulate adds trap handlers equivalent to 680x0.library");
+            reason.push_str("\nhint: --fpsp adds trap handlers equivalent to 680x0.library");
         }
         Some((reason, pc))
     }
@@ -5420,7 +5419,7 @@ mod tests {
     }
 
     /// Runs `words` as a guest on `cpu_type` with an FPU and no
-    /// `--fpsp-emulate`, through the stub exactly as `main.rs` sets it
+    /// `--fpsp`, through the stub exactly as `main.rs` sets it
     /// up, and returns the `UnexpectedStop` reason and pc (issue #217).
     fn unhandled_fpu_trap_reason(cpu_type: CpuType, words: &[u16]) -> (String, u32) {
         let mut mem = FlatMemory::new(0x2_0000);
@@ -5459,7 +5458,7 @@ mod tests {
                 reason,
                 format!(
                     "f200 000e: unimplemented FPU instruction on {cpu} (exception vector 11)\n\
-                     hint: --fpsp-emulate adds trap handlers equivalent to 680x0.library"
+                     hint: --fpsp adds trap handlers equivalent to 680x0.library"
                 )
             );
             assert_eq!(pc, entry + 2, "{cpu_type:?}: reported pc");

@@ -391,7 +391,7 @@ struct Options {
     /// [`volamos_core::memory::FlatMemory::enable_mem_timing`] for the
     /// model. CLI-only, like `cache`/`clock_mhz` above.
     mem_wait: Option<(f64, f64)>,
-    /// `--fpsp-emulate` (issue #129, extended to `--cpu 68040` by issue
+    /// `--fpsp` (issue #129, extended to `--cpu 68040` by issue
     /// #217): software-emulate the real-68060 "unimplemented
     /// instruction" set (most FPU transcendentals plus MOVEP/CHK2/CMP2/
     /// misaligned-CAS2/64-bit-MUL-DIV) or the real-68040 one (a smaller,
@@ -738,7 +738,7 @@ struct Cli {
                      own Amiga system or an archive such as MMULib) before the program \
                      starts, as SetPatch does at boot, so its own FPSP/ISP handlers deal with \
                      what the CPU left out of silicon instead of volamos's built-in emulation \
-                     (compare --fpsp-emulate, which this cannot be combined with). The \
+                     (compare --fpsp, which this cannot be combined with). The \
                      library runs as real code: its init needs mmu.library, found the \
                      ordinary way through LIBS: (-a LIBS:DIR, or --libs-dir), and a stand-in \
                      input.device is placed on the device list for it. If the library cannot \
@@ -879,7 +879,10 @@ struct Cli {
 
     /// Software-emulate 68040/68060-unimplemented instructions instead of trapping (off by default)
     #[arg(
-        long = "fpsp-emulate",
+        long = "fpsp",
+        // The flag's original name (issue #129), kept working but out of
+        // --help.
+        alias = "fpsp-emulate",
         action = ArgAction::SetTrue,
         help_heading = "Machine",
         long_help = "Software-emulate the instructions a real 68040/68060 removed from silicon \
@@ -1872,7 +1875,7 @@ fn attn_flags_for(cpu_type: CpuType, fpu: bool) -> u16 {
             // ixemul.library's own init is one of them. This runtime
             // matches the post-SetPatch state, consistent with the FPU
             // transcendentals those libraries would trap-and-emulate
-            // being available via `--fpsp-emulate` rather than a trap
+            // being available via `--fpsp` rather than a trap
             // being the only outcome.
             CpuType::M68040 | CpuType::M68060 => {
                 flags |= AFF_FPU40 | AFF_68881 | AFF_68882;
@@ -1934,7 +1937,7 @@ fn cpu_library_open_name(file: &Path) -> Result<String, String> {
 /// (issue #102), threaded alongside `InstrumentationOptions` for the
 /// same reason (see `Options::clock_mhz`'s doc). The first `bool` is
 /// `--cache` (issue #148, see `Options::cache`'s doc); the second is
-/// `--fpsp-emulate` (issue #129, see `Options::fpsp_emulate`'s doc); the
+/// `--fpsp` (issue #129, see `Options::fpsp_emulate`'s doc); the
 /// third is `--stack-report` (see `Options::stack_report`'s doc) --
 /// all CLI-only for the same reason.
 type RawParsedArgs = (
@@ -2703,8 +2706,8 @@ fn build_nested_runtime(
     // Execute() run gets its own fresh cycle counter, starting at `0`
     // again, same as its own fresh CPU.
     cpu.set_clock_mhz(clock_mhz);
-    // --fpsp-emulate (issue #129, extended to --cpu 68040 by issue #217):
-    // a nested System()/Execute() run shares the parent's --fpsp-emulate
+    // --fpsp (issue #129, extended to --cpu 68040 by issue #217):
+    // a nested System()/Execute() run shares the parent's --fpsp
     // setting, same as it shares --cpu/--fpu. Both calls are needed --
     // see M68kCpu::set_emulate_unimplemented_040's doc for why the 040
     // one can't be skipped just because fpsp_emulate is false here.
@@ -2722,7 +2725,7 @@ fn build_nested_runtime(
     // see Runtime::enable_host_break_folding's doc (issue #210).
     runtime.enable_host_break_folding();
     // --stack-report: a nested System()/Execute() run shares the
-    // parent's --stack-report setting, same as --cache/--fpsp-emulate
+    // parent's --stack-report setting, same as --cache/--fpsp
     // above -- its own report just isn't surfaced anywhere yet (nothing
     // calls stack_usage_report() on a nested Runtime), matching
     // --clock-mhz's own cycle count for a nested run today.
@@ -2926,7 +2929,7 @@ fn run(opts: &Options) -> Result<i32, String> {
     // M68kCpu::set_clock_mhz's doc for how the two would conflict if it
     // weren't.
     cpu.set_clock_mhz(opts.clock_mhz);
-    // --fpsp-emulate (issue #129, extended to --cpu 68040 by issue #217):
+    // --fpsp (issue #129, extended to --cpu 68040 by issue #217):
     // each call is only meaningful for its own `CpuType` (`M68060`/
     // `M68040` respectively), but harmless to set unconditionally for
     // any other model. Both calls are needed regardless of
@@ -3481,10 +3484,20 @@ fn main() -> ExitCode {
     // own fully-formatted help/usage/error text to the right stream and
     // exits with clap's own convention: 0 for `--help`/`--version`, 2 for
     // an actual parse error.
+    // `--fpsp-emulate` is a hidden clap alias of `--fpsp`, so the parsed
+    // `Cli` can't tell the spellings apart: look at the raw flags (only
+    // volamos's own, before `<program>`).
+    let old_fpsp_spelling = before.iter().any(|arg| arg == "--fpsp-emulate");
     let mut cli = match Cli::try_parse_from(std::iter::once("volamos".to_string()).chain(before)) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    if old_fpsp_spelling {
+        eprintln!(
+            "volamos: --fpsp-emulate is now called --fpsp (the old name still works) -- \
+             pass --fpsp to avoid this note"
+        );
+    }
     cli.guest_args = guest_args;
     let workbench = cli.workbench;
     let shell = cli.shell;
@@ -5021,7 +5034,7 @@ mod tests {
 
     #[test]
     fn cache_is_cli_only_not_a_config_override() {
-        // Like --sanitize/--net/--clock-mhz/--fpsp-emulate, this must
+        // Like --sanitize/--net/--clock-mhz/--fpsp, this must
         // never be settable via ~/.volamos/.volamos -- see
         // `Options::cache`'s doc. `cli_to_raw`'s `config::Overrides`
         // literal has no field for it at all, so this documents the
@@ -5060,7 +5073,7 @@ mod tests {
         }
     }
 
-    // --- --fpsp-emulate (issue #129) ---
+    // --- --fpsp (issue #129) ---
 
     #[test]
     fn default_fpsp_emulate_is_off() {
@@ -5073,8 +5086,23 @@ mod tests {
 
     #[test]
     fn fpsp_emulate_flag_turns_it_on() {
+        let opts = parse_args(args(&["--fpsp", "prog"])).unwrap();
+        assert!(opts.fpsp_emulate);
+    }
+
+    #[test]
+    fn fpsp_emulate_old_spelling_still_works() {
         let opts = parse_args(args(&["--fpsp-emulate", "prog"])).unwrap();
         assert!(opts.fpsp_emulate);
+        assert_eq!(opts.program, "prog");
+    }
+
+    #[test]
+    fn fpsp_emulate_old_spelling_is_hidden_from_help() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--fpsp"), "{help}");
+        assert!(!help.contains("fpsp-emulate"), "{help}");
     }
 
     #[test]
@@ -5086,7 +5114,7 @@ mod tests {
         // the flag's value flows out of `cli_to_raw` as a plain `bool`
         // alongside (not inside) `overrides`.
         let (overrides, _, _, _, _, fpsp_emulate, _, _, _, _) =
-            parse_args_raw(args(&["--fpsp-emulate", "prog"])).unwrap();
+            parse_args_raw(args(&["--fpsp", "prog"])).unwrap();
         assert!(fpsp_emulate);
         // `Overrides` has no `fpsp_emulate` field to assert on by name;
         // the absence of one is exactly the point -- a stray
@@ -5108,7 +5136,7 @@ mod tests {
 
     #[test]
     fn stack_report_is_cli_only_not_a_config_override() {
-        // Like --sanitize/--net/--clock-mhz/--fpsp-emulate, this must
+        // Like --sanitize/--net/--clock-mhz/--fpsp, this must
         // never be settable via ~/.volamos/.volamos -- see
         // `Options::stack_report`'s doc. `cli_to_raw`'s
         // `config::Overrides` literal has no field for it at all, so

@@ -5,7 +5,7 @@ volamos [-v|--verbose] [-s|--snoop] [-V NAME:hostdir]... [-a NAME:target[+target
         [--var NAME=VALUE]... [--cwd AMIGAPATH] [--auto-assign HOSTDIR] [--defaults|--no-defaults]
         [--volumes-dir HOSTDIR] [--stack SIZE] [--ram SIZE] [--chip SIZE] [--fast SIZE]
         [--slow SIZE] [--accel SIZE] [--z3 SIZE] [--cpu MODEL]
-        [--fpu|--no-fpu] [--fpsp-emulate] [--cpu-library FILE] [--jit|--no-jit]
+        [--fpu|--no-fpu] [--fpsp] [--cpu-library FILE] [--jit|--no-jit]
         [--clock-mhz N] [--sanitize]
         [--sanitize-uninit] [--sanitize-lowmem] [--sanitize-wild]
         [--sanitize-ignore-pc ADDR] [--dirty-heap] [--uae-debug]
@@ -433,11 +433,17 @@ the pre-seeded stub like any other guest memory write.
     just decides whether real F-line instructions execute instead of
     trapping.
 
-## `--fpsp-emulate`
+<a id="-fpsp-emulate"></a>
+
+## `--fpsp`
 
 Software-emulates the instructions a real 68040 or 68060 removed from
 silicon, instead of taking the real "unimplemented instruction"
-exception a genuine chip does for them:
+exception a genuine chip does for them. The name comes from FPSP,
+Motorola's Floating-Point Software Package, which `68040.library` and
+`68060.library` install for the same job. The flag's original name,
+`--fpsp-emulate`, still works, with a note on stderr suggesting the
+new one.
 
 - On `--cpu 68060`: most FPU transcendentals (`FSIN`/`FCOS`/`FATAN`/
   `FETOX`/`FLOGN`/`FMOD`/`FSCALE`/`FGETEXP`/`FGETMAN`/`FSINCOS`/...)
@@ -458,12 +464,12 @@ compiler's test suite notices code that a real 68040/68060 can't run:
 ```console
 $ volamos --cpu 68040 a-68881-binary
 volamos: a-68881-binary: unexpected CPU stop at 0x000032ec: f200 0003: unimplemented FPU instruction on 68040 (exception vector 11)
-hint: --fpsp-emulate adds trap handlers equivalent to 680x0.library
+hint: --fpsp adds trap handlers equivalent to 680x0.library
 ```
 
 ```sh
-volamos --cpu 68060 --fpu --fpsp-emulate a-68040-fp-binary
-volamos --cpu 68040 --fpsp-emulate a-68040-fp-binary
+volamos --cpu 68060 --fpu --fpsp a-68040-fp-binary
+volamos --cpu 68040 --fpsp a-68040-fp-binary
 ```
 
 A guest that installs its own handler at the Line-F vector (as
@@ -481,7 +487,7 @@ run without needing any real library file at all — or, to run the
 ### Built-in emulation or the real libraries?
 
 For most programs the built-in emulation is the better choice, and it is
-what `--fpsp-emulate` gives you: it needs no library files, it runs at
+what `--fpsp` gives you: it needs no library files, it runs at
 full speed, and its values are right. The emulation comes from the `m68k`
 crate, whose transcendental functions follow Motorola's reference
 68040/68060 software packages. The libraries real Amiga systems run
@@ -508,7 +514,7 @@ after such an operation; ordinary arithmetic is unaffected.
 When you need what the real machine does, exactly, run the real library with
 [`--cpu-library`](#-cpu-library-file) instead.
 
-CLI-only: unlike most flags on this page, `--fpsp-emulate` can't be
+CLI-only: unlike most flags on this page, `--fpsp` can't be
 set in `~/.volamos`/`.volamos` — silently swapping real hardware
 behavior (a trap) for software emulation is exactly the kind of thing
 a stale config file shouldn't be able to turn on for every future run
@@ -519,7 +525,7 @@ in a directory.
 Opens a real `68040.library` or `68060.library` before the program
 runs, as `SetPatch` does at boot, so *its* FPSP/ISP handlers deal with
 what the CPU left out of silicon, instead of volamos's built-in
-emulation ([`--fpsp-emulate`](#-fpsp-emulate), which this cannot be
+emulation ([`--fpsp`](#-fpsp), which this cannot be
 combined with). The library is real 68k code you supply (from your own
 Amiga system, or an archive such as MMULib); nothing is bundled.
 
@@ -565,7 +571,7 @@ the smallest extended denormal through `FATAN` sets only the inexact flag under
 the real `68040.library` 47.1 and `68060.library` 47.2 (as on a real 68882),
 where the built-in emulation also raises underflow.
 
-CLI-only, like `--fpsp-emulate`: running unvalidated 68k code is not
+CLI-only, like `--fpsp`: running unvalidated 68k code is not
 something a stale `~/.volamos` should switch on.
 
 ## `--jit`, `--no-jit`
