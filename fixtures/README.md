@@ -1383,3 +1383,15 @@ its copy to `changed`. Expected stdout: `inherited\nunset\ninherited\ninherited\
 exit 0, the same as on real Kickstart 3.1 (see the generator's
 docstring for the Copperline setup). Used by
 `crates/volamos/tests/dosseg_e2e.rs`.
+
+## `console.device` library-unit fixture: `rawkeytest`
+
+Opens `console.device` unit -1 (`CONU_LIBRARY`, no window), as the Amiga
+Installer does, and calls `RawKeyConvert` through the `io_Device` it got
+back (issue #425). Source of truth: `gen_rawkeytest.py` (no vasm). It
+converts Shift+`h`, `i` and Shift+`1` with the default keymap, checks
+that F1 (`CSI 0 ~`) into a two-byte buffer returns -1, and prints the
+result: stdout `Hi!\n`, exit 0 (20, 10 or 11 for the failure it hit),
+the same as on real Kickstart 3.1. Used by
+`crates/volamos/tests/console_e2e.rs`.
+

@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod battclock;
 pub mod bsdsocket;
+pub mod console;
 pub mod cpu;
 pub mod dispatch;
 pub mod dosanchor;

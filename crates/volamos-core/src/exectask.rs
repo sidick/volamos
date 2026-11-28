@@ -2277,14 +2277,14 @@ const IOERR_NOCMD: i8 = -3;
 const IOERR_ABORTED: i8 = -2;
 
 /// `struct IORequest.io_Device` byte offset.
-const IO_DEVICE_OFFSET: u32 = 20;
+pub(crate) const IO_DEVICE_OFFSET: u32 = 20;
 /// `struct IORequest.io_Command` byte offset (`UWORD`).
 const IO_COMMAND_OFFSET: u32 = 28;
 /// `struct IORequest.io_Error` byte offset (`io_Message` is 20 bytes:
 /// `mn_Node` 14 + `mn_ReplyPort` 4 + `mn_Length` 2; then `io_Device` 4,
 /// `io_Unit` 4, `io_Command` 2, `io_Flags` 1, `io_Error` 1 -- 32 bytes
 /// total, the standard `sizeof(struct IORequest)`).
-const IO_ERROR_OFFSET: u32 = 31;
+pub(crate) const IO_ERROR_OFFSET: u32 = 31;
 /// `struct timerequest.tr_time` (a `struct timeval`: `tv_secs`/
 /// `tv_micro`, both `ULONG`) sits right after the 32-byte `IORequest`.
 const TR_TIME_SECS_OFFSET: u32 = 32;
@@ -2292,7 +2292,7 @@ const TR_TIME_MICRO_OFFSET: u32 = 36;
 
 /// `struct IORequest.io_Unit`: `APTR`, offset 24 (`io_Message` 20 +
 /// `io_Device` 4).
-const IO_UNIT_OFFSET: u32 = 24;
+pub(crate) const IO_UNIT_OFFSET: u32 = 24;
 
 /// `devices/timer.h`'s unit numbers (`UNIT_VBLANK` is 1 and, like
 /// `UNIT_MICROHZ`, takes a plain duration, so it needs no name here).
@@ -2424,7 +2424,9 @@ pub(crate) const ECLOCK_PAL_HZ: u32 = 709_379;
 /// `dos.library` handlers) -- so `timer.device` succeeds, with
 /// `io_Device` set to the real [`TIMER_DEVICE_BASE`] (whose jump table
 /// backs the RKRM-documented `TimerBase = io_Device` library-call idiom
-/// -- see that constant's doc), and everything else still fails with
+/// -- see that constant's doc). `console.device` opens for its library
+/// unit (`-1`) only, for `RawKeyConvert` (see [`crate::console`]), and
+/// everything else still fails with
 /// `IOERR_OPENFAIL`, matching the real, documented "device/unit failed
 /// to open" convention for a device this runtime genuinely can't back.
 fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), DispatchError> {
@@ -2445,6 +2447,23 @@ fn open_device_handler<C: Cpu>(ctx: &mut HandlerContext<'_, C>) -> Result<(), Di
         };
         ctx.mem
             .write_u32(ioreq + IO_UNIT_OFFSET, timer_unit_token(unit));
+        ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
+        ctx.cpu.set_data_register(DataRegister(0), 0);
+        return Ok(());
+    }
+
+    // console.device's library unit (issue #425): no console, just the
+    // base whose RawKeyConvert vector the caller wants. The window units
+    // fall through to IOERR_OPENFAIL below -- see crate::console.
+    if name.eq_ignore_ascii_case(crate::console::CONSOLE_NAME.as_bytes())
+        && ctx.cpu.data_register(DataRegister(0)) == crate::console::CONU_LIBRARY
+    {
+        ctx.mem.write_u32(
+            ioreq + IO_DEVICE_OFFSET,
+            crate::dispatch::CONSOLE_DEVICE_BASE,
+        );
+        ctx.mem
+            .write_u32(ioreq + IO_UNIT_OFFSET, crate::console::CONU_LIBRARY);
         ctx.mem.write_u8(ioreq + IO_ERROR_OFFSET, 0);
         ctx.cpu.set_data_register(DataRegister(0), 0);
         return Ok(());

@@ -533,6 +533,40 @@ which only advances while the guest runs, but a request still waits out
 host time (as `Delay()` does), so a `UNIT_WAITECLOCK` request can come
 back before the emulated counter reaches its target.
 
+## console.device
+
+Only the library unit: `OpenDevice("console.device", -1, ...)`
+(`CONU_LIBRARY`) opens without a window and returns the device base in
+`io_Device`, as programs such as the Amiga Installer expect, and
+`RawKeyConvert` works through it. The window units (`0`, `1`, `3`) still
+fail to open with `IOERR_OPENFAIL`: there is no display to put a console
+in.
+
+`RawKeyConvert` converts one key event with the default (usa) keymap,
+and matches real Kickstart 3.1 for every raw key under Shift, Caps Lock,
+Ctrl, Alt, Alt+Shift, the Amiga and numeric-pad qualifiers and key
+repeat:
+
+- Function, cursor and Help keys give their `CSI` sequences.
+- Caps Lock only affects letters.
+- A key that doesn't repeat gives nothing with `IEQUALIFIER_REPEAT`.
+- A key-up event, or an event that isn't `IECLASS_RAWKEY`, gives 0
+  bytes.
+- If the result won't fit in the buffer, it returns -1 and writes
+  nothing.
+
+These fail the run with an error naming the call, rather than return
+bytes volamos can't vouch for:
+
+- An event chain (`ie_NextEvent` set). Real Kickstart 3.1 handles
+  chains erratically, and hangs on some.
+- A keymap other than the default (`keyMap` not `NULL`).
+- Dead-key composition: a key whose previous-key fields
+  (`ie_Prev1DownCode`/`ie_Prev2DownCode`) name an Alt+`F`/`G`/`H`/`J`/`K`
+  dead key.
+- Alt together with Ctrl or Caps Lock.
+- `CDInputHandler`, which feeds input to console windows.
+
 ## expansion.library
 
 The Zorro autoconfig bookkeeping library — and here, the truthful

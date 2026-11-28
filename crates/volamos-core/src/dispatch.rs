@@ -545,6 +545,15 @@ pub const EXPANSION_LIBRARY_BASE: u32 = 0x2F80;
 /// for which calls are implemented and why the rest fail loudly.
 pub const ICON_LIBRARY_BASE: u32 = 0x31B0;
 
+/// Real `console.device` base address -- the `0x3204`..`0x3404` chunk
+/// past [`ICON_LIBRARY_BASE`]'s, at the usual `0x1AC` into it. Only the
+/// library unit (`-1`) opens, and only its two library vectors exist:
+/// `CDInputHandler` at `-42` and `RawKeyConvert` at `-48`, after the six
+/// standard device vectors. A device base, so its node type is
+/// `NT_DEVICE`, like [`TIMER_DEVICE_BASE`]'s. See [`crate::console`]'s
+/// module docs (issue #425).
+pub const CONSOLE_DEVICE_BASE: u32 = 0x33B0;
+
 /// `exec/nodes.h`'s `NT_DEVICE` -- [`TIMER_DEVICE_BASE`]'s node type
 /// (a device's base is `struct Device`, a `struct Library` whose
 /// `ln_Type` is `NT_DEVICE` rather than `NT_LIBRARY`).
@@ -3092,6 +3101,7 @@ impl<C: Cpu + 'static> Runtime<C> {
         // format (a missing icon, tool-type parsing, BumpRevision) --
         // see crate::icon's module docs for what still fails loudly.
         crate::icon::register_icon_handlers(&mut table, &mut mem);
+        crate::console::register_console_handlers(&mut table, &mut mem);
 
         // exec.library list/node primitives and single-threaded message
         // ports (Phase 3 stage 4): AddHead/AddTail/Remove/RemHead/
@@ -3161,13 +3171,12 @@ impl<C: Cpu + 'static> Runtime<C> {
         write_library_node(&mut mem, LOCALE_LIBRARY_BASE);
         write_library_node(&mut mem, INTUITION_LIBRARY_BASE);
         write_library_node(&mut mem, ICON_LIBRARY_BASE);
-        write_library_node(&mut mem, TIMER_DEVICE_BASE);
         // A device's node type is NT_DEVICE, not write_library_node's
         // NT_LIBRARY -- see TIMER_DEVICE_BASE's doc.
-        mem.write_u8(
-            TIMER_DEVICE_BASE.wrapping_add(LIB_NODE_TYPE_OFFSET),
-            NT_DEVICE,
-        );
+        for device in [TIMER_DEVICE_BASE, CONSOLE_DEVICE_BASE] {
+            write_library_node(&mut mem, device);
+            mem.write_u8(device.wrapping_add(LIB_NODE_TYPE_OFFSET), NT_DEVICE);
+        }
 
         // dl_TimeReq: give dos.library a real (fake) persistent
         // timerequest whose io_Device is TIMER_DEVICE_BASE, exactly as
