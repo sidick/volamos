@@ -3,6 +3,26 @@
 This page tracks major milestones during development, following the
 version scheme in `Cargo.toml`.
 
+## [0.24.0](https://github.com/sidick/volamos/compare/v0.23.0...v0.24.0) (2026-11-28)
+
+
+### Features
+
+* **cli:** preset local shell variables with --var and VAR ([#446](https://github.com/sidick/volamos/issues/446)) ([5e9ba91](https://github.com/sidick/volamos/commit/5e9ba91bd2b798ae327c85b6c922038dcebd6ebc))
+* **cli:** rename --fpsp-emulate to --fpsp ([#447](https://github.com/sidick/volamos/issues/447)) ([030f659](https://github.com/sidick/volamos/commit/030f6592480e53a45461e9eca75d3f6f23f3e535))
+* **cli:** translate Amiga console output for a host terminal ([#450](https://github.com/sidick/volamos/issues/450)) ([880fea7](https://github.com/sidick/volamos/commit/880fea73448bcfae6af6c5c4fa80a086a7a43fbe))
+* **cli:** translate host terminal input for the guest ([#451](https://github.com/sidick/volamos/issues/451)) ([31cd25e](https://github.com/sidick/volamos/commit/31cd25e6895df47521d66b622b5d765a34fb1805))
+* **exec:** console.device unit -1 with RawKeyConvert ([#448](https://github.com/sidick/volamos/issues/448)) ([0d2318b](https://github.com/sidick/volamos/commit/0d2318b5bb21465df9f134f24fad4f70538cc6dc))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate m68k to v0.17.3 ([#434](https://github.com/sidick/volamos/issues/434)) ([bc16397](https://github.com/sidick/volamos/commit/bc1639791ef22993931a28168c28bc03ab901b56))
+* **deps:** update rust crate m68k to v0.18.0 ([#438](https://github.com/sidick/volamos/issues/438)) ([d63e47d](https://github.com/sidick/volamos/commit/d63e47da114e2c66934a24bfafda2563058e8a78))
+* **deps:** update rust crate m68k to v0.18.1 ([#440](https://github.com/sidick/volamos/issues/440)) ([bf4e3c8](https://github.com/sidick/volamos/commit/bf4e3c84a15847bb3c463f86038f7ae235ff6e03))
+* **deps:** update rust crate m68k to v0.18.2 ([#441](https://github.com/sidick/volamos/issues/441)) ([bce329f](https://github.com/sidick/volamos/commit/bce329f8044f5c47de9e4019207fa55cf1a61ba9))
+* **deps:** update rust crate m68k to v0.18.3 ([#442](https://github.com/sidick/volamos/issues/442)) ([d1b689f](https://github.com/sidick/volamos/commit/d1b689f01b7e58f6f934cb09cd5024e04a8b1504))
+
 ## [0.23.0](https://github.com/sidick/volamos/compare/v0.22.0...v0.23.0) (2026-11-22)
 
 
